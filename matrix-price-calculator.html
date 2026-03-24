@@ -1,0 +1,1647 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Matrix Homeserver Cloudflare 价格计算器</title>
+    <style>
+      :root {
+        --bg: #f4f1ea;
+        --panel: rgba(255, 253, 249, 0.86);
+        --panel-strong: #fffdfa;
+        --ink: #1a1917;
+        --muted: #625b52;
+        --line: rgba(88, 77, 64, 0.14);
+        --accent: #0e7c66;
+        --accent-soft: rgba(14, 124, 102, 0.12);
+        --accent-strong: #0b6a58;
+        --warm: #ac5f2c;
+        --warn: #b54d2a;
+        --shadow: 0 24px 60px -28px rgba(28, 22, 15, 0.28);
+        --radius-xl: 30px;
+        --radius-lg: 22px;
+        --radius-md: 16px;
+        --max: 1380px;
+        --mono: "JetBrains Mono", "SFMono-Regular", "Consolas", monospace;
+        --sans: "Avenir Next", "Segoe UI Variable", "Helvetica Neue", "Noto Sans SC",
+          "PingFang SC", sans-serif;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html {
+        scroll-behavior: smooth;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100dvh;
+        font-family: var(--sans);
+        color: var(--ink);
+        background:
+          radial-gradient(circle at top right, rgba(14, 124, 102, 0.14), transparent 30%),
+          radial-gradient(circle at left 20%, rgba(172, 95, 44, 0.12), transparent 26%),
+          linear-gradient(180deg, #f8f4ed 0%, #f0ebe1 100%);
+        letter-spacing: 0.01em;
+      }
+
+      body::before {
+        content: "";
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+        background-image:
+          linear-gradient(rgba(255, 255, 255, 0.35), rgba(255, 255, 255, 0.05)),
+          radial-gradient(rgba(26, 25, 23, 0.035) 0.75px, transparent 0.75px);
+        background-size: 100% 100%, 18px 18px;
+        opacity: 0.45;
+        z-index: 0;
+      }
+
+      .page {
+        position: relative;
+        z-index: 1;
+        max-width: var(--max);
+        margin: 0 auto;
+        padding: 28px 18px 64px;
+      }
+
+      .hero {
+        display: grid;
+        grid-template-columns: minmax(0, 1.2fr) minmax(300px, 0.8fr);
+        gap: 24px;
+        align-items: stretch;
+        margin-bottom: 26px;
+      }
+
+      .hero-copy,
+      .hero-total,
+      .panel,
+      details.panel {
+        background: var(--panel);
+        backdrop-filter: blur(16px);
+        -webkit-backdrop-filter: blur(16px);
+        border: 1px solid rgba(255, 255, 255, 0.75);
+        box-shadow:
+          var(--shadow),
+          inset 0 1px 0 rgba(255, 255, 255, 0.72);
+      }
+
+      .hero-copy,
+      .hero-total {
+        border-radius: var(--radius-xl);
+        overflow: hidden;
+      }
+
+      .hero-copy {
+        padding: 34px;
+        display: grid;
+        gap: 22px;
+        min-height: 320px;
+        align-content: space-between;
+      }
+
+      .eyebrow {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        width: fit-content;
+        padding: 10px 14px;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.66);
+        border: 1px solid rgba(255, 255, 255, 0.8);
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.14em;
+      }
+
+      .eyebrow::before {
+        content: "";
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--accent);
+        box-shadow: 0 0 0 6px rgba(14, 124, 102, 0.12);
+      }
+
+      h1 {
+        margin: 0;
+        font-size: clamp(2.9rem, 6vw, 5.8rem);
+        line-height: 0.94;
+        letter-spacing: -0.05em;
+        max-width: 8.8ch;
+      }
+
+      .hero-copy p {
+        margin: 0;
+        max-width: 62ch;
+        color: var(--muted);
+        line-height: 1.7;
+        font-size: 15px;
+      }
+
+      .hero-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 12px;
+      }
+
+      .hero-stat {
+        padding: 16px;
+        border-radius: 18px;
+        background: rgba(255, 255, 255, 0.64);
+        border: 1px solid rgba(255, 255, 255, 0.75);
+      }
+
+      .hero-stat strong {
+        display: block;
+        font-size: 24px;
+        line-height: 1;
+        letter-spacing: -0.05em;
+        margin-bottom: 8px;
+      }
+
+      .hero-stat span {
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .hero-total {
+        padding: 28px;
+        display: grid;
+        gap: 18px;
+        align-content: start;
+        position: relative;
+        isolation: isolate;
+      }
+
+      .hero-total::after {
+        content: "";
+        position: absolute;
+        inset: 18px;
+        border-radius: 24px;
+        background:
+          linear-gradient(135deg, rgba(14, 124, 102, 0.14), transparent 56%),
+          linear-gradient(220deg, rgba(172, 95, 44, 0.12), transparent 55%);
+        z-index: -1;
+      }
+
+      .kicker {
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+      }
+
+      .money {
+        display: flex;
+        align-items: baseline;
+        gap: 14px;
+        flex-wrap: wrap;
+      }
+
+      .money strong {
+        font-size: clamp(2.8rem, 7vw, 5.2rem);
+        line-height: 0.92;
+        letter-spacing: -0.07em;
+      }
+
+      .money span {
+        color: var(--muted);
+        font-size: 14px;
+      }
+
+      .total-note {
+        padding: 14px 16px;
+        border-radius: 18px;
+        background: rgba(255, 255, 255, 0.7);
+        border: 1px solid rgba(255, 255, 255, 0.8);
+        color: var(--muted);
+        line-height: 1.65;
+        font-size: 14px;
+      }
+
+      .mini-breakdown {
+        display: grid;
+        gap: 10px;
+      }
+
+      .mini-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 14px;
+        padding: 12px 14px;
+        border-radius: 16px;
+        background: rgba(255, 255, 255, 0.66);
+        border: 1px solid rgba(255, 255, 255, 0.76);
+      }
+
+      .mini-row small {
+        display: block;
+        color: var(--muted);
+        font-size: 12px;
+        margin-top: 4px;
+      }
+
+      .mini-row strong {
+        font-family: var(--mono);
+        font-size: 14px;
+      }
+
+      .preset-bar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        margin-bottom: 18px;
+      }
+
+      .preset {
+        border: 0;
+        background: rgba(255, 255, 255, 0.78);
+        color: var(--ink);
+        padding: 12px 14px;
+        border-radius: 999px;
+        cursor: pointer;
+        font: inherit;
+        font-size: 14px;
+        box-shadow:
+          0 10px 24px -20px rgba(0, 0, 0, 0.5),
+          inset 0 1px 0 rgba(255, 255, 255, 0.85);
+        transition: transform 180ms ease, background 180ms ease;
+      }
+
+      .preset:hover {
+        transform: translateY(-1px);
+        background: #ffffff;
+      }
+
+      .preset:active {
+        transform: translateY(1px) scale(0.99);
+      }
+
+      .content {
+        display: grid;
+        grid-template-columns: minmax(0, 1.08fr) minmax(320px, 0.92fr);
+        gap: 24px;
+      }
+
+      .stack {
+        display: grid;
+        gap: 18px;
+      }
+
+      .panel,
+      details.panel {
+        border-radius: var(--radius-lg);
+        padding: 22px;
+        background: var(--panel);
+      }
+
+      .panel-title {
+        display: flex;
+        align-items: end;
+        justify-content: space-between;
+        gap: 16px;
+        margin-bottom: 18px;
+      }
+
+      .panel-title h2,
+      .panel-title h3 {
+        margin: 0;
+        font-size: 1.2rem;
+        line-height: 1.1;
+        letter-spacing: -0.04em;
+      }
+
+      .panel-title p {
+        margin: 8px 0 0;
+        font-size: 13px;
+        color: var(--muted);
+        max-width: 54ch;
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 14px;
+      }
+
+      .field {
+        display: grid;
+        gap: 8px;
+      }
+
+      .field--wide {
+        grid-column: 1 / -1;
+      }
+
+      label {
+        font-size: 13px;
+        font-weight: 700;
+        color: var(--ink);
+      }
+
+      .hint {
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.5;
+      }
+
+      input,
+      select {
+        width: 100%;
+        border: 1px solid var(--line);
+        border-radius: 15px;
+        background: rgba(255, 255, 255, 0.82);
+        color: var(--ink);
+        padding: 14px 14px;
+        font: inherit;
+        font-size: 15px;
+        outline: none;
+        transition: border-color 160ms ease, box-shadow 160ms ease, transform 160ms ease;
+      }
+
+      input:focus,
+      select:focus {
+        border-color: rgba(14, 124, 102, 0.42);
+        box-shadow: 0 0 0 4px rgba(14, 124, 102, 0.12);
+      }
+
+      input[type="checkbox"] {
+        width: 18px;
+        height: 18px;
+        padding: 0;
+        accent-color: var(--accent);
+        border-radius: 6px;
+      }
+
+      .inline-toggle {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 14px 16px;
+        background: rgba(255, 255, 255, 0.74);
+        border: 1px solid rgba(255, 255, 255, 0.78);
+        border-radius: 16px;
+      }
+
+      details.panel summary {
+        list-style: none;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+
+      details.panel summary::-webkit-details-marker {
+        display: none;
+      }
+
+      details.panel summary h3 {
+        margin: 0;
+        font-size: 1.06rem;
+        letter-spacing: -0.04em;
+      }
+
+      details.panel summary span {
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .caret {
+        width: 32px;
+        height: 32px;
+        border-radius: 50%;
+        display: inline-grid;
+        place-items: center;
+        background: rgba(255, 255, 255, 0.78);
+        border: 1px solid rgba(255, 255, 255, 0.8);
+        transition: transform 180ms ease;
+      }
+
+      details[open] .caret {
+        transform: rotate(180deg);
+      }
+
+      .advanced-body {
+        margin-top: 18px;
+        padding-top: 18px;
+        border-top: 1px solid var(--line);
+      }
+
+      .summary-card {
+        position: sticky;
+        top: 18px;
+        display: grid;
+        gap: 18px;
+      }
+
+      .breakdown-card {
+        padding: 22px;
+        border-radius: var(--radius-lg);
+        background: var(--panel-strong);
+        border: 1px solid rgba(255, 255, 255, 0.82);
+        box-shadow:
+          0 18px 42px -28px rgba(28, 22, 15, 0.18),
+          inset 0 1px 0 rgba(255, 255, 255, 0.86);
+      }
+
+      .line-item {
+        display: grid;
+        gap: 10px;
+        padding: 16px 0;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .line-item:last-child {
+        padding-bottom: 0;
+        border-bottom: 0;
+      }
+
+      .line-top {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+
+      .line-top strong {
+        font-size: 15px;
+      }
+
+      .line-top span {
+        font-family: var(--mono);
+        font-size: 13px;
+      }
+
+      .meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+
+      .pill {
+        padding: 7px 10px;
+        border-radius: 999px;
+        background: rgba(14, 124, 102, 0.08);
+        color: var(--accent-strong);
+        font-size: 12px;
+        border: 1px solid rgba(14, 124, 102, 0.14);
+      }
+
+      .pill--warn {
+        background: rgba(181, 77, 42, 0.1);
+        color: var(--warn);
+        border-color: rgba(181, 77, 42, 0.18);
+      }
+
+      .usage {
+        display: grid;
+        gap: 7px;
+      }
+
+      .bar {
+        overflow: hidden;
+        height: 10px;
+        border-radius: 999px;
+        background: rgba(17, 17, 17, 0.08);
+      }
+
+      .bar > span {
+        display: block;
+        height: 100%;
+        border-radius: inherit;
+        background: linear-gradient(90deg, var(--accent), #20a684);
+        transition: width 220ms ease;
+      }
+
+      .bar > span.warn {
+        background: linear-gradient(90deg, var(--warm), var(--warn));
+      }
+
+      .usage small {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .insights {
+        display: grid;
+        gap: 12px;
+      }
+
+      .insight {
+        padding: 16px;
+        border-radius: 18px;
+        background: rgba(255, 255, 255, 0.72);
+        border: 1px solid rgba(255, 255, 255, 0.8);
+      }
+
+      .insight strong {
+        display: block;
+        margin-bottom: 8px;
+        letter-spacing: -0.03em;
+      }
+
+      .insight p {
+        margin: 0;
+        color: var(--muted);
+        line-height: 1.62;
+        font-size: 14px;
+      }
+
+      .footnote {
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.7;
+      }
+
+      .sr-only {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        margin: -1px;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        white-space: nowrap;
+        border: 0;
+      }
+
+      @media (max-width: 1080px) {
+        .hero,
+        .content {
+          grid-template-columns: 1fr;
+        }
+
+        .summary-card {
+          position: static;
+        }
+      }
+
+      @media (max-width: 740px) {
+        .page {
+          padding-inline: 14px;
+        }
+
+        .hero-copy,
+        .hero-total,
+        .panel,
+        details.panel,
+        .breakdown-card {
+          border-radius: 22px;
+        }
+
+        .hero-copy {
+          padding: 24px;
+          min-height: auto;
+        }
+
+        .hero-total {
+          padding: 22px;
+        }
+
+        .hero-grid,
+        .grid {
+          grid-template-columns: 1fr;
+        }
+
+        h1 {
+          max-width: 10.5ch;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="page">
+      <section class="hero">
+        <div class="hero-copy">
+          <div>
+            <div class="eyebrow">Cloudflare Matrix Rough Estimator</div>
+            <h1>大致估算 Matrix homeserver 月费用</h1>
+          </div>
+          <p>
+            这是一个面向评估阶段的粗粒度计算器。它不会假装知道你未来的精确架构，而是把
+            <code>/sync</code> 在线负载、消息写放大、媒体存储与读取、搜索索引和日志这些最影响账单的因素压缩成一页可调参数。
+          </p>
+          <div class="hero-grid">
+            <div class="hero-stat">
+              <strong>Base $5</strong>
+              <span>Workers Paid Plan 最低月费始终计入</span>
+            </div>
+            <div class="hero-stat">
+              <strong>Sync First</strong>
+              <span>在线设备与长轮询通常比媒体更贵</span>
+            </div>
+            <div class="hero-stat">
+              <strong>Rough Only</strong>
+              <span>适合评估，不代替正式容量规划</span>
+            </div>
+          </div>
+        </div>
+
+        <aside class="hero-total" aria-label="总估算">
+          <div class="kicker">Monthly Estimate</div>
+          <div class="money">
+            <strong id="headline-total">$5.00</strong>
+            <span id="headline-band">大致落在包含额度内</span>
+          </div>
+          <div class="total-note" id="headline-note">
+            当前输入下，预计主要费用仍然停留在基础月费附近。
+          </div>
+          <div class="mini-breakdown" id="top-drivers"></div>
+        </aside>
+      </section>
+
+      <div class="preset-bar" aria-label="预设">
+        <button class="preset" type="button" data-preset="team20">20 人团队</button>
+        <button class="preset" type="button" data-preset="alwaysOn20">20 设备常在线</button>
+        <button class="preset" type="button" data-preset="community200">200 人社区</button>
+        <button class="preset" type="button" data-preset="public1000">1000 人公开站点</button>
+      </div>
+
+      <section class="content">
+        <div class="stack">
+          <section class="panel">
+            <div class="panel-title">
+              <div>
+                <h2>基础输入</h2>
+                <p>先只改这些。它们通常已经足够把大部分账单趋势估出来。</p>
+              </div>
+            </div>
+
+            <div class="grid">
+              <div class="field">
+                <label for="users">用户数</label>
+                <input id="users" type="number" min="1" step="1" value="20" />
+                <div class="hint">总注册用户数，主要影响搜索和在线上限。</div>
+              </div>
+
+              <div class="field">
+                <label for="devicesPerUser">平均设备数 / 用户</label>
+                <input id="devicesPerUser" type="number" min="0.5" step="0.1" value="1.2" />
+                <div class="hint">手机、桌面、网页都算设备。</div>
+              </div>
+
+              <div class="field">
+                <label for="onlineDevices">平均同时在线设备</label>
+                <input id="onlineDevices" type="number" min="0" step="1" value="6" />
+                <div class="hint">这是最影响 <code>/sync</code> 成本的参数。</div>
+              </div>
+
+              <div class="field">
+                <label for="onlineHours">每天在线小时</label>
+                <input id="onlineHours" type="number" min="0" max="24" step="0.5" value="8" />
+                <div class="hint">若是 24x7 常连设备，填 24。</div>
+              </div>
+
+              <div class="field">
+                <label for="messages">每月消息数</label>
+                <input id="messages" type="number" min="0" step="100" value="1000" />
+                <div class="hint">只算内部聊天消息，不含联邦。</div>
+              </div>
+
+              <div class="field">
+                <label for="syncMode">Sync 模式</label>
+                <select id="syncMode">
+                  <option value="economy">省钱：每次 sync 探测 1 次 DO</option>
+                  <option value="balanced" selected>平衡：每次 sync 探测 3 次 DO</option>
+                  <option value="realtime">低延迟：每次 sync 探测 6 次 DO</option>
+                </select>
+                <div class="hint">探测越频繁，延迟越低，但 DO 请求越多。</div>
+              </div>
+
+              <div class="field">
+                <label for="searchMode">搜索模式</label>
+                <select id="searchMode">
+                  <option value="off" selected>关闭：不做全文搜索</option>
+                  <option value="light">轻量：少量搜索、轻索引</option>
+                  <option value="deep">重型：公开站点级全文搜索</option>
+                </select>
+                <div class="hint">这主要影响 D1 写入，而不是媒体或带宽。</div>
+              </div>
+
+              <div class="field">
+                <label for="mediaStorage">媒体平均存量 GB</label>
+                <input id="mediaStorage" type="number" min="0" step="1" value="10" />
+                <div class="hint">按月平均 GB-month 估算。</div>
+              </div>
+
+              <div class="field">
+                <label for="mediaUploads">媒体上传次数 / 月</label>
+                <input id="mediaUploads" type="number" min="0" step="10" value="120" />
+                <div class="hint">大致对应 R2 Class A。</div>
+              </div>
+
+              <div class="field">
+                <label for="mediaReads">媒体下载次数 / 月</label>
+                <input id="mediaReads" type="number" min="0" step="100" value="2400" />
+                <div class="hint">大致对应 R2 Class B。</div>
+              </div>
+
+              <div class="field">
+                <label for="logMode">日志模式</label>
+                <select id="logMode">
+                  <option value="sparse" selected>克制：只打错误与少量采样</option>
+                  <option value="normal">普通：少量请求级日志</option>
+                  <option value="verbose">详细：大量结构化日志</option>
+                </select>
+                <div class="hint">高频 <code>/sync</code> 路由不要默认逐请求打日志。</div>
+              </div>
+            </div>
+          </section>
+
+          <details class="panel">
+            <summary>
+              <div>
+                <h3>高级微调</h3>
+                <span>只在你想修正模型时展开。默认值已经偏向评估阶段的粗估。</span>
+              </div>
+              <div class="caret" aria-hidden="true">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M6 9l6 6 6-6"></path>
+                </svg>
+              </div>
+            </summary>
+
+            <div class="advanced-body">
+              <div class="grid">
+                <div class="field">
+                  <label for="syncInterval">Sync 间隔秒数</label>
+                  <input id="syncInterval" type="number" min="5" step="1" value="30" />
+                  <div class="hint">30 秒是常见 long-poll 口径。</div>
+                </div>
+
+                <div class="field">
+                  <label for="workerCpuSync">Worker CPU ms / 每次 sync</label>
+                  <input id="workerCpuSync" type="number" min="0" step="0.1" value="1" />
+                  <div class="hint">空轮询应尽量很低。</div>
+                </div>
+
+                <div class="field">
+                  <label for="workerReqPerMsg">Worker 请求数 / 每条消息</label>
+                  <input id="workerReqPerMsg" type="number" min="0" step="0.1" value="2" />
+                  <div class="hint">发送、回执、局部读取等粗略折算。</div>
+                </div>
+
+                <div class="field">
+                  <label for="doReqPerMsg">DO 请求数 / 每条消息</label>
+                  <input id="doReqPerMsg" type="number" min="0" step="0.1" value="1.2" />
+                  <div class="hint">通常至少会碰到 RoomDO。</div>
+                </div>
+
+                <div class="field">
+                  <label for="doRowsWritePerMsg">DO 写行数 / 每条消息</label>
+                  <input id="doRowsWritePerMsg" type="number" min="0" step="1" value="8" />
+                  <div class="hint">事件主记录、索引、关系、membership 热索引等。</div>
+                </div>
+
+                <div class="field">
+                  <label for="doRowsReadPerProbe">DO 读行数 / 每次 sync 探测</label>
+                  <input id="doRowsReadPerProbe" type="number" min="0" step="1" value="1" />
+                  <div class="hint">通常很低，更多是请求数而不是读行数在花钱。</div>
+                </div>
+
+                <div class="field">
+                  <label for="manualDoStorage">DO 热存储 GB</label>
+                  <input id="manualDoStorage" type="number" min="0" step="0.1" value="0.2" />
+                  <div class="hint">跨全部 RoomDO / UserDO 的热层总存储粗估。</div>
+                </div>
+
+                <div class="field">
+                  <label for="manualD1Storage">D1 索引存储 GB</label>
+                  <input id="manualD1Storage" type="number" min="0" step="0.1" value="0.2" />
+                  <div class="hint">搜索和目录类索引的总存储粗估。</div>
+                </div>
+
+                <div class="field">
+                  <label for="queueMessages">后台队列消息 / 月</label>
+                  <input id="queueMessages" type="number" min="0" step="100" value="0" />
+                  <div class="hint">用于缩略图、索引、联邦重试等。每条默认按 3 次操作计费。</div>
+                </div>
+
+                <div class="field">
+                  <label for="extraWorkerRequests">额外 Worker 请求 / 月</label>
+                  <input id="extraWorkerRequests" type="number" min="0" step="100" value="0" />
+                  <div class="hint">后台管理、健康检查、导入导出等杂项。</div>
+                </div>
+
+                <div class="field field--wide">
+                  <div class="inline-toggle">
+                    <input id="badPattern" type="checkbox" />
+                    <div>
+                      <label for="badPattern">把 long-poll 停在 UserDO 里</label>
+                      <div class="hint">
+                        不推荐。开启后会把 <code>/sync</code> 的等待时间计入 DO duration，账单会明显放大。
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </details>
+
+          <section class="panel">
+            <div class="panel-title">
+              <div>
+                <h3>当前负载摘要</h3>
+                <p>它们不是直接收费项，但能帮助你快速判断当前大头来自哪里。</p>
+              </div>
+            </div>
+            <div class="grid" id="usage-summary"></div>
+          </section>
+        </div>
+
+        <aside class="summary-card">
+          <section class="breakdown-card">
+            <div class="panel-title">
+              <div>
+                <h3>分项账单</h3>
+                <p>显示基础月费、超额费用与各服务包含额度占用。</p>
+              </div>
+            </div>
+            <div id="line-items"></div>
+          </section>
+
+          <section class="breakdown-card">
+            <div class="panel-title">
+              <div>
+                <h3>判断与提示</h3>
+                <p>只显示当前输入下最值得关心的几件事。</p>
+              </div>
+            </div>
+            <div class="insights" id="insights"></div>
+          </section>
+
+          <section class="breakdown-card">
+            <div class="panel-title">
+              <div>
+                <h3>模型说明</h3>
+              </div>
+            </div>
+            <div class="footnote">
+              <p>
+                这个估算器故意是“粗而有方向”的，不是精确财务模型。它默认假设：
+                Worker 持有 <code>/sync</code> long-poll，DO 只做短探测，媒体存储使用 R2 Standard，
+                搜索索引使用 D1，主权热状态在 SQLite-backed Durable Objects。
+              </p>
+              <p>
+                价格和包含额度来自 Cloudflare 官方文档：Workers、Durable Objects、D1、R2、Queues、Workers Logs。
+                页面内计算只做大致估算，不代替正式容量测试和上线前成本验证。
+              </p>
+            </div>
+          </section>
+        </aside>
+      </section>
+    </main>
+
+    <script>
+      const PRICE = {
+        workersBase: 5,
+        workersIncludedRequests: 10_000_000,
+        workersIncludedCpuMs: 30_000_000,
+        workersRequestPerMillion: 0.30,
+        workersCpuPerMillionMs: 0.02,
+
+        workersLogsIncluded: 20_000_000,
+        workersLogsPerMillion: 0.60,
+
+        doIncludedRequests: 1_000_000,
+        doIncludedDurationGBs: 400_000,
+        doRequestPerMillion: 0.15,
+        doDurationPerMillionGBs: 12.5,
+        doIncludedRowsRead: 25_000_000_000,
+        doRowsReadPerMillion: 0.001,
+        doIncludedRowsWrite: 50_000_000,
+        doRowsWritePerMillion: 1.0,
+        doIncludedStorageGb: 5,
+        doStoragePerGb: 0.20,
+
+        d1IncludedRowsRead: 25_000_000_000,
+        d1RowsReadPerMillion: 0.001,
+        d1IncludedRowsWrite: 50_000_000,
+        d1RowsWritePerMillion: 1.0,
+        d1IncludedStorageGb: 5,
+        d1StoragePerGb: 0.75,
+
+        r2IncludedStorageGb: 10,
+        r2StoragePerGb: 0.015,
+        r2IncludedClassA: 1_000_000,
+        r2ClassAPerMillion: 4.5,
+        r2IncludedClassB: 10_000_000,
+        r2ClassBPerMillion: 0.36,
+
+        queuesIncludedOps: 1_000_000,
+        queuesPerMillionOps: 0.40,
+      };
+
+      const SEARCH_MODELS = {
+        off: {
+          label: "关闭",
+          searchesPerUserPerDay: 0,
+          rowsReadPerSearch: 0,
+          rowsWritePerMessage: 0,
+        },
+        light: {
+          label: "轻量",
+          searchesPerUserPerDay: 0.08,
+          rowsReadPerSearch: 400,
+          rowsWritePerMessage: 1,
+        },
+        deep: {
+          label: "重型",
+          searchesPerUserPerDay: 0.25,
+          rowsReadPerSearch: 2000,
+          rowsWritePerMessage: 12,
+        },
+      };
+
+      const SYNC_MODELS = {
+        economy: { label: "省钱", probesPerSync: 1 },
+        balanced: { label: "平衡", probesPerSync: 3 },
+        realtime: { label: "低延迟", probesPerSync: 6 },
+      };
+
+      const LOG_MODELS = {
+        sparse: { label: "克制", rate: 0.001 },
+        normal: { label: "普通", rate: 0.01 },
+        verbose: { label: "详细", rate: 0.05 },
+      };
+
+      const PRESETS = {
+        team20: {
+          users: 20,
+          devicesPerUser: 1.2,
+          onlineDevices: 6,
+          onlineHours: 8,
+          messages: 1000,
+          syncMode: "balanced",
+          searchMode: "off",
+          mediaStorage: 10,
+          mediaUploads: 120,
+          mediaReads: 2400,
+          logMode: "sparse",
+          syncInterval: 30,
+          workerCpuSync: 1,
+          workerReqPerMsg: 2,
+          doReqPerMsg: 1.2,
+          doRowsWritePerMsg: 8,
+          doRowsReadPerProbe: 1,
+          manualDoStorage: 0.2,
+          manualD1Storage: 0.2,
+          queueMessages: 0,
+          extraWorkerRequests: 0,
+          badPattern: false,
+        },
+        alwaysOn20: {
+          users: 20,
+          devicesPerUser: 1,
+          onlineDevices: 20,
+          onlineHours: 24,
+          messages: 1000,
+          syncMode: "economy",
+          searchMode: "off",
+          mediaStorage: 10,
+          mediaUploads: 120,
+          mediaReads: 3600,
+          logMode: "sparse",
+          syncInterval: 30,
+          workerCpuSync: 1,
+          workerReqPerMsg: 2,
+          doReqPerMsg: 1.2,
+          doRowsWritePerMsg: 8,
+          doRowsReadPerProbe: 1,
+          manualDoStorage: 0.2,
+          manualD1Storage: 0.2,
+          queueMessages: 0,
+          extraWorkerRequests: 0,
+          badPattern: false,
+        },
+        community200: {
+          users: 200,
+          devicesPerUser: 1.3,
+          onlineDevices: 40,
+          onlineHours: 12,
+          messages: 50_000,
+          syncMode: "balanced",
+          searchMode: "light",
+          mediaStorage: 500,
+          mediaUploads: 6000,
+          mediaReads: 180_000,
+          logMode: "normal",
+          syncInterval: 30,
+          workerCpuSync: 1.2,
+          workerReqPerMsg: 2.3,
+          doReqPerMsg: 1.4,
+          doRowsWritePerMsg: 8,
+          doRowsReadPerProbe: 1,
+          manualDoStorage: 2,
+          manualD1Storage: 1.5,
+          queueMessages: 50_000,
+          extraWorkerRequests: 20_000,
+          badPattern: false,
+        },
+        public1000: {
+          users: 1000,
+          devicesPerUser: 1.4,
+          onlineDevices: 220,
+          onlineHours: 16,
+          messages: 1_000_000,
+          syncMode: "realtime",
+          searchMode: "deep",
+          mediaStorage: 5000,
+          mediaUploads: 150_000,
+          mediaReads: 12_000_000,
+          logMode: "normal",
+          syncInterval: 30,
+          workerCpuSync: 1.5,
+          workerReqPerMsg: 2.8,
+          doReqPerMsg: 1.8,
+          doRowsWritePerMsg: 8,
+          doRowsReadPerProbe: 1,
+          manualDoStorage: 18,
+          manualD1Storage: 8,
+          queueMessages: 500_000,
+          extraWorkerRequests: 120_000,
+          badPattern: false,
+        },
+      };
+
+      const els = Object.fromEntries(
+        [
+          "users",
+          "devicesPerUser",
+          "onlineDevices",
+          "onlineHours",
+          "messages",
+          "syncMode",
+          "searchMode",
+          "mediaStorage",
+          "mediaUploads",
+          "mediaReads",
+          "logMode",
+          "syncInterval",
+          "workerCpuSync",
+          "workerReqPerMsg",
+          "doReqPerMsg",
+          "doRowsWritePerMsg",
+          "doRowsReadPerProbe",
+          "manualDoStorage",
+          "manualD1Storage",
+          "queueMessages",
+          "extraWorkerRequests",
+          "badPattern",
+        ].map((id) => [id, document.getElementById(id)])
+      );
+
+      const currency = new Intl.NumberFormat("en-US", {
+        style: "currency",
+        currency: "USD",
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      });
+
+      const compact = new Intl.NumberFormat("zh-CN", {
+        notation: "compact",
+        maximumFractionDigits: 1,
+      });
+
+      const integer = new Intl.NumberFormat("zh-CN", {
+        maximumFractionDigits: 0,
+      });
+
+      function num(value) {
+        return Number(value) || 0;
+      }
+
+      function clamp(value, min, max) {
+        return Math.min(Math.max(value, min), max);
+      }
+
+      function overageCost(used, included, ratePerMillion) {
+        return (Math.max(used - included, 0) / 1_000_000) * ratePerMillion;
+      }
+
+      function storageCost(usedGb, includedGb, ratePerGb) {
+        return Math.max(usedGb - includedGb, 0) * ratePerGb;
+      }
+
+      function percent(used, included) {
+        if (!included) return 0;
+        return (used / included) * 100;
+      }
+
+      function formatMaybeFree(cost) {
+        return cost < 0.005 ? "在包含额度内" : currency.format(cost);
+      }
+
+      function usagePill(used, included, unitLabel) {
+        return `${compact.format(used)} / ${compact.format(included)} ${unitLabel}`;
+      }
+
+      function barMarkup(used, included) {
+        const pct = percent(used, included);
+        const width = `${Math.min(pct, 100)}%`;
+        const warn = pct > 100 ? "warn" : "";
+        return `
+          <div class="usage">
+            <div class="bar"><span class="${warn}" style="width:${width}"></span></div>
+            <small>${pct.toFixed(1)}% of included usage</small>
+          </div>
+        `;
+      }
+
+      function collectInputs() {
+        const users = Math.max(1, num(els.users.value));
+        const devicesPerUser = Math.max(0.5, num(els.devicesPerUser.value));
+        const totalDevices = users * devicesPerUser;
+        const onlineDevices = clamp(num(els.onlineDevices.value), 0, totalDevices);
+        const onlineHours = clamp(num(els.onlineHours.value), 0, 24);
+        const messages = Math.max(0, num(els.messages.value));
+        const syncMode = SYNC_MODELS[els.syncMode.value];
+        const searchMode = SEARCH_MODELS[els.searchMode.value];
+        const logMode = LOG_MODELS[els.logMode.value];
+        const mediaStorage = Math.max(0, num(els.mediaStorage.value));
+        const mediaUploads = Math.max(0, num(els.mediaUploads.value));
+        const mediaReads = Math.max(0, num(els.mediaReads.value));
+        const syncInterval = Math.max(5, num(els.syncInterval.value));
+        const workerCpuSync = Math.max(0, num(els.workerCpuSync.value));
+        const workerReqPerMsg = Math.max(0, num(els.workerReqPerMsg.value));
+        const doReqPerMsg = Math.max(0, num(els.doReqPerMsg.value));
+        const doRowsWritePerMsg = Math.max(0, num(els.doRowsWritePerMsg.value));
+        const doRowsReadPerProbe = Math.max(0, num(els.doRowsReadPerProbe.value));
+        const manualDoStorage = Math.max(0, num(els.manualDoStorage.value));
+        const manualD1Storage = Math.max(0, num(els.manualD1Storage.value));
+        const queueMessages = Math.max(0, num(els.queueMessages.value));
+        const extraWorkerRequests = Math.max(0, num(els.extraWorkerRequests.value));
+        const badPattern = els.badPattern.checked;
+
+        return {
+          users,
+          devicesPerUser,
+          totalDevices,
+          onlineDevices,
+          onlineHours,
+          messages,
+          syncMode,
+          searchMode,
+          logMode,
+          mediaStorage,
+          mediaUploads,
+          mediaReads,
+          syncInterval,
+          workerCpuSync,
+          workerReqPerMsg,
+          doReqPerMsg,
+          doRowsWritePerMsg,
+          doRowsReadPerProbe,
+          manualDoStorage,
+          manualD1Storage,
+          queueMessages,
+          extraWorkerRequests,
+          badPattern,
+        };
+      }
+
+      function calculate() {
+        const input = collectInputs();
+
+        const syncRequests =
+          (input.onlineDevices * input.onlineHours * 3600 * 30) / input.syncInterval;
+        const workerRequests =
+          syncRequests +
+          input.messages * input.workerReqPerMsg +
+          input.mediaUploads +
+          input.mediaReads +
+          input.extraWorkerRequests;
+        const workerCpuMs =
+          syncRequests * input.workerCpuSync +
+          input.messages * 4 +
+          input.mediaUploads * 8 +
+          input.mediaReads * 0.25;
+
+        const doRequests =
+          syncRequests * input.syncMode.probesPerSync + input.messages * input.doReqPerMsg;
+        const doRowsRead =
+          syncRequests * input.doRowsReadPerProbe + input.messages * 2;
+        const doRowsWrite = input.messages * input.doRowsWritePerMsg + input.queueMessages;
+        const doDurationGBs = input.badPattern
+          ? syncRequests * input.syncInterval * 0.125
+          : 0;
+
+        const searchesPerMonth =
+          input.users * input.searchMode.searchesPerUserPerDay * 30;
+        const d1RowsRead = searchesPerMonth * input.searchMode.rowsReadPerSearch;
+        const d1RowsWrite = input.messages * input.searchMode.rowsWritePerMessage;
+
+        const r2ClassA = input.mediaUploads;
+        const r2ClassB = input.mediaReads;
+        const queueOps = input.queueMessages * 3;
+
+        const logEvents = workerRequests * input.logMode.rate;
+
+        const workersCost =
+          PRICE.workersBase +
+          overageCost(
+            workerRequests,
+            PRICE.workersIncludedRequests,
+            PRICE.workersRequestPerMillion
+          ) +
+          overageCost(
+            workerCpuMs,
+            PRICE.workersIncludedCpuMs,
+            PRICE.workersCpuPerMillionMs
+          );
+
+        const doCost =
+          overageCost(doRequests, PRICE.doIncludedRequests, PRICE.doRequestPerMillion) +
+          overageCost(
+            doDurationGBs,
+            PRICE.doIncludedDurationGBs,
+            PRICE.doDurationPerMillionGBs
+          ) +
+          overageCost(doRowsRead, PRICE.doIncludedRowsRead, PRICE.doRowsReadPerMillion) +
+          overageCost(doRowsWrite, PRICE.doIncludedRowsWrite, PRICE.doRowsWritePerMillion) +
+          storageCost(input.manualDoStorage, PRICE.doIncludedStorageGb, PRICE.doStoragePerGb);
+
+        const d1Cost =
+          overageCost(d1RowsRead, PRICE.d1IncludedRowsRead, PRICE.d1RowsReadPerMillion) +
+          overageCost(d1RowsWrite, PRICE.d1IncludedRowsWrite, PRICE.d1RowsWritePerMillion) +
+          storageCost(input.manualD1Storage, PRICE.d1IncludedStorageGb, PRICE.d1StoragePerGb);
+
+        const r2Cost =
+          storageCost(input.mediaStorage, PRICE.r2IncludedStorageGb, PRICE.r2StoragePerGb) +
+          overageCost(r2ClassA, PRICE.r2IncludedClassA, PRICE.r2ClassAPerMillion) +
+          overageCost(r2ClassB, PRICE.r2IncludedClassB, PRICE.r2ClassBPerMillion);
+
+        const queueCost = overageCost(
+          queueOps,
+          PRICE.queuesIncludedOps,
+          PRICE.queuesPerMillionOps
+        );
+
+        const logsCost = overageCost(
+          logEvents,
+          PRICE.workersLogsIncluded,
+          PRICE.workersLogsPerMillion
+        );
+
+        const totalCost = workersCost + doCost + d1Cost + r2Cost + queueCost + logsCost;
+
+        return {
+          input,
+          derived: {
+            syncRequests,
+            workerRequests,
+            workerCpuMs,
+            doRequests,
+            doRowsRead,
+            doRowsWrite,
+            doDurationGBs,
+            searchesPerMonth,
+            d1RowsRead,
+            d1RowsWrite,
+            r2ClassA,
+            r2ClassB,
+            queueOps,
+            logEvents,
+          },
+          costs: {
+            workers: workersCost,
+            do: doCost,
+            d1: d1Cost,
+            r2: r2Cost,
+            queues: queueCost,
+            logs: logsCost,
+            total: totalCost,
+          },
+        };
+      }
+
+      function renderUsageSummary(model) {
+        const { input, derived } = model;
+        const cards = [
+          {
+            title: "总设备上限",
+            value: integer.format(input.totalDevices),
+            detail: `用户 ${integer.format(input.users)} × ${input.devicesPerUser.toFixed(1)} 设备/人`,
+          },
+          {
+            title: "月 Sync 请求",
+            value: compact.format(derived.syncRequests),
+            detail: `${input.onlineDevices.toFixed(0)} 在线设备 × ${input.onlineHours.toFixed(1)} 小时/天`,
+          },
+          {
+            title: "月消息写入",
+            value: compact.format(input.messages),
+            detail: `${input.doRowsWritePerMsg.toFixed(0)} DO 写行 / 消息`,
+          },
+          {
+            title: "搜索查询 / 月",
+            value: compact.format(derived.searchesPerMonth),
+            detail: `模式：${input.searchMode.label}`,
+          },
+          {
+            title: "媒体读 / 月",
+            value: compact.format(input.mediaReads),
+            detail: `${input.mediaStorage.toFixed(1)} GB 平均存量`,
+          },
+          {
+            title: "日志写入 / 月",
+            value: compact.format(derived.logEvents),
+            detail: `日志模式：${input.logMode.label}`,
+          },
+        ];
+
+        document.getElementById("usage-summary").innerHTML = cards
+          .map(
+            (card) => `
+              <div class="hero-stat">
+                <strong>${card.value}</strong>
+                <span>${card.title}<br />${card.detail}</span>
+              </div>
+            `
+          )
+          .join("");
+      }
+
+      function renderHeadline(model) {
+        const { costs, input } = model;
+        const extra = costs.total - PRICE.workersBase;
+        const totalEl = document.getElementById("headline-total");
+        const bandEl = document.getElementById("headline-band");
+        const noteEl = document.getElementById("headline-note");
+        totalEl.textContent = currency.format(costs.total);
+
+        if (extra < 0.25) {
+          bandEl.textContent = "大致仍在基础月费附近";
+          noteEl.textContent =
+            "当前输入下，大部分用量仍留在包含额度内。这个规模更像是架构选择问题，不是账单问题。";
+        } else if (extra < 25) {
+          bandEl.textContent = "会开始出现小额超额费用";
+          noteEl.textContent =
+            "账单已经不再是纯基础月费，但仍然比较温和。通常是 /sync 的 DO 探测、日志或媒体操作在往上推。";
+        } else {
+          bandEl.textContent = "已经进入需要容量规划的区间";
+          noteEl.textContent =
+            "当前规模下，/sync 请求量、DO 请求与写放大、搜索或媒体读取中至少有一项已经显著放大。";
+        }
+
+        if (input.badPattern) {
+          noteEl.textContent =
+            "你开启了“把 long-poll 停在 UserDO 里”的错误模式。此时 DO duration 会迅速成为主要账单来源。";
+        }
+      }
+
+      function renderTopDrivers(model) {
+        const entries = [
+          ["Workers", model.costs.workers],
+          ["Durable Objects", model.costs.do],
+          ["D1", model.costs.d1],
+          ["R2", model.costs.r2],
+          ["Queues", model.costs.queues],
+          ["Logs", model.costs.logs],
+        ]
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 3);
+
+        document.getElementById("top-drivers").innerHTML = entries
+          .map(
+            ([label, value]) => `
+              <div class="mini-row">
+                <div>
+                  <strong>${label}</strong>
+                  <small>${value < 0.005 ? "当前基本在包含额度内" : "当前主要成本项之一"}</small>
+                </div>
+                <strong>${currency.format(value)}</strong>
+              </div>
+            `
+          )
+          .join("");
+      }
+
+      function renderLineItems(model) {
+        const { derived, costs, input } = model;
+        const items = [
+          {
+            label: "Workers",
+            amount: costs.workers,
+            meta: [
+              `<span class="pill">Base ${currency.format(PRICE.workersBase)}</span>`,
+              `<span class="pill">${usagePill(derived.workerRequests, PRICE.workersIncludedRequests, "req")}</span>`,
+              `<span class="pill">${usagePill(derived.workerCpuMs, PRICE.workersIncludedCpuMs, "CPU ms")}</span>`,
+            ],
+            bar: barMarkup(
+              Math.max(
+                percent(derived.workerRequests, PRICE.workersIncludedRequests),
+                percent(derived.workerCpuMs, PRICE.workersIncludedCpuMs)
+              ),
+              100
+            ),
+            valueText: `${formatMaybeFree(costs.workers - PRICE.workersBase)} + base`,
+          },
+          {
+            label: "Durable Objects",
+            amount: costs.do,
+            meta: [
+              `<span class="pill">${usagePill(derived.doRequests, PRICE.doIncludedRequests, "req")}</span>`,
+              `<span class="pill">${usagePill(derived.doRowsWrite, PRICE.doIncludedRowsWrite, "write rows")}</span>`,
+              `<span class="pill">${usagePill(input.manualDoStorage, PRICE.doIncludedStorageGb, "GB")}</span>`,
+              input.badPattern
+                ? `<span class="pill pill--warn">${usagePill(derived.doDurationGBs, PRICE.doIncludedDurationGBs, "GB-s")}</span>`
+                : "",
+            ].join(""),
+            bar: barMarkup(
+              Math.max(
+                percent(derived.doRequests, PRICE.doIncludedRequests),
+                percent(derived.doRowsWrite, PRICE.doIncludedRowsWrite),
+                percent(input.manualDoStorage, PRICE.doIncludedStorageGb),
+                percent(derived.doDurationGBs, PRICE.doIncludedDurationGBs)
+              ),
+              100
+            ),
+            valueText: formatMaybeFree(costs.do),
+          },
+          {
+            label: "D1",
+            amount: costs.d1,
+            meta: [
+              `<span class="pill">${usagePill(derived.d1RowsRead, PRICE.d1IncludedRowsRead, "read rows")}</span>`,
+              `<span class="pill">${usagePill(derived.d1RowsWrite, PRICE.d1IncludedRowsWrite, "write rows")}</span>`,
+              `<span class="pill">${usagePill(input.manualD1Storage, PRICE.d1IncludedStorageGb, "GB")}</span>`,
+            ],
+            bar: barMarkup(
+              Math.max(
+                percent(derived.d1RowsRead, PRICE.d1IncludedRowsRead),
+                percent(derived.d1RowsWrite, PRICE.d1IncludedRowsWrite),
+                percent(input.manualD1Storage, PRICE.d1IncludedStorageGb)
+              ),
+              100
+            ),
+            valueText: formatMaybeFree(costs.d1),
+          },
+          {
+            label: "R2",
+            amount: costs.r2,
+            meta: [
+              `<span class="pill">${usagePill(input.mediaStorage, PRICE.r2IncludedStorageGb, "GB-month")}</span>`,
+              `<span class="pill">${usagePill(derived.r2ClassA, PRICE.r2IncludedClassA, "Class A")}</span>`,
+              `<span class="pill">${usagePill(derived.r2ClassB, PRICE.r2IncludedClassB, "Class B")}</span>`,
+            ],
+            bar: barMarkup(
+              Math.max(
+                percent(input.mediaStorage, PRICE.r2IncludedStorageGb),
+                percent(derived.r2ClassA, PRICE.r2IncludedClassA),
+                percent(derived.r2ClassB, PRICE.r2IncludedClassB)
+              ),
+              100
+            ),
+            valueText: formatMaybeFree(costs.r2),
+          },
+          {
+            label: "Queues",
+            amount: costs.queues,
+            meta: [
+              `<span class="pill">${usagePill(derived.queueOps, PRICE.queuesIncludedOps, "ops")}</span>`,
+            ],
+            bar: barMarkup(derived.queueOps, PRICE.queuesIncludedOps),
+            valueText: formatMaybeFree(costs.queues),
+          },
+          {
+            label: "Workers Logs",
+            amount: costs.logs,
+            meta: [
+              `<span class="pill">${usagePill(derived.logEvents, PRICE.workersLogsIncluded, "events")}</span>`,
+            ],
+            bar: barMarkup(derived.logEvents, PRICE.workersLogsIncluded),
+            valueText: formatMaybeFree(costs.logs),
+          },
+        ];
+
+        document.getElementById("line-items").innerHTML = items
+          .map(
+            (item) => `
+              <article class="line-item">
+                <div class="line-top">
+                  <strong>${item.label}</strong>
+                  <span>${item.valueText}</span>
+                </div>
+                <div class="meta">${item.meta}</div>
+                ${item.bar}
+              </article>
+            `
+          )
+          .join("");
+      }
+
+      function renderInsights(model) {
+        const { input, derived, costs } = model;
+        const insights = [];
+
+        if (input.badPattern) {
+          insights.push({
+            title: "你开启了一个会显著放大账单的模式",
+            text: "把 /sync 的等待时间停在 UserDO 里，会把本来应该由 Worker 低成本持有的 long-poll 变成按 DO duration 计费的 wall-clock 时间。",
+          });
+        }
+
+        if (derived.syncRequests > input.messages * 300) {
+          insights.push({
+            title: "/sync 远大于发消息",
+            text: "当前场景里，在线设备和在线时长明显比消息量更能决定成本。这通常意味着你应该优先盯住在线设备数、sync 节拍和 DO 探测次数。",
+          });
+        }
+
+        if (costs.d1 > costs.r2 && costs.d1 > 0.5) {
+          insights.push({
+            title: "索引层比媒体更贵",
+            text: "这通常意味着搜索模式偏重，或者你在用较高的每消息索引写入模型。对 Cloudflare 而言，搜索写放大往往比媒体存储更危险。",
+          });
+        }
+
+        if (costs.r2 < 0.01 && input.mediaStorage <= PRICE.r2IncludedStorageGb) {
+          insights.push({
+            title: "媒体目前基本还在免费区间",
+            text: "R2 Standard 自带 10 GB-month 和一定量的操作额度。小团队或内部站点在媒体侧常常不会先撞线。",
+          });
+        }
+
+        if (costs.logs > 1) {
+          insights.push({
+            title: "日志已经开始有存在感",
+            text: "如果这只是评估阶段，建议先把 /sync、媒体 GET、健康检查等高频路由的日志打到最低，再看真正的业务成本。",
+          });
+        }
+
+        if (costs.total <= PRICE.workersBase + 0.25) {
+          insights.push({
+            title: "这个规模更接近架构评审，而不是成本优化",
+            text: "在当前输入下，账单几乎还停留在基础月费附近。更重要的是确保 /sync、RoomDO 和媒体分层方向正确。",
+          });
+        }
+
+        if (!insights.length) {
+          insights.push({
+            title: "当前没有明显的单一危险项",
+            text: "这个结果说明你的参数还比较均衡。接下来更有价值的是拿几组更高在线数或更重搜索的场景做对比，而不是追求小数点级准确。",
+          });
+        }
+
+        document.getElementById("insights").innerHTML = insights
+          .slice(0, 4)
+          .map(
+            (item) => `
+              <article class="insight">
+                <strong>${item.title}</strong>
+                <p>${item.text}</p>
+              </article>
+            `
+          )
+          .join("");
+      }
+
+      function update() {
+        const model = calculate();
+        renderHeadline(model);
+        renderTopDrivers(model);
+        renderUsageSummary(model);
+        renderLineItems(model);
+        renderInsights(model);
+      }
+
+      function applyPreset(name) {
+        const preset = PRESETS[name];
+        if (!preset) return;
+        Object.entries(preset).forEach(([key, value]) => {
+          if (!els[key]) return;
+          if (typeof value === "boolean") {
+            els[key].checked = value;
+          } else {
+            els[key].value = value;
+          }
+        });
+        update();
+      }
+
+      Object.values(els).forEach((el) => {
+        const eventName = el.type === "checkbox" ? "change" : "input";
+        el.addEventListener(eventName, update);
+        if (el.tagName === "SELECT") {
+          el.addEventListener("change", update);
+        }
+      });
+
+      document.querySelectorAll("[data-preset]").forEach((button) => {
+        button.addEventListener("click", () => applyPreset(button.dataset.preset));
+      });
+
+      update();
+    </script>
+  </body>
+</html>
