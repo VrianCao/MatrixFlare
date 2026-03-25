@@ -1,6 +1,6 @@
 # Data Contract Catalog
 
-状态：Outline  
+状态：Draft-Normative
 角色：数据契约总目录  
 负责主文档章节：3，4，6  
 扩展范围：所有持久化、缓存、游标、令牌与重建输入
@@ -17,124 +17,103 @@
 * 不替代接口契约定义传输形态；
 * 不替代迁移 runbook 细节。
 
-## 2. 数据条目模型
+## 2. 全局令牌与标识数据
 
-每个数据条目至少需要包含：
+| DATA-ID | Category | Logical Entity / Shape | Authority | Runtime Owner | Physical Store | Key / Pattern | Consistency | Recovery Source | Notes |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `DATA-ID-001` | token | `next_batch` sync token | authoritative | `UserDO` | DO SQLite + signed token | opaque | per-user serial | none | 对客户端 opaque，内部至少包含版本和 `user_stream_pos`。 |
+| `DATA-ID-002` | cursor | room pagination token | authoritative | `RoomDO` | signed cursor | opaque | per-room serial | none | 不依赖可变服务端内存。 |
+| `DATA-ID-003` | token | access token hash | authoritative | `UserDO` | DO SQLite | session id / token hash | per-user serial | none | 只存 hash。 |
+| `DATA-ID-004` | token | refresh token hash | authoritative | `UserDO` | DO SQLite | refresh session id | per-user serial | none | 轮换后旧 token 必须可判失效。 |
+| `DATA-ID-005` | manifest | queue job id / replay job id | authoritative | producer | DO SQLite / D1 control plane | job id | per job serial | control plane log | 用于补偿、取消和恢复。 |
 
-* `DATA-ID`
-* 数据类别
-* 逻辑实体 / 表 / 对象 / keyspace / token 类型
-* Authority level
-* Owning spec
-* Owning runtime component
-* 物理载体
-* 主键 / key pattern
-* 核心字段 / schema 引用
-* 写入路径
-* 读取路径
-* 一致性语义
-* 保留策略
-* 隐私 / 敏感级别
-* 恢复来源
-* 迁移规则
-* Test / Evidence IDs
+## 3. `UserDO` 数据契约
 
-### 2.1 标准表头
+| DATA-ID | Category | Logical Entity / Shape | Authority | Runtime Owner | Physical Store | Key / Pattern | Consistency | Recovery Source | Notes |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `DATA-USER-001` | table | sessions | authoritative | `UserDO` | DO SQLite | `session_id` | per-user serial | user export | 包含 access/refresh 生命周期字段。 |
+| `DATA-USER-002` | table | devices | authoritative | `UserDO` | DO SQLite | `device_id` | per-user serial | user export | 设备显示名、最近活跃等。 |
+| `DATA-USER-003` | table | device keys / cross-signing | authoritative | `UserDO` | DO SQLite | `{device_id,key_id}` | per-user serial | user export | 包含签名与版本戳。 |
+| `DATA-USER-004` | table | one-time keys | authoritative | `UserDO` | DO SQLite | `{device_id,algorithm,key_id}` | per-user serial | none | claim 后进入 tombstone 或删除。 |
+| `DATA-USER-005` | table | fallback keys | authoritative | `UserDO` | DO SQLite | `{device_id,algorithm,key_id}` | per-user serial | user export | 与上传和 `/sync` 计数联动。 |
+| `DATA-USER-006` | table | global account data | authoritative | `UserDO` | DO SQLite | `type` | per-user serial | user export | 按最新值覆盖。 |
+| `DATA-USER-007` | table | room account data | authoritative | `UserDO` | DO SQLite | `{room_id,type}` | per-user serial | user export | RoomDO 不直接拥有此数据。 |
+| `DATA-USER-008` | table | to-device queue | authoritative | `UserDO` | DO SQLite | `{target_device_id,stream_pos}` | per-user serial | none | 读取后按设备确认收割。 |
+| `DATA-USER-009` | table | presence state | authoritative | `UserDO` | DO SQLite | `user_id` | per-user serial | user export | 当前值 + version。 |
+| `DATA-USER-010` | table | user stream | authoritative | `UserDO` | DO SQLite | `stream_pos` | per-user serial | rebuild from truth + export | `/sync` 唯一用户增量流。 |
+| `DATA-USER-011` | table | room key backup manifest | authoritative | `UserDO` | DO SQLite | `backup_version` | per-user serial | user export | 只保存备份版本、计数、etag 等元数据，不解释密钥内容。 |
+| `DATA-USER-012` | table | profile document | authoritative | `UserDO` | DO SQLite | `key_name` | per-user serial | user export | 独立于 account data；包含 `displayname`、`avatar_url`、`m.tz` 与允许的 namespaced custom fields；同一逻辑文档必须持有单调递增的 `profile_version`，用于传播、重放与去重。 |
+| `DATA-USER-013` | table | push rules overrides / enablement | authoritative | `UserDO` | DO SQLite | `{scope,kind,rule_id}` | per-user serial | user export | 默认规则来自 Matrix `v1.17` 基线；这里只存用户覆盖、顺序和 enabled 状态。 |
+| `DATA-USER-014` | table | stored filters | authoritative | `UserDO` | DO SQLite | `filter_id` | per-user serial | user export | 存 canonical filter JSON、filter hash 和创建版本。 |
+| `DATA-USER-015` | table | pending media upload grants | authoritative | `UserDO` | DO SQLite | `pending_upload_id` | per-user serial | none | 记录上传配额检查结果、允许的 MIME/尺寸、TTL 与 finalize 状态；R2 写失败或超时必须可撤销。 |
 
-| DATA-ID | Category | Logical Entity / Shape | Authority | Owning Spec | Runtime Owner | Physical Store | Key / Pattern | Schema Ref | Write Paths | Read Paths | Consistency | Retention | Sensitivity | Recovery Source | Migration Rule | TEST/EVID IDs |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| DATA-... | table / object / keyspace / token / cursor / manifest | one canonical shape | authoritative / derived / cache | owning spec | runtime component | DO SQLite / D1 / R2 / KV / memory | pk / object key / prefix | schema location | `IF-*` / runtime flow | `IF-*` / query path | linearizable / per-object serial / eventual / strong read-after-write | TTL / forever / archive / tombstone | public / internal / sensitive / secret-derived | replay / rebuild / export / none | additive / migration-needed / rebuild-only | `TEST-*` / `EVID-*` |
+## 4. `RoomDO` 数据契约
 
-### 2.2 颗粒度规则
+| DATA-ID | Category | Logical Entity / Shape | Authority | Runtime Owner | Physical Store | Key / Pattern | Consistency | Recovery Source | Notes |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `DATA-ROOM-001` | table | events metadata | authoritative | `RoomDO` | DO SQLite | `event_id` / `room_pos` | per-room serial | R2 archive + replay | 热层必须保留最小元数据。 |
+| `DATA-ROOM-002` | table | hot canonical event JSON | authoritative | `RoomDO` | DO SQLite | `event_id` | per-room serial | R2 archive | 仅保留热点时间窗。 |
+| `DATA-ROOM-003` | table | prev edges | authoritative | `RoomDO` | DO SQLite | `{event_id,prev_event_id}` | per-room serial | replay | DAG 结构。 |
+| `DATA-ROOM-004` | table | auth edges | authoritative | `RoomDO` | DO SQLite | `{event_id,auth_event_id}` | per-room serial | replay | auth chain 结构。 |
+| `DATA-ROOM-005` | table | state snapshots | authoritative | `RoomDO` | DO SQLite | `snapshot_id` | per-room serial | replay | extremity-set 到 resolved state 的缓存。 |
+| `DATA-ROOM-006` | table | state entries | authoritative | `RoomDO` | DO SQLite | `{snapshot_id,type,state_key}` | per-room serial | replay | 当前状态与历史快照公用形态。 |
+| `DATA-ROOM-007` | table | membership projection | authoritative | `RoomDO` | DO SQLite | `{user_id}` | per-room serial | replay | 房间主权 membership 当前视图。 |
+| `DATA-ROOM-008` | table | forward extremities | authoritative | `RoomDO` | DO SQLite | `event_id` | per-room serial | replay | 状态解析输入。 |
+| `DATA-ROOM-009` | table | receipts current view | authoritative | `RoomDO` | DO SQLite | `{receipt_type,user_id,thread_id}` | per-room serial | none | 只保留最新值。 |
+| `DATA-ROOM-010` | table | typing current view | authoritative | `RoomDO` | DO SQLite | `user_id` | per-room serial | none | 由 alarm 过期。 |
 
-* 一个 `DATA-ID` 只表示一个规范意义上独立的数据形态。
-* 同一实体若在不同存储中以不同 authority 存在，必须拆分为多条。
-* token、cursor、checkpoint、manifest 不能作为注释附带，必须单独建条。
+## 5. `RemoteServerDO` 数据契约
 
-## 3. 全局标识与令牌目录
+| DATA-ID | Category | Logical Entity / Shape | Authority | Runtime Owner | Physical Store | Key / Pattern | Consistency | Recovery Source | Notes |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `DATA-FED-001` | table | outbound transactions | authoritative | `RemoteServerDO` | DO SQLite | `txn_id` | per-server serial | local truth replay | payload 一旦入队不可变。 |
+| `DATA-FED-002` | table | retry schedule | authoritative | `RemoteServerDO` | DO SQLite | `txn_id` | per-server serial | derived from queue | attempt count、next_retry_at。 |
+| `DATA-FED-003` | table | inbound txn dedupe | authoritative | `RemoteServerDO` | DO SQLite | `{origin,txn_id}` | per-server serial | none | 用于重复提交幂等。 |
+| `DATA-FED-004` | table | gap repair backlog | authoritative | `RemoteServerDO` | DO SQLite | repair job id | per-server serial | repair manifest | 缺事件与缺状态恢复任务。 |
+| `DATA-FED-005` | cache/table | discovery and remote key cache | cache-derived | `RemoteServerDO` | DO SQLite + KV optional | `{server_name,key_id}` | cache semantics | refetch | 不能跳过官方发现流程。 |
 
-### 3.1 Matrix Identifiers
+## 6. D1 Derived Data Contracts
 
-* User IDs
-* Room IDs
-* Event IDs
-* Device IDs
-* Room aliases
-* Server names
+| DATA-ID | Category | Logical Entity / Shape | Authority | Runtime Owner | Physical Store | Key / Pattern | Consistency | Recovery Source | Notes |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `DATA-D1-001` | table | search index rows | derived | `jobs-worker` | D1 | `event_id` | eventual | full reindex | 只索引可见文本与必要 filter 字段。 |
+| `DATA-D1-002` | table | user directory | derived | `jobs-worker` | D1 | `user_id` | eventual | rebuild from `UserDO` exports | 来源于 `DATA-USER-012` 与本地目录策略；受隐私与可发现性规则约束。 |
+| `DATA-D1-003` | table | public room directory | derived | `jobs-worker` | D1 | `room_id` | eventual | rebuild from `RoomDO` | 可见性随 join rules/public flag 更新；每行必须带来源 `room_serial` / visibility watermark，用于判断“可见性是否不确定”。 |
+| `DATA-D1-004` | table | media catalog | derived | `jobs-worker` | D1 | `mxc_uri` | eventual | R2 listing + finalize logs | 不能成为下载前置单点。 |
+| `DATA-D1-005` | table | appservice config / txn cursors | authoritative-control-plane | `ops-worker` / `jobs-worker` | D1 + secrets | `{appservice_id}` | strong at primary / session consistent | config backup | 控制面数据，不是房间或用户真相。 |
+| `DATA-D1-006` | table | operator authz policy | authoritative-control-plane | `ops-worker` | D1 + Cloudflare Access config | `principal_id` | strong at primary / session consistent | config backup | 记录人类/自动化 operator principal、允许 scope、失效时间与审计要求；不存 Access secret 本体。 |
 
-### 3.2 Internal Identifiers and Tokens
+## 7. R2 / KV Contracts
 
-* Sync tokens
-* Stream cursors
-* Transaction IDs
-* Idempotency keys
-* Queue job IDs
-* Export / replay job IDs
+| DATA-ID | Category | Logical Entity / Shape | Authority | Runtime Owner | Physical Store | Key / Pattern | Consistency | Recovery Source | Notes |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `DATA-R2-001` | object | local media object | authoritative | media subsystem | R2 | `media/local/{media_id}` | strong | none | 本地媒体对象真相。 |
+| `DATA-R2-002` | object | remote media cache object | authoritative-cache | media subsystem | R2 | `media/remote/{origin}/{media_id}` | strong | refetch remote | 可按策略驱逐重取。 |
+| `DATA-R2-003` | object | thumbnail object | derived | `jobs-worker` | R2 | `media/thumb/...` | strong | regenerate | 变体由 `{width,height,method}` 唯一决定。 |
+| `DATA-R2-004` | object | room cold archive segments | authoritative-cold | `RoomDO` + `jobs-worker` | R2 | `archive/rooms/{room_id}/...` | strong | replay source | RoomDO 热层保留索引；每个 segment 都必须被 manifest 引用并带内容哈希、sequence、`export_epoch` 与签名 key version。 |
+| `DATA-R2-005` | object | export / recovery bundles | authoritative-ops | `ops-worker` | R2 | `exports/...` | strong | none | 仅控制面产生；bundle manifest 必须包含 schema version、内容哈希、签名、加密 key version 与 completeness 标记。 |
+| `DATA-R2-006` | object | encrypted room key backup segments | authoritative-opaque | `UserDO` | R2 | `backup/{user_id}/{backup_version}/...` | strong | user export | 服务端视为加密 opaque blob。 |
+| `DATA-KV-001` | keyspace | `/.well-known` cache | cache | `gateway-worker` | KV | `wellknown:*` | eventual | refetch | 可整前缀清空。 |
+| `DATA-KV-002` | keyspace | remote discovery / capability cache | cache | `gateway-worker` / `RemoteServerDO` | KV | `remote:*` | eventual | refetch | 只能作性能缓存。 |
 
-## 4. Authoritative DO Data Contracts
+## 8. Recovery and Rebuild Contracts
 
-### 4.1 `RoomDO`
+| DATA-ID | Category | Logical Entity / Shape | Authority | Runtime Owner | Physical Store | Key / Pattern | Consistency | Recovery Source | Notes |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `DATA-OPS-001` | manifest | replay manifest | authoritative-control-plane | `ops-worker` | D1 + R2 | `job_id` | per job serial | operator-created | 标记来源、范围、书签、`export_epoch`、source watermark 与允许的 restore / repair 模式。 |
+| `DATA-OPS-002` | manifest | rebuild checkpoint | authoritative-control-plane | `jobs-worker` | D1 / DO SQLite | `{job_id,shard}` | per job serial | manifest | 用于断点续跑。 |
+| `DATA-OPS-003` | manifest | repair decision log | authoritative-control-plane | `ops-worker` | D1 | `decision_id` | append-only | operator action | 记录人工修复与影响面。 |
+| `DATA-OPS-004` | log | audit event log | authoritative-control-plane | `ops-worker` | D1 + R2 immutable export | `{event_id}` | append-only | periodic export | 记录 `operator_principal_id`、auth mechanism、scope、request_id、idempotency_key、causation_id、result、affected objects；控制面写操作必须先落此日志。 |
 
-* Timeline
-* State snapshot
-* Membership
-* Auth chain helpers
-* Event dedupe and indexing helpers
+## 9. 兼容与迁移规则
 
-### 4.2 `UserDO`
+* DO SQLite schema 必须采用向前可读、向后可跳过字段的演进方式。
+* D1 派生表允许 “drop and rebuild”，但前提是 rebuild path 已存在且经验证。
+* Token 格式变更必须保留版本前缀，不得静默改变旧 token 解释。
 
-* Access sessions
-* Devices
-* Account data
-* To-device queues
-* Presence / notification streams
+## 10. 完成标准
 
-### 4.3 `RemoteServerDO`
-
-* Outbound txn queue
-* Retry state
-* Missing event recovery backlog
-* Remote key/cache helpers if applicable
-
-## 5. Derived and Shared Storage Contracts
-
-### 5.1 D1
-
-* Search indexes
-* User directory
-* Public room directory
-* Appservice control-plane data
-* Operational metadata
-
-### 5.2 R2
-
-* Local media objects
-* Remote media cache objects
-* Thumbnails
-* Archives / exports / cold history
-
-### 5.3 KV
-
-* Cache-only keyspaces
-* Invalidation rules
-
-## 6. Recovery and Rebuild Data Contracts
-
-* Replay input records
-* Reindex checkpoints
-* Repair manifests
-* Export manifests
-* Tombstones and deletion markers
-
-## 7. 兼容与迁移规则
-
-* 每个数据契约都必须声明是否允许前向 / 后向兼容。
-* 每个 schema 演进都必须声明迁移、回放、重建路径。
-* 派生数据必须声明真相来源与可重建性。
-
-## 8. 完成标准
-
-* 所有数据真相面与派生面都已登记；
+* 所有关键真相面与派生面都已登记；
 * token、cursor、idempotency 规则不再散落；
 * 恢复与迁移有明确数据入口；
 * 开发团队可据此开始 schema 与 keyspace 设计。

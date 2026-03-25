@@ -1,6 +1,6 @@
 # Spec Authority and Version Policy
 
-状态：Outline  
+状态：Draft-Normative
 角色：权威模型分册  
 负责主文档章节：1  
 扩展的单体章节：1-5 的治理语义

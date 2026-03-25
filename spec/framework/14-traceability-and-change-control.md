@@ -1,6 +1,6 @@
 # Traceability and Change Control
 
-状态：Outline  
+状态：Draft-Normative
 角色：追溯与变更控制分册  
 负责主文档章节：1，7  
 扩展范围：全部文档体系
@@ -24,6 +24,13 @@
 * `EVID`：验证证据
 * `DEC`：决策
 * `OQ`：未决问题
+
+### 2.1 `DEC` / `OQ` 寄存器约定
+
+* `DEC` 文档必须存放在 `spec/decisions/<DEC-ID>.md`。
+* `OQ` 文档必须存放在 `spec/open-questions/<OQ-ID>.md`。
+* 每个 `DEC` 至少包含：状态、结论、原因、影响的 `REQ/MX/CF/IF/DATA/TEST/EVID`、owner、批准日期、失效或复审日期。
+* Evidence waiver、规范冲突裁决和恢复例外都必须引用已存在的 `DEC-ID`，不得只写自然语言说明。
 
 ## 3. 必须建立的双向链接
 

@@ -1,8 +1,8 @@
 # Observability, Performance, and Cost Spec
 
-状态：Outline  
-角色：运营度量分册  
-负责主文档章节：5  
+状态：Draft-Normative
+角色：运营度量分册
+负责主文档章节：5
 继承的单体章节：20-22
 
 ## 1. 文档职责
@@ -17,46 +17,182 @@
 * 不定义部署与回放流程正文；
 * 不替代财务预算系统。
 
-## 2. 依赖与边界
+## 2. 可观测性总原则
 
-* 上游输入：所有架构与协议分册。
-* 下游输出：可观测性模型、容量模型、成本模型、运营度量域 `REQ/CF/TEST/EVID` 入口。
-* 与其他分册接口：消化各域的请求、CPU、存储、队列、连接占用。
-* 必须引用的官方资料：Workers、Durable Objects、D1、R2、Queues pricing 与 limits，Workers logs/telemetry docs。
+| REQ-ID | Requirement | Normative Statement |
+| --- | --- | --- |
+| `REQ-OPS-001` | Structured logs | 所有生产 Worker 必须输出结构化 JSON 日志。 |
+| `REQ-OPS-002` | Correlation IDs | 每个请求、异步任务、联邦事务和运维作业都必须能关联到稳定 ID。 |
+| `REQ-OPS-003` | Cost attribution | 每个主要成本面都必须有可观测指标与月度归因面板。 |
+| `REQ-OPS-004` | Truth-path visibility | `UserDO`、`RoomDO`、`RemoteServerDO` 的核心提交路径必须有独立指标。 |
+| `REQ-OPS-005` | Derived-lag visibility | D1/Queue/R2 派生滞后必须可测。 |
 
-## 3. 待填充章节
+## 3. Metrics Model
 
-### 3.1 Metrics Model
+### 3.1 必备指标字典
 
-### 3.2 Logs Model
+| Metric Family | Required Dimensions | Owner |
+| --- | --- | --- |
+| Worker requests / CPU / wall time / errors | worker, route family, status, version | `gateway-worker`,`jobs-worker`,`ops-worker` |
+| `/sync` active waiters / wake latency / empty returns | environment, user cohort, worker version | `gateway-worker`,`UserDO` |
+| `UserDO` requests / stream append rate / auth failures | class, shard key hash, method | `UserDO` |
+| `RoomDO` requests / admission latency / soft-fail count / state-resolution cost | room cohort, room version, method | `RoomDO` |
+| `RemoteServerDO` queue depth / retry count / backoff age | remote server, error class | `RemoteServerDO` |
+| D1 reads / writes / latency / overload | database, query family | `jobs-worker`,`ops-worker` |
+| R2 storage / Class A / Class B / remote media cache hit rate | bucket, object class | media subsystem |
+| Queue backlog / retry / poison | queue name, consumer version | `jobs-worker` |
+| Control-plane jobs / rebuild progress / export progress | job type, job id | `ops-worker` |
 
-### 3.3 Traces and Correlation
+### 3.2 指标最小集合
 
-### 3.4 Cost Observability
+* `worker.request.count`
+* `worker.cpu_ms`
+* `worker.wall_ms`
+* `worker.error.count`
+* `sync.waiter.active`
+* `sync.wake.latency_ms`
+* `userdo.stream.append.count`
+* `roomdo.admission.latency_ms`
+* `roomdo.state_resolution.count`
+* `federation.outbound.queue_depth`
+* `federation.retry.count`
+* `d1.query.latency_ms`
+* `r2.class_a.count`
+* `r2.class_b.count`
+* `queue.backlog.depth`
 
-### 3.5 Primary Load Drivers
+## 4. Logs Model
 
-### 3.6 Capacity and Sizing Guardrails
+### 4.1 必备字段
 
-### 3.7 Performance Budgets
+| Field | Requirement |
+| --- | --- |
+| `request_id` | 每个公开请求唯一 |
+| `causation_id` | 异步任务和重试链的因果 ID |
+| `worker_name` / `worker_version` | 必备 |
+| `route_family` | 必备 |
+| `user_id` / `device_id` | 如适用 |
+| `room_id` | 如适用 |
+| `remote_server` / `txn_id` | 联邦场景必备 |
+| `event_id` | 房间事件场景必备 |
+| `outcome` / `errcode` / `error_class` | 必备 |
+| `latency_ms` / `cpu_ms` | 必备 |
+| `cf_ray` | 如可得 |
 
-### 3.8 Cost Components and Included Quotas
+### 4.2 日志约束
 
-### 3.9 Scenario Models and Cost Guardrails
+* 生产默认启用 Workers Logs。引用：`CF-WKR-015`。
+* 正常高频请求必须采样，错误、控制面和恢复事件必须全量。
+* 禁止记录 secrets、token 明文和敏感密钥材料。
+* Workers Logs 只有 `7` 天保留期，只能作为短期运行遥测；控制面审计与恢复证据必须落到 `DATA-OPS-004` / `EVID-*`。
 
-### 3.10 SLO / SLA Entry Points
+## 5. Traces and Correlation
 
-## 4. 必备附件
+### 5.1 相关性规则
 
-* 指标字典
-* 日志字段字典
-* 链路追踪相关性表
-* 容量模型参数表
-* 成本驱动与额度矩阵
-* `CF-ID -> Cost/Perf Impact` 映射表
-* 运营度量域测试与证据清单
+* 所有公开请求都生成 `request_id`。
+* 所有异步任务都生成 `job_id`，并携带上游 `causation_id`。
+* 所有联邦事务都保留 `txn_id`。
+* 所有恢复、回放、重建操作都保留 `job_id` 和 `operator_principal_id`。
 
-## 5. 完成标准
+### 5.2 OTel 导出
+
+* 若启用 OTel export，必须明确是否把数据同时持久化到 Cloudflare dashboard。
+* Cloudflare OTel `persist` 默认是 `true`；若只需要外部 sink，应设为 `false`。引用：`CF-WKR-018`。
+* OTel export 当前只作为 logs/traces 出口，不替代 metrics 采集。引用：`CF-WKR-018`。
+
+## 6. Cost Observability
+
+### 6.1 月度成本面板必须覆盖
+
+* Workers requests / CPU ms
+* Workers Logs event volume
+* DO requests / duration / SQLite rows / storage
+* D1 rows / storage
+* R2 storage / Class A / Class B
+* KV reads / writes / storage
+* Queue operations
+* optional OTel export events
+
+### 6.2 Included Quotas Matrix
+
+| Cost Surface | Included Quota | CF IDs |
+| --- | --- | --- |
+| Workers requests | `10M / month` | `CF-WKR-019` |
+| Workers CPU | `30M CPU ms / month` | `CF-WKR-019` |
+| Workers Logs | `20M log events / month`, retention `7 days` | `CF-WKR-015` |
+| DO requests | `1M / month`；计费单位定义见 `CF-DO-013` | `CF-DO-011`,`CF-DO-013` |
+| DO duration | `400,000 GB-s / month` | `CF-DO-011` |
+| DO SQLite rows | reads `25B / month`, writes `50M / month` | `CF-DO-012` |
+| DO SQLite storage | `5 GB-month` | `CF-DO-012` |
+| D1 rows | reads `25B / month`, writes `50M / month` | `CF-D1-006` |
+| D1 storage | `5 GB` | `CF-D1-006` |
+| R2 | storage `10 GB-month`, Class A `1M`, Class B `10M` | `CF-R2-005` |
+| KV | reads `10M / month`, writes `1M / month`, storage `1 GB` | `CF-KV-003` |
+| Queues | `1M ops / month` | `CF-QUE-001` |
+| OTel export | `10M` logs + `10M` traces events / month when enabled | `CF-WKR-018` |
+
+### 6.3 Cost Model Rules
+
+* 只有在 deployment 采用 Workers `Standard` usage model 时，Worker-to-Worker calls via Service Bindings 才不产生额外 Worker request fee；legacy `Bundled/Unbound` 必须把 caller 与 callee requests 分别计费。引用：`CF-WKR-016`,`CF-WKR-009`。
+* `/sync` 设计优先消耗 Worker wall time，而不是 DO duration。引用：`CF-WKR-001`,`CF-DO-009`,`CF-DO-011`。
+* 媒体读取的主成本来自 R2 请求与存储，不来自 R2 Internet egress。引用：`CF-R2-003`,`CF-R2-005`。
+* DO request 成本必须把 DO HTTP、RPC、WebSocket message 与 alarm invocation 一并建模，并按官方 transport-specific request unit 定义换算，不得只按 DO HTTP 入口估算。引用：`CF-DO-013`。
+
+## 7. Primary Load Drivers
+
+* 在线设备数
+* 活跃 `/sync` waiter 数
+* 单房间热点写入
+* 远端联邦恢复与 backfill
+* 媒体对象量与远端 cache miss
+* 搜索与目录派生滞后
+
+## 8. Capacity and Sizing Guardrails
+
+### 8.1 Hard/Soft Ceiling Awareness
+
+* 单 `RoomDO` 或 `UserDO` 不得被当作无限扩展单元；Cloudflare 给出的单对象吞吐是软上限约 `1,000 req/s`。引用：`CF-DO-002`。
+* 单个 Worker 请求必须受 `6` 个 simultaneous open connections 约束。引用：`CF-WKR-006`。
+* 单个 D1 数据库必须被视为单线程资源。引用：`CF-D1-002`。
+
+### 8.2 设计护栏
+
+* 单 session 只允许一个活跃 `/sync` waiter。
+* 单房间 typing/receipt 更新必须先聚合再 fanout。
+* 远端媒体抓取与联邦拉取必须显式限并发。
+* 搜索、目录和缩略图必须可延迟，不得阻塞真相面。
+
+## 9. Performance Budgets
+
+本分册定义的是预算方向，不是 SLA 承诺：
+
+* 认证热路径应保持低 CPU、无外部网络等待。
+* 本地非联邦房间发送应以单次 `RoomDO` 提交为主要时延来源，而不是 D1/R2/Queue。
+* `/sync` 的“有事件后唤醒到返回”预算应优先优化 Worker 组装和房间投影，而不是长时间轮询频率。
+
+具体数值门槛必须通过 `TEST-PERF-*` 压测固化到发布记录。
+
+## 10. SLO / SLA Entry Points
+
+进入 `L3` 前，至少必须定义以下 SLI：
+
+* client request success rate
+* `/sync` wake-to-response latency
+* room event admission latency
+* federation outbound success latency
+* media upload/download success rate
+* rebuild/recovery completion success rate
+
+## 11. 运营度量域测试入口
+
+| Area | TEST IDs | EVID IDs |
+| --- | --- | --- |
+| performance and capacity | `TEST-PERF-001`,`TEST-PERF-002` | `EVID-PERF-001` |
+| cost model and quotas | `TEST-COST-001` | `EVID-COST-001` |
+| deployment observability | `TEST-OPS-001` | `EVID-OPS-001` |
+
+## 12. 完成标准
 
 * 关键路径均有观测方案；
 * 主要容量瓶颈有量化入口；

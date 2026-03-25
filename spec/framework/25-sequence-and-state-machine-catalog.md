@@ -1,6 +1,6 @@
 # Sequence and State Machine Catalog
 
-状态：Outline  
+状态：Draft-Normative
 角色：流程与状态机目录  
 负责主文档章节：3，4，6，7  
 扩展范围：所有关键行为流程
@@ -13,61 +13,63 @@
 
 ## 2. 时序图目录
 
-后续至少需要以下 `FLOW-*`：
+### 2.1 客户端与身份域
 
-* `FLOW-CS-DISCOVERY`
-* `FLOW-CS-REGISTER`
-* `FLOW-CS-LOGIN`
-* `FLOW-CS-REFRESH`
-* `FLOW-CS-LOGOUT`
-* `FLOW-CS-SYNC-LONGPOLL`
-* `FLOW-CS-SEND-EVENT`
-* `FLOW-CS-SEND-TO-DEVICE`
-* `FLOW-CS-ROOM-MEMBERSHIP`
-* `FLOW-CS-MEDIA-UPLOAD`
-* `FLOW-CS-MEDIA-DOWNLOAD`
-* `FLOW-CS-REMOTE-MEDIA-FETCH`
-* `FLOW-ROOM-EVENT-ADMISSION`
-* `FLOW-ROOM-LOCAL-FANOUT`
-* `FLOW-FED-DISCOVERY`
-* `FLOW-FED-INBOUND-TXN`
-* `FLOW-FED-OUTBOUND-TXN`
-* `FLOW-FED-MISSING-EVENT-RECOVERY`
-* `FLOW-FED-JOIN`
-* `FLOW-FED-LEAVE`
-* `FLOW-AS-TXN-DELIVERY`
-* `FLOW-SEARCH-INDEX`
-* `FLOW-DEPLOY-VERSION-SKEW`
-* `FLOW-REPLAY-REBUILD`
-* `FLOW-DISASTER-RECOVERY`
+| FLOW-ID | Name | Owning Spec | Participants | Trigger | Success Path | Failure / Retry Path |
+| --- | --- | --- | --- | --- | --- | --- |
+| `FLOW-CS-DISCOVERY` | client discovery | `30` | client, `gateway-worker` | `/.well-known` or `/versions` or `/capabilities` | 返回能力与 homeserver 元数据 | 静态错误或缓存回退 |
+| `FLOW-CS-REGISTER` | registration | `30` | client, `gateway-worker`, `UserDO` | `POST /register` | 创建用户、初始设备、初始 session | 保持幂等错误响应，不做半创建 |
+| `FLOW-CS-LOGIN` | login | `30` | client, `gateway-worker`, `UserDO` | `POST /login` | 认证、创建设备 session、返回 token | 失败不创建任何 session |
+| `FLOW-CS-REFRESH` | refresh token | `30` | client, `gateway-worker`, `UserDO` | `POST /refresh` | 校验 refresh token、轮换 session | refresh 重放必须失败或返回已轮换结果 |
+| `FLOW-CS-PROFILE-PROPAGATION` | profile update propagation | `30`,`31` | client, `gateway-worker`, `UserDO`, `RoomDO`, optional `jobs-worker` | `PUT` or `DELETE /_matrix/client/*/profile/{userId}/{keyName}` | 更新 profile 真相、发出 presence 增量、对已加入房间传播 membership refresh | 不得产生半更新；传播重试必须按 profile version 幂等 |
+| `FLOW-CS-SYNC-LONGPOLL` | sync long poll | `30` | client, `gateway-worker`, `UserDO`, `RoomDO` | `GET /sync` | Worker 持有请求，收到唤醒后组装响应 | 通道断开早返回；不得推进 token |
+| `FLOW-CS-SEND-TO-DEVICE` | send to-device | `30` | client, `gateway-worker`, `UserDO`, optional `RemoteServerDO` | `PUT /sendToDevice` | 写本地队列并派发远端 EDU | 远端失败不影响本地提交 |
 
-### 2.1 时序图元数据表头
+### 2.2 房间域
 
-| FLOW-ID | Name | Owning Spec | Participants | Trigger | Success Path | Failure / Retry Path | Key Contracts | Key Data | TEST IDs |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `FLOW-*` | concrete flow name | owning child spec | worker / DO / client / remote server | initiating event | summary | retry / timeout / error branch | `IF-*` | `DATA-*` | `TEST-*` |
+| FLOW-ID | Name | Owning Spec | Participants | Trigger | Success Path | Failure / Retry Path |
+| --- | --- | --- | --- | --- | --- | --- |
+| `FLOW-CS-SEND-EVENT` | local event send | `31` | client, `gateway-worker`, `UserDO`, `RoomDO` | `PUT /rooms/.../send` | `RoomDO` 准入、提交、fanout | 校验失败原子拒绝 |
+| `FLOW-CS-ROOM-MEMBERSHIP` | membership mutation | `31` | client, `gateway-worker`, `UserDO`, `RoomDO`, optional federation | join/invite/leave/ban/knock | 生成 membership event 并走同一准入管道 | 联邦握手失败不得伪造本地成功 |
+| `FLOW-ROOM-EVENT-ADMISSION` | unified room admission | `31` | `gateway-worker`, `RoomDO`, `UserDO`, `RemoteServerDO` | local/fed/AS event ingress | 统一 auth/state resolution/commit | 失败不产生 partial state |
+| `FLOW-ROOM-LOCAL-FANOUT` | local user fanout | `31` | `RoomDO`, `UserDO`, `jobs-worker` | room commit success | 写用户流、推送索引任务 | 单用户失败可补偿重试 |
+
+### 2.3 联邦域
+
+| FLOW-ID | Name | Owning Spec | Participants | Trigger | Success Path | Failure / Retry Path |
+| --- | --- | --- | --- | --- | --- | --- |
+| `FLOW-FED-DISCOVERY` | remote server discovery | `32` | `gateway-worker`, DNS, remote server | outbound federation call | 依 Matrix 发现流程得到目标地址 | 失败缓存按 TTL 失效并重试 |
+| `FLOW-FED-QUERY` | federation query surfaces | `32`,`34` | remote server, `gateway-worker`, `UserDO`, `RoomDO`, `jobs-worker`, D1 | hierarchy / directory / profile / generic query request | 验签后走只读查询分发，返回 truth 或 derived 结果 | 未知 query type 显式报错；derived 滞后只能 fail-closed |
+| `FLOW-FED-INBOUND-TXN` | inbound transaction | `32` | remote server, `gateway-worker`, `RoomDO`, `UserDO` | `PUT /send/{txnId}` | 验签、去重、分发并返回结果 | 重复事务幂等；部分 PDU 错误单独记录 |
+| `FLOW-FED-OUTBOUND-TXN` | outbound transaction | `32` | `RemoteServerDO`, remote server | local event or EDU egress | 排序、打包、发送、确认 | 失败保持同一 `txn_id` 重试 |
+| `FLOW-FED-MISSING-EVENT-RECOVERY` | gap repair | `32` | `RemoteServerDO`, `RoomDO`, remote server | 缺 `prev_events` / state gap | 拉取缺失事件并重新准入 | 达到上限进入 dead-letter / repair queue |
+| `FLOW-FED-JOIN-LEAVE` | make/send join or leave | `32` | `gateway-worker`, `RoomDO`, `RemoteServerDO`, remote server | federation membership | 模板、签名、提交、状态同步 | 任一步失败都不得污染本地房间真相 |
+
+### 2.4 媒体与派生域
+
+| FLOW-ID | Name | Owning Spec | Participants | Trigger | Success Path | Failure / Retry Path |
+| --- | --- | --- | --- | --- | --- | --- |
+| `FLOW-CS-MEDIA-UPLOAD` | media upload | `33` | client, `gateway-worker`, `UserDO`, R2, D1 | upload request | 鉴权、配额、流式写 R2、写目录投影 | 失败回滚 pending upload binding |
+| `FLOW-CS-MEDIA-DOWNLOAD` | local media download | `33` | client, `gateway-worker`, R2 | media GET | 鉴权、查最小元数据、流式返回 | 对象缺失返回协议错误并记审计 |
+| `FLOW-CS-REMOTE-MEDIA-FETCH` | remote media cache | `33` | client, `gateway-worker`, remote server, R2 | cache miss | 拉取远端、写 R2、返回客户端 | 受并发上限和尺寸限制保护 |
+| `FLOW-SEARCH-INDEX` | search/index update | `34` | `RoomDO`, `UserDO`, `jobs-worker`, D1 | truth commit success | 按幂等键更新 D1 | 失败进入重建队列 |
+| `FLOW-AS-TXN-DELIVERY` | appservice delivery | `34` | `jobs-worker`, appservice, D1 control plane | truth commit success | 顺序投递 AS transaction | 失败重试且不影响主业务提交 |
+| `FLOW-REPLAY-REBUILD` | replay/reindex | `42`,`34` | `ops-worker`, `jobs-worker`, DOs, D1, R2 | operator action | 从真相与归档重放衍生面 | 断点续跑并保留 manifest |
 
 ## 3. 状态机目录
 
-后续至少需要以下 `STATE-*`：
-
-* `STATE-USER-SESSION`
-* `STATE-DEVICE-LIFECYCLE`
-* `STATE-SYNC-WAITER`
-* `STATE-ROOM-EVENT-ADMISSION`
-* `STATE-ROOM-MEMBERSHIP`
-* `STATE-REMOTE-SERVER-RETRY`
-* `STATE-MEDIA-CACHE-OBJECT`
-* `STATE-APPSERVICE-TXN`
-* `STATE-DEPLOYMENT-ROLLOUT`
-* `STATE-REBUILD-JOB`
-* `STATE-EXPORT-JOB`
-
-### 3.1 状态机元数据表头
-
-| STATE-ID | Name | Owning Spec | Entity | Persistent State | Triggers | Guards | Side Effects | Recovery Action | TEST IDs |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `STATE-*` | concrete machine name | owning child spec | session / room event / retry queue / media object | yes / no | input events | validation rules | writes / enqueues / emits | timeout / rebuild / replay | `TEST-*` |
+| STATE-ID | Name | Owning Spec | Entity | Core States | Recovery Focus |
+| --- | --- | --- | --- | --- | --- |
+| `STATE-USER-SESSION` | session lifecycle | `30` | access/refresh session | created, active, rotated, revoked, expired | token rotation and logout consistency |
+| `STATE-DEVICE-LIFECYCLE` | device lifecycle | `30` | device | provisioned, active, soft-deleted, hard-deleted | device key invalidation |
+| `STATE-SYNC-WAITER` | sync waiter | `30` | worker-held long poll | opened, waiting, woken, assembling, returned, aborted | wake channel loss and deploy interruption |
+| `STATE-ROOM-EVENT-ADMISSION` | room event admission | `31` | event | received, validated, waiting-missing, auth-checked, committed, rejected, soft-failed | missing event repair and deterministic rejection |
+| `STATE-ROOM-MEMBERSHIP` | membership | `31` | room/user membership | leave, invite, join, knock, ban, forgotten | edge-case transitions and visibility |
+| `STATE-REMOTE-SERVER-RETRY` | outbound retry | `32` | remote txn | queued, sending, backoff, ready, dead-letter, drained | retry schedule stability |
+| `STATE-MEDIA-CACHE-OBJECT` | remote media cache object | `33` | cached media | miss, fetching, present, stale, purging, deleted | partial fetch cleanup |
+| `STATE-APPSERVICE-TXN` | appservice txn | `34` | appservice delivery | queued, sending, acked, retrying, poison | exactly-once illusion via idempotency |
+| `STATE-REBUILD-JOB` | rebuild job | `42`,`34` | replay/reindex job | pending, scanning, applying, checkpointed, completed, failed, canceled | resumability |
+| `STATE-EXPORT-JOB` | export job | `42` | export bundle | pending, materializing, uploading, finalized, failed | partial export cleanup |
 
 ## 4. 图示规范
 
@@ -77,8 +79,9 @@
 
 ## 5. 审查规则
 
-* 若某一行为存在并发、重试、恢复、版本偏斜或缓存语义，则必须有图。
-* 若某一对象具有生命周期、重试或多阶段处理，则必须有状态机。
+* 若某行为存在并发、重试、恢复、版本偏斜或缓存语义，则必须有图。
+* 若某对象具有生命周期、重试或多阶段处理，则必须有状态机。
+* 任一 `IF-ID` 若跨越信任边界或 authority handoff，必须至少挂一个 `FLOW-ID`。
 
 ## 6. 完成标准
 
