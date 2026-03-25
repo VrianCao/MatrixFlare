@@ -31,7 +31,7 @@
 | --- | --- | --- | --- | --- | --- | --- |
 | `FLOW-CS-SEND-EVENT` | local event send | `31` | client, `gateway-worker`, `UserDO`, `RoomDO` | `PUT /rooms/.../send` | `RoomDO` 准入、提交、fanout | 校验失败原子拒绝 |
 | `FLOW-CS-ROOM-MEMBERSHIP` | membership mutation | `31` | client, `gateway-worker`, `UserDO`, `RoomDO`, optional federation | join/invite/leave/ban/knock | 生成 membership event 并走同一准入管道 | 联邦握手失败不得伪造本地成功 |
-| `FLOW-CS-ROOM-QUERY` | room history and state query | `31` | client, `gateway-worker`, `RoomDO` | `/messages`, `/context`, `/event`, `/state` | 按 cursor 与可见性规则返回房间读结果 | cursor 无效或可见性不满足时 fail-closed，不得改写真相 |
+| `FLOW-CS-ROOM-QUERY` | room history and state query | `31` | client, `gateway-worker`, `RoomDO` | `/messages`, `/context`, `/event`, `/state`, `/members`, `/joined_members`, `/relations`, `/threads`, `/timestamp_to_event` | 按 cursor、关系索引、时间定位与可见性规则返回房间读结果 | cursor 无效、时间定位失败或可见性不满足时 fail-closed，不得改写真相 |
 | `FLOW-ROOM-EVENT-ADMISSION` | unified room admission | `31` | `gateway-worker`, `RoomDO`, `UserDO`, `RemoteServerDO` | local/fed/AS event ingress | 统一 auth/state resolution/commit | 失败不产生 partial state |
 | `FLOW-ROOM-LOCAL-FANOUT` | local user fanout | `31` | `RoomDO`, `UserDO`, `jobs-worker` | room commit success | 写用户流、推送索引任务 | 单用户失败可补偿重试 |
 
@@ -72,6 +72,8 @@
 | `STATE-APPSERVICE-TXN` | appservice txn | `34` | appservice delivery | queued, sending, acked, retrying, poison | exactly-once illusion via idempotency |
 | `STATE-REBUILD-JOB` | rebuild job | `42`,`34` | replay/reindex job | pending, scanning, applying, checkpointed, completed, failed, canceled | resumability |
 | `STATE-EXPORT-JOB` | export job | `42` | export bundle | pending, materializing, uploading, finalized, failed | partial export cleanup |
+| `STATE-RESTORE-JOB` | restore job | `42` | restore/import job | pending, validating, importing, cutover-ready, cutover, completed, failed, canceled | manifest validation and cutover safety |
+| `STATE-REPAIR-JOB` | repair job | `42` | scoped repair job | pending, scanning, applying, verifying, completed, failed, canceled | bounded blast radius and re-verification |
 
 ## 4. 图示规范
 

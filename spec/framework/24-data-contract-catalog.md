@@ -51,7 +51,7 @@
 
 | DATA-ID | Category | Logical Entity / Shape | Authority | Runtime Owner | Physical Store | Key / Pattern | Consistency | Recovery Source | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `DATA-ROOM-001` | table | events metadata | authoritative | `RoomDO` | DO SQLite | `event_id` / `room_pos` | per-room serial | R2 archive + replay | 热层必须保留最小元数据。 |
+| `DATA-ROOM-001` | table | events metadata | authoritative | `RoomDO` | DO SQLite | `event_id` / `room_pos` | per-room serial | R2 archive + replay | 热层必须保留最小元数据，并携带 `/messages`、`/relations`、`/threads`、`/timestamp_to_event` 所需的最小查询键。 |
 | `DATA-ROOM-002` | table | hot canonical event JSON | authoritative | `RoomDO` | DO SQLite | `event_id` | per-room serial | R2 archive | 仅保留热点时间窗。 |
 | `DATA-ROOM-003` | table | prev edges | authoritative | `RoomDO` | DO SQLite | `{event_id,prev_event_id}` | per-room serial | replay | DAG 结构。 |
 | `DATA-ROOM-004` | table | auth edges | authoritative | `RoomDO` | DO SQLite | `{event_id,auth_event_id}` | per-room serial | replay | auth chain 结构。 |

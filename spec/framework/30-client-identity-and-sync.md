@@ -127,6 +127,9 @@
 * filter 创建时必须按 [22-data-consistency-and-routing.md](/root/Matrix/spec/framework/22-data-consistency-and-routing.md) 的非事件 JSON canonicalization 规则处理 JSON，再生成稳定 hash 和 `filter_id`；`filter_id` 不得以 `{` 开头。
 * `GET /_matrix/client/*/sync` 的 `filter` 查询参数必须按首字符解释：若首字符是 `{`，则视为 inline JSON filter string；否则视为此前创建的 stored `filter_id`。
 * `/sync` 对 stored filter 和 inline filter 的解释都必须确定；相同 `{since,filter}` 不得因部署节点不同而产生语义分叉。
+* Matrix `v1.17` filter 中与 `/sync` 响应结构直接相关的布尔开关必须明确实现：`include_leave`、`lazy_load_members`、`include_redundant_members`、`unread_thread_notifications`。未显式给出的布尔值按规范默认 `false` 处理。
+* `include_leave = false` 时，`rooms.leave` bucket 必须整体省略，即使本地真相仍保留 left / banned-but-not-forgotten 房间；只有在 `include_leave = true` 时，这些房间才允许出现在 `/sync`。
+* `include_redundant_members` 只有在启用 `lazy_load_members` 时才有意义；否则必须按 `false` 处理，不得制造与未启用 lazy-load 不同的成员事件输出。
 
 ### 5.2 Profile Truth and Propagation
 
@@ -134,6 +137,9 @@
 * `v1.17` 基线下，必须支持 `displayname`、`avatar_url`、`m.tz` 以及 policy 允许的 namespaced custom fields。
 * `PUT /_matrix/client/*/profile/{userId}/{keyName}` 的请求体必须是“恰好一个属性”的 JSON object，且该属性名必须与 URL 中的 `keyName` 完全一致。
 * `keyName` 只允许 `displayname`、`avatar_url`、`m.tz` 或满足 namespaced grammar 的自定义字段；`displayname` 必须是 string，`avatar_url` 必须是 MXC URI，`m.tz` 必须是 IANA 时区标识。
+* `keyName` 的 UTF-8 字节长度必须不超过 `255`；超限必须返回 `M_KEY_TOO_LARGE`。
+* 自定义 namespaced key 的 value 允许是任意合法 JSON 值；只有 `displayname`、`avatar_url`、`m.tz` 三类规范字段受额外类型约束。
+* 请求体不是合法 JSON 时必须返回 `M_NOT_JSON`；请求体是合法 JSON 但缺少与 `keyName` 对应的属性、存在额外顶层属性、或值形状不符合该字段约束时，必须返回 `M_MISSING_PARAM` 或 `M_BAD_JSON` 中被本实现固定选定并测试覆盖的那一个，不得随节点漂移。
 * 服务端可以拒绝 `null` 值；若接受 `null`，则必须按 `null` 存储，而不是把它解释成删除。删除字段只能走 `DELETE /_matrix/client/*/profile/{userId}/{keyName}`。
 * 更新后的 total profile document 必须小于 `64 KiB`；超限时必须按协议返回 `M_PROFILE_TOO_LARGE`。
 * successful profile write 必须先原子更新 `DATA-USER-012`，再启动传播路径。
@@ -154,13 +160,13 @@
 ### 5.4 Push Rules and Notification State
 
 * custom push rules、enabled 状态和规则顺序的权威表是 `DATA-USER-013`。
-* Matrix `v1.17` 默认 push rules 必须由服务端按规范基线合成；用户存储只保存覆盖、禁用和顺序调整。
-* 服务端合成的默认 push rules 基线至少必须包含以下 rule IDs，并保持 Matrix `v1.17` 规定的条件、actions 与优先顺序：
-  * `override`: `.m.rule.master`, `.m.rule.suppress_notices`, `.m.rule.invite_for_me`, `.m.rule.member_event`, `.m.rule.is_user_mention`, `.m.rule.is_room_mention`, `.m.rule.tombstone`, `.m.rule.reaction`, `.m.rule.room.server_acl`, `.m.rule.suppress_edits`
-  * `underride`: `.m.rule.call`, `.m.rule.encrypted_room_one_to_one`, `.m.rule.room_one_to_one`, `.m.rule.message`, `.m.rule.encrypted`
+* Matrix `v1.17` 默认 push rules 必须由服务端按规范基线精确合成；用户存储只保存覆盖、禁用和顺序调整。
+* 规范性基线固定在 [92-appendices.md](/root/Matrix/spec/framework/92-appendices.md) 的 “Matrix `v1.17` Default Push-Rules Baseline” 附录中；运行时生成的 server-default rules 必须与该附录逐条等价，包括 `kind`、顺序、`rule_id`、`enabled` 默认值、conditions 与 actions。
+* `v1.17` 的 server-default baseline 中，`content`、`room`、`sender` 三类默认规则集为空；同时 `v1.17` 已移除 legacy “在 `content.body` 中寻找 mention” 的默认规则，不得再合成旧规则。
 * 必须支持 `GET /pushrules/`、`GET /pushrules/global/`、`GET/PUT/DELETE /pushrules/global/{kind}/{ruleId}`、`GET/PUT /.../{ruleId}/actions`、`GET/PUT /.../{ruleId}/enabled` 这些 `v1.17` 路由面。
 * `kind` 只允许 `override`、`underride`、`sender`、`room`、`content`；用户自定义 `ruleId` 不得以 `.` 开头，且不得包含 `/` 或 `\\`。
-* `PUT /pushrules/global/{kind}/{ruleId}` 创建规则时，若没有 `before` / `after`，新规则必须成为同类用户自定义规则中最高优先级；若同时给出 `before` 和 `after`，必须以 `before` 为主确定新顺序。
+* `PUT /pushrules/global/{kind}/{ruleId}` 在创建**或更新**规则时，若没有 `before` / `after`，该规则必须成为同类用户自定义规则中最高优先级；若同时给出 `before` 和 `after`，必须以 `before` 为主确定新顺序。
+* `before` / `after` 只能相对于同类 `kind` 中的**用户自定义规则**定位；禁止把用户规则插入 server-default rules 之间，也禁止借此改变 [92-appendices.md](/root/Matrix/spec/framework/92-appendices.md) 中钉死的 server-default 相对顺序。
 * 新创建的 push rule 必须默认 `enabled = true`。
 * `/actions` 与 `/enabled` 子资源只允许修改对应字段，不得隐式重写条件、pattern 或顺序。
 * push rule 写入必须由 `UserDO` 线性化，并在后续 `/sync` 中生效。
@@ -314,7 +320,7 @@
 
 ### 9.2 Initial / Incremental 语义
 
-* `since` 缺失表示 initial sync；实现必须在单一 `upper_bound_user_stream_pos` 上返回用户当前可见的 joined / invited / knocked / left-but-not-forgotten 房间视图与当前用户域快照。
+* `since` 缺失表示 initial sync；实现必须在单一 `upper_bound_user_stream_pos` 上返回用户当前可见的 joined / invited / knocked 房间视图与当前用户域快照；`rooms.leave` 只在 filter 显式启用 `include_leave = true` 时返回 left / banned-but-not-forgotten 房间。
 * `since` 存在表示 incremental sync；实现只能返回满足 `stream_pos > since_pos && stream_pos <= upper_bound_user_stream_pos` 的增量。
 * token 解析失败、版本不兼容、设备或用户作用域不匹配时，必须在进入 long poll 前失败，并且不得前移任何 session ack 状态。
 
@@ -338,7 +344,7 @@ membership 到 `/sync` bucket 的映射必须固定为：
 * `join` -> `rooms.join`
 * `invite` -> `rooms.invite`，且只返回 stripped invite state
 * `knock` -> `rooms.knock`，且只返回 stripped knock state
-* `leave` / `ban` -> `rooms.leave`，直到客户端执行 forget
+* `leave` / `ban` -> `rooms.leave`，但仅当本次请求的 filter 启用 `include_leave = true`；否则必须从响应中省略，直到未来某次请求显式要求包含 leave rooms
 * forgotten rooms 不得再出现在任何 bucket 中
 
 若同一房间在 `(since, upper_bound]` 窗口内跨多个 membership bucket 迁移，响应中必须只出现最终 bucket；为解释最终 bucket 所必需的 timeline / state 仍必须一并返回。
@@ -353,9 +359,11 @@ membership 到 `/sync` bucket 的映射必须固定为：
 ### 9.5 Filter 应用、`full_state` 与 `use_state_after`
 
 * `UserDO` 必须先应用 user-scoped filter 分支，例如 account data、presence、to-device、device lists；`RoomDO` 必须应用 room-scoped filter 分支，例如 room include/exclude、timeline、state、ephemeral。
-* `full_state = true` 时，joined 房间必须返回 `upper_bound_user_stream_pos` 对应时刻的完整当前可见状态，并仍受 filter 的 state 约束。
-* `use_state_after = true` 时，joined 房间必须输出 `state_after`，其含义是“应用本次返回的 timeline events 之后的当前状态”；否则必须输出 legacy `state` 载荷。
+* `full_state = true` 时，服务端必须忽略 `timeout`，并且对适用房间返回 `upper_bound_user_stream_pos` 对应时刻的完整当前可见状态，即使这些状态事件的 stream position 不在 `(since, upper_bound]` 内；该完整状态仍受 filter 的 state 维度约束。
+* `use_state_after = true` 时，`rooms.join` 与 `rooms.leave` 中凡返回 timeline/state delta 的房间都必须输出 `state_after`，其含义是“应用本次返回的 timeline events 之后的当前状态”；此时必须省略 legacy `state`，且 `state_after` 即使为空数组也必须显式出现。
 * 同一房间在同一次 `/sync` 响应中不得混用 `state` 与 `state_after`。
+* 当启用 `lazy_load_members` 时，成员事件只能按 Matrix `v1.17` lazy-load 规则输出：至少必须包含本次 timeline 中事件 sender 所需的 member state、`state`/`state_after` 中显式返回的 member state，以及客户端自己在 joined 房间中的 membership event；若同时启用 `full_state = true`，则 joined 房间中客户端自己的 membership event 仍必须返回。
+* 当 `lazy_load_members = true` 且 `include_redundant_members = false` 时，服务端可以省略“此前已向同一设备会话返回过、且这次并非再次必需”的成员事件；当 `include_redundant_members = true` 时，这些成员事件必须重新发送。
 * unread / notification counts 必须使用 `upper_bound_user_stream_pos` 时刻的 push-rules snapshot 计算，而不是使用响应开始时或结束时的漂移视图。
 * 任一房间投影失败都必须使整个 `/sync` 失败并保持 `next_batch` 不前移；禁止返回“部分房间成功、部分房间失败”的 `200` 响应，必须返回明确错误并允许客户端按相同 `since` 安全重试。
 

@@ -55,26 +55,27 @@
 
 ### 3.3 运维认证规则
 
-* 人类运维请求必须经 Cloudflare Access 保护的专用管理域进入；`ops-worker` 必须验证 Access identity、`aud`、`exp` 与 issuer 绑定。
+* 人类运维请求必须经 Cloudflare Access 保护的专用管理域进入；`ops-worker` 必须验证 Access identity、`aud`、`exp` 与 issuer 绑定。引用：`CF-NET-004`,`CF-NET-005`。
 * 自动化运维请求必须使用 Access service token 或等价受限凭据，且同样只能打到专用管理域。
 * `ops-worker` 必须把 Access subject / service principal 映射为内部 `operator_principal_id`，并按 `DATA-D1-006` 裁决 scope。
 * 每个控制面写请求都必须通过 HTTP `Idempotency-Key` 头携带 `idempotency_key`；`ops-worker` 必须用 `DATA-OPS-004` 检测重放并把重复请求折叠为同一作业或显式拒绝。
-* 运维入口的凭据撤销与轮换必须依赖 Cloudflare Access / service token 生命周期，而不是长寿命静态 bearer token。
+* 运维入口的凭据撤销与轮换必须依赖 Cloudflare Access / service token 生命周期，而不是长寿命静态 bearer token。引用：`CF-NET-006`。
 
 #### 3.3.1 接受的 Access 身份传输形态
 
 * `ops-worker` 只接受通过 Cloudflare Access 成功鉴权后附带的 Access JWT 作为应用层身份依据；规范首选 `CF-Access-Jwt-Assertion`。
 * `CF-Access-Client-Id` / `CF-Access-Client-Secret` 只被视为 Access 边缘策略的入站凭据，不得被 `ops-worker` 当作应用层 bearer secret 直接信任。
 * `Cf-Access-Authenticated-User-Email`、common-name 等 Access 注入头只能用于日志和展示，不得单独作为授权依据。
+* 不得把 `CF_Authorization` cookie 当成唯一身份源；只有在 `CF-Access-Jwt-Assertion` 缺失且已存在显式 `DEC-ID` 豁免时，才允许讨论替代路径。默认实现必须 fail-closed。引用：`CF-NET-004`。
 
 #### 3.3.2 `ops-worker` JWT 验证与裁决步骤
 
 `ops-worker` 对每个管理面请求必须按以下固定顺序处理：
 
 1. 读取 `CF-Access-Jwt-Assertion`，缺失则直接返回 `401`。
-2. 使用配置的 Access team / account JWKs 或 certs 验证签名。
+2. 使用 Access team domain 的 `/cdn-cgi/access/certs` JWK/cert 集按 JWT `kid` 验证签名；实现必须缓存当前和上一个有效 key，并在 `kid` miss 时先强制刷新一次 JWK 集再裁决。不得把单一 `public_cert` 硬编码为唯一信任根。引用：`CF-NET-005`。
 3. 校验 `iss`、`aud`、`exp`、`nbf`、`sub`；任一失败都必须返回 `401`。
-4. 以 `{iss,aud,stable_subject}` 映射 `DATA-D1-006 principal_id`；其中 human 默认取 JWT `sub`，service principal 必须取稳定的 service token 标识字段，而不是空 `sub` 或展示性邮箱。
+4. 以 `{iss,aud,stable_subject}` 映射 `DATA-D1-006 principal_id`；其中 human 默认取 JWT `sub`，service principal 必须取部署时明确登记的“稳定服务主体 claim 优先级列表”中的首个命中项；若没有稳定 claim 命中，则必须返回 `401/403`，不得退化为展示性邮箱或空 `sub`。
 5. 按 `allowed_scopes` 与 `target_scope_constraints` 裁决授权；失败返回 `403`。
 6. 对写请求读取 `idempotency_key` 并查询 `DATA-OPS-004` dedupe projection；冲突返回 `409`。
 7. 先写入审计事件，再创建或驱动作业。
@@ -83,6 +84,7 @@
 
 * Access service token 只用于通过 Cloudflare Access 策略；
 * 到达 `ops-worker` 时仍必须表现为可验证的 Access JWT；
+* 对于 service-auth only 的 Access 应用，自动化调用方通常需要在每次请求继续向 Access 发送 service token；但 `ops-worker` 仍只信任经 Access 生成并注入的 JWT。
 * 因此 `ops-worker` 无需持有或比较 service token secret 本体。
 
 ## 4. 授权模型

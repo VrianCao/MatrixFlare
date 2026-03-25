@@ -111,7 +111,7 @@
 * DO requests / duration / SQLite rows / storage
 * D1 rows / storage
 * R2 storage / Class A / Class B
-* KV reads / writes / storage
+* KV reads / writes / deletes / list / storage
 * Queue operations
 * optional OTel export events
 
@@ -129,7 +129,7 @@
 | D1 rows | reads `25B / month`, writes `50M / month` | `CF-D1-006` |
 | D1 storage | `5 GB` | `CF-D1-006` |
 | R2 | storage `10 GB-month`, Class A `1M`, Class B `10M` | `CF-R2-005` |
-| KV | reads `10M / month`, writes `1M / month`, storage `1 GB` | `CF-KV-003` |
+| KV | reads `10M / month`, writes `1M / month`, deletes `1M / month`, list requests `1M / month`, storage `1 GB` | `CF-KV-003` |
 | Queues | `1M ops / month` | `CF-QUE-001` |
 | OTel export | `10M` logs + `10M` traces events / month when enabled | `CF-WKR-018` |
 
@@ -138,8 +138,8 @@
 * 只有在 deployment 采用 Workers `Standard` usage model 时，Worker-to-Worker calls via Service Bindings 才不产生额外 Worker request fee；legacy `Bundled/Unbound` 必须把 caller 与 callee requests 分别计费。引用：`CF-WKR-016`,`CF-WKR-009`。
 * `/sync` 设计优先消耗 Worker wall time，而不是 DO duration。引用：`CF-WKR-001`,`CF-DO-009`,`CF-DO-011`。
 * 媒体读取的主成本来自 R2 请求与存储，不来自 R2 Internet egress。引用：`CF-R2-003`,`CF-R2-005`。
-* DO request 成本必须把 DO HTTP、RPC、WebSocket message 与 alarm invocation 一并建模，并按官方 transport-specific request unit 定义换算，不得只按 DO HTTP 入口估算。引用：`CF-DO-013`。
-* Hibernation WebSocket 的入站消息计费必须单独建模；出站发送不会形成对等 DO request 计数，但仍会占用网络与 CPU 预算。引用：`CF-DO-013`。
+* DO request 成本必须把 DO HTTP、顶层 RPC sessions、WebSocket 建连、入站 WebSocket messages 与 alarm invocations 一并建模，并按官方 transport-specific request unit 定义换算，不得只按 DO HTTP 入口估算。引用：`CF-DO-013`。
+* Hibernation WebSocket 的入站消息计费必须单独建模；其 request fee 按 `20:1` 折算为 billing requests。WebSocket 建连会形成 request，出站发送不会形成对等 DO request 计数，但仍会占用网络与 CPU 预算。引用：`CF-DO-013`。
 * Queues 成本必须按 write / read / delete 三类操作分别计数，并按每 `64 KiB` payload chunk 换算；batch 只改变吞吐与调用频率，不会把多条消息折叠成一次计费。引用：`CF-QUE-001`。
 * 若为冷归档采用 R2 Infrequent Access，成本模型必须额外纳入 retrieval fee、`30` 天 minimum storage duration 与“无 included quota”的事实；默认 Included Quotas Matrix 只适用于 R2 Standard。引用：`CF-R2-005`。
 

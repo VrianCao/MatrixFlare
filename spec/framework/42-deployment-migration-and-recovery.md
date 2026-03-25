@@ -159,25 +159,39 @@ DO 内部 SQLite schema 演进规则：
 * DO 权威状态没有等价内建 PITR，必须由应用层导出补足。引用：`CF-DO-004`。
 * 生产默认 DR 目标为 `RPO <= 15 min`、`RTO <= 8 h`，适用于单 homeserver 部署在支持规模内的全量 namespace 恢复。
 
-### 11.2 应用层导出要求
+### 11.2 应用层导出模式
 
-* `ops-worker` 必须先创建全局 `export_epoch`，再触发 `RoomDO`、`UserDO` 与控制面导出；同一轮全量导出的所有 manifest 都必须引用同一个 `export_epoch`。
-* `ops-worker` 在创建 `export_epoch` 时，必须同步冻结本轮导出的 shard registry snapshot；该 snapshot 至少枚举 room shards、user shards、remote-server shards 与 control-plane shards。导出开始后新创建的 shard 自动归入下一轮 `export_epoch`。
-* `RoomDO` 必须至少每 `15` 分钟导出房间 archive segment 与 state snapshot manifest 到 R2。
-* `UserDO` 必须至少每 `15` 分钟导出设备、账号数据、密钥和 backup manifest 快照到 R2。
-* 每个 shard manifest 都必须记录 `started_at`、`completed_at`、source watermark / serial、对象哈希列表、schema version、签名 key version 与 completeness state。
-* 每个 shard manifest 还必须记录 `registry_snapshot_id` 与该 shard 在 registry 中的唯一 shard key；不得在导出后期再动态追加“临时发现的 shard”到同一轮 registry。
-* 只有当一组导出在同一 `export_epoch` 下、所有必需 shard manifest 都标记为 `complete`，并且签名 / 哈希校验通过时，才允许用于全量 namespace restore。
+系统必须区分两类导出，而不是把所有恢复能力都压成“每 `15` 分钟全量导一次 namespace”：
+
+* continuous recovery checkpoint export：自动、分 shard、增量，仅要求 dirty shard 在 RPO 窗口内把最新权威 watermark 刷到恢复介质；
+* operator full export bundle：显式控制面作业，冻结 registry snapshot，并产出可审计、可完整验证的 bundle 以供 namespace restore。
+
+#### 11.2.1 Continuous Recovery Checkpoint Export
+
+* 只有 source watermark 自上次 complete checkpoint 之后发生推进的 dirty shard，才要求进入恢复导出；idle shard 不得被强制每 `15` 分钟重导一次。
+* dirty `RoomDO` shard 必须在“首次未导出 watermark 推进”后的 `15` 分钟内，把新增 archive segments 与对应 checkpoint manifest 刷到 R2。
+* dirty `UserDO` shard 必须在相同 `15` 分钟窗口内，把设备、账号数据、密钥与 backup metadata 的恢复快照或增量分片刷到 R2。
+* `RemoteServerDO` 与控制面 shard 若其权威状态参与 DR，也必须遵守同一 dirty-shard checkpoint cadence。
+* 每个 checkpoint manifest 都必须记录 `started_at`、`completed_at`、source watermark / serial、对象哈希列表、schema version、签名 key version 与 completeness state。
+* continuous checkpoint 不要求创建全局 `export_epoch`；它的职责是满足 RPO，而不是直接充当“单次全量 bundle”。
+
+#### 11.2.2 Full Export Bundle
+
+* `ops-worker` 发起 full export 时，必须先创建全局 `export_epoch`，再冻结本轮导出的 shard registry snapshot；该 snapshot 至少枚举 room shards、user shards、remote-server shards 与 control-plane shards。
+* full export 可以复用“已经存在且 source watermark 满足 cut 条件”的最新 complete shard checkpoint；若某 shard 没有满足 cut 条件的 checkpoint，则必须为该 shard 启动 fresh export。
+* full export 中的每个 shard manifest 都必须记录 `registry_snapshot_id` 与该 shard 在 registry 中的唯一 shard key；不得在导出后期再动态追加“临时发现的 shard”到同一轮 registry。
+* 导出开始后新创建的 shard 自动归入下一轮 `export_epoch`，不得 retroactively 注入当前 snapshot。
+* 只有当一组导出在同一 `export_epoch` 下、所有 required shard manifest 都标记为 `complete`，并且签名 / 哈希校验通过时，才允许用于全量 namespace restore。
 * `partial` 或 `incomplete` 导出只能用于 scoped repair；若要把它用于其他用途，必须先产生 `DEC-ID`。
 * `ops-worker` 必须支持从完整导出包重放到新的 namespaces。
 
-`complete` 的判定必须基于 registry snapshot，而不是“当前看起来导出了很多 shard”。至少满足：
+`complete` 的判定必须基于 frozen registry snapshot，而不是“当前看起来导出了很多 shard”。至少满足：
 
 * registry 中每个 required shard 恰好对应一个终态 `complete` manifest
 * 不允许存在缺失 shard、重复 complete manifest 或 `watermark` 回退
 * bundle manifest 必须包含 registry snapshot 的 hash，以便 restore 前验证“所验的完整性集合”和“当时声明的完整性集合”一致
 
-#### 11.2.1 Export Manifest 的 Canonicalization、Hash、Signature、Encryption
+#### 11.2.3 Export Manifest 的 Canonicalization、Hash、Signature、Encryption
 
 导出与恢复格式必须固定以下密码学规则：
 
@@ -200,7 +214,7 @@ DO 内部 SQLite schema 演进规则：
 * 导出对象加密固定为 `AES-256-GCM`；每个 bundle 或 shard 必须有独立 nonce / data key，并通过 `encryption_key_version` 绑定到外层 KEK 或外部 KMS。
 * 任何 restore 在开始导入前都必须依次完成 completeness、hash、signature、key-version allowlist 与 decryptability 校验；任一步失败都必须 fail-closed。
 
-#### 11.2.2 Restore Cutover 语义
+#### 11.2.4 Restore Cutover 语义
 
 * full namespace restore 只能导入到新的 Worker / DO / D1 / R2 / KV namespaces，不得原地覆写正在服务的生产权威状态。
 * 执行 restore cutover 前，`ops-worker` 必须先把公网写流量切到 quiescing 状态；此时只允许健康检查、作业查询与显式允许的只读请求继续通过。

@@ -213,7 +213,30 @@ room version `12` 的以下差异必须封装在策略层：
 * unread / notification 计数不是 `RoomDO` 真相表；`RoomDO` 只输出“是否需要按当前 push-rules snapshot 重算”的信号。
 * ephemeral 写入失败不得影响 timeline 或 current state 提交。
 
-## 10. Membership 边界条件
+## 10. 房间查询面
+
+### 10.1 统一只读查询族
+
+下列 client query surfaces 必须统一归入同一个 `RoomDO` 只读裁决面，而不是散落到独立副本或缓存逻辑：
+
+* `/messages`
+* `/context/{eventId}`
+* `/event/{eventId}`
+* `/state` 与 `/state/{eventType}/{stateKey}`
+* `/members` 与 `/joined_members`
+* `/relations/{eventId}` 家族
+* `/threads`
+* `/timestamp_to_event`
+
+这些查询都必须共享同一套房间可见性、redaction 后视图与 membership 边界判断；任何查询面都不得绕过 `RoomDO` 直接从 D1、KV 或 R2 给出权威答案。
+
+### 10.2 关系、线程与时间定位
+
+* `RoomDO` 必须维护足够的事件元数据，使 `/relations`、`/threads` 与 `/timestamp_to_event` 能在热路径上完成查询，而不是为每次请求重扫冷归档。
+* `/relations` 与 `/threads` 的结果必须基于房间权威事件图和 relation metadata 计算，并应用与普通 timeline 相同的可见性与 redaction 规则。
+* `/timestamp_to_event` 必须按规范给出“相对目标 timestamp 与方向约束下的最近可见事件”；若不存在满足条件的可见事件，必须返回该 endpoint 允许的 no-result 语义，而不是猜测最近 `room_pos`。
+
+## 11. Membership 边界条件
 
 规范性 membership 状态机引用：`STATE-ROOM-MEMBERSHIP`。
 
@@ -229,16 +252,16 @@ room version `12` 的以下差异必须封装在策略层：
 
 forget 只影响客户端可见性，不删除房间真相。
 
-## 11. 房间域接口归属
+## 12. 房间域接口归属
 
 | Capability | Public IF | Internal IF | Primary Data |
 | --- | --- | --- | --- |
 | create/join/leave/invite/ban/knock | `IF-CS-030`,`IF-CS-031` | `IF-INT-ROOM-001` | `DATA-ROOM-001`,`007` |
 | send state / message | `IF-CS-032`,`IF-CS-033` | `IF-INT-ROOM-001` | `DATA-ROOM-001`-`008` |
-| paginate / context / event lookup | `IF-CS-034` | `IF-INT-ROOM-003` | `DATA-ROOM-001`,`002` |
+| paginate / members / relations / threads / timestamp lookup | `IF-CS-034` | `IF-INT-ROOM-003` | `DATA-ROOM-001`,`002` |
 | room sync projection | via `IF-CS-020` | `IF-INT-ROOM-002` | `DATA-ROOM-005`-`010` |
 
-## 12. 完成标准
+## 13. 完成标准
 
 * 房间事件真相路径唯一；
 * 房间版本适配边界可编码；

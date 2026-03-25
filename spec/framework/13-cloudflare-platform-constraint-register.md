@@ -46,7 +46,7 @@
 | `CF-WKR-007` | Workers | limits | workers-limits | Account/Zone | 请求体上限取决于 Cloudflare plan，而不是 Workers plan：Free/Pro `100 MB`，Business `200 MB`，Enterprise 默认 `500 MB`。 | `m.upload.size` 必须取业务配置与 zone plan 上限中的较小值。 | `13`,`21`,`33`,`41` |
 | `CF-WKR-008` | Workers | limits | workers-limits | Paid | 压缩后 Worker bundle 上限 `10 MB`。 | 房间版本算法、媒体处理、搜索逻辑必须模块化，避免单 Worker 过胖。 | `21`,`31`,`33`,`34` |
 | `CF-WKR-009` | Service Bindings | limits | service-bindings | Paid | 单个顶层请求最多 `32` 次 Worker invocations；每次 Service Binding 调用都会计入。 | Worker 切分可以做，但调用链必须浅，不能把内部 RPC 设计成多跳网格。 | `21`,`23` |
-| `CF-WKR-010` | Service Bindings | limits | service-bindings | Paid | Service Binding 调用计入 subrequest，并与顶层请求共享 simultaneous open connections 预算；不会为被调用 Worker 生成独立连接额度。 | 内部 Worker 通信优先用 Service Binding，而不是公网 `fetch()`，但连接预算仍必须按顶层请求统一核算。 | `21`,`23` |
+| `CF-WKR-010` | Service Bindings | limits | service-bindings | Paid | Service Binding 调用计入 subrequest limit，且单个顶层请求最多 `32` 次 Worker invocations；但 Service Binding 调用**不计入** simultaneous open connections limit。 | 内部 Worker 通信优先用 Service Binding，而不是公网 `fetch()`；容量规划必须受 subrequest 与 invocation 上限约束，但不得把它误算进 `6` 个 open connections。 | `21`,`23` |
 | `CF-WKR-011` | Smart Placement | placement | workers-placement | Paid | Smart Placement 只影响 `fetch` handler，不影响 RPC methods 或 named entrypoints。 | `gateway-worker` 到 DO/Worker RPC 热路径不能依赖 Smart Placement 获得语义正确性。 | `21`,`23` |
 | `CF-WKR-012` | Worker deployments | deployment | workers-versions-deployments | Paid | Worker 版本与部署是分离概念；新版本可先上传后再部署。 | 生产发布必须使用 versions/deployments，而不是隐式“每改即发”。 | `21`,`42` |
 | `CF-WKR-013` | Workers Secrets | security | workers-secrets | Paid | Secrets 是加密绑定，Cloudflare 明确要求不要用 `vars` 存放敏感信息。 | 所有密钥、token、凭据都必须放入 secrets/Secrets Store。 | `40`,`42` |
@@ -73,7 +73,8 @@
 | `CF-DO-010` | Durable Objects WebSocket | deployment | do-websockets | Paid | 部署新版本会断开 DO 持有的 WebSocket。 | `/sync` 唤醒通道断开必须被视为正常短暂事件，不得破坏 token 语义。 | `21`,`30`,`42` |
 | `CF-DO-011` | Durable Objects | billing | do-pricing | Paid | DO 含 requests `1M/月` 与 duration `400,000 GB-s/月`。 | 任何 DO 成本估算都必须先抵扣包含量，并避免把长等待放在非 hibernating DO 上。 | `41` |
 | `CF-DO-012` | Durable Objects SQLite | billing | do-pricing | Paid | SQLite-backed DO 含 rows reads `25B/月`、rows writes `50M/月`、stored data `5 GB-month`。 | DO truth schema 与批处理策略必须考虑读写和存储预算。 | `41` |
-| `CF-DO-013` | Durable Objects | billing semantics | do-pricing | Paid | DO request 计费面不仅包含 DO HTTP requests，还包含 RPC、WebSocket message 与 alarm invocation 等 request units；不同 transport 的 request units 必须按官方定价定义换算，hibernation 入站消息与出站发送的计费语义也不同。 | 成本模型必须把 RPC、hibernation WebSocket message 与 alarm 触发量单独计入，不得只按 HTTP 请求估算 DO requests。 | `21`,`30`,`32`,`41` |
+| `CF-DO-013` | Durable Objects | billing semantics | do-pricing | Paid | DO request 计费面不仅包含 DO HTTP requests，还包含 RPC sessions、WebSocket messages 与 alarm invocations；每次顶层 DO stub RPC method call 计为一个 billed RPC session，但返回 `RpcTarget` 后在同一 session 上继续调用不额外计费；入站 WebSocket messages 仅按 `20:1` 折算为 billing request，出站 WebSocket messages 不计 DO requests。 | 成本模型必须把 DO HTTP、顶层 RPC session、WebSocket 建连、入站 WebSocket message 与 alarm 触发量分别建模，不得把“所有 RPC 调用”等价成同一种 request unit。 | `21`,`30`,`32`,`41` |
+| `CF-DO-014` | Durable Objects | known issue / uniqueness | do-known-issues | Paid | DO global uniqueness 在“开始新事件”和“访问 durable storage”时强制；若事件运行较久且从未访问 durable storage，则对象可能已不再 current。此时若晚些再访问 storage 会抛异常；若始终不访问 storage，事件可能静默完成但已失去全局唯一性保证。 | 所有权威处理路径都必须在 handler 早期触碰 durable storage 以强制 currentness；不得把长时间只靠内存的 authority logic 视为安全的单实例串行路径。 | `21`,`22`,`30`,`31`,`32`,`42` |
 
 ## 5. D1 约束
 
@@ -94,7 +95,7 @@
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `CF-KV-001` | KV | consistency | kv-how-it-works | Paid | KV 是最终一致的；跨地域可见性可能延迟 `60s` 或更久。 | KV 不能承载会话撤销、房间状态、媒体存在性、联邦幂等等强一致路径。 | `21`,`22`,`30`,`31`,`32`,`33` |
 | `CF-KV-002` | KV | consistency | kv-how-it-works | Paid | negative lookups 也会被缓存。 | 不得把 KV 中的“不存在”作为权威结论。 | `21`,`22`,`32`,`33` |
-| `CF-KV-003` | KV | billing | workers-pricing | Paid | Workers KV 含 reads `10M/月`、writes `1M/月`、storage `1GB`。 | 任何 KV 使用都必须被视为有限缓存预算。 | `41` |
+| `CF-KV-003` | KV | billing | workers-pricing | Paid | Workers KV 含 reads `10M/月`、writes `1M/月`、deletes `1M/月`、list requests `1M/月`、storage `1 GB`。 | 任何 KV 使用都必须被视为有限缓存预算；失效、扫描和批量清理同样要进入成本模型。 | `41` |
 
 ## 7. R2 约束
 
@@ -121,6 +122,9 @@
 | `CF-NET-001` | Edge Network | ports | network-ports | Zone | Cloudflare 代理支持 HTTPS `443` 与 `8443` 等端口；`8448` 不在标准代理 HTTPS 端口列表中。 | Matrix 联邦发现不能假设入站走 `8448`，必须支持 `443`/`8443` + `/.well-known`/SRV。 | `21`,`32` |
 | `CF-NET-002` | Edge Network | ports/cache | network-ports | Zone | `8443` 等额外 HTTPS 端口默认禁用缓存。 | 若使用 `8443` 承载联邦，不影响正确性，但不能把缓存特性作为前提。 | `32`,`33` |
 | `CF-NET-003` | Cloudflare Access | compatibility | network-ports | Zone | Cloudflare Access 会去掉 URL 中的端口。 | 内部运维入口若用 Access，不能依赖端口区分应用。 | `21`,`42` |
+| `CF-NET-004` | Cloudflare Access | request identity propagation | access-validate-jwt | Zone | 通过 Access 成功鉴权后，请求到达 origin/Worker 时会带 `Cf-Access-Jwt-Assertion` 头；浏览器流量还可能带 `CF_Authorization` cookie，但 cookie 不保证总会传递。 | 应用层身份校验必须首选 `Cf-Access-Jwt-Assertion`，不得只信任 cookie 或展示性注入头。 | `40`,`42` |
+| `CF-NET-005` | Cloudflare Access | signing keys | access-validate-jwt | Zone | Access JWT 必须使用 team domain 的 `/cdn-cgi/access/certs` JWK/cert 集校验；签名 key 默认约每 `6` 周轮换，旧 key 约保留 `7` 天；必须按 JWT `kid` 选择匹配 key，而不是钉死单一当前证书。 | `ops-worker` 必须实现 JWK 集缓存、`kid` 命中与轮换容忍，且在无匹配有效 key 时 fail-closed。 | `40`,`42` |
+| `CF-NET-006` | Cloudflare Access | service tokens | access-service-tokens | Zone | Access service token 是发给 Access 边缘的 `Client ID + Client Secret` 凭据；在 service-auth only 应用中，调用方通常需要在每次请求继续发送该凭据给 Access。origin/Worker 应信任 Access 生成并注入的 JWT，而不是直接把 service-token headers 当作应用层 bearer secret。 | 运维自动化必须把 service token 视为 Access ingress credential；`ops-worker` 的应用层授权只基于已验证 JWT 与内部 authz policy。 | `40`,`42` |
 
 ## 10. 规范性设计结论
 
@@ -128,6 +132,8 @@
 * 所有权威真相必须落在以 DO SQLite 为核心的主权对象中，D1/KV 只能承担衍生或缓存角色。引用：`CF-DO-001`,`CF-DO-007`,`CF-D1-002`,`CF-KV-001`。
 * 所有 Worker/DO 内部接口都必须前后兼容，并为 DO migration 单独建立发布与回滚流程。引用：`CF-DO-005`,`CF-DO-006`,`CF-WKR-012`。
 * 所有媒体上传能力都必须同时受 Matrix 协议能力声明和 Cloudflare zone request body 限制约束。引用：`CF-WKR-007`,`CF-R2-002`。
+* 所有通过 Cloudflare Access 保护的管理面都必须以 `Cf-Access-Jwt-Assertion` 为应用层身份源，并实现 JWK 轮换容忍；service token 只用于 Access 边缘鉴权，不是 origin 侧长期 bearer secret。引用：`CF-NET-004`,`CF-NET-005`,`CF-NET-006`。
+* 所有主权 DO 的 authority handler 都必须在早期强制 currentness；不得把“未触碰 durable storage 的长运行事件”当作仍受全局唯一性保证的安全路径。引用：`CF-DO-014`。
 
 ## 11. 完成标准
 

@@ -31,9 +31,9 @@
 
 | TEST-ID | Test Scope | Environment | Gate Profiles | Notes |
 | --- | --- | --- | --- | --- |
-| `TEST-GOV-001` | source baseline, traceability, ID integrity lint | CI | `L1-L3` | 校验 `REQ/MX/CF/IF/DATA/FLOW/TEST/EVID` 链接完整性。 |
+| `TEST-GOV-001` | source baseline, traceability, ID integrity lint | CI | `L1-L3` | 校验 `REQ/MX/CF/IF/DATA/FLOW/STATE/TEST/EVID` 链接完整性、无未登记引用、无 compatibility page 误用为权威正文。 |
 | `TEST-CS-001` | discovery, capabilities, registration, login, refresh, logout, profile surfaces and profile propagation basics | CI + staging | `L1-L3` | 必须覆盖 `/capabilities`、profile `keyName` 语义与 profile change propagation 基线。 |
-| `TEST-CS-002` | filter lifecycle, `/sync` initial/incremental/limited/`use_state_after`, account data, push rules, and notification counts | CI + staging | `L1-L3` | 重点验证 token 单调性、filter determinism 和通知计数语义。 |
+| `TEST-CS-002` | filter lifecycle, `/sync` initial/incremental/limited/`full_state`/`use_state_after`, `include_leave`, lazy-load members, account data, push rules, and notification counts | CI + staging | `L1-L3` | 重点验证 token 单调性、filter determinism、leave-room visibility、member lazy-load 以及通知计数语义。 |
 | `TEST-CS-003` | devices, to-device, key upload/query/claim, backup metadata | CI + staging | `L1-L3` | 必须验证 one-time key at-most-once。 |
 | `TEST-ROOM-001` | room creation, membership, event send, redaction, receipts, typing | CI + staging | `L1-L3` | 房间核心行为。 |
 | `TEST-ROOM-002` | enabled room version strategy compatibility | CI + staging | `L1-L3` | `L1` 至少覆盖 room version `12`；`L2-L3` 必须覆盖 `11` / `12` 差异，包括 redaction 与 state resolution。 |
@@ -85,6 +85,7 @@
 * 所有协议合规测试必须直接从 Matrix `v1.17` versioned spec 生成。
 * 社区测试套件可以作为补充回归，但不能作为规范来源。
 * 对每个 `Required-Core` `MX-ID`，至少必须有一个 `TEST-ID` 和一个 `EVID-ID`。
+* push-rules 合规测试必须把运行时生成的 server-default baseline 与 [92-appendices.md](/root/Matrix/spec/framework/92-appendices.md) 中钉死的 `v1.17` 基线逐条比对，至少覆盖 `kind`、顺序、`rule_id`、`enabled`、conditions 和 actions。
 
 ## 7. Load, Capacity, and Chaos Testing
 

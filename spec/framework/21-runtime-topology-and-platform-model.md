@@ -114,12 +114,14 @@
 * `gateway-worker` 默认 CPU 限额按热路径设计在 `30s` 默认值之内；只有特殊导出或诊断入口才允许更高上限。引用：`CF-WKR-003`。
 * 所有大对象读取与转发必须使用 stream，不得完整读入内存。引用：`CF-WKR-004`。
 * 内部 RPC 链必须限制为浅层拓扑：`gateway -> DO` 或 `gateway -> jobs -> DO`，禁止多跳扇出图。引用：`CF-WKR-009`。
+* Service Binding 调用计入 subrequest 与 `32` 次 Worker invocation 上限，但不计入 simultaneous open connections；不得再把内部 Worker 调用误算进 `6` 个连接预算。引用：`CF-WKR-009`,`CF-WKR-010`。
 
 ### 7.2 DO 使用规则
 
 * 所有 DO 构造函数必须只做最小初始化，不得在构造阶段执行高成本扫描。引用：`CF-DO-004`,`CF-DO-009`。
 * DO schema 变更必须以向前兼容读 + 延迟回填或单独迁移完成。引用：`CF-DO-005`,`CF-DO-006`。
 * 大量批处理写入必须分批提交并施加背压。引用：`CF-DO-008`。
+* 所有 authority handler 必须在业务处理早期触碰 durable storage，以强制 currentness 并尽早暴露 not-current 条件；禁止把“长时间只靠内存/WS attachment 且延迟首次存储访问”的逻辑当作安全的单实例串行路径。引用：`CF-DO-014`。
 
 ### 7.3 D1 / KV / R2 使用规则
 
