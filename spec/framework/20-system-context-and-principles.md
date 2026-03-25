@@ -54,7 +54,7 @@
 系统的规范性上下文如下：
 
 1. 所有公开流量先进入 `gateway-worker`。
-2. `gateway-worker` 只负责接入、鉴权、路由、聚合与流式响应，不拥有房间或用户真相。
+2. `gateway-worker` 只负责接入、鉴权、路由、聚合与流式响应，不拥有房间或用户真相；它可以签发短时 UIA challenge token，但不得把 durable auth truth 保存在 Worker 本地。
 3. `UserDO(user_id)` 是用户主权状态机。
 4. `RoomDO(room_id)` 是房间主权状态机。
 5. `RemoteServerDO(server_name)` 是远端服务器出站联邦状态机。

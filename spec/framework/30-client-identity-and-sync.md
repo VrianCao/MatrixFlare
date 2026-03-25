@@ -24,6 +24,7 @@
 
 `UserDO(user_id)` 必须拥有以下真相：
 
+* user principal / auth profile
 * access token / refresh token 生命周期
 * device 清单与设备元数据
 * device keys、cross-signing、one-time/fallback keys
@@ -52,6 +53,7 @@
 ### 3.1 用户模型
 
 * 用户身份以 Matrix `user_id` 为唯一主键。
+* 本地账户主记录是 `DATA-USER-017`；它至少承载 password credential、`user_type`、deactivated 状态、`erase_requested` 标记与单调递增的 `auth_version`。
 * 所有认证成功最终都必须归一到 “生成或恢复一个 `UserDO` 作用域内的 session”。
 * 用户注销、停用、会话吊销都必须从 `UserDO` 真相出发，而不是依赖缓存层。
 
@@ -74,6 +76,7 @@
 
 * access token 仅以 hash 形式存储。引用：`DATA-ID-003`。
 * refresh token 仅以 hash 形式存储。引用：`DATA-ID-004`。
+* session 有效性判定必须同时受 `DATA-USER-017.deactivated_at_or_null` 与 `DATA-USER-017.auth_version` 约束；账户已停用或 session 落后于当前 `auth_version` 时，必须直接失效。
 * `logout` 撤销当前 session；`logout/all` 撤销用户全部活动 session。
 * 推荐在 `UserDO` 内维护 `session_epoch`；`logout/all` 通过 epoch 跳变实现 O(1) 失效判定，然后异步清扫旧 session 记录。
 
@@ -86,34 +89,83 @@
   * `session_id`
   * `expires_at`
   * `is_guest`
+  * `auth_version`
   * `session_epoch`
 * 任何鉴权失败都不得进入 `RoomDO` 或后续业务路径。
 
-## 4. 注册、登录、刷新与注销规则
+## 4. 注册、登录、密码变更、停用、刷新与注销规则
 
-### 4.1 注册
+### 4.1 共享 UIA Challenge 模型
 
+* 当前 profile 下所有启用的 UIA 路由族至少包括 `POST /register`、`POST /account/password` 与 `POST /account/deactivate`。
+* `gateway-worker` 必须为 UIA 发行 `DATA-ID-006` 短时 challenge token，而不是依赖本地内存态；token 必须签名、opaque、route-bound，并绑定：
+  * 目标 route family 与 HTTP method
+  * `issued_at` / `expires_at`
+  * `auth_subject_hint`
+  * `completed_stages`
+  * `nonce`
+  * `root_key_version`
+* 同一个 UIA challenge token 不得跨 route family、跨主体或跨根密钥版本重放。
+* `DATA-ID-006` 的签发与签名验证只能由 `gateway-worker` 执行；`UserDO` 只可接收已归一化的 challenge 裁决结果，不得自行解析 raw token 或持有对应签名 secret。
+* UIA active keyring 必须显式支持 rollout overlap：至少保留当前 verify key 与上一个 verify key，且旧 `root_key_version` 只能在“所有旧 deployment 已退出 + 最大 token TTL 已过”之后移除。
+* 若 UIA keyring 存放于 Worker secrets，其单 secret 序列化体必须满足 Cloudflare `5 KB` 上限；若超过该上限，必须先切换到 Secrets Store 或分片 versioned secrets，再允许进入发布门禁。
+* challenge 完成后真正落盘的写路径仍必须回到对应 authority；对客户端域而言，最终提交一律由 `UserDO` 裁决。
+
+### 4.2 注册
+
+* `GET /_matrix/client/*/register/available` 必须存在，并只根据当前 registration policy、MXID grammar 与本地账户真值裁决可用性；不得读取可陈旧目录索引替代 `DATA-USER-017`。
+* `GET /_matrix/client/*/register/available` 不得被 shared edge cache、browser cache 或其它跨请求缓存当作可陈旧结果复用；响应必须使用 `no-store` 语义，最多只允许同一请求链路内的局部 memoization。
 * 所有注册流程都必须收敛到 `UserDO` 创建用户主记录、初始 device 和初始 session。
+* 成功注册必须原子写入 `DATA-USER-017`、初始 `DATA-USER-002` device 与初始 `DATA-USER-001` session。
 * 若注册需要 UIA、registration token 或其他前置校验，`gateway-worker` 只负责协议编排，最终提交仍由 `UserDO` 原子完成。
+* `/_matrix/client/*/register/{email,msisdn}/requestToken` 属于 `MX-CS-025`；当前默认关闭时必须落到 `IF-CS-007` stub，而不是局部创建 verification session。
 * 同一注册请求的重试不得造成重复用户创建。
 
-### 4.2 登录
+### 4.3 登录
 
 * `GET /_matrix/client/*/login` 必须始终可用，并由 `IF-CS-005` 输出当前真实支持的 login flow 集合。
 * `L1-L3` 基线下，`GET /login` 必须宣告 `m.login.password`；只有在 `MX-CS-003` 真正启用且 dedicated contracts 完整落地后，才允许宣告 `m.login.sso`。
 * `m.login.token` 只有在服务器同时支持对应的 login-token consumption 语义时才允许出现在 `GET /login`；当前默认关闭 `MX-CS-003` 时不得宣告。
 * `POST /login` 若收到未在 `GET /login` 中宣告的 login type，必须按 Matrix `v1.17` core login 规则返回 `400` + `M_UNKNOWN`，不得把“关闭的 flow”做成节点间漂移的任意错误。
+* `POST /login` 对本地 password flow 的认证真值必须来自 `DATA-USER-017.password_hash_or_null` 与 `password_login_enabled`；不得绕过 `UserDO` 在 Worker 内直接验密。
+* 若账户已在 `DATA-USER-017` 中标记停用，登录必须返回 `M_USER_DEACTIVATED`。
 * 登录成功必须创建或恢复一个 device 关联的活动 session。
 * `login` 响应中的 access token 和 refresh token 必须绑定到同一 `session_id`。
 * 登录失败不得产生任何残留 session、device 或用户流副作用。
 
-### 4.3 刷新
+### 4.4 密码变更
+
+* `GET /_matrix/client/*/capabilities` 必须把 `m.change_password.enabled` 与 `IF-CS-006` 的真实可达性保持一致；`L1-L3` 基线下必须返回 `true`。
+* `POST /_matrix/client/*/account/password` 必须使用 route-bound UIA challenge，不得把某个 route 上通过的 UIA 直接复用于其它高风险写路径。
+* 当请求携带有效 access token 时，UIA 的主体必须与该 session 绑定的 `user_id` 完全一致。
+* 当请求不携带 access token 时，当前 profile 仍允许通过本地 password UIA 完成密码变更；但 `/_matrix/client/*/account/password/{email,msisdn}/requestToken` 默认关闭，必须继续落到 `IF-CS-007` stub。
+* 密码变更成功时，`UserDO` 必须在同一原子提交中：
+  * 更新 `DATA-USER-017.password_hash_or_null`
+  * 单调递增 `DATA-USER-017.auth_version`
+  * 按 `logout_devices` 参数裁决其他 session / device 的后续有效性
+* `logout_devices` 缺省值是 `true`；当其为 `true` 时，除请求所用的当前 session 外，其它 session 必须立即失效；当其为 `false` 时，服务端可以保留其它 session，但不得让旧密码继续通过新的 UIA / login 校验。
+* 任一失败都不得出现“密码已更新但 `auth_version` 未推进”或“部分 session 仍按旧密码语义工作”的中间态。
+
+### 4.5 账户停用
+
+* `POST /_matrix/client/*/account/deactivate` 必须使用 route-bound UIA challenge。
+* 停用成功时，`UserDO` 必须原子完成以下动作：
+  * 写入 `DATA-USER-017.deactivated_at_or_null`
+  * 清空或禁用本地 password credential，使后续 login / UIA 返回 `M_USER_DEACTIVATED`
+  * 单调递增 `DATA-USER-017.auth_version`
+  * 撤销全部现有 access/refresh session
+* 返回体中的 `id_server_unbind_result` 必须按 Matrix `v1.17` 固定为 `success` 或 `no-support`；在当前默认 profile 没有任何已绑定 3PID 时，该字段必须返回 `success`。
+* 当 `erase = true` 时，系统必须尽最大可能清理本地非事件数据；至少包括 `DATA-USER-006`、`DATA-USER-007`、`DATA-USER-009`、`DATA-USER-012`、`DATA-USER-013`，并设置 `erase_requested_flag` 供后续房间可见性路径对未来加入者只暴露 redacted copies。
+* `erase = true` 不得伪造联邦 redaction，也不得把“对未来本地可见性变红”误实现成修改历史事件真相。
+* 停用成功后，任何旧 session、refresh token 或 password UIA 都不得继续通过。
+
+### 4.6 刷新
 
 * `refresh` 必须通过 `IF-CS-012` 与 `IF-INT-USER-001`/`IF-INT-USER-002` 相同的 `UserDO` 权威路径完成。
 * refresh 成功后，旧 refresh token 必须失效，access token 应同时轮换。
 * refresh token 重放必须返回明确失败，而不是返回新的可用 token。
 
-### 4.4 注销
+### 4.7 注销
 
 * `logout` 只撤销当前 session。
 * `logout/all` 撤销全部 session，并强制后续 access token 失效。
@@ -126,6 +178,7 @@
 * `GET /_matrix/client/*/capabilities` 的结果来自部署时配置与运行时策略，但其返回值必须与真实可写权限一致。
 * `m.profile_fields` 必须返回规范要求的 `enabled`，并按实际策略返回可选的 `allowed` / `disallowed` 列表。
 * 若 `m.profile_fields` 直接或间接禁止修改 `displayname` 或 `avatar_url`，则已废弃的 `m.set_displayname` / `m.set_avatar_url` 也必须同步返回 `enabled: false`。
+* `m.change_password.enabled` 必须只在 `IF-CS-006` 真实可用时返回 `true`；当前 `L1-L3` 基线必须显式返回 `true`。
 * 当 `MX-CS-005` 默认关闭时，`GET /_matrix/client/*/capabilities` 必须显式返回 `m.3pid_changes.enabled = false`，避免客户端按“未列出即默认可改”误判。
 * 当 `MX-CS-003` 默认关闭时，`GET /_matrix/client/*/capabilities` 必须显式返回 `m.get_login_token.enabled = false`。
 * `m.profile_fields`、`m.set_avatar_url`、`m.set_displayname`、room versions 等 capability 不得“宣称支持但写路径拒绝”。
@@ -136,7 +189,7 @@
 * Matrix `v1.17` filter 中与 `/sync` 响应结构直接相关的布尔开关必须明确实现：`include_leave`、`lazy_load_members`、`include_redundant_members`、`unread_thread_notifications`。未显式给出的布尔值按规范默认 `false` 处理。
 * `include_leave = false` 时，`rooms.leave` bucket 必须整体省略，即使本地真相仍保留 left / banned-but-not-forgotten 房间；只有在 `include_leave = true` 时，这些房间才允许出现在 `/sync`。
 * `include_redundant_members` 只有在启用 `lazy_load_members` 时才有意义；否则必须按 `false` 处理，不得制造与未启用 lazy-load 不同的成员事件输出。
-* capability truth 与 route truth 必须一致：若 `m.3pid_changes.enabled = false` 或 `m.get_login_token.enabled = false`，则对应公开路由必须继续落到 `IF-CS-060` / `IF-CS-059` 的 deterministic stub，而不是部分接通。
+* capability truth 与 route truth 必须一致：若 `m.change_password.enabled = false`、`m.3pid_changes.enabled = false` 或 `m.get_login_token.enabled = false`，则对应公开路由必须继续维持相同真值，不得出现 capability 与 route handler 漂移。
 
 ### 5.2 Profile Truth and Propagation
 
@@ -170,7 +223,7 @@
 * Matrix `v1.17` 默认 push rules 必须由服务端按规范基线精确合成；用户存储只保存覆盖、禁用和顺序调整。
 * 规范性基线固定在 [92-appendices.md](/root/Matrix/spec/framework/92-appendices.md) 的 “Matrix `v1.17` Default Push-Rules Baseline” 附录中；运行时生成的 server-default rules 必须与该附录逐条等价，包括 `kind`、顺序、`rule_id`、`enabled` 默认值、conditions 与 actions。
 * `v1.17` 的 server-default baseline 中，`content`、`room`、`sender` 三类默认规则集为空；同时 `v1.17` 已移除 legacy “在 `content.body` 中寻找 mention” 的默认规则，不得再合成旧规则。
-* 必须支持 `GET /pushrules/`、`GET /pushrules/global/`、`GET/PUT/DELETE /pushrules/global/{kind}/{ruleId}`、`GET/PUT /.../{ruleId}/actions`、`GET/PUT /.../{ruleId}/enabled` 这些 `v1.17` 路由面。
+* 必须支持 `GET /pushrules/`、`GET /pushrules/global/`、`GET/PUT/DELETE /pushrules/global/{kind}/{ruleId}`、`GET/PUT /pushrules/global/{kind}/{ruleId}/actions`、`GET/PUT /pushrules/global/{kind}/{ruleId}/enabled` 这些 `v1.17` 路由面。
 * `kind` 只允许 `override`、`underride`、`sender`、`room`、`content`；用户自定义 `ruleId` 不得以 `.` 开头，且不得包含 `/` 或 `\\`。
 * `PUT /pushrules/global/{kind}/{ruleId}` 在创建**或更新**规则时，若没有 `before` / `after`，该规则必须成为同类用户自定义规则中最高优先级；若同时给出 `before` 和 `after`，必须以 `before` 为主确定新顺序。
 * `before` / `after` 只能相对于同类 `kind` 中的**用户自定义规则**定位；禁止把用户规则插入 server-default rules 之间，也禁止借此改变 [92-appendices.md](/root/Matrix/spec/framework/92-appendices.md) 中钉死的 server-default 相对顺序。
@@ -389,7 +442,9 @@ membership 到 `/sync` bucket 的映射必须固定为：
 
 | Capability | Public IF | Internal IF | Primary Data |
 | --- | --- | --- | --- |
-| register/login/logout/refresh | `IF-CS-010`,`IF-CS-011`,`IF-CS-012`,`IF-CS-013` | `IF-INT-USER-001` | `DATA-USER-001` |
+| register availability + register/login/logout/refresh | `IF-CS-009`,`IF-CS-010`,`IF-CS-011`,`IF-CS-012`,`IF-CS-013` | `IF-INT-USER-001` | `DATA-USER-001`,`DATA-USER-017`,`DATA-ID-006` |
+| password change / deactivate | `IF-CS-006`,`IF-CS-008` | `IF-INT-USER-001` | `DATA-ID-006`,`DATA-USER-001`,`DATA-USER-017` |
+| registration/password-reset requestToken bootstrap | `IF-CS-007` | none | `none` |
 | capabilities / filters | `IF-CS-002`,`IF-CS-003`,`IF-CS-004` | none | `DATA-USER-014` |
 | profile | `IF-CS-017` | none | `DATA-USER-012` |
 | device management | `IF-CS-040` | `IF-INT-USER-001` | `DATA-USER-002`,`DATA-USER-003` |

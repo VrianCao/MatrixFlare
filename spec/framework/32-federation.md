@@ -9,6 +9,7 @@
 
 * 定义服务器发现、委派、签名、密钥、交易、恢复与重试。
 * 定义联邦入站、出站、缺失事件恢复、媒体联邦边界。
+* 定义联邦查询面、用户设备与密钥交换、以及显式关闭的联邦 surface。
 * 定义 `RemoteServerDO` 的职责、队列和重试模型。
 
 明确不包含：
@@ -21,7 +22,7 @@
 
 * `gateway-worker` 负责联邦公开入口、`X-Matrix` 验签、路由与最小协议编排。
 * `RoomDO` 负责房间 PDU 的最终语义裁决。
-* `UserDO` 负责用户域 EDU、to-device 与设备键相关语义。
+* `UserDO` 负责用户域 EDU、to-device、`/user/devices`、`/user/keys/query` 与 `/user/keys/claim` 的本地语义。
 * `RemoteServerDO(server_name)` 负责对单一远端服务器的出站排序、重试、去重和恢复。
 
 ## 3. 发现与委派
@@ -113,8 +114,10 @@
 `RemoteServerDO` 必须按如下优先级协调恢复：
 
 1. `get_missing_events`
-2. `event` / `state_ids` / `state`
-3. `backfill`
+2. `event_auth`
+3. `event` / `state_ids` / `state`
+4. `timestamp_to_event`
+5. `backfill`
 
 恢复取得的数据仍必须重新进入 `RoomDO` 统一准入管道。
 
@@ -146,6 +149,8 @@
 
 以下 surface 属于联邦查询面，而不是 repair/backfill 面：
 
+* `GET /_matrix/federation/*/publicRooms`
+* `POST /_matrix/federation/*/publicRooms`
 * `/_matrix/federation/*/hierarchy/{roomId}`
 * `/_matrix/federation/*/query/directory`
 * `/_matrix/federation/*/query/profile`
@@ -155,26 +160,67 @@
 
 ### 9.2 Dispatch 规则
 
-* `hierarchy` 与 `query/directory` 可以以 `DATA-D1-003` 作为 fast path，但任何可见性不确定场景都必须 fail-closed，而不是把潜在私有房间暴露给远端。
+* `publicRooms`、`hierarchy` 与 `query/directory` 可以以 `DATA-D1-003` 作为 fast path，但任何可见性不确定场景都必须 fail-closed，而不是把潜在私有房间暴露给远端。
 * “可见性不确定” 至少包括：目录行缺失但 `RoomDO` 明确存在、目录行的 source watermark 落后于当前房间真相、目录 rebuild 正在进行、或决定公开性所需的 join rules / history visibility / world readable / published 标记任一缺失。
 * 遇到可见性不确定时，实现只能执行两种动作：回退读取 `RoomDO` 真相后再裁决，或直接返回 endpoint 允许的 `403/404`；不得猜测公开，也不得返回未经确认的部分结果。
+* `publicRooms` 的 `GET` 与 `POST` 变体只允许共用同一可见性裁决真相，不允许因分页参数、筛选器或请求方法差异而走不同 truth path。
 * `query/profile` 必须读取本地 `DATA-USER-012` profile truth，并应用 Matrix 允许的 profile 可见性规则；`field` 只允许 `displayname` 或 `avatar_url`，响应也只允许返回这两个字段。
+* `query/profile`、`/user/devices/{userId}`、`/user/keys/query` 与 `/user/keys/claim` 只允许远端请求本 homeserver 本地用户；任一非本地域用户都必须显式拒绝，而不是转发或回环到其它远端。
 * `query/{queryType}` 只允许显式登记并实现的 query types；未知 query type 必须返回明确联邦错误，不得透传到 client handler。
 * 所有联邦查询都必须先完成 `X-Matrix` 验签与目标 server name 检查，再进入只读 dispatch。
 
-## 10. 联邦媒体
+## 10. 联邦用户设备与密钥交换
+
+### 10.1 Scope
+
+本分册把以下 surface 视为联邦用户设备与密钥交换面：
+
+* `GET /_matrix/federation/*/user/devices/{userId}`
+* `POST /_matrix/federation/*/user/keys/query`
+* `POST /_matrix/federation/*/user/keys/claim`
+* 由本地设备变化触发、经联邦事务发送的 `m.device_list_update` EDU
+
+### 10.2 Truth Ownership
+
+* `gateway-worker` 只负责联邦验签、路由归一化与请求边界检查。
+* 本地用户设备列表、设备键、fallback keys 与 one-time keys 的权威裁决都必须落在 `UserDO`。
+* `/user/devices/{userId}` 与 `/user/keys/query` 必须是只读快照，不得在读取时顺带修正、回填或懒初始化设备真相。
+* `/user/keys/claim` 必须按目标本地用户串行化执行，并保证 one-time key 的 at-most-once 语义；重复 claim 不得双花，也不得因重试而重新生成 claim 结果。
+
+### 10.3 与出站事务的关系
+
+* 本地设备列表变化、fallback key 变化与 to-device 相关联邦 EDU，仍必须通过 `IF-INT-FED-001` 进入 `RemoteServerDO` 的单远端有序队列。
+* 任何联邦用户域行为都不得绕过 `UserDO` 直接写 `DATA-FED-001` 或直接拼装远端事务 payload。
+* 远端对 `/user/devices`、`/user/keys/query` 的读取结果，与后续 `m.device_list_update` 增量传播必须能对齐到同一 `UserDO` 权威版本线。
+
+## 11. 显式关闭的联邦 Surface
+
+### 11.1 OpenID Userinfo
+
+* `GET /_matrix/federation/*/openid/userinfo` 当前产品范围固定为不支持。
+* 该路由必须无条件返回 deterministic `401` + Matrix `M_UNKNOWN_TOKEN`，并复用固定 stub wire contract。
+* 实现不得先做 token introspection、不得尝试映射本地 session，也不得因为 token 形态差异产生不同错误码。
+
+### 11.2 3PID Callback 与 Third-Party Invite Exchange
+
+* `PUT /_matrix/federation/*/3pid/onbind` 与 `PUT /_matrix/federation/*/exchange_third_party_invite/{roomId}` 当前产品范围固定为不支持。
+* 这两个路由必须无条件返回 deterministic `404` + Matrix `M_UNRECOGNIZED`。
+* fixed reject 必须先于 identity-service callback 处理、房间成员事件验证、`X-Matrix` 验签或任何下游 dispatch 执行。
+* 在 dedicated identity-service / third-party invite 子规范落地前，不允许局部启用其中任一半面。
+
+## 12. 联邦媒体
 
 * 远端媒体拉取属于媒体域功能，但其远端发现与出站连接约束受本分册管理。
 * 单个请求中的远端抓取并发必须显式受限，以避免触碰 `6` 个 open connections 上限。引用：`CF-WKR-006`。
 * 远端媒体一旦成功拉取，必须落 R2 并生成本地缓存元数据，再返回给客户端。
 
-## 11. Cloudflare 贴合规则
+## 13. Cloudflare 贴合规则
 
 * 联邦发现设计必须明确兼容 `443`/`8443` + `/.well-known`，不得把 `8448` 作为部署前提。引用：`CF-NET-001`。
 * 所有联邦入站和出站实现都必须容忍 Worker/DO 版本偏斜。引用：`CF-DO-005`。
 * 联邦长恢复与大 backfill 不能在单次公网请求里完成，必须拆成 `RemoteServerDO` + alarm/queue 工作。引用：`CF-WKR-003`。
 
-## 12. 联邦域接口归属
+## 14. 联邦域接口归属
 
 | Capability | Public IF | Internal IF | Primary Data |
 | --- | --- | --- | --- |
@@ -182,14 +228,16 @@
 | inbound transactions | `IF-FED-002` | `IF-INT-FED-002`,`IF-INT-ROOM-001` | `DATA-FED-003`,`DATA-FED-006`,`DATA-ROOM-001`,`DATA-ROOM-002`,`DATA-ROOM-003`,`DATA-ROOM-004`,`DATA-ROOM-005`,`DATA-ROOM-006`,`DATA-ROOM-007`,`DATA-ROOM-008`,`DATA-ROOM-009`,`DATA-ROOM-010` |
 | outbound transactions | remote HTTP push | `IF-INT-FED-001`,`IF-ALARM-001` | `DATA-FED-001`,`DATA-FED-002` |
 | join/leave/knock | `IF-FED-003` | `IF-INT-ROOM-001` | `DATA-FED-004`,`DATA-ROOM-001`,`DATA-ROOM-002`,`DATA-ROOM-003`,`DATA-ROOM-004`,`DATA-ROOM-005`,`DATA-ROOM-006`,`DATA-ROOM-007`,`DATA-ROOM-008`,`DATA-ROOM-009`,`DATA-ROOM-010` |
-| repair/backfill | `IF-FED-004` | `IF-ALARM-001` | `DATA-FED-004` |
+| state retrieval / repair / backfill | `IF-FED-004` | `IF-ALARM-001` | `DATA-FED-004`,`DATA-ROOM-001`,`DATA-ROOM-002`,`DATA-ROOM-003`,`DATA-ROOM-004`,`DATA-ROOM-005`,`DATA-ROOM-006`,`DATA-ROOM-007`,`DATA-ROOM-008` |
 | query surfaces | `IF-FED-006` | none | `DATA-USER-012`,`DATA-D1-003`,`DATA-ROOM-005`,`DATA-ROOM-006`,`DATA-ROOM-007` |
+| user devices and key exchange | `IF-FED-007`,`IF-FED-008` | `IF-INT-USER-004`,`IF-INT-FED-001` | `DATA-USER-002`,`DATA-USER-003`,`DATA-USER-004`,`DATA-USER-005`,`DATA-USER-008`,`DATA-FED-001` |
+| explicit unsupported federation surfaces | `IF-FED-009`,`IF-FED-010` | none | `none` |
 
-## 13. 完成标准
+## 15. 完成标准
 
 * 发现与委派规则可直接实现；
 * 入站、出站、恢复三条路径闭合；
-* 联邦查询与 repair/backfill 面已明确分离；
+* 联邦查询、用户设备/密钥交换、disabled federation surface 与 repair/backfill 面已明确分离；
 * 联邦重试与隔离规则明确；
 * 联邦域已接入接口、数据、流程目录；
 * 房间域与联邦域的边界没有重叠。

@@ -39,7 +39,13 @@
 * `jobs-worker` 以 `event_id` 作为幂等键写入 `DATA-D1-001`。
 * 删除、redaction、visibility 变化必须生成对应的补偿索引更新。
 
-### 3.3 Rebuild
+### 3.3 Query Service
+
+* `IF-CS-052` 是 derived read path，不是 indexing path。
+* `gateway-worker` 对 `search`、`user_directory/search`、`publicRooms` 与 client `hierarchy` 的请求，必须走统一只读 query dispatch。
+* 任何可见性不确定场景都必须回退 truth 或 fail-closed；不得因为索引存在就直接暴露结果。
+
+### 3.4 Rebuild
 
 * 搜索索引必须支持全量重建和按房间重建。
 * 重建输入来自 `RoomDO` 真相与 R2 冷历史。

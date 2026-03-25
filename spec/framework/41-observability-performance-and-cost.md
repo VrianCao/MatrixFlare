@@ -84,8 +84,8 @@
 * 生产默认启用 Workers Logs。引用：`CF-WKR-015`。
 * 正常高频请求必须采样，错误、控制面和恢复事件必须全量。
 * 禁止记录 secrets、token 明文和敏感密钥材料。
-* Workers Logs 只有 `7` 天保留期，只能作为短期运行遥测；控制面审计与恢复证据必须落到 `DATA-OPS-004` / `EVID-*`。
-* 单条 Workers Logs 事件必须受平台 `256 KB` 单事件大小限制约束；超限被截断时，必须以平台提供的 `$cloudflare.truncated = true` 为权威信号，并映射到内部日志 schema，避免把截断日志当作完整证据。
+* Workers Logs 只有 `7` 天保留期，只能作为短期运行遥测；控制面审计与恢复证据必须落到 `DATA-OPS-004` / `EVID-*`。引用：`CF-WKR-015`。
+* 单条 Workers Logs 事件必须受平台 `256 KB` 单事件大小限制约束；超限被截断时，必须以平台提供的 `$cloudflare.truncated = true` 为权威信号，并映射到内部日志 schema，避免把截断日志当作完整证据。引用：`CF-WKR-015`。
 
 ## 5. Traces and Correlation
 
@@ -117,6 +117,8 @@
 
 ### 6.2 Included Quotas Matrix
 
+`Included Quotas Matrix` 中的 Workers requests / CPU rows，只在 deployment 采用 Workers `Standard` usage model 时成立；若 deployment 使用其他 usage model 或合同计费，必须用相应合同事实替换。引用：`CF-WKR-019`。
+
 | Cost Surface | Included Quota | CF IDs |
 | --- | --- | --- |
 | Workers requests | `10M / month` | `CF-WKR-019` |
@@ -140,7 +142,7 @@
 * 媒体读取的主成本来自 R2 请求与存储，不来自 R2 Internet egress。引用：`CF-R2-003`,`CF-R2-005`。
 * DO request 成本必须把 DO HTTP、顶层 RPC sessions、WebSocket 建连、入站 WebSocket messages 与 alarm invocations 一并建模，并按官方 transport-specific request unit 定义换算，不得只按 DO HTTP 入口估算。引用：`CF-DO-013`。
 * Hibernation WebSocket 的入站消息计费必须单独建模；其 request fee 按 `20:1` 折算为 billing requests。WebSocket 建连会形成 request，出站发送不会形成对等 DO request 计数，但仍会占用网络与 CPU 预算。引用：`CF-DO-013`。
-* Queues 成本必须按 write / read / delete 三类操作分别计数，并按每 `64 KiB` payload chunk 换算；batch 只改变吞吐与调用频率，不会把多条消息折叠成一次计费。引用：`CF-QUE-001`。
+* Queues 成本必须按 write / read / delete 三类操作分别计数，并按每 `64 KB` payload chunk 换算（`KB = 1000 bytes`）；每条消息还隐含约 `100` bytes 平台元数据；retry 会额外产生 read op，DLQ 写入会额外产生 write op，过期消息只产生 write+delete；batch 只改变吞吐与调用频率，不会把多条消息折叠成一次计费。引用：`CF-QUE-001`。
 * 若为冷归档采用 R2 Infrequent Access，成本模型必须额外纳入 retrieval fee、`30` 天 minimum storage duration 与“无 included quota”的事实；默认 Included Quotas Matrix 只适用于 R2 Standard。引用：`CF-R2-005`。
 
 ## 7. Primary Load Drivers
@@ -175,7 +177,7 @@
 * 本地非联邦房间发送应以单次 `RoomDO` 提交为主要时延来源，而不是 D1/R2/Queue。
 * `/sync` 的“有事件后唤醒到返回”预算应优先优化 Worker 组装和房间投影，而不是长时间轮询频率。
 
-具体数值门槛必须通过 `TEST-PERF-*` 压测固化到发布记录。
+具体数值门槛必须通过 `TEST-PERF-001`,`TEST-PERF-002` 压测固化到发布记录。
 
 ## 10. SLO / SLA Entry Points
 

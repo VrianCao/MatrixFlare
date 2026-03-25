@@ -26,6 +26,7 @@
 | `DATA-ID-003` | token | access token hash | authoritative | `UserDO` | DO SQLite | session id / token hash | per-user serial | none | 只存 hash。 |
 | `DATA-ID-004` | token | refresh token hash | authoritative | `UserDO` | DO SQLite | refresh session id | per-user serial | none | 轮换后旧 token 必须可判失效。 |
 | `DATA-ID-005` | manifest | queue job id / replay job id | authoritative | producer | DO SQLite / D1 control plane | job id | per job serial | control plane log | 用于补偿、取消和恢复。 |
+| `DATA-ID-006` | token | UIA session token | authoritative | `gateway-worker` | signed opaque token | opaque | route-bound, TTL-bound | none | 用于 `register`、`account/password`、`account/deactivate` 等当前启用的 UIA 路由；payload 至少绑定 `route_family`、HTTP method、`issued_at`、`expires_at`、`auth_subject_hint`、`completed_stages`、`nonce` 与 `root_key_version`；不得被其它路由或其它主体重放。签名验证责任只允许落在 `gateway-worker`，其它 Worker/DO 只可接收归一化后的已验证 challenge 结果，不得直接依赖原始 token bytes 或签名 secret。 |
 
 ## 3. `UserDO` 数据契约
 
@@ -47,6 +48,7 @@
 | `DATA-USER-014` | table | stored filters | authoritative | `UserDO` | DO SQLite | `filter_id` | per-user serial | user export | 存 canonical filter JSON、filter hash 和创建版本。 |
 | `DATA-USER-015` | table | pending media upload grants | authoritative | `UserDO` | DO SQLite | `pending_upload_id` | per-user serial | none | 记录上传配额检查结果、允许的 MIME/尺寸、TTL 与 finalize 状态；R2 写失败或超时必须可撤销。 |
 | `DATA-USER-016` | table | to-device txn dedupe registry | authoritative | `UserDO` | DO SQLite | `txn_dedupe_key` | per-user serial | user export | 用于 `PUT /sendToDevice/{eventType}/{txnId}` 幂等裁决；最小唯一键至少绑定 `{sender_user_id,event_type,txn_id}`，并持久化 canonical request hash、结果摘要与终态。若一次请求会命中多个目标设备/用户，则每个目标 `UserDO` 上都必须以同一 public txn key 与同一 canonical request hash 作局部裁决，不得把目标设备 ID 混入 public dedupe key。 |
+| `DATA-USER-017` | table | user principal / auth profile | authoritative | `UserDO` | DO SQLite | `singleton` | per-user serial | user export | 本地用户主记录；至少包含 `user_id`、`localpart`、`user_type`、`password_hash_or_null`、`password_login_enabled`、`created_at`、`deactivated_at_or_null`、`erase_requested_flag`、`auth_version` 与注册来源元数据。`auth_version` 必须在 password change、account deactivate 等会影响后续认证裁决的写路径上单调递增。 |
 
 ## 4. `RoomDO` 数据契约
 
@@ -169,7 +171,7 @@
 | `DATA-R2-002` | object | remote media cache object | authoritative-cache | media subsystem | R2 | `media/remote/{origin}/{media_id}` | strong | refetch remote | 可按策略驱逐重取。 |
 | `DATA-R2-003` | object | thumbnail object | derived | `jobs-worker` | R2 | `media/thumb/...` | strong | regenerate | 变体由 `{width,height,method}` 唯一决定。 |
 | `DATA-R2-004` | object | room cold archive segments | authoritative-cold | `RoomDO` + `jobs-worker` | R2 | `archive/rooms/{room_id}/...` | strong | replay source | RoomDO 热层保留索引；每个 segment 都必须被 checkpoint manifest 引用并带内容哈希、sequence、`checkpoint_id` 与签名 key version；若某 segment 被 full export bundle 收录，则对应 bundle manifest 另外记录其 `export_epoch`。 |
-| `DATA-R2-005` | object | export / recovery bundles | authoritative-ops | `ops-worker` | R2 | `exports/...` | strong | none | 仅控制面产生；bundle manifest 必须包含 schema version、内容哈希、签名、加密 key version 与 completeness 标记。 |
+| `DATA-R2-005` | object | export / recovery bundles | authoritative-ops | `ops-worker` | R2 | `exports/{export_epoch_or_import_batch}/{artifact_kind}/{scope_kind}/{scope_id_or_global}/{object_id}` | strong | none | 仅控制面产生；bundle manifest 必须包含 schema version、内容哈希、签名、加密 key version 与 completeness 标记。 |
 | `DATA-R2-006` | object | encrypted room key backup segments | authoritative-opaque | `UserDO` | R2 | `backup/{user_id}/{backup_version}/...` | strong | user export | 服务端视为加密 opaque blob。 |
 | `DATA-KV-001` | keyspace | `/.well-known` cache | cache | `gateway-worker` | KV | `wellknown:*` | eventual | refetch | 可整前缀清空。 |
 | `DATA-KV-002` | keyspace | remote discovery / capability cache | cache | `gateway-worker` / `RemoteServerDO` | KV | `remote:*` | eventual | refetch | 只能作性能缓存。 |
@@ -226,6 +228,23 @@
 * shard registry row 的 `schema_version` 必须反映该 shard 当前导出/恢复所需的最小 schema 解释版本。
 * `DATA-OPS-011` 只能由 full export 或显式巡检作业从 `DATA-OPS-010` 冻结生成；冻结后不得在同一 snapshot 中动态追加新发现 shard。
 * full export、restore preflight 与 completeness 校验必须引用 `DATA-OPS-011`，不得以“运行时扫描到多少 shard”为准。
+
+## 8.3 `DATA-R2-005` 导出对象键空间规则
+
+为避免导出/恢复工具各自脑补 R2 key layout，`DATA-R2-005` 的 `artifact_kind` 首版固定如下：
+
+* `bundle-manifest`
+* `shard-manifest`
+* `registry-snapshot`
+* `checkpoint-manifest`
+* `checkpoint-object`
+
+键空间约束：
+
+* `scope_kind` / `scope_id_or_global` 必须与控制面 request scope 一致；`global` 时固定写字面量 `global`.
+* `object_id` 必须是导出 manifest 中的稳定逻辑 ID，而不是随机文件名。
+* 同一 `{export_epoch_or_import_batch,artifact_kind,scope_kind,scope_id_or_global,object_id}` 不得被不同内容覆盖；若内容 hash 不同，必须视为数据完整性冲突。
+* `checkpoint-object` 的 key 必须能从 checkpoint manifest 直接推导，不得依赖 R2 list/scan 发现。
 
 ## 9. 兼容与迁移规则
 

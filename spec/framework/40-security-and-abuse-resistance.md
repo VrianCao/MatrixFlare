@@ -22,10 +22,10 @@
 | REQ-ID | Requirement | Normative Statement |
 | --- | --- | --- |
 | `REQ-SEC-001` | Token truth | access token 与 refresh token 的有效性只以 `UserDO` 真相为准。 |
-| `REQ-SEC-002` | Secret storage | 所有敏感密钥、token 和凭据都必须存放于 Workers secrets 或 Secrets Store。 |
+| `REQ-SEC-002` | Secret storage | 所有敏感密钥、bearer token 本体与可离线重放的凭据都必须存放于 Workers secrets 或 Secrets Store；不适用于仅以 hash 形式存于 `UserDO` 真相中的 access/refresh token。 |
 | `REQ-SEC-003` | No plaintext secrets | 严禁把敏感信息存入 Wrangler `vars`、D1、KV、Git 或日志。 |
 | `REQ-SEC-004` | Room authorization | 房间级授权最终只由 `RoomDO` + room version auth rules 裁决。 |
-| `REQ-SEC-005` | Federation auth | 联邦请求只以 `X-Matrix` 签名和 Matrix 规则验证，不以 IP allowlist 替代。 |
+| `REQ-SEC-005` | Federation auth | 除显式登记为 deterministic disabled stub 的联邦路由外，联邦请求只以 `X-Matrix` 签名和 Matrix 规则验证，不以 IP allowlist 替代。 |
 | `REQ-SEC-006` | Abuse controls | 注册、登录、媒体、房间发送、联邦入口、搜索等都必须具备限流或配额控制。 |
 | `REQ-SEC-007` | Auditability | 所有高权限操作都必须有审计记录与因果链。 |
 | `REQ-SEC-008` | Single-tenant isolation | 首版隔离边界是“每个 homeserver 域名独立部署单元”。 |
@@ -49,6 +49,7 @@
 
 ### 3.2 联邦认证规则
 
+* `IF-FED-009`,`IF-FED-010` 这类已在接口目录登记为 deterministic disabled stub 的联邦路由，必须按固定 stub wire contract 在鉴权前短路；这是 `REQ-SEC-005` 的显式例外，而不是实现漂移。
 * 每个联邦请求都必须先验证 `origin`、签名、key 有效期和目标 server name。
 * 验签失败不得进入 `RoomDO` 或 `UserDO`。
 * 远端 key cache 命中只能优化性能，不能绕过过期与重拉取逻辑。
@@ -109,7 +110,7 @@
 | Secret Class | Allowed Storage | Forbidden Storage | Rotation Rule | Related CF IDs |
 | --- | --- | --- | --- | --- |
 | homeserver signing key | Workers secrets / Secrets Store | `vars`, D1, KV, Git | 进入正式发布流程并保留旧公钥验证窗口 | `CF-WKR-013`,`CF-WKR-014` |
-| session HMAC / token root key | Workers secrets / Secrets Store | `vars`, D1, KV, Git | 通过版本化部署轮换，支持双读验证窗口 | `CF-WKR-013`,`CF-WKR-014` |
+| session HMAC / token root key | Workers secrets / Secrets Store | `vars`, D1, KV, Git | 通过版本化部署轮换，支持双读验证窗口，并保留旧 verify key 直到 rollout overlap 与最大 token TTL 同时结束 | `CF-WKR-012`,`CF-WKR-013`,`CF-WKR-014`,`CF-WKR-020`,`CF-WKR-021` |
 | appservice tokens | Workers secrets / Secrets Store | `vars`, D1 plaintext, KV | 与 appservice config 变更一起发布 | `CF-WKR-013`,`CF-WKR-014` |
 | OTel / external integration credentials | Workers secrets / Secrets Store | `vars`, D1, KV | 与集成变更耦合发布 | `CF-WKR-013`,`CF-WKR-014` |
 | export bundle encryption key | Workers secrets / external KMS if adopted | `vars`, D1, KV | 必须可审计轮换 | `CF-WKR-013` |
@@ -118,6 +119,8 @@
 
 * 必须使用 secrets 而不是 `vars` 保存敏感信息。引用：`CF-WKR-013`。
 * secret 变更会生成新的 Worker version；渐进发布场景必须使用 `wrangler versions secret put/delete`。引用：`CF-WKR-014`。
+* 任何 secret-backed stateless token keyring 都必须显式控制活跃 key 数量与序列化体积；若以 Worker secret 注入，必须满足单 secret `5 KB` 上限。引用：`CF-WKR-020`。
+* 默认应避免多 Worker 共享同一签名 secret；若确需共享，必须使用 Secrets Store 或受控的 duplicated versioned secrets，并保证所有参与验证的 Worker 看到同一 `root_key_version -> key` 映射。引用：`CF-WKR-021`。
 
 ## 6. Abuse Resistance
 
@@ -177,8 +180,8 @@
 
 | Area | TEST IDs | EVID IDs |
 | --- | --- | --- |
-| auth and token revocation | `TEST-SEC-001` | `EVID-SEC-001` |
-| abuse resistance and rate limits | `TEST-SEC-002` | `EVID-SEC-001` |
+| auth, token revocation, and baseline abuse guards | `TEST-SEC-001` | `EVID-SEC-001` |
+| advanced abuse hardening and external-provider surfaces | `TEST-SEC-002` | `EVID-SEC-001` |
 | deployment/secret coupling | `TEST-OPS-001` | `EVID-OPS-001` |
 
 ## 11. 完成标准

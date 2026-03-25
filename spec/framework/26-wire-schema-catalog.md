@@ -1,0 +1,746 @@
+# Wire Schema Catalog
+
+状态：Draft-Normative
+角色：线协议与 payload schema 总目录
+负责主文档章节：3，6
+扩展范围：本地 `/_ops`、内部 RPC、Queue、Alarm、固定错误体与 Matrix-native 逻辑契约的引接规则
+
+## 1. 文档职责
+
+* 为 [23-interface-contract-catalog.md](./23-interface-contract-catalog.md) 中出现的本地逻辑契约名提供唯一 wire schema 真相。
+* 规定本地控制面、内部 RPC、队列负载与固定错误体的字段、枚举、版本与演进规则。
+* 防止“接口表里只有类型名，没有 payload shape”的灰区继续存在。
+
+明确不包含：
+
+* 不重复抄录 Matrix `v1.17` 官方公开路由的完整 request/response schema；
+* 不定义持久化数据 schema；
+* 不替代责任分册中的业务规则与状态机。
+
+## 2. 权威边界与 Join 规则
+
+* [23-interface-contract-catalog.md](./23-interface-contract-catalog.md) 中 `Input Contract` / `Output Contract` 列使用的逻辑契约名，是本分册的 canonical join key。
+* 若某逻辑契约对应 Matrix client-server / server-server / appservice 官方公开路由，则其权威 wire schema 仍来自钉死的 Matrix `v1.17` versioned spec；本分册只定义本项目额外收紧、固定 stub 或 route-family 归一化规则。
+* 若某逻辑契约对应本地 `/_ops`、内部 RPC、Queue、Alarm 或固定错误体，则本分册是唯一 schema authority。
+* 同一逻辑契约名不得在不同接口上承载两个不兼容 shape；若确有破坏性演进，必须引入新契约名或新 `schema_version` 主版本。
+
+## 3. 全局编码、版本与演进规则
+
+### 3.1 编码规则
+
+* 本分册定义的本地 payload 一律为 UTF-8 JSON object；禁止 tuple-like positional array 作为顶层类型。
+* JSON 字段名一律使用 `snake_case`。
+* 时间戳一律使用 RFC 3339 UTC `Z` 结尾字符串。
+* 哈希字段一律使用 `base64url(sha256(bytes))`，除非对应 Matrix 官方 schema 另有定义。
+
+### 3.2 版本规则
+
+* 所有 Queue payload 与跨 Worker 的长寿命异步作业 payload 都必须包含整数型 `schema_version`。
+* `schema_version` 主版本不兼容时，consumer 必须 poison / reject，而不是猜测兼容。
+* 同主版本下只允许 additive 变更；删除、重命名或改变字段语义都必须升级主版本。
+
+### 3.3 Unknown Field 规则
+
+* `/_ops` 写请求对未知顶层字段必须返回 `422`，防止审计与幂等指纹被“看不见的输入”污染。
+* `/_ops` 读响应允许新增 additive 字段，但不得移除已发布字段。
+* 内部 RPC 在 `schema_version` 主版本相同前提下可以忽略未知 additive 字段。
+* Queue consumer 在 `schema_version` 主版本相同前提下可以忽略未知 additive 字段；若忽略后会影响幂等键、路由键或恢复语义，则必须 fail-closed。
+
+### 3.4 共享字段约定
+
+* `request_fingerprint`：对“接口语义已定义的 canonical request object”执行 RFC 8785 JCS 后再做 `sha256`。
+* `idempotency_key`：直接来自调用方 header 或 control-plane request，不得在中途重写。
+* `scope_kind` 只允许 `global`、`room_id`、`user_id`、`server_name`、`appservice_id`。
+* `scope_id` 在 `scope_kind = global` 时必须为 `null`；其他情况必须为非空字符串。
+
+## 4. 固定错误体 Contract
+
+### 4.1 `MatrixUnrecognizedErrorBody`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `errcode` | string | 固定为 `M_UNRECOGNIZED` |
+| `error` | string | 固定为 `Unrecognized or unsupported endpoint` |
+
+适用面：
+
+* `IF-CS-007`,`IF-CS-053`,`IF-CS-054`,`IF-CS-055`,`IF-CS-056`,`IF-CS-057`,`IF-CS-058`,`IF-CS-059`,`IF-CS-060`,`IF-CS-061`,`IF-CS-062`,`IF-CS-063`,`IF-CS-064`,`IF-CS-065`
+* `IF-FED-010`
+
+### 4.2 `MatrixUnknownTokenErrorBody`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `errcode` | string | 固定为 `M_UNKNOWN_TOKEN` |
+| `error` | string | 固定为 `Unknown or unsupported token` |
+
+适用面：
+
+* `IF-FED-009`
+
+附加规则：
+
+* 联邦 stub 不得追加 client-session 语义字段，例如 `soft_logout`。
+
+### 4.3 `OpsErrorResponse`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `code` | string | `unauthorized`,`forbidden`,`not_found`,`idempotency_conflict`,`validation_failed`,`precondition_failed`,`rate_limited`,`internal` |
+| `message` | string | 人类可读错误摘要 |
+| `request_id` | string | 控制面请求相关 ID |
+| `retryable` | boolean | 是否建议调用方自动重试 |
+| `details` | object or null | 可选结构化细节；不得泄漏 secret 或 token 材料 |
+
+### 4.4 `InternalErrorEnvelope`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `code` | string | 由 owning spec 定义的稳定 typed error code |
+| `message` | string | 人类可读摘要 |
+| `retryable` | boolean | 是否允许自动重试 |
+| `details` | object or null | 可选结构化字段；不得携带 secret、token 本体或大型 payload |
+
+适用规则：
+
+* [23-interface-contract-catalog.md](./23-interface-contract-catalog.md) 中所有 “typed auth/cursor/query/projection/delivery/internal error” 默认都实例化为该 envelope。
+* `code` 的枚举集合由对应 owning spec 负责定义；若未定义，不得声称是 “typed error”。
+
+#### 最小 `code` vocabulary
+
+为避免不同实现各自发明错误码，首版最小稳定 `code` 集合固定如下：
+
+* auth/session 类：`invalid_token`,`expired_session`,`deactivated_account`,`unknown_session`
+* cursor/sync 类：`invalid_cursor`,`cursor_from_future`,`filter_mismatch`
+* room admission 类：`auth_forbidden`,`state_conflict`,`missing_prev`,`soft_failed`
+* room query/projection 类：`visibility_denied`,`archive_missing`,`invalid_range`
+* key claim / to-device 类：`unsupported_algorithm`,`already_claimed`,`target_not_local`,`idempotency_conflict`
+* federation internal 类：`duplicate_txn`,`payload_mismatch`,`retry_scheduled`
+* control-plane / worker internal 类：`unsupported_schema_version`,`backpressure`,`job_conflict`,`not_current`
+
+规则：
+
+* owning spec 可以在不改变既有语义的前提下扩展枚举，但不得重载以上 code 的含义。
+* 若某接口只允许上述子集之一，必须在 owning spec 中显式点名适用子集。
+
+## 5. 控制面 HTTP Payload
+
+### 5.1 共享类型
+
+#### `TargetScope`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `scope_kind` | string | `global`,`room_id`,`user_id`,`server_name`,`appservice_id` |
+| `scope_id` | string or null | `global` 时必须为 `null`，否则必须为非空 |
+
+#### `JobHandle`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `job_id` | string | 全局唯一控制面作业 ID |
+| `job_type` | string | `export`,`restore`,`rebuild`,`repair` |
+| `state` | string | `accepted`,`queued`,`running`,`succeeded`,`failed`,`cancel_requested`,`cancelled` |
+| `scope` | `TargetScope` | 本次作业目标范围 |
+| `accepted_at` | string | RFC 3339 UTC |
+| `request_fingerprint` | string | canonical request hash |
+| `idempotency_key_echo` | string | 原样回显 header 中的 `Idempotency-Key` |
+
+#### `JobSummary`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `job_id` | string | 同 `JobHandle.job_id` |
+| `job_type` | string | 同 `JobHandle.job_type` |
+| `state` | string | 同 `JobHandle.state` |
+| `scope` | `TargetScope` | 作业范围 |
+| `created_at` | string | RFC 3339 UTC |
+| `started_at` | string or null | RFC 3339 UTC |
+| `completed_at` | string or null | RFC 3339 UTC |
+| `progress` | object | 至少包含 `completed_units`,`total_units`,`unit_name` |
+| `checkpoint_state` | object or null | 长作业 checkpoint 摘要 |
+| `last_error` | `OpsErrorResponse` or null | 最近失败信息 |
+
+#### 外部 `JobHandle.state` 与内部状态机映射
+
+`JobHandle.state` / `JobSummary.state` 是对 [25-sequence-and-state-machine-catalog.md](./25-sequence-and-state-machine-catalog.md) 中内部 job state machine 的外部归一化投影，固定映射如下：
+
+* `accepted`：内部状态 `pending`
+* `queued`：内部状态 `checkpointed` 或任何已入队未执行状态
+* `running`：内部状态 `scanning`,`applying`,`materializing`,`uploading`,`validating`,`importing`,`cutover-ready`,`cutover`,`verifying`
+* `succeeded`：内部状态 `completed` 或 `finalized`
+* `failed`：内部状态 `failed`
+* `cancel_requested`：内部状态 `cancel_requested`
+* `cancelled`：内部状态 `canceled` 或 `cancelled`
+
+约束：
+
+* 对外 API 只允许暴露归一化后的 `JobHandle.state`，不得把内部状态机名称直接泄漏为另一套并行真相。
+
+### 5.2 `OpsHealthResponse`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `service` | string | 固定为 `ops-worker` |
+| `status` | string | `ok`,`degraded`,`fail` |
+| `observed_at` | string | RFC 3339 UTC |
+| `worker_version_id` | string | 当前 Worker version ID |
+| `deployment_id` | string | 当前 deployment ID |
+| `compatibility_date` | string | 当前 compatibility date |
+| `release_profile` | string | `L1`,`L2`,`L3` 之一 |
+| `dependencies` | array | 每项至少包含 `name`,`kind`,`status`,`detail` |
+
+### 5.3 `ExportJobRequest`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `export_mode` | string | `full_bundle` 或 `scoped_bundle` |
+| `scope` | `TargetScope` | `full_bundle` 时必须为 `global` |
+| `reason` | string | 非空变更原因 / 操作原因 |
+| `ticket_id` | string or null | 外部工单号 |
+| `reuse_checkpoint_policy` | string | `reuse_complete_if_cut_satisfied` 或 `force_fresh` |
+| `max_checkpoint_age_seconds` | integer or null | 复用 checkpoint 的最大陈旧阈值 |
+| `include_optional_objects` | boolean | 是否包含 `required_for_restore = false` 的对象 |
+| `output_encryption_key_version` | string | 导出使用的加密 key version |
+
+### 5.4 `RestoreJobRequest`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `restore_mode` | string | `full_namespace` 或 `scoped_repair` |
+| `scope` | `TargetScope` | `full_namespace` 时必须为 `global` |
+| `reason` | string | 非空 |
+| `ticket_id` | string or null | 外部工单号 |
+| `source_bundle_uri` | string | 待恢复 bundle 的不可变定位符 |
+| `source_bundle_hash` | string | bundle manifest hash |
+| `target_environment_id` | string | 预先准备好的目标 namespace 集标识 |
+| `allow_incomplete` | boolean | 默认 `false`；`full_namespace` 时必须为 `false` |
+| `allowed_signing_key_versions` | array | restore allowlist |
+| `allowed_encryption_key_versions` | array | decrypt allowlist |
+
+### 5.5 `RebuildJobRequest`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `rebuild_target` | string | `search_index`,`user_directory`,`public_room_directory`,`all_derived`,`appservice_projection` |
+| `scope` | `TargetScope` | 重建范围 |
+| `reason` | string | 非空 |
+| `ticket_id` | string or null | 外部工单号 |
+| `force_full_scan` | boolean | 是否禁用增量/fast path |
+
+### 5.6 `RepairJobRequest`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `repair_kind` | string | `room_graph`,`room_user_fanout`,`user_device_keys`,`remote_server_txn_queue`,`remote_media_catalog`,`search_reindex` |
+| `scope` | `TargetScope` | 必须与 `repair_kind` 相容 |
+| `reason` | string | 非空 |
+| `ticket_id` | string or null | 外部工单号 |
+| `dry_run` | boolean | `true` 时只允许产出 repair plan，不得改写真相 |
+| `source_bundle_uri` | string or null | 若修复依赖外部导出包，则必须显式给出 |
+
+### 5.7 `JobStatusQuery`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `job_id` | string or null | 精确查询时使用 |
+| `job_type` | string or null | 列表查询过滤 |
+| `state` | string or null | 列表查询过滤 |
+| `scope` | `TargetScope` or null | 列表查询过滤 |
+| `limit` | integer or null | 默认值由实现设定，但必须有上限 |
+| `cursor` | string or null | 列表分页游标 |
+
+约束：
+
+* `job_id` 非空时，`job_type`、`state`、`scope`、`cursor` 必须为 `null`。
+
+### 5.8 `JobStatusResponse`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `job` | `JobSummary` or null | 精确查询时返回 |
+| `jobs` | array or null | 列表查询时返回 `JobSummary[]` |
+| `next_cursor` | string or null | 仅列表查询可返回 |
+
+约束：
+
+* `job` 与 `jobs` 必须二选一，禁止同时非空。
+
+### 5.9 `JobCancelRequest`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `reason` | string | 非空 |
+| `ticket_id` | string or null | 外部工单号 |
+| `if_in_states` | array or null | 若非空，仅当当前 state 在该集合中才接受取消 |
+
+### 5.10 `JobCancelResponse`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `job_id` | string | 被取消作业 ID |
+| `previous_state` | string | 取消前状态 |
+| `new_state` | string | `cancel_requested` 或 `cancelled` |
+| `accepted_at` | string | RFC 3339 UTC |
+
+### 5.11 `AppserviceNamespaceRule`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `regex` | string | namespace 匹配规则 |
+| `exclusive` | boolean | 是否排他 |
+
+### 5.12 `AppserviceDescriptor`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `appservice_id` | string | 全局唯一 appservice 标识 |
+| `url` | string | AS 接收事务与查询的基准 URL |
+| `sender_localpart` | string | AS 发送者 localpart |
+| `hs_token_secret_ref` | string | homeserver token 的 secret ref，禁止明文返回 |
+| `as_token_secret_ref` | string | appservice token 的 secret ref，禁止明文返回 |
+| `namespaces` | object | `users`,`aliases`,`rooms` 三个数组，元素为 `AppserviceNamespaceRule` |
+| `protocols` | array | 可选 third-party protocol 声明 |
+| `rate_limited` | boolean | 是否启用 AS 级限流 |
+| `receive_ephemeral` | boolean | 是否接收 ephemeral payload |
+| `healthcheck_enabled` | boolean | 是否纳入健康检查 |
+| `disabled_at` | string or null | 非空表示逻辑停用 |
+| `delivery_state` | object | 至少包含 `last_success_at`,`backlog_depth`,`retry_state`,`last_error` |
+
+### 5.13 `AppserviceConfigRequest`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `appservice` | `AppserviceDescriptor` | `POST` / `PUT` 时必填；`GET` / `DELETE` 时为空 |
+
+### 5.14 `AppserviceConfigResponse`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `appservice` | `AppserviceDescriptor` or null | 单项读取/写入返回 |
+| `appservices` | array or null | 列表读取返回 `AppserviceDescriptor[]` |
+| `next_cursor` | string or null | 列表分页游标 |
+
+## 6. 内部 RPC 与异步作业 Payload
+
+### 6.1 通用 ACK 类型
+
+#### `Ack`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `accepted` | boolean | 是否接受该请求 |
+| `accepted_at` | string | RFC 3339 UTC |
+| `dedupe_key` | string or null | 若适用，回显实际使用的幂等键 |
+
+#### `AppendAck`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `accepted` | boolean | 是否已 durable 追加 |
+| `accepted_at` | string | RFC 3339 UTC |
+| `durable_stream_pos` | integer | 目标流上的 durable 位置 |
+
+#### `QueueAck`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `accepted` | boolean | 是否已 durable 入队 |
+| `accepted_at` | string | RFC 3339 UTC |
+| `server_name` | string | 目标远端 server |
+| `queue_seq` | integer | 远端队列顺序号 |
+
+#### `ExportShardAck`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `accepted` | boolean | 是否接受该 shard 导出 |
+| `accepted_at` | string | RFC 3339 UTC |
+| `job_id` | string | 控制面作业 ID |
+| `shard_type` | string | `UserDO`,`RoomDO`,`RemoteServerDO` 之一 |
+| `shard_key` | string | 该 shard 的 canonical key |
+| `checkpoint_id` | string or null | 若已分配 checkpoint，则返回 |
+
+### 6.2 会话、同步、用户与房间 RPC
+
+#### `AccessTokenEnvelope`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `access_token_hash` | string | 已哈希，不传明文 |
+| `presented_at` | string | RFC 3339 UTC |
+
+#### `SessionContext`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `user_id` | string | 本地用户 ID |
+| `device_id` | string or null | 设备 ID |
+| `session_id` | string | 会话 ID |
+| `auth_version` | integer | 必须与 `DATA-USER-017.auth_version` 对齐 |
+| `is_guest` | boolean | 访客标记 |
+| `expires_at` | string or null | 过期时间 |
+
+#### `SyncCursorRequest`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `user_id` | string | 发起用户 |
+| `session_id` | string | 当前会话 |
+| `since_token` | string or null | 上次 `next_batch` |
+| `filter_hash` | string | canonical filter hash |
+| `full_state` | boolean | 是否 full-state |
+| `use_state_after` | boolean | 是否启用相关行为 |
+| `timeout_ms` | integer | long-poll 超时上限 |
+
+#### `UserStreamDeltaBatch`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `user_id` | string | 所属用户 |
+| `from_stream_pos` | integer | 起始位置 |
+| `to_stream_pos` | integer | 结束位置 |
+| `entries` | array | 用户流增量条目 |
+| `limited` | boolean | 是否触发 limited |
+
+#### `KeyClaimQuery`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `target_user_id` | string | 目标本地用户 |
+| `device_queries` | array | 每项至少含 `device_id`,`algorithm`,`count` |
+
+#### `ClaimedKeyBatch`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `target_user_id` | string | 目标本地用户 |
+| `claimed_keys` | array | 每项至少含 `device_id`,`algorithm`,`key_id`,`key_json` |
+| `fallback_key_counts` | object | algorithm -> remaining count |
+
+#### `ToDeviceEnqueueRequest`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `sender_user_id` | string | 发送者 |
+| `event_type` | string | to-device 类型 |
+| `txn_id` | string | 公共事务键 |
+| `canonical_request_hash` | string | 请求 hash |
+| `messages` | object | `target_user_id -> target_device_id -> content` |
+
+#### `RoomFanoutDelta`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `room_id` | string | 房间 ID |
+| `room_pos` | integer | committed room position |
+| `user_id` | string | 目标本地用户 |
+| `membership_bucket` | string | 供 `/sync` 投影使用 |
+| `stream_entries` | array | 要写入用户流的条目 |
+| `notification_delta` | object | unread / highlight 增量 |
+
+#### `EventAdmissionRequest`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `room_id` | string | 目标房间 |
+| `request_kind` | string | `client`,`federation`,`repair`,`backfill` |
+| `candidate_event` | object | canonical event JSON |
+| `request_fingerprint` | string | admission 请求 hash |
+
+#### `EventAdmissionResult`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `decision` | string | `accepted`,`rejected`,`waiting_missing` |
+| `event_id` | string or null | 被接纳事件 ID |
+| `room_pos` | integer or null | committed room position |
+| `snapshot_id` | integer or null | 相关 snapshot |
+| `error_code` | string or null | 拒绝时的 typed error code |
+
+#### `RoomProjectionRequest`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `user_id` | string | 请求者 |
+| `room_id` | string | 房间 ID |
+| `room_pos` | integer | 投影截止位置 |
+| `membership_bucket` | string | 参与可见性裁决 |
+| `filter_hash` | string | canonical filter hash |
+| `visibility_context` | object | 不得省略 |
+
+#### `RoomSyncProjection`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `room_id` | string | 房间 ID |
+| `room_pos` | integer | 对应位置 |
+| `timeline` | array | `/sync` timeline 片段 |
+| `state` | array | state delta |
+| `ephemeral` | array | ephemeral 项 |
+| `limited` | boolean | 是否 limited |
+
+#### `RoomReadRequest`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `kind` | string | `timeline`,`context`,`event`,`state`,`members`,`joined_members`,`relations`,`threads`,`timestamp_lookup` |
+| `room_id` | string | 房间 ID |
+| `requester_user_id` | string | 请求用户 |
+| `cursor` | object or null | timeline / pagination 上下文 |
+| `event_id` | string or null | event/context/relations 使用 |
+| `timestamp` | integer or null | `timestamp_lookup` 使用 |
+| `limit` | integer or null | 可选限制 |
+
+#### `RoomReadResult`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `kind` | string | 与 request 对齐 |
+| `room_id` | string | 房间 ID |
+| `chunk` | array | timeline / relations / threads 结果 |
+| `state` | array | state 结果 |
+| `event` | object or null | 单事件结果 |
+| `start` | string or null | 起始游标 |
+| `end` | string or null | 结束游标 |
+
+#### `MediaUploadIntent`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `user_id` | string | 上传用户 |
+| `device_id` | string or null | 上传设备 |
+| `filename` | string or null | 原始文件名 |
+| `content_type` | string | MIME |
+| `declared_size` | integer | 客户端声明字节数 |
+| `sha256` | string or null | 若客户端已知可带上 |
+
+#### `PendingUploadGrant`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `pending_upload_id` | string | 上传授权 ID |
+| `max_bytes` | integer | 本次允许的最大字节数 |
+| `allowed_content_types` | array | 允许 MIME 集 |
+| `expires_at` | string | 授权过期时间 |
+
+#### `MediaFinalizeRequest`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `pending_upload_id` | string | 上传授权 ID |
+| `r2_object_key` | string | 已写入对象键 |
+| `byte_size` | integer | 实际大小 |
+| `content_type` | string | 实际 MIME |
+| `sha256` | string | 对象 hash |
+| `upload_completed_at` | string | RFC 3339 UTC |
+
+#### `MediaFinalizeAck`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `mxc_uri` | string | 最终 MXC |
+| `media_id` | string | 本地 media ID |
+| `catalog_visibility` | string | `pending` 或 `visible` |
+| `thumbnail_job_enqueued` | boolean | 是否已投递缩略图作业 |
+
+### 6.3 联邦内部 Payload
+
+#### `OutboundTxnIntent`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `server_name` | string | 目标远端服务器 |
+| `txn_scope` | string | `pdu`,`edu`,`mixed` |
+| `origin_kind` | string | `room`,`user` |
+| `event_or_edu_ids` | array | 本次 intent 覆盖的逻辑单元 ID |
+| `payload_ref` | string or null | 若 payload 已外置，可给出 locator |
+| `not_before` | string or null | 最早发送时间 |
+
+#### `InboundTxnEnvelope`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `origin` | string | 远端服务器名 |
+| `txn_id` | string | 远端事务 ID |
+| `canonical_request_hash` | string | 已验证后 transaction body 的 hash |
+| `received_at` | string | RFC 3339 UTC |
+| `pdu_count` | integer | PDU 数量 |
+| `edu_count` | integer | EDU 数量 |
+
+#### `TxnDedupeResult`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `decision` | string | `proceed`,`cached_result`,`conflict_payload_mismatch` |
+| `canonical_response` | object or null | 若可直接返回缓存，则给出 |
+
+### 6.4 控制面跨 Worker Job Spec
+
+以下四类 payload 都继承共同字段：
+
+* `schema_version`
+* `job_id`
+* `scope`
+* `operator_principal_id`
+* `reason`
+* `accepted_at`
+* `request_fingerprint`
+
+#### `RebuildJobSpec`
+
+附加字段：
+
+* `rebuild_target`
+* `force_full_scan`
+
+#### `ExportJobSpec`
+
+附加字段：
+
+* `export_mode`
+* `reuse_checkpoint_policy`
+* `max_checkpoint_age_seconds`
+* `include_optional_objects`
+* `output_encryption_key_version`
+* `registry_snapshot_id`
+* `export_epoch`
+
+#### `RestoreJobSpec`
+
+附加字段：
+
+* `restore_mode`
+* `source_bundle_uri`
+* `source_bundle_hash`
+* `target_environment_id`
+* `allow_incomplete`
+* `allowed_signing_key_versions`
+* `allowed_encryption_key_versions`
+
+#### `RepairJobSpec`
+
+附加字段：
+
+* `repair_kind`
+* `dry_run`
+* `source_bundle_uri`
+
+#### `UserExportSpec`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `schema_version` | integer | 当前主版本 |
+| `job_id` | string | 控制面作业 ID |
+| `shard_type` | string | 固定为 `UserDO` |
+| `shard_key` | string | 用户 shard key |
+| `registry_snapshot_id` | string or null | full export 时必须非空 |
+| `export_epoch` | string or null | full export 时必须非空 |
+| `checkpoint_strategy` | string | `reuse_complete` 或 `force_fresh` |
+
+#### `RoomExportSpec`
+
+与 `UserExportSpec` 同 shape，但 `shard_type` 固定为 `RoomDO`。
+
+#### `RemoteQueueExportSpec`
+
+与 `UserExportSpec` 同 shape，但 `shard_type` 固定为 `RemoteServerDO`。
+
+### 6.5 Queue Payload
+
+#### `DerivedWorkBatch`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `schema_version` | integer | 当前主版本 |
+| `batch_id` | string | 批次 ID |
+| `requested_by` | string | 触发方组件 |
+| `work_items` | array | 每项至少含 `work_type`,`scope`,`idempotency_key`,`source_refs` |
+
+#### `SearchIndexJob`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `schema_version` | integer | 当前主版本 |
+| `event_id` | string | 幂等主键 |
+| `room_id` | string | 事件所在房间 |
+| `room_pos` | integer | committed order |
+| `visibility_watermark` | integer | 可见性相关水位 |
+| `redaction_watermark` | integer | redaction 相关水位 |
+| `enqueued_at` | string | RFC 3339 UTC |
+
+#### `ThumbnailJob`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `schema_version` | integer | 当前主版本 |
+| `mxc_uri` | string | 目标媒体 |
+| `source_kind` | string | `local` 或 `remote_cache` |
+| `r2_object_key` | string | 源对象键 |
+| `variants` | array | 每项至少含 `width`,`height`,`method` |
+| `content_type` | string | 原对象 MIME |
+| `enqueued_at` | string | RFC 3339 UTC |
+
+#### `AppserviceTxnJob`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `schema_version` | integer | 当前主版本 |
+| `appservice_id` | string | 目标 AS |
+| `txn_id` | integer | HS->AS 事务号 |
+| `payload_locator` | string | 事务 payload 定位符 |
+| `not_before` | string or null | 最早投递时间 |
+| `attempt` | integer | 当前尝试次数 |
+
+#### `RebuildShardJob`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `schema_version` | integer | 当前主版本 |
+| `job_id` | string | 控制面作业 ID |
+| `rebuild_target` | string | 与 `RebuildJobSpec` 对齐 |
+| `shard_type` | string | shard 类型 |
+| `shard_key` | string | shard key |
+| `attempt` | integer | 当前尝试次数 |
+
+#### `ExportShardJob`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `schema_version` | integer | 当前主版本 |
+| `job_id` | string | 控制面作业 ID |
+| `export_epoch` | string | full export 时必须非空 |
+| `shard_type` | string | shard 类型 |
+| `shard_key` | string | shard key |
+| `checkpoint_strategy` | string | `reuse_complete` 或 `force_fresh` |
+| `attempt` | integer | 当前尝试次数 |
+
+#### `RestoreShardJob`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `schema_version` | integer | 当前主版本 |
+| `job_id` | string | 控制面作业 ID |
+| `checkpoint_id` | string | 待恢复 checkpoint |
+| `shard_type` | string | shard 类型 |
+| `shard_key` | string | shard key |
+| `apply_phase` | string | `truth-core`,`truth-aux`,`ephemeral-current`,`dedupe-and-outbox`,`control-plane` |
+| `attempt` | integer | 当前尝试次数 |
+
+#### `RepairShardJob`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `schema_version` | integer | 当前主版本 |
+| `job_id` | string | 控制面作业 ID |
+| `repair_kind` | string | 与 `RepairJobSpec` 对齐 |
+| `scope_kind` | string | 与 `TargetScope.scope_kind` 对齐 |
+| `scope_id` | string or null | 与 `TargetScope.scope_id` 对齐 |
+| `attempt` | integer | 当前尝试次数 |
+
+## 7. 完成标准
+
+* `23-interface-contract-catalog.md` 中本地逻辑契约名不再只是“名字”；
+* 控制面 HTTP、内部 RPC、Queue payload 都有可编码的最小字段集；
+* fixed stub/error body 已有唯一 wire truth；
+* 开发团队可以据此生成 request validator、worker RPC DTO、queue consumer schema 与类型定义。

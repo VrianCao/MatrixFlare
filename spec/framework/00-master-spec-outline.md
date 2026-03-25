@@ -33,7 +33,7 @@
 
 ### 3. Platform and Data Foundations
 
-主责分册：`21-runtime-topology-and-platform-model.md` + `22-data-consistency-and-routing.md` + `23-interface-contract-catalog.md` + `24-data-contract-catalog.md` + `25-sequence-and-state-machine-catalog.md`
+主责分册：`21-runtime-topology-and-platform-model.md` + `22-data-consistency-and-routing.md` + `23-interface-contract-catalog.md` + `24-data-contract-catalog.md` + `25-sequence-and-state-machine-catalog.md` + `26-wire-schema-catalog.md`
 
 ### 4. Protocol Domain Specifications
 
@@ -71,6 +71,7 @@
 | 8-25 的接口横切层 | `23-interface-contract-catalog.md` | 所有 HTTP、RPC、Queue、Alarm 合同统一收口 |
 | 10-24 的数据横切层 | `24-data-contract-catalog.md` | 所有 schema、keyspace、token、cursor 统一收口 |
 | 13-24 的流程横切层 | `25-sequence-and-state-machine-catalog.md` | 所有关键时序图与状态机统一收口 |
+| 23-25 的本地线协议类型层 | `26-wire-schema-catalog.md` | 本地 `/_ops`、内部 RPC、Queue、固定 stub/error body 的 payload shape 统一收口 |
 | 13 + 9.1 + 9.3 + 9.4 | `30-client-identity-and-sync.md` | 身份、设备、E2EE 传输、同步统一成客户端责任域 |
 | 14 + 9.2 | `31-room-processing-and-room-versions.md` | 房间核心规则单独收口 |
 | 15 + 9.6 | `32-federation.md` | 联邦全部单独收口 |
@@ -89,7 +90,7 @@
 
 1. 主文档
 2. `10-15` 治理控制层
-3. `20-25` 架构与契约基础层
+3. `20-26` 架构与契约基础层
 4. `30` 协议域分册
 5. `40-44` 安全、运营、交付、验证分册
 6. `spec/open-questions/`、`spec/decisions/` 与附录
@@ -98,7 +99,7 @@
 
 1. 先填主文档的文档控制、范围、章节摘要、分册摘要。
 2. 再填 `10-15` 治理控制层。
-3. 再填 `20-25` 架构、数据、契约、流程基础层。
+3. 再填 `20-26` 架构、数据、契约、流程与 wire schema 基础层。
 4. 再按客户端、房间、联邦、媒体、派生能力的顺序填 `30` 系列。
 5. 最后填 `40-44`、`spec/open-questions/`、`spec/decisions/` 与附录。
 
@@ -111,6 +112,7 @@
 * 数据真相面与派生面摘要
 * 接口契约与数据契约摘要
 * 关键时序与状态机摘要
+* 本地 wire schema 与控制面 payload 摘要
 * 协议域分册索引摘要
 * 安全与交付索引摘要
 * 测试与验证索引摘要

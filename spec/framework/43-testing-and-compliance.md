@@ -32,21 +32,22 @@
 | TEST-ID | Test Scope | Environment | Gate Profiles | Notes |
 | --- | --- | --- | --- | --- |
 | `TEST-GOV-001` | source baseline, traceability, ID integrity lint | CI | `L1-L3` | 校验 `REQ/MX/CF/IF/DATA/FLOW/STATE/TEST/EVID/DEC/OQ` 链接完整性、生成并校验 machine-readable traceability matrix、`15-source-observation-register.md` 存在且日期/字段合法、无未登记引用、无 ID 区间/后缀缩写、无缺失 pinned source snapshot 的 `CF-ID` 被当作 `Draft-Normative`、无 compatibility page 误用为权威正文、无把仅靠 `Deferred` 降级而未经 `DEC` 或 contracts 收敛的 `OQ` 误标为 `closed`。 |
-| `TEST-CS-001` | discovery, capabilities, registration, login discovery/exchange, refresh, logout, profile surfaces and profile propagation basics | CI + staging | `L1-L3` | 必须覆盖 `GET /login` flow advertisement、`/capabilities` 中 `m.3pid_changes` / `m.get_login_token` disabled truth、profile `keyName` 语义与 profile change propagation 基线。 |
+| `TEST-CS-001` | discovery, capabilities, registration availability, registration, login discovery/exchange, password change, account deactivation, refresh, logout, profile surfaces and profile propagation basics | CI + staging | `L1-L3` | 必须覆盖 `GET /login` flow advertisement、`GET /register/available` truth、`/capabilities` 中 `m.change_password` / `m.3pid_changes` / `m.get_login_token` truth、password change / deactivate 的 UIA 基线，并显式覆盖带 access token 与不带 access token 的 password-UIA 分支，以及 profile `keyName` 语义与 profile change propagation。 |
 | `TEST-CS-002` | filter lifecycle, `/sync` initial/incremental/limited/`full_state`/`use_state_after`, `include_leave`, lazy-load members, account data, push rules, and notification counts | CI + staging | `L1-L3` | 重点验证 token 单调性、filter determinism、leave-room visibility、member lazy-load 以及通知计数语义。 |
 | `TEST-CS-003` | devices, to-device, key upload/query/claim, backup metadata | CI + staging | `L1-L3` | 必须验证 one-time key at-most-once。 |
-| `TEST-CS-004` | explicit deferred/conditional/unsupported route guard behavior | CI + staging | `L1-L3` | 必须验证 `IF-CS-053` 到 `IF-CS-061` 在当前 profile 下返回固定 unsupported response、无副作用、无下游 truth write；并验证 `GET /login` / `GET /capabilities` 不会把已 stub 的 SSO、login-token、3PID surfaces 误宣称为可用。 |
+| `TEST-CS-004` | explicit deferred/conditional/unsupported route guard behavior | CI + staging | `L1-L3` | 必须验证 `IF-CS-007`,`IF-CS-053`,`IF-CS-054`,`IF-CS-055`,`IF-CS-056`,`IF-CS-057`,`IF-CS-058`,`IF-CS-059`,`IF-CS-060`,`IF-CS-061`,`IF-CS-062`,`IF-CS-063`,`IF-CS-064`,`IF-CS-065` 在当前 profile 下返回固定 unsupported response、无副作用、无下游 truth write，且 stub 短路优先于 access token / UIA / provider callout；并验证 `GET /login` / `GET /capabilities` 不会把已 stub 的 SSO、login-token、3PID surfaces 误宣称为可用。 |
 | `TEST-ROOM-001` | room creation, membership, event send, redaction, receipts, typing | CI + staging | `L1-L3` | 房间核心行为。 |
 | `TEST-ROOM-002` | enabled room version strategy compatibility | CI + staging | `L1-L3` | `L1` 至少覆盖 room version `12`；`L2-L3` 必须覆盖 `11` / `12` 差异，包括 redaction 与 state resolution。 |
-| `TEST-FED-001` | federation discovery, key retrieval, request authentication, and query-surface auth/routing | staging | `L2-L3` | 必须覆盖 `/.well-known` / SRV / direct host paths，以及 `IF-FED-006`。 |
-| `TEST-FED-002` | inbound/outbound txn idempotency and join/leave/knock flows | staging | `L2-L3` | 验证 per-server ordering。 |
+| `TEST-FED-001` | federation discovery, key retrieval, request authentication, and query-surface auth/routing | staging | `L2-L3` | 必须覆盖 `/.well-known` / SRV / direct host paths，以及 `IF-FED-006` 的 `publicRooms` / hierarchy / directory / profile / generic query dispatch。 |
+| `TEST-FED-002` | inbound/outbound txn idempotency, federation user-device/key exchange, and join/leave/knock flows | staging | `L2-L3` | 必须验证 per-server ordering、`/user/devices` / `/user/keys/query` 正确性，以及 `/user/keys/claim` 的 one-time key at-most-once。 |
 | `TEST-FED-003` | missing event recovery, backfill, gap repair chaos | pre-release | `L2-L3` | 必须覆盖缺 `prev_events` / `auth_events`。 |
+| `TEST-FED-004` | explicit unsupported federation route guard behavior | CI + staging | `L2-L3` | 必须验证 `IF-FED-009`,`IF-FED-010` 返回固定 wire behavior、无副作用、无 identity/token/membership truth write，且不会因为 auth 差异产生 401/403/404/200 漂移。 |
 | `TEST-MEDIA-001` | local upload/download/thumbnail/quota | CI + staging | `L1-L3` | 必须验证 streaming 与 body limit handling。 |
 | `TEST-MEDIA-002` | remote media cache, timeout, retry, cache eviction | staging | `L2-L3` | 受连接上限约束。 |
 | `TEST-DER-001` | search, user directory, public rooms derived consistency | CI + staging | `L1-L3` | 验证派生索引正确性与 rebuild 后一致性。 |
 | `TEST-AS-001` | appservice namespace, query, transaction delivery and retry | staging | `L3 when enabled` | appservice 开启时才进入门禁。 |
-| `TEST-SEC-001` | token revocation, secret handling, federation auth failures | CI + staging | `L1-L3` | 重点验证 auth invalidation 与 secret boundaries。 |
-| `TEST-SEC-002` | abuse resistance, rate limits, SSRF and quota guards | staging + pre-release | `L3` | URL preview 启用时必须额外覆盖；若启用 pushers / external push gateway，也必须把对应配置、鉴权与回调边界纳入同一门禁。 |
+| `TEST-SEC-001` | token revocation, UIA challenge binding, secret handling, baseline abuse guards, federation auth failures | CI + staging | `L1-L3` | 重点验证 auth invalidation、`auth_version` 推进、route-bound UIA challenge 不可跨路由重放、secret boundaries，以及对始终开启的注册、登录、媒体、房间发送、搜索和本地公开入口的 baseline rate-limit / quota guard。 |
+| `TEST-SEC-002` | advanced abuse resistance, SSRF, provider trust, and conditional external integrations | staging + pre-release | `L3` | 在 `TEST-SEC-001` baseline 之上，覆盖 URL preview 的 SSRF / fetch guard；若启用 pushers / external push gateway、email/SMS `requestToken` bootstrap 或 TURN credential issuance，也必须把对应 provider trust、鉴权、回调/credential 边界纳入同一门禁。 |
 | `TEST-OPS-001` | new Worker -> old DO and old Worker -> new DO compatibility | staging + pre-release | `L1-L3` | 版本偏斜门禁。 |
 | `TEST-OPS-002` | replay, rebuild, export, restore, scoped repair | pre-release + periodic drill | `L3` | 恢复门禁。 |
 | `TEST-PERF-001` | `/sync` concurrency and online device scaling | pre-release | `L3` | 重点看 Worker wall time、wake latency。 |
@@ -118,7 +119,7 @@
 | Profile ID | Canonical Name | Mandatory TEST IDs |
 | --- | --- | --- |
 | `L1` | `Local-Core` | `TEST-GOV-001`,`TEST-CS-001`,`TEST-CS-002`,`TEST-CS-003`,`TEST-CS-004`,`TEST-ROOM-001`,`TEST-ROOM-002`,`TEST-MEDIA-001`,`TEST-DER-001`,`TEST-SEC-001`,`TEST-OPS-001`,`TEST-COST-001` |
-| `L2` | `Federation-Core` | `L1` + `TEST-FED-001`,`TEST-FED-002`,`TEST-FED-003`,`TEST-MEDIA-002` |
+| `L2` | `Federation-Core` | `L1` + `TEST-FED-001`,`TEST-FED-002`,`TEST-FED-003`,`TEST-FED-004`,`TEST-MEDIA-002` |
 | `L3` | `Enterprise-Hardening` | `L2` + `TEST-AS-001` when enabled, `TEST-SEC-002`,`TEST-OPS-002`,`TEST-PERF-001`,`TEST-PERF-002` |
 
 ## 10. Coverage and Traceability Matrix Rules

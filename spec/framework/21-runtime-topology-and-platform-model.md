@@ -60,13 +60,14 @@
 
 | DO Class | Identity Key | Authority Domain | Primary Responsibilities | Forbidden Responsibilities |
 | --- | --- | --- | --- | --- |
-| `UserDO` | `user_id` | 用户 | session、refresh token、device、account data、to-device、one-time/fallback keys、presence、用户增量流 | 不裁决房间状态；不直接做联邦重试排序 |
+| `UserDO` | `user_id` | 用户 | user principal / password credential、session、refresh token、device、account data、to-device、one-time/fallback keys、presence、用户增量流 | 不裁决房间状态；不直接做联邦重试排序 |
 | `RoomDO` | `room_id` | 房间 | 事件准入、DAG、state、auth、membership、timeline、receipt/typing 当前视图、房间投影 | 不持有客户端长轮询；不做跨房间全局搜索 |
 | `RemoteServerDO` | `server_name` | 远端服务器 | 出站事务队列、退避重试、联邦去重、缺事件恢复调度、远端发现缓存 | 不裁决房间 auth/state；不拥有本地用户设备真相 |
 
 ### 4.1 `UserDO` 设计规则
 
 * 所有 access token 和 refresh token 的有效性判断必须经过 `UserDO`。
+* 本地 password credential、deactivated 状态与 `auth_version` 必须只存在于 `UserDO` 主记录，不得复制到 Worker 内存或 D1 作为认证真相。
 * `/keys/claim` 语义必须由 `UserDO` 线性化，以保证 one-time key 至多返回一次。
 * `UserDO` 产生的 `user_stream_pos` 是 `/sync` 的唯一权威用户流基准。
 
@@ -114,9 +115,9 @@
 
 * `gateway-worker` 默认 CPU 限额按热路径设计在 `30s` 默认值之内；只有特殊导出或诊断入口才允许更高上限。引用：`CF-WKR-003`。
 * 所有大对象读取与转发必须使用 stream，不得完整读入内存。引用：`CF-WKR-004`。
-* 若通过 `fetch`、R2、KV、Queues 或 D1 打开连接后不再需要响应体，必须显式取消或尽快读尽，以释放 `6` 个 simultaneous open connections 预算。引用：`CF-WKR-006`。
+* 若通过 `fetch`、R2、KV、Queues 或 D1 打开连接后不再需要响应体，必须显式取消或尽快读尽；网络 I/O 受 `CF-WKR-006` 约束，D1 并发连接另受 `CF-D1-009` 约束。
 * 内部 RPC 链必须限制为浅层拓扑：`gateway -> DO` 或 `gateway -> jobs -> DO`，禁止多跳扇出图。引用：`CF-WKR-009`。
-* Service Binding 调用计入 subrequest 与 `32` 次 Worker invocation 上限，但不计入 simultaneous open connections；不得再把内部 Worker 调用误算进 `6` 个连接预算。引用：`CF-WKR-009`,`CF-WKR-010`。
+* Service Binding 调用计入 subrequest 与 `32` 次 Worker invocation 上限，调用本身不单独占用 open-connection slot；但由同一 top-level request 触发的全部 Worker 仍共享同一组 `6` 个 simultaneous open connections 预算。不得把拆分 Worker 当作扩大连接并发的手段。引用：`CF-WKR-009`,`CF-WKR-010`。
 * Service Binding RPC 只适用于明确需要结果的同步内部调用；任何未 `await` 的绑定调用都视为错误实现。引用：`CF-WKR-009`,`CF-WKR-010`。
 
 ### 7.2 DO 使用规则
@@ -129,6 +130,7 @@
 ### 7.3 D1 / KV / R2 使用规则
 
 * 任何要求 read-after-write 的路径不得依赖 D1 普通查询。引用：`CF-D1-003`,`CF-D1-004`。
+* 单次 invocation 使用 D1 时，必须同时满足“最多 `1,000` 条 queries”“单 SQL 最长 `30s`”“最多 `6` 个 D1 connections”三条边界。引用：`CF-D1-007`,`CF-D1-008`,`CF-D1-009`。
 * KV key 只允许保存“陈旧可接受”的缓存。引用：`CF-KV-001`,`CF-KV-002`。
 * R2 下载路径必须优先使用 Worker binding，不得把缓存域名的一致性当成真相。引用：`CF-R2-001`,`CF-R2-004`。
 

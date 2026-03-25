@@ -18,12 +18,16 @@
 | FLOW-ID | Name | Owning Spec | Participants | Trigger | Success Path | Failure / Retry Path |
 | --- | --- | --- | --- | --- | --- | --- |
 | `FLOW-CS-DISCOVERY` | client discovery | `30` | client, `gateway-worker` | `/.well-known` or `/versions` or `/capabilities` | 返回能力与 homeserver 元数据 | 静态错误或缓存回退 |
+| `FLOW-CS-UIA` | shared UIA challenge orchestration | `30`,`40` | client, `gateway-worker`, optional `UserDO` | `register`, `account/password`, `account/deactivate`, or other enabled UIA endpoint | 发行 route-bound challenge token、校验 stage、在最终提交前把 challenge 绑定到同一路由与同一主体 | challenge 过期、路由绑定不匹配、主体漂移或 completed stage 重放必须 fail-closed，不得落盘部分业务结果 |
 | `FLOW-CS-REGISTER` | registration | `30` | client, `gateway-worker`, `UserDO` | `POST /register` | 创建用户、初始设备、初始 session | 保持幂等错误响应，不做半创建 |
 | `FLOW-CS-LOGIN` | login | `30` | client, `gateway-worker`, `UserDO` | `POST /login` | 认证、创建设备 session、返回 token | 失败不创建任何 session |
+| `FLOW-CS-PASSWORD-CHANGE` | password change | `30`,`40` | client, `gateway-worker`, `UserDO` | `POST /account/password` | 先完成 UIA，再原子更新 password credential / `auth_version`，并按 `logout_devices` 裁决其他 session 与 device | 任一 UIA、credential 校验或 session/device 后处理失败都不得留下半更新密码状态 |
+| `FLOW-CS-ACCOUNT-DEACTIVATE` | account deactivation | `30`,`40` | client, `gateway-worker`, `UserDO`, optional `jobs-worker` | `POST /account/deactivate` | 先完成 UIA，再原子标记 deactivated、撤销登录能力、清理本地非事件数据，并返回稳定 `id_server_unbind_result` | 任一失败都不得出现“密码已失效但账户未停用”或“停用已提交但仍可登录”的裂脑状态 |
 | `FLOW-CS-REFRESH` | refresh token | `30` | client, `gateway-worker`, `UserDO` | `POST /refresh` | 校验 refresh token、轮换 session | refresh 重放必须失败或返回已轮换结果 |
 | `FLOW-CS-PROFILE-PROPAGATION` | profile update propagation | `30`,`31` | client, `gateway-worker`, `UserDO`, `RoomDO`, optional `jobs-worker` | `PUT` or `DELETE /_matrix/client/*/profile/{userId}/{keyName}` | 更新 profile 真相、发出 presence 增量、对已加入房间传播 membership refresh | 不得产生半更新；传播重试必须按 profile version 幂等 |
 | `FLOW-CS-SYNC-LONGPOLL` | sync long poll | `30` | client, `gateway-worker`, `UserDO`, `RoomDO` | `GET /sync` | Worker 持有请求，收到唤醒后组装响应 | 通道断开早返回；不得推进 token |
 | `FLOW-CS-SEND-TO-DEVICE` | send to-device | `30` | client, `gateway-worker`, `UserDO`, optional `RemoteServerDO` | `PUT /sendToDevice` | 写本地队列并派发远端 EDU | 远端失败不影响本地提交 |
+| `FLOW-CS-SEARCH-QUERY` | search and derived read query | `34` | client, `gateway-worker`, D1, optional `RoomDO`, optional `UserDO` | `/search`, `/user_directory/search`, `publicRooms`, or client hierarchy request | 读取 D1 derived plane 并在可见性不确定时回退 truth 或 fail-closed | derived 滞后、目录 watermark 落后或可见性不确定时不得猜测公开结果 |
 | `FLOW-CS-DISABLED-ROUTE` | explicit disabled/deferred client route | `12`,`23` | client, `gateway-worker` | deferred, disabled, or explicitly unsupported public client route | 返回固定 unsupported response，且不得产生任何 authority or side-effect write；若该能力在 `GET /login` 或 `GET /capabilities` 有 discoverability 面，则 discoverability 也必须同步维持 disabled truth | 实现漂移、误接通下游 handler、discoverability 与 route truth 不一致、或出现副作用都必须视为失败 |
 
 ### 2.2 房间域
@@ -42,11 +46,16 @@
 | FLOW-ID | Name | Owning Spec | Participants | Trigger | Success Path | Failure / Retry Path |
 | --- | --- | --- | --- | --- | --- | --- |
 | `FLOW-FED-DISCOVERY` | remote server discovery | `32` | `gateway-worker`, DNS, remote server | outbound federation call | 依 Matrix 发现流程得到目标地址 | 失败缓存按 TTL 失效并重试 |
-| `FLOW-FED-QUERY` | federation query surfaces | `32`,`34` | remote server, `gateway-worker`, `UserDO`, `RoomDO`, `jobs-worker`, D1 | hierarchy / directory / profile / generic query request | 验签后走只读查询分发，返回 truth 或 derived 结果 | 未知 query type 显式报错；derived 滞后只能 fail-closed |
+| `FLOW-FED-METADATA-SERVE` | federation metadata serve | `32` | remote server, `gateway-worker`, optional `RemoteServerDO` | remote request for `/.well-known/matrix/server`, `/_matrix/federation/*/version`, or server key material | 返回本地 discovery / version / signing-key metadata，并保持与当前发布 keyset 一致 | keyset 轮换窗口、缓存副本漂移或签名材料不可用时必须 fail-closed |
+| `FLOW-FED-QUERY` | federation query surfaces | `32`,`34` | remote server, `gateway-worker`, `UserDO`, `RoomDO`, `jobs-worker`, D1 | `publicRooms`, hierarchy, directory, profile, or generic federation query request | 验签后走只读查询分发，返回 truth 或 derived 结果 | 未知 query type 显式报错；derived 滞后只能 fail-closed |
 | `FLOW-FED-INBOUND-TXN` | inbound transaction | `32` | remote server, `gateway-worker`, `RoomDO`, `UserDO` | `PUT /send/{txnId}` | 验签、去重、分发并返回结果 | 重复事务幂等；部分 PDU 错误单独记录 |
 | `FLOW-FED-OUTBOUND-TXN` | outbound transaction | `32` | `RemoteServerDO`, remote server | local event or EDU egress | 排序、打包、发送、确认 | 失败保持同一 `txn_id` 重试 |
+| `FLOW-FED-STATE-RETRIEVAL-SERVE` | federation state and event retrieval serve | `32`,`31` | remote server, `gateway-worker`, `RoomDO`, optional R2 | inbound `event`, `event_auth`, `state`, `state_ids`, `backfill`, `get_missing_events`, or `timestamp_to_event` request | 读取房间 truth / archive 指针并返回协议允许结果 | 可见性不满足、归档缺段或事件不存在时 fail-closed，不得虚构 repair backlog 结果 |
 | `FLOW-FED-MISSING-EVENT-RECOVERY` | gap repair | `32` | `RemoteServerDO`, `RoomDO`, remote server | 缺 `prev_events` / state gap | 拉取缺失事件并重新准入 | 达到上限进入 dead-letter / repair queue |
 | `FLOW-FED-JOIN-LEAVE` | make/send join or leave | `32` | `gateway-worker`, `RoomDO`, `RemoteServerDO`, remote server | federation membership | 模板、签名、提交、状态同步 | 任一步失败都不得污染本地房间真相 |
+| `FLOW-FED-USER-KEYS` | federation user devices and key exchange | `32`,`30` | remote server, `gateway-worker`, `UserDO`, optional `RemoteServerDO` | `/user/devices`, `/user/keys/query`, `/user/keys/claim`, or outbound `m.device_list_update` continuity | 验签后按本地用户真相返回 device snapshot / identity keys，或原子 claim one-time keys；设备列表变化继续通过联邦 EDU 增量传播 | 非本地域用户、验签失败或 claim 冲突必须 fail-closed；重复 claim 不得双花 one-time keys |
+| `FLOW-FED-MEDIA-SERVE` | federation media serve | `32`,`33` | remote server, `gateway-worker`, R2 | remote server requests media download or thumbnail | 返回本地或已缓存媒体对象，不得依赖外部抓取完成当前请求 | 对象缺失、鉴权不满足或缩略图不可用时返回协议允许错误，不得伪造本地存在性 |
+| `FLOW-FED-DISABLED-ROUTE` | explicit disabled/unsupported federation route | `12`,`23`,`32` | remote caller, `gateway-worker` | unsupported federation public route | 返回固定 unsupported response，且不得产生任何 authority or side-effect write | 认证漂移、局部调用下游 handler 或出现副作用都必须视为失败 |
 
 ### 2.4 媒体与派生域
 
@@ -55,9 +64,9 @@
 | `FLOW-CS-MEDIA-UPLOAD` | media upload | `33` | client, `gateway-worker`, `UserDO`, R2, D1 | upload request | 鉴权、配额、流式写 R2、写目录投影 | 失败回滚 pending upload binding |
 | `FLOW-CS-MEDIA-DOWNLOAD` | local media download | `33` | client, `gateway-worker`, R2 | media GET | 鉴权、查最小元数据、流式返回 | 对象缺失返回协议错误并记审计 |
 | `FLOW-CS-REMOTE-MEDIA-FETCH` | remote media cache | `33` | client, `gateway-worker`, remote server, R2 | cache miss | 拉取远端、写 R2、返回客户端 | 受并发上限和尺寸限制保护 |
-| `FLOW-SEARCH-INDEX` | search/index update | `34` | `RoomDO`, `UserDO`, `jobs-worker`, D1 | truth commit success | 按幂等键更新 D1 | 失败进入重建队列 |
+| `FLOW-SEARCH-INDEX` | search/index update | `34` | `gateway-worker`, `RoomDO`, `UserDO`, `jobs-worker`, D1 | truth commit success or explicit derived-work enqueue | 按幂等键更新 D1 | 失败进入重建队列 |
 | `FLOW-AS-TXN-DELIVERY` | appservice delivery | `34` | `jobs-worker`, appservice, D1 control plane | truth commit success | 顺序投递 AS transaction | 失败重试且不影响主业务提交 |
-| `FLOW-OPS-JOB-CONTROL` | control-plane job control | `42`,`40` | operator, Cloudflare Access, `ops-worker`, `jobs-worker`, D1, R2, optional DOs | Access-protected `/_ops` request | 认证、scope 裁决、审计先落盘，再创建/查询/取消作业 | duplicate idempotency key 折叠或冲突拒绝；manifest/hash/authz 失败必须 fail-closed |
+| `FLOW-OPS-JOB-CONTROL` | control-plane job control | `42`,`40` | operator, Cloudflare Access, `ops-worker`, `jobs-worker`, D1, R2, optional DOs | Access-protected `/_ops` request | 认证、scope 裁决、审计先落盘；若为 full export，必须先冻结 `DATA-OPS-010` 为 `DATA-OPS-011` 再 fanout shard 作业；随后创建/查询/取消作业 | duplicate idempotency key 折叠或冲突拒绝；manifest/hash/authz 失败必须 fail-closed |
 | `FLOW-REPLAY-REBUILD` | replay/reindex | `42`,`34` | `ops-worker`, `jobs-worker`, DOs, D1, R2 | operator action | 从真相与归档重放衍生面 | 断点续跑并保留 manifest |
 
 ## 3. 状态机目录
@@ -65,6 +74,7 @@
 | STATE-ID | Name | Owning Spec | Entity | Core States | Recovery Focus |
 | --- | --- | --- | --- | --- | --- |
 | `STATE-USER-SESSION` | session lifecycle | `30` | access/refresh session | created, active, rotated, revoked, expired | token rotation and logout consistency |
+| `STATE-UIA-SESSION` | UIA challenge lifecycle | `30`,`40` | route-bound challenge token | issued, challenged, partially-completed, satisfied, expired, rejected | challenge replay, route binding, and stage completion safety |
 | `STATE-DEVICE-LIFECYCLE` | device lifecycle | `30` | device | provisioned, active, soft-deleted, hard-deleted | device key invalidation |
 | `STATE-SYNC-WAITER` | sync waiter | `30` | worker-held long poll | opened, waiting, woken, assembling, returned, aborted | wake channel loss and deploy interruption |
 | `STATE-ROOM-EVENT-ADMISSION` | room event admission | `31` | event | received, validated, waiting-missing, auth-checked, committed, rejected, soft-failed | missing event repair and deterministic rejection |

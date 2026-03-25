@@ -34,7 +34,7 @@
 3. 生成本地 `mxc://server/media_id`。
 4. 将请求体流式写入 `DATA-R2-001`。
 5. 写入成功后调用 `IF-INT-MEDIA-002 finalizeMediaUpload(result)`。
-6. 投递 `IF-QUE-002` 缩略图和媒体目录更新任务。
+6. 投递 `IF-QUE-002`，异步执行缩略图生成与媒体目录 upsert。
 
 ### 3.2 尺寸限制
 
@@ -73,7 +73,7 @@
 2. 执行远端发现与连接。
 3. 流式抓取远端媒体。
 4. 同步写入 `DATA-R2-002`。
-5. 写入媒体目录投影。
+5. 投递 `IF-QUE-002`，异步写入媒体目录与需要的缩略图任务。
 6. 向客户端返回本次流。
 
 ### 5.2 远端抓取护栏
@@ -146,10 +146,10 @@
 
 | Capability | Public IF | Internal IF | Primary Data |
 | --- | --- | --- | --- |
-| media config / create / upload | `IF-CS-050` | `IF-INT-MEDIA-001`,`IF-INT-MEDIA-002` | `DATA-R2-001`,`DATA-D1-004` |
-| local download | `IF-CS-051` | none | `DATA-R2-001` |
-| remote media cache | federation/media route family | none | `DATA-R2-002`,`DATA-D1-004` |
-| thumbnails | `IF-CS-051` | `IF-QUE-002` | `DATA-R2-003` |
+| media config / create / upload | `IF-CS-050` | `IF-INT-MEDIA-001`,`IF-INT-MEDIA-002`,`IF-QUE-002` | `DATA-USER-015`,`DATA-R2-001` |
+| local media serve | `IF-CS-051`,`IF-FED-005` | none | `DATA-R2-001`,`DATA-R2-003` |
+| remote media cache | `IF-CS-051` | `IF-QUE-002` | `DATA-R2-002`,`DATA-D1-004` |
+| thumbnails and media catalog derivation | none | `IF-QUE-002` | `DATA-R2-003`,`DATA-D1-004` |
 
 ## 12. 完成标准
 

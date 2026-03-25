@@ -45,6 +45,7 @@
 * [23-interface-contract-catalog.md](./23-interface-contract-catalog.md)：外部 HTTP、内部 RPC、队列、告警等接口契约总目录。
 * [24-data-contract-catalog.md](./24-data-contract-catalog.md)：DO、D1、R2、KV、令牌、游标等数据契约总目录。
 * [25-sequence-and-state-machine-catalog.md](./25-sequence-and-state-machine-catalog.md)：关键时序图与状态机目录。
+* [26-wire-schema-catalog.md](./26-wire-schema-catalog.md)：本地 `/_ops`、内部 RPC、Queues、固定错误体等 wire schema 总目录。
 * [30-client-identity-and-sync.md](./30-client-identity-and-sync.md)：身份、设备、会话、E2EE 传输、`/sync`。
 * [31-room-processing-and-room-versions.md](./31-room-processing-and-room-versions.md)：房间处理、状态解析、房间版本策略。
 * [32-federation.md](./32-federation.md)：联邦发现、签名、交易、恢复、重试。
@@ -65,7 +66,7 @@
 
 1. 先填 [00-master-spec-outline.md](./00-master-spec-outline.md) 的主文档总览与章节摘要。
 2. 再填 `10-15` 治理控制层，先把范围、权威模型、协议覆盖、平台约束、追溯规则与来源观察寄存器钉死。
-3. 再填 `20-25` 架构基础层，先把平台、数据、契约、流程骨架钉死。
+3. 再填 `20-26` 架构基础层，先把平台、数据、契约、流程与 wire schema 骨架钉死。
 4. 之后按协议责任域回填 `30` 系列分册。
 5. 再填 `40-44` 安全、运营、交付、验证分册。
 6. 最后持续维护 `spec/open-questions/`、`spec/decisions/` 与附录。
@@ -88,6 +89,7 @@
 * 每个外部或内部接口都已经在 [23-interface-contract-catalog.md](./23-interface-contract-catalog.md) 定义契约。
 * 每个持久化或令牌型数据都已经在 [24-data-contract-catalog.md](./24-data-contract-catalog.md) 定义契约。
 * 每条关键流程都已经在 [25-sequence-and-state-machine-catalog.md](./25-sequence-and-state-machine-catalog.md) 建立时序图或状态机。
+* 每个本地 `/_ops`、内部 RPC、Queue、Alarm 与固定错误体 payload 都已经在 [26-wire-schema-catalog.md](./26-wire-schema-catalog.md) 定义 wire schema。
 * 每个 requirement、constraint、contract 都能在 [14-traceability-and-change-control.md](./14-traceability-and-change-control.md) 规则下追到测试和证据。
 * 每个发布门禁都能在 [43-testing-and-compliance.md](./43-testing-and-compliance.md) 与 [44-verification-and-evidence-register.md](./44-verification-and-evidence-register.md) 找到验证闭环。
 

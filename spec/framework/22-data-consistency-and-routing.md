@@ -40,6 +40,7 @@
 | Entity | Authority | Primary Store | Secondary Store | Notes |
 | --- | --- | --- | --- | --- |
 | User | `UserDO` | DO SQLite | D1 user directory projection | 单一 `user_id` 主权。 |
+| User principal / auth profile | `UserDO` | DO SQLite | none | 用户主记录、password credential、停用与 erase 标志都只能由 `UserDO` 裁决。 |
 | Device | `UserDO` | DO SQLite | D1 device lookup projection | 设备删除与 key 变更都在 `UserDO`。 |
 | Session / Refresh | `UserDO` | DO SQLite | none | 不允许缓存为权威。 |
 | User stream | `UserDO` | DO SQLite | none | `/sync` token 基准。 |
