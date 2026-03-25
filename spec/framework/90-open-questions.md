@@ -1,43 +1,30 @@
 # Open Questions Register
 
-状态：Outline  
-角色：未决问题寄存器  
+状态：Deprecated
+角色：未决问题兼容索引
 负责主文档章节：8  
 继承的单体章节：26
 
 ## 1. 文档职责
 
-* 记录尚未定案、但会影响架构、实现、成本或交付的问题。
-* 为每个问题绑定责任分册、影响面、决策截止点与退出条件。
+* 为历史引用提供向后兼容入口。
+* 指向当前唯一权威的 `spec/open-questions/` 目录。
 
-## 2. 记录结构
+本页不再承载任何 `OQ-*` 正文，不得被引用为现行真相。
 
-### 2.1 Question ID
+## 2. 当前权威入口
 
-### 2.2 Question Statement
+* 权威目录：`spec/open-questions/`
+* 入口文档：`spec/open-questions/README.md`
+* 逐条问题文件：`spec/open-questions/<OQ-ID>.md`
 
-### 2.3 Owning Spec
+## 3. 历史兼容规则
 
-### 2.4 Impact Area
-
-### 2.5 Impacted REQ / MX / CF / IF / DATA IDs
-
-### 2.6 Required Research or Spike
-
-### 2.7 Decision Deadline
-
-### 2.8 Closure Criteria
-
-## 3. 必备附件
-
-* 未决问题清单表
-* 风险等级字段
-* 责任人与截止点字段
-* 受影响规范工件字段
+* 旧引用若指向本页，必须在同一变更包中改为指向 `spec/open-questions/README.md` 或具体 `OQ-ID` 文档。
+* 新增 `OQ-*` 一律不得写入本页。
 
 ## 4. 完成标准
 
-* 所有阻塞性问题均有唯一归属；
-* 每个问题都能追到某一分册；
-* 每个问题都能追到受影响的规范工件；
-* 问题关闭条件明确。
+* 不再被当作 `OQ` 权威正文引用；
+* 所有活跃问题均迁移到 `spec/open-questions/`；
+* 本页只保留目录跳转价值。

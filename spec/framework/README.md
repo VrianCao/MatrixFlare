@@ -55,8 +55,10 @@
 * [42-deployment-migration-and-recovery.md](./42-deployment-migration-and-recovery.md)：部署、版本、迁移、回放、恢复。
 * [43-testing-and-compliance.md](./43-testing-and-compliance.md)：测试、合规、验证门禁。
 * [44-verification-and-evidence-register.md](./44-verification-and-evidence-register.md)：测试证据、发布门禁、需求到证据闭环。
-* [90-open-questions.md](./90-open-questions.md)：未决问题寄存器。
-* [91-decision-log.md](./91-decision-log.md)：架构与实现决策日志。
+* [`../open-questions/README.md`](../open-questions/README.md)：未决问题权威入口。
+* [`../decisions/README.md`](../decisions/README.md)：架构与实现决策权威入口。
+* [90-open-questions.md](./90-open-questions.md)：兼容索引页，指向权威未决问题目录。
+* [91-decision-log.md](./91-decision-log.md)：兼容索引页，指向权威决策目录。
 * [92-appendices.md](./92-appendices.md)：术语、附录、补充材料入口。
 
 ## 4. 回填顺序
@@ -66,7 +68,7 @@
 3. 再填 `20-25` 架构基础层，先把平台、数据、契约、流程骨架钉死。
 4. 之后按协议责任域回填 `30` 系列分册。
 5. 再填 `40-44` 安全、运营、交付、验证分册。
-6. 最后持续维护 `90` 系列寄存器。
+6. 最后持续维护 `spec/open-questions/`、`spec/decisions/` 与附录。
 
 ## 5. 后续回填输入
 

@@ -23,9 +23,9 @@
 
 规范性运行时拓扑固定如下：
 
-* 公网只暴露 `gateway-worker`。
+* Matrix 协议公网面只暴露 `gateway-worker`。
 * 异步处理与重建由 `jobs-worker` 执行。
-* 内部控制面由 `ops-worker` 执行。
+* Access 保护的管理面由 `ops-worker` 执行。
 * 所有权威业务状态由 DO 类承载。
 * 所有 Worker-to-Worker 通信必须使用 Service Bindings。
 * 所有 Worker-to-DO 通信默认使用 DO RPC；只有 upgrade 或协议透传场景才允许 HTTP `fetch()`。
@@ -36,7 +36,7 @@
 | --- | --- | --- | --- | --- |
 | `gateway-worker` | public | 路由、基础鉴权、联邦签名校验、`/.well-known`、`/sync` 长轮询、媒体流式转发、聚合响应 | 不得成为房间/用户真相拥有者；不得在热路径内执行长 CPU 作业 | `CF-WKR-001`,`CF-WKR-006`,`CF-WKR-007` |
 | `jobs-worker` | internal | Queue consumer、缩略图、索引、导出、重建、补偿 | 不得独立创造权威业务事实；不得绕过 DO 改写真相 | `CF-WKR-003`,`CF-QUE-002` |
-| `ops-worker` | internal | 健康检查、迁移编排、修复、回放、审计导出、运维接口 | 不得替代公网 API；不得通过临时脚本直接修改 DO 真相表 | `CF-WKR-012`,`CF-DO-006` |
+| `ops-worker` | access-protected admin | 健康检查、迁移编排、修复、回放、审计导出、运维接口 | 不得替代 Matrix 公网 API；不得通过临时脚本直接修改 DO 真相表 | `CF-WKR-012`,`CF-DO-006`,`CF-NET-003` |
 
 ### 3.1 `gateway-worker` 公开路由面
 
@@ -154,7 +154,8 @@
 ## 10. 控制面放置
 
 * 运维入口默认通过 `ops-worker` 暴露。
-* `ops-worker` 只能通过专用管理域访问；人类入口必须经 Cloudflare Access，自动化入口必须经 Access service token 或等价受限凭据。
+* `ops-worker` 只能通过专用管理域访问；该域在网络层可达，但必须被视为 Access 保护的管理面，而不是内部私网入口。
+* 人类入口必须经 Cloudflare Access；自动化入口必须经 Access service token 或等价受限凭据。
 * 所有修复、回放、重建动作都必须通过显式作业对象和审计日志执行，不允许临时脚本直写 DO 存储。
 
 ## 11. 完成标准

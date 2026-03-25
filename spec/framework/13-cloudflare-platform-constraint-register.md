@@ -51,7 +51,7 @@
 | `CF-WKR-012` | Worker deployments | deployment | workers-versions-deployments | Paid | Worker 版本与部署是分离概念；新版本可先上传后再部署。 | 生产发布必须使用 versions/deployments，而不是隐式“每改即发”。 | `21`,`42` |
 | `CF-WKR-013` | Workers Secrets | security | workers-secrets | Paid | Secrets 是加密绑定，Cloudflare 明确要求不要用 `vars` 存放敏感信息。 | 所有密钥、token、凭据都必须放入 secrets/Secrets Store。 | `40`,`42` |
 | `CF-WKR-014` | Workers Secrets | deployment | workers-secrets | Paid | `wrangler secret put/delete` 会创建新 Worker version 并立即部署；渐进发布应改用 `wrangler versions secret put/delete`。 | secret rotation 必须纳入版本化部署流程。 | `40`,`42` |
-| `CF-WKR-015` | Workers Logs | billing/retention | workers-pricing, workers-logs | Paid | Workers Logs 含 `20M` log events/月，保留 `7` 天。 | 生产必须设计日志采样与保留策略。 | `41` |
+| `CF-WKR-015` | Workers Logs | billing/retention | workers-pricing, workers-logs | Paid | Workers Logs 含 `20M` log events/月，保留 `7` 天；单条日志事件有平台大小上限，超限会被截断。 | 生产必须设计日志采样、摘要化与截断标记策略。 | `41` |
 | `CF-WKR-016` | Service Bindings | billing | workers-pricing | Paid under Standard pricing | 只有在 Workers `Standard` usage model 下，经 Service Binding 调用另一 Worker 才不产生额外 Worker request fee；legacy `Bundled/Unbound` 不适用。 | 任何成本模型只要用到 Service Binding request fee 优惠，都必须先声明 deployment 采用 `Standard` usage model。 | `21`,`41` |
 | `CF-WKR-017` | OpenTelemetry | billing | workers-opentelemetry | Paid | OTel 导出 logs/traces 各含 `10M` events/月，超额按量计费。 | 启用 OTel 时必须进入成本面板。 | `41` |
 | `CF-WKR-018` | OpenTelemetry | behavior | workers-opentelemetry | Paid | OTel export `persist` 默认为 `true`，会同时导出并存入 Cloudflare dashboard；可设 `false` 仅发外部 sink。 | 必须显式决定是否接受双重留存与相应计费。 | `41` |
@@ -73,7 +73,7 @@
 | `CF-DO-010` | Durable Objects WebSocket | deployment | do-websockets | Paid | 部署新版本会断开 DO 持有的 WebSocket。 | `/sync` 唤醒通道断开必须被视为正常短暂事件，不得破坏 token 语义。 | `21`,`30`,`42` |
 | `CF-DO-011` | Durable Objects | billing | do-pricing | Paid | DO 含 requests `1M/月` 与 duration `400,000 GB-s/月`。 | 任何 DO 成本估算都必须先抵扣包含量，并避免把长等待放在非 hibernating DO 上。 | `41` |
 | `CF-DO-012` | Durable Objects SQLite | billing | do-pricing | Paid | SQLite-backed DO 含 rows reads `25B/月`、rows writes `50M/月`、stored data `5 GB-month`。 | DO truth schema 与批处理策略必须考虑读写和存储预算。 | `41` |
-| `CF-DO-013` | Durable Objects | billing semantics | do-pricing | Paid | DO request 计费面不仅包含 DO HTTP requests，还包含 RPC、WebSocket message 与 alarm invocation 等 request units；不同 transport 的 request units 必须按官方定价定义换算。 | 成本模型必须把 RPC、hibernation WebSocket message 与 alarm 触发量单独计入，不得只按 HTTP 请求估算 DO requests。 | `21`,`30`,`32`,`41` |
+| `CF-DO-013` | Durable Objects | billing semantics | do-pricing | Paid | DO request 计费面不仅包含 DO HTTP requests，还包含 RPC、WebSocket message 与 alarm invocation 等 request units；不同 transport 的 request units 必须按官方定价定义换算，hibernation 入站消息与出站发送的计费语义也不同。 | 成本模型必须把 RPC、hibernation WebSocket message 与 alarm 触发量单独计入，不得只按 HTTP 请求估算 DO requests。 | `21`,`30`,`32`,`41` |
 
 ## 5. D1 约束
 
@@ -104,13 +104,13 @@
 | `CF-R2-002` | R2 | limits | r2-limits | Paid | 单次 single-part 上传上限 `5 GiB`；multipart 总对象可达 `4.995 TiB`。 | 标准 Matrix 上传只能通过 Worker 接入时，仍受 zone request body 限制。 | `21`,`33`,`41` |
 | `CF-R2-003` | R2 | pricing | r2-pricing | Paid | 通过 Workers API、S3 API、`r2.dev` 直取 R2 不收 Internet egress 费。 | 媒体读取主成本来自请求与存储，而不是 R2 对外带宽。 | `33`,`41` |
 | `CF-R2-004` | R2 + CDN | caching | r2-consistency | Paid | 若通过带缓存的域名公开对象，删除后缓存副本可能仍可见，需显式 purge。 | 认证媒体与远端缓存媒体不应依赖公共缓存域名作为唯一出口。 | `33`,`40` |
-| `CF-R2-005` | R2 | billing | r2-pricing | Paid | R2 含 storage `10 GB-month`、Class A `1M/月`、Class B `10M/月`。 | 媒体和归档成本模型必须先抵扣包含量。 | `41` |
+| `CF-R2-005` | R2 | billing | r2-pricing | Paid | R2 Standard 含 storage `10 GB-month`、Class A `1M/月`、Class B `10M/月`；若使用 Infrequent Access，则无对应 included quota，并有 retrieval fee 与 `30` 天 minimum storage duration。 | 媒体和归档成本模型必须先区分 Standard 与 IA，再决定是否能使用包含量抵扣。 | `41` |
 
 ## 8. Queues 约束
 
 | CF-ID | Product | Category | Official Source | Plan Scope | Constraint / Behavior | Design Impact | Owning Spec |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `CF-QUE-001` | Queues | billing | queues-pricing | Paid | 标准操作每月含 `1,000,000` 次，超额按量计费。 | 队列仅用于衍生与补偿工作，不能滥用作同步控制总线。 | `21`,`34`,`41` |
+| `CF-QUE-001` | Queues | billing | queues-pricing | Paid | 标准操作每月含 `1,000,000` 次，超额按量计费；write/read/delete 都单独计数，并按每 `64 KiB` payload chunk 计费。 | 队列仅用于衍生与补偿工作，不能滥用作同步控制总线；batch 不能被当作“单次计费”假设。 | `21`,`34`,`41` |
 | `CF-QUE-002` | Queues | runtime | workers-limits | Paid | Queue consumer 单次 wall time 上限 `15 min`。 | 重建、导出、缩略图任务必须可断点续跑。 | `21`,`33`,`34`,`42` |
 | `CF-QUE-003` | Queues | retention | queues-pricing | Paid | Message retention 默认 `4` 天，可配置到 `14` 天。 | 长期恢复或重建不允许只依赖 Queue 本身保留。 | `42` |
 

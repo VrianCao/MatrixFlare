@@ -85,6 +85,7 @@
 * 正常高频请求必须采样，错误、控制面和恢复事件必须全量。
 * 禁止记录 secrets、token 明文和敏感密钥材料。
 * Workers Logs 只有 `7` 天保留期，只能作为短期运行遥测；控制面审计与恢复证据必须落到 `DATA-OPS-004` / `EVID-*`。
+* 单条 Workers Logs 事件必须受平台单事件大小限制约束；超限被截断时必须带上应用层 `truncated=true` 或等价标记，避免把截断日志当作完整证据。
 
 ## 5. Traces and Correlation
 
@@ -138,6 +139,9 @@
 * `/sync` 设计优先消耗 Worker wall time，而不是 DO duration。引用：`CF-WKR-001`,`CF-DO-009`,`CF-DO-011`。
 * 媒体读取的主成本来自 R2 请求与存储，不来自 R2 Internet egress。引用：`CF-R2-003`,`CF-R2-005`。
 * DO request 成本必须把 DO HTTP、RPC、WebSocket message 与 alarm invocation 一并建模，并按官方 transport-specific request unit 定义换算，不得只按 DO HTTP 入口估算。引用：`CF-DO-013`。
+* Hibernation WebSocket 的入站消息计费必须单独建模；出站发送不会形成对等 DO request 计数，但仍会占用网络与 CPU 预算。引用：`CF-DO-013`。
+* Queues 成本必须按 write / read / delete 三类操作分别计数，并按每 `64 KiB` payload chunk 换算；batch 只改变吞吐与调用频率，不会把多条消息折叠成一次计费。引用：`CF-QUE-001`。
+* 若为冷归档采用 R2 Infrequent Access，成本模型必须额外纳入 retrieval fee、`30` 天 minimum storage duration 与“无 included quota”的事实；默认 Included Quotas Matrix 只适用于 R2 Standard。引用：`CF-R2-005`。
 
 ## 7. Primary Load Drivers
 

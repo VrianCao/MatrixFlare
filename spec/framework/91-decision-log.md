@@ -1,43 +1,30 @@
 # Decision Log
 
-状态：Outline  
-角色：决策日志  
+状态：Deprecated
+角色：决策兼容索引
 负责主文档章节：8  
 继承的单体章节：27
 
 ## 1. 文档职责
 
-* 记录所有关键架构、平台、协议、成本、测试与交付决策。
-* 保留决策背景、备选方案、取舍、影响面和生效范围。
+* 为历史引用提供向后兼容入口。
+* 指向当前唯一权威的 `spec/decisions/` 目录。
 
-## 2. 记录结构
+本页不再承载任何 `DEC-*` 正文，不得被引用为现行真相。
 
-### 2.1 Decision ID
+## 2. 当前权威入口
 
-### 2.2 Status
+* 权威目录：`spec/decisions/`
+* 入口文档：`spec/decisions/README.md`
+* 逐条决策文件：`spec/decisions/<DEC-ID>.md`
 
-### 2.3 Context
+## 3. 历史兼容规则
 
-### 2.4 Options Considered
-
-### 2.5 Decision
-
-### 2.6 Consequences
-
-### 2.7 Owning Spec and Affected Specs
-
-### 2.8 Affected REQ / MX / CF / IF / DATA / TEST IDs
-
-## 3. 必备附件
-
-* 决策日志表
-* 状态流转规则
-* 生效版本字段
-* 受影响规范工件字段
+* 旧引用若指向本页，必须在同一变更包中改为指向 `spec/decisions/README.md` 或具体 `DEC-ID` 文档。
+* 新增 `DEC-*` 一律不得写入本页。
 
 ## 4. 完成标准
 
-* 关键决策可追溯；
-* 每条决策都能回链到正文分册；
-* 每条决策都能回链到受影响的规范工件；
-* 变更时可以更新而不污染正文。
+* 不再被当作 `DEC` 权威正文引用；
+* 所有活跃决策均迁移到 `spec/decisions/`；
+* 本页只保留目录跳转价值。

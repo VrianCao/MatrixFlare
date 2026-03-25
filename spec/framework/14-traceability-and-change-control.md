@@ -29,6 +29,7 @@
 
 * `DEC` 文档必须存放在 `spec/decisions/<DEC-ID>.md`。
 * `OQ` 文档必须存放在 `spec/open-questions/<OQ-ID>.md`。
+* `90-open-questions.md` 与 `91-decision-log.md` 只允许作为目录跳转页；不得再被引用为 `DEC` / `OQ` 的权威正文。
 * 每个 `DEC` 至少包含：状态、结论、原因、影响的 `REQ/MX/CF/IF/DATA/TEST/EVID`、owner、批准日期、失效或复审日期。
 * Evidence waiver、规范冲突裁决和恢复例外都必须引用已存在的 `DEC-ID`，不得只写自然语言说明。
 
@@ -90,6 +91,11 @@
 ### 5.3 证据闭环规则
 
 * 没有 `TEST` 与 `EVID` 的 requirement，不得进入 `Normative`。
+
+### 5.4 Canonical ID 规则
+
+* `MX`、`IF`、`DATA`、`FLOW`、`STATE`、`TEST`、`EVID` 字段中禁止使用 `reserved`、`future profile`、`session contracts`、`session flows` 等自然语言占位符代替 canonical ID。
+* 若某能力当前未定义对应契约，必须显式写 `none`，或把该能力降为 `Deferred` / `Unsupported` 并补充说明。
 
 ## 6. 审查与合并门禁
 

@@ -31,6 +31,7 @@
 | --- | --- | --- | --- | --- | --- | --- |
 | `FLOW-CS-SEND-EVENT` | local event send | `31` | client, `gateway-worker`, `UserDO`, `RoomDO` | `PUT /rooms/.../send` | `RoomDO` 准入、提交、fanout | 校验失败原子拒绝 |
 | `FLOW-CS-ROOM-MEMBERSHIP` | membership mutation | `31` | client, `gateway-worker`, `UserDO`, `RoomDO`, optional federation | join/invite/leave/ban/knock | 生成 membership event 并走同一准入管道 | 联邦握手失败不得伪造本地成功 |
+| `FLOW-CS-ROOM-QUERY` | room history and state query | `31` | client, `gateway-worker`, `RoomDO` | `/messages`, `/context`, `/event`, `/state` | 按 cursor 与可见性规则返回房间读结果 | cursor 无效或可见性不满足时 fail-closed，不得改写真相 |
 | `FLOW-ROOM-EVENT-ADMISSION` | unified room admission | `31` | `gateway-worker`, `RoomDO`, `UserDO`, `RemoteServerDO` | local/fed/AS event ingress | 统一 auth/state resolution/commit | 失败不产生 partial state |
 | `FLOW-ROOM-LOCAL-FANOUT` | local user fanout | `31` | `RoomDO`, `UserDO`, `jobs-worker` | room commit success | 写用户流、推送索引任务 | 单用户失败可补偿重试 |
 
@@ -54,6 +55,7 @@
 | `FLOW-CS-REMOTE-MEDIA-FETCH` | remote media cache | `33` | client, `gateway-worker`, remote server, R2 | cache miss | 拉取远端、写 R2、返回客户端 | 受并发上限和尺寸限制保护 |
 | `FLOW-SEARCH-INDEX` | search/index update | `34` | `RoomDO`, `UserDO`, `jobs-worker`, D1 | truth commit success | 按幂等键更新 D1 | 失败进入重建队列 |
 | `FLOW-AS-TXN-DELIVERY` | appservice delivery | `34` | `jobs-worker`, appservice, D1 control plane | truth commit success | 顺序投递 AS transaction | 失败重试且不影响主业务提交 |
+| `FLOW-OPS-JOB-CONTROL` | control-plane job control | `42`,`40` | operator, Cloudflare Access, `ops-worker`, `jobs-worker`, D1, R2, optional DOs | Access-protected `/_ops` request | 认证、scope 裁决、审计先落盘，再创建/查询/取消作业 | duplicate idempotency key 折叠或冲突拒绝；manifest/hash/authz 失败必须 fail-closed |
 | `FLOW-REPLAY-REBUILD` | replay/reindex | `42`,`34` | `ops-worker`, `jobs-worker`, DOs, D1, R2 | operator action | 从真相与归档重放衍生面 | 断点续跑并保留 manifest |
 
 ## 3. 状态机目录

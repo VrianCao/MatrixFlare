@@ -81,7 +81,44 @@
 | `DATA-D1-003` | table | public room directory | derived | `jobs-worker` | D1 | `room_id` | eventual | rebuild from `RoomDO` | 可见性随 join rules/public flag 更新；每行必须带来源 `room_serial` / visibility watermark，用于判断“可见性是否不确定”。 |
 | `DATA-D1-004` | table | media catalog | derived | `jobs-worker` | D1 | `mxc_uri` | eventual | R2 listing + finalize logs | 不能成为下载前置单点。 |
 | `DATA-D1-005` | table | appservice config / txn cursors | authoritative-control-plane | `ops-worker` / `jobs-worker` | D1 + secrets | `{appservice_id}` | strong at primary / session consistent | config backup | 控制面数据，不是房间或用户真相。 |
-| `DATA-D1-006` | table | operator authz policy | authoritative-control-plane | `ops-worker` | D1 + Cloudflare Access config | `principal_id` | strong at primary / session consistent | config backup | 记录人类/自动化 operator principal、允许 scope、失效时间与审计要求；不存 Access secret 本体。 |
+| `DATA-D1-006` | table | operator authz policy | authoritative-control-plane | `ops-worker` | D1 + Cloudflare Access config | `principal_id` | strong at primary / session consistent | config backup | 记录人类/自动化 operator principal、Access binding、允许 scope、target scope 约束、失效时间与审计要求；不存 Access secret 本体。 |
+
+### 6.1 `DATA-D1-006` Operator Authz Policy 最小形态
+
+`DATA-D1-006` 至少必须能表达以下字段：
+
+* `principal_id`
+* `principal_type`：`human` 或 `service`
+* `access_issuer`
+* `access_audience`
+* `access_subject_binding`
+* `allowed_scopes`
+* `target_scope_constraints`
+* `expires_at`
+* `disabled_at`
+* `require_reason`
+* `require_ticket`
+
+规范 scope vocabulary 首版固定为：
+
+* `ops.read`
+* `ops.audit.read`
+* `ops.export.write`
+* `ops.restore.write`
+* `ops.rebuild.write`
+* `ops.repair.write`
+* `ops.appservice.write`
+* `ops.schema.write`
+
+裁决规则：
+
+* `ops-worker` 必须先完成 Access JWT 验证，再把 `{issuer,aud,stable_subject}` 映射为 `principal_id`
+* `access_subject_binding` 的稳定主体计算必须固定：
+  * `human` principal 默认使用 Access JWT `sub`
+  * `service` principal 不得依赖空 `sub`；必须使用 Access identity 中稳定的 service token 标识，例如 `common_name` / Client ID 等价字段
+* scope 计算必须 fail-closed；无匹配 principal 或无匹配 scope 时必须返回 `403`
+* `target_scope_constraints` 至少必须支持 `global`、`room_id`、`user_id`、`server_name`、`appservice_id` 五类约束
+* 不允许使用隐式通配符；任何 wildcard 或前缀匹配都必须在本表中显式表示
 
 ## 7. R2 / KV Contracts
 
@@ -100,10 +137,43 @@
 
 | DATA-ID | Category | Logical Entity / Shape | Authority | Runtime Owner | Physical Store | Key / Pattern | Consistency | Recovery Source | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `DATA-OPS-001` | manifest | replay manifest | authoritative-control-plane | `ops-worker` | D1 + R2 | `job_id` | per job serial | operator-created | 标记来源、范围、书签、`export_epoch`、source watermark 与允许的 restore / repair 模式。 |
+| `DATA-OPS-001` | manifest | replay manifest | authoritative-control-plane | `ops-worker` | D1 + R2 | `job_id` | per job serial | operator-created | 标记来源、范围、书签、`export_epoch`、registry snapshot hash、source watermark 与允许的 restore / repair 模式。 |
 | `DATA-OPS-002` | manifest | rebuild checkpoint | authoritative-control-plane | `jobs-worker` | D1 / DO SQLite | `{job_id,shard}` | per job serial | manifest | 用于断点续跑。 |
 | `DATA-OPS-003` | manifest | repair decision log | authoritative-control-plane | `ops-worker` | D1 | `decision_id` | append-only | operator action | 记录人工修复与影响面。 |
-| `DATA-OPS-004` | log | audit event log | authoritative-control-plane | `ops-worker` | D1 + R2 immutable export | `{event_id}` | append-only | periodic export | 记录 `operator_principal_id`、auth mechanism、scope、request_id、idempotency_key、causation_id、result、affected objects；控制面写操作必须先落此日志。 |
+| `DATA-OPS-004` | log | audit event log + idempotency registry | authoritative-control-plane | `ops-worker` | D1 + R2 immutable export | `{event_id}` | append-only source + strongly consistent dedupe lookup | periodic export | 记录 `operator_principal_id`、auth mechanism、scope、request_id、idempotency_key、request_fingerprint、causation_id、result、affected objects；控制面写操作必须先落此契约。 |
+
+### 8.1 `DATA-OPS-004` 审计与幂等裁决规则
+
+`DATA-OPS-004` 是控制面权威审计源，同时承担幂等裁决所需的强一致 lookup。逻辑上至少包含两类记录：
+
+* append-only `audit_event`
+* unique `request_dedupe_projection`
+
+`audit_event` 的最小字段：
+
+* `event_id`
+* `event_type`
+* `occurred_at`
+* `operator_principal_id`
+* `auth_mechanism`
+* `scope`
+* `request_id`
+* `idempotency_key`
+* `request_fingerprint`
+* `job_id` 或 `causation_id`
+* `result_code`
+* `affected_objects`
+
+`request_dedupe_projection` 的最小唯一键：
+
+* `{operator_principal_id,idempotency_key,target_scope}`
+
+并满足以下语义：
+
+* 首次控制面写请求必须先在同一事务中写入 `accepted` 审计事件，并建立 dedupe projection，再开始副作用
+* 若再次收到相同唯一键且 `request_fingerprint` 相同，必须返回同一 `job_id` 或同一终态结果
+* 若再次收到相同唯一键但 `request_fingerprint` 不同，必须返回 idempotency conflict，不得静默覆盖
+* 作业状态迁移必须继续追加 `audit_event`，而不是原地覆盖首条记录
 
 ## 9. 兼容与迁移规则
 

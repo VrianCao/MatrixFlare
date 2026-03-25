@@ -155,19 +155,58 @@ DO 内部 SQLite schema 演进规则：
 
 ### 11.1 DR 基线
 
-* D1 在 Workers Paid 上有 `30` 天 Time Travel / point-in-time recovery。引用：`CF-D1-005`。
+* D1 在 Workers Paid 上有 `30` 天 Time Travel / point-in-time recovery。引用：`CF-D1-005`。该值属于平台事实断言，发布与年度治理审查时必须重新核对。
 * DO 权威状态没有等价内建 PITR，必须由应用层导出补足。引用：`CF-DO-004`。
 * 生产默认 DR 目标为 `RPO <= 15 min`、`RTO <= 8 h`，适用于单 homeserver 部署在支持规模内的全量 namespace 恢复。
 
 ### 11.2 应用层导出要求
 
 * `ops-worker` 必须先创建全局 `export_epoch`，再触发 `RoomDO`、`UserDO` 与控制面导出；同一轮全量导出的所有 manifest 都必须引用同一个 `export_epoch`。
+* `ops-worker` 在创建 `export_epoch` 时，必须同步冻结本轮导出的 shard registry snapshot；该 snapshot 至少枚举 room shards、user shards、remote-server shards 与 control-plane shards。导出开始后新创建的 shard 自动归入下一轮 `export_epoch`。
 * `RoomDO` 必须至少每 `15` 分钟导出房间 archive segment 与 state snapshot manifest 到 R2。
 * `UserDO` 必须至少每 `15` 分钟导出设备、账号数据、密钥和 backup manifest 快照到 R2。
 * 每个 shard manifest 都必须记录 `started_at`、`completed_at`、source watermark / serial、对象哈希列表、schema version、签名 key version 与 completeness state。
+* 每个 shard manifest 还必须记录 `registry_snapshot_id` 与该 shard 在 registry 中的唯一 shard key；不得在导出后期再动态追加“临时发现的 shard”到同一轮 registry。
 * 只有当一组导出在同一 `export_epoch` 下、所有必需 shard manifest 都标记为 `complete`，并且签名 / 哈希校验通过时，才允许用于全量 namespace restore。
 * `partial` 或 `incomplete` 导出只能用于 scoped repair；若要把它用于其他用途，必须先产生 `DEC-ID`。
 * `ops-worker` 必须支持从完整导出包重放到新的 namespaces。
+
+`complete` 的判定必须基于 registry snapshot，而不是“当前看起来导出了很多 shard”。至少满足：
+
+* registry 中每个 required shard 恰好对应一个终态 `complete` manifest
+* 不允许存在缺失 shard、重复 complete manifest 或 `watermark` 回退
+* bundle manifest 必须包含 registry snapshot 的 hash，以便 restore 前验证“所验的完整性集合”和“当时声明的完整性集合”一致
+
+#### 11.2.1 Export Manifest 的 Canonicalization、Hash、Signature、Encryption
+
+导出与恢复格式必须固定以下密码学规则：
+
+* shard manifest、bundle manifest 与 control-plane metadata 一律使用 RFC 8785 JCS canonical JSON，编码为 UTF-8。
+* 每个导出对象的 `content_hash` 必须是 `base64url(sha256(raw_bytes))`。
+* 每个 unsigned manifest 都必须至少包含：
+  * `manifest_version`
+  * `export_epoch`
+  * `job_id`
+  * `shard_id` 或 `bundle_id`
+  * `hash_algorithm`
+  * `signature_algorithm`
+  * `encryption_algorithm`
+  * `signing_key_version`
+  * `encryption_key_version`
+  * `objects[]`
+  * `completeness_state`
+* manifest hash 必须对 unsigned manifest 的 canonical bytes 计算；签名对象不得把自身签名字段再次纳入 hash。
+* manifest 签名算法固定为 `Ed25519`；验证方必须按 `signing_key_version` 选择对应验证公钥。
+* 导出对象加密固定为 `AES-256-GCM`；每个 bundle 或 shard 必须有独立 nonce / data key，并通过 `encryption_key_version` 绑定到外层 KEK 或外部 KMS。
+* 任何 restore 在开始导入前都必须依次完成 completeness、hash、signature、key-version allowlist 与 decryptability 校验；任一步失败都必须 fail-closed。
+
+#### 11.2.2 Restore Cutover 语义
+
+* full namespace restore 只能导入到新的 Worker / DO / D1 / R2 / KV namespaces，不得原地覆写正在服务的生产权威状态。
+* 执行 restore cutover 前，`ops-worker` 必须先把公网写流量切到 quiescing 状态；此时只允许健康检查、作业查询与显式允许的只读请求继续通过。
+* quiescing 窗口内必须记录最终 source watermark，并把它写入 restore job manifest。
+* restore 导入完成后，必须先执行结构校验、抽样读校验与关键协议路径 smoke test，再允许切换公网流量。
+* 切流后旧 namespace 必须保留为只读回退源，直到通过发布门禁或人工确认删除。
 
 ### 11.3 修复流程
 
@@ -182,8 +221,8 @@ DO 内部 SQLite schema 演进规则：
 ## 12. Operations Control Plane
 
 * 控制面只能通过 `ops-worker` 进入。
-* 控制面入口必须使用专用管理域；人类入口使用 Cloudflare Access JWT，自动化入口使用 Access service token。
-* 所有控制面写请求都必须携带 `idempotency_key` 和目标 scope。
+* 控制面入口必须使用专用管理域；人类入口使用 Cloudflare Access JWT，自动化入口使用 Access service token 通过 Access 策略，但到达 `ops-worker` 时仍必须表现为可验证的 Access JWT。
+* 所有控制面写请求都必须通过 HTTP `Idempotency-Key` 头携带 `idempotency_key`，并显式声明目标 scope。
 * 所有重建、回放、迁移、修复都必须是显式作业对象。
 * 所有控制面写请求与作业状态变更都必须追加 `DATA-OPS-004` 审计记录。
 * 每个作业必须持有：

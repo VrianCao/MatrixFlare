@@ -58,8 +58,32 @@
 * 人类运维请求必须经 Cloudflare Access 保护的专用管理域进入；`ops-worker` 必须验证 Access identity、`aud`、`exp` 与 issuer 绑定。
 * 自动化运维请求必须使用 Access service token 或等价受限凭据，且同样只能打到专用管理域。
 * `ops-worker` 必须把 Access subject / service principal 映射为内部 `operator_principal_id`，并按 `DATA-D1-006` 裁决 scope。
-* 每个控制面写请求都必须携带 `idempotency_key`；`ops-worker` 必须用 `DATA-OPS-004` 检测重放并把重复请求折叠为同一作业或显式拒绝。
+* 每个控制面写请求都必须通过 HTTP `Idempotency-Key` 头携带 `idempotency_key`；`ops-worker` 必须用 `DATA-OPS-004` 检测重放并把重复请求折叠为同一作业或显式拒绝。
 * 运维入口的凭据撤销与轮换必须依赖 Cloudflare Access / service token 生命周期，而不是长寿命静态 bearer token。
+
+#### 3.3.1 接受的 Access 身份传输形态
+
+* `ops-worker` 只接受通过 Cloudflare Access 成功鉴权后附带的 Access JWT 作为应用层身份依据；规范首选 `CF-Access-Jwt-Assertion`。
+* `CF-Access-Client-Id` / `CF-Access-Client-Secret` 只被视为 Access 边缘策略的入站凭据，不得被 `ops-worker` 当作应用层 bearer secret 直接信任。
+* `Cf-Access-Authenticated-User-Email`、common-name 等 Access 注入头只能用于日志和展示，不得单独作为授权依据。
+
+#### 3.3.2 `ops-worker` JWT 验证与裁决步骤
+
+`ops-worker` 对每个管理面请求必须按以下固定顺序处理：
+
+1. 读取 `CF-Access-Jwt-Assertion`，缺失则直接返回 `401`。
+2. 使用配置的 Access team / account JWKs 或 certs 验证签名。
+3. 校验 `iss`、`aud`、`exp`、`nbf`、`sub`；任一失败都必须返回 `401`。
+4. 以 `{iss,aud,stable_subject}` 映射 `DATA-D1-006 principal_id`；其中 human 默认取 JWT `sub`，service principal 必须取稳定的 service token 标识字段，而不是空 `sub` 或展示性邮箱。
+5. 按 `allowed_scopes` 与 `target_scope_constraints` 裁决授权；失败返回 `403`。
+6. 对写请求读取 `idempotency_key` 并查询 `DATA-OPS-004` dedupe projection；冲突返回 `409`。
+7. 先写入审计事件，再创建或驱动作业。
+
+自动化运维的规范路径是：
+
+* Access service token 只用于通过 Cloudflare Access 策略；
+* 到达 `ops-worker` 时仍必须表现为可验证的 Access JWT；
+* 因此 `ops-worker` 无需持有或比较 service token secret 本体。
 
 ## 4. 授权模型
 
@@ -138,7 +162,7 @@
 ### 8.3 审计日志契约
 
 * 所有 8.2 中的事件都必须首先写入 `DATA-OPS-004`，再返回控制面结果。
-* `DATA-OPS-004` 必须至少记录 `operator_principal_id`、auth mechanism、scope、request_id、idempotency_key、causation_id、结果码与影响对象。
+* `DATA-OPS-004` 必须至少记录 `operator_principal_id`、auth mechanism、scope、request_id、idempotency_key、request_fingerprint、causation_id、结果码与影响对象。
 * Workers Logs 只用于运维遥测，不得被视为长期审计存储或不可抵赖证据来源。
 
 ## 9. Privacy and Data Handling Boundaries

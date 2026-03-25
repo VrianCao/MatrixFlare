@@ -122,11 +122,31 @@ membership 变更规则：
 
 * 新建房间默认 room version 为 `12`。
 * 面向联邦 GA 前，必须稳定支持 room version `11` 与 `12`。
+* `createRoom` 必须允许显式请求 `11`；当请求未显式指定版本时，项目策略默认选 `12`，这是本实现决策，而不是对 Matrix 推荐默认值的转述。
 
 ### 6.2 版本差异封装
 
-* room version `11` 的 redaction 规则差异必须封装在策略层。
-* room version `12` 的 room ID 生成、creator power level 语义与 state resolution 变化必须封装在策略层。
+room version `11` 的以下差异必须封装在策略层：
+
+* redaction 保留字段集合与旧版本不同：顶层 `origin`、`membership`、`prev_state` 不再受保护。
+* `m.room.create` 被 redaction 后必须保留完整 `content`。
+* `m.room.redaction` 被 redaction 后必须保留 `content.redacts`。
+* `m.room.power_levels` 被 redaction 后必须保留 `content.invite`。
+* `m.room.member` 的 `third_party_invite` 在 redaction 后只允许保留其 `signed` 子键。
+* `m.room.redaction` 的可发送性按普通事件 auth rules 裁决，不再把 redact level 直接塞进 auth rule 快捷分支。
+
+room version `12` 的以下差异必须封装在策略层：
+
+* 房间 ID 必须是 `m.room.create` 事件 ID 把 sigil 从 `$` 替换为 `!` 后得到；创建事件自身不得携带 `room_id`。
+* `m.room.create` 的 `content.additional_creators` 若存在，必须是合法 user ID 字符串数组。
+* room creators 的 power level 必须视为“无限高”，不能被后续 `m.room.power_levels` 降权。
+* auth events selection 中不得把 `m.room.create` 选入 `auth_events`；其存在由 `room_id` 隐含。
+* 若事件的 `room_id` 不能对应到已接受的 `m.room.create` 事件 ID，则必须拒绝。
+
+两种版本共同要求：
+
+* 事件 ID 继续使用基于引用哈希的 URL-safe base64 形态。
+* state resolution 继续使用 room state resolution v2；任何差异都只能体现在策略层的输入校验、auth selection 与 redaction 规则上。
 * `RoomDO` 业务代码中禁止散落 `if (roomVersion === ...)` 分支。
 
 ### 6.3 老版本与未来版本

@@ -30,17 +30,18 @@
 
 * `spec/framework/00-master-spec-outline.md` 负责定义主入口与章节主责。
 * `10-44` 分册负责定义各责任域的规范性内容。
-* `90-92` 分册负责决策、问题与附录，不直接定义产品行为。
+* `spec/decisions/`、`spec/open-questions/` 与 `92-appendices.md` 负责承载决策、问题与附录，不直接定义产品行为。
+* `90-open-questions.md` 与 `91-decision-log.md` 仅为兼容索引页，不再是权威寄存器。
 
 ### 2.2.1 真相层级表
 
-| Level | Artifact Class | Authority |
+| Authority Level | Artifact Class | Authority |
 | --- | --- | --- |
-| L0 | Matrix / Cloudflare 官方来源 | 外部事实来源 |
-| L1 | `00` 主文档骨架与 `10-14` 治理控制层 | 内部治理真相 |
-| L2 | `20-44` 责任分册 | 内部设计与实现真相 |
-| L3 | `90-92` 寄存器与附录 | 支持性与审计性真相 |
-| L4 | `research/`、`notes/`、遗留单体 Spec | 非规范输入 |
+| `AUTH-L0` | Matrix / Cloudflare 官方来源 | 外部事实来源 |
+| `AUTH-L1` | `00` 主文档骨架与 `10-14` 治理控制层 | 内部治理真相 |
+| `AUTH-L2` | `20-44` 责任分册 | 内部设计与实现真相 |
+| `AUTH-L3` | `spec/decisions/`、`spec/open-questions/`、`92-appendices.md` | 支持性与审计性真相 |
+| `AUTH-L4` | `research/`、`notes/`、遗留单体 Spec | 非规范输入 |
 
 ### 2.3 非规范性材料
 

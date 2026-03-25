@@ -124,7 +124,7 @@
 * 若 `m.profile_fields` 直接或间接禁止修改 `displayname` 或 `avatar_url`，则已废弃的 `m.set_displayname` / `m.set_avatar_url` 也必须同步返回 `enabled: false`。
 * `m.profile_fields`、`m.set_avatar_url`、`m.set_displayname`、room versions 等 capability 不得“宣称支持但写路径拒绝”。
 * stored filters 的权威表是 `DATA-USER-014`。
-* filter 创建时必须对 JSON 做 canonicalization，再生成稳定 hash 和 `filter_id`；`filter_id` 不得以 `{` 开头。
+* filter 创建时必须按 [22-data-consistency-and-routing.md](/root/Matrix/spec/framework/22-data-consistency-and-routing.md) 的非事件 JSON canonicalization 规则处理 JSON，再生成稳定 hash 和 `filter_id`；`filter_id` 不得以 `{` 开头。
 * `GET /_matrix/client/*/sync` 的 `filter` 查询参数必须按首字符解释：若首字符是 `{`，则视为 inline JSON filter string；否则视为此前创建的 stored `filter_id`。
 * `/sync` 对 stored filter 和 inline filter 的解释都必须确定；相同 `{since,filter}` 不得因部署节点不同而产生语义分叉。
 
@@ -155,12 +155,16 @@
 
 * custom push rules、enabled 状态和规则顺序的权威表是 `DATA-USER-013`。
 * Matrix `v1.17` 默认 push rules 必须由服务端按规范基线合成；用户存储只保存覆盖、禁用和顺序调整。
+* 服务端合成的默认 push rules 基线至少必须包含以下 rule IDs，并保持 Matrix `v1.17` 规定的条件、actions 与优先顺序：
+  * `override`: `.m.rule.master`, `.m.rule.suppress_notices`, `.m.rule.invite_for_me`, `.m.rule.member_event`, `.m.rule.is_user_mention`, `.m.rule.is_room_mention`, `.m.rule.tombstone`, `.m.rule.reaction`, `.m.rule.room.server_acl`, `.m.rule.suppress_edits`
+  * `underride`: `.m.rule.call`, `.m.rule.encrypted_room_one_to_one`, `.m.rule.room_one_to_one`, `.m.rule.message`, `.m.rule.encrypted`
 * 必须支持 `GET /pushrules/`、`GET /pushrules/global/`、`GET/PUT/DELETE /pushrules/global/{kind}/{ruleId}`、`GET/PUT /.../{ruleId}/actions`、`GET/PUT /.../{ruleId}/enabled` 这些 `v1.17` 路由面。
 * `kind` 只允许 `override`、`underride`、`sender`、`room`、`content`；用户自定义 `ruleId` 不得以 `.` 开头，且不得包含 `/` 或 `\\`。
 * `PUT /pushrules/global/{kind}/{ruleId}` 创建规则时，若没有 `before` / `after`，新规则必须成为同类用户自定义规则中最高优先级；若同时给出 `before` 和 `after`，必须以 `before` 为主确定新顺序。
 * 新创建的 push rule 必须默认 `enabled = true`。
 * `/actions` 与 `/enabled` 子资源只允许修改对应字段，不得隐式重写条件、pattern 或顺序。
 * push rule 写入必须由 `UserDO` 线性化，并在后续 `/sync` 中生效。
+* push rule 评估必须使用“用户 overrides snapshot + 规范默认基线”的组合视图；不得把默认规则物化进用户表后再在读时猜测真实顺序。
 * 为控制 Cloudflare CPU 和滥用面，单用户自定义 push rules 默认上限为 `256` 条；单条规则最多 `32` 个 conditions；用户 overrides 的总 canonical JSON 体积默认上限为 `64 KiB`。
 * unread counters、notification counts 和 `unread_thread_notifications` 必须由 `RoomDO` delta 与当前 push-rules snapshot 共同计算，再进入 `user_stream`。
 * private / threaded receipts 与 read markers 是计数输入；但 receipt 当前视图仍由 `RoomDO` 权威持有。
@@ -240,6 +244,27 @@
 * fallback key types
 * receipt / typing 聚合更新
 
+### 7.4 `/sync` 请求标准化
+
+`gateway-worker` 在 dedupe、waiter 管理与 `collectSince()` 调用前，必须先把公开请求归一化为稳定 `SyncRequestKey`：
+
+* `session_id`
+* `device_id`
+* `since_kind`：`initial` 或 `incremental`
+* `since_pos`
+* `filter_hash`
+* `full_state`
+* `use_state_after`
+* `set_presence`
+* `timeout_ms_normalized`
+
+其中：
+
+* `timeout_ms_normalized = min(max(requested_timeout_ms,0), configured_sync_timeout_max_ms)`
+* stored filter 与 inline filter 都必须先解析到同一个 `canonical_filter_hash`
+* waiter 去重必须基于 `SyncRequestKey`，而不是原始 query string
+* 若两个并发请求只有 `timeout_ms_normalized` 不同，则实现可以保留较新的请求并结束较旧请求，但不得让二者同时长期驻留
+
 ## 8. Worker-Held Long Poll 设计
 
 ### 8.1 规范性结论
@@ -279,10 +304,60 @@
 
 ## 9. `/sync` 响应组装规则
 
+### 9.1 快照边界与 `next_batch`
+
 * `/sync` 响应的房间部分由 `RoomDO.projectForSync()` 提供局部投影，而不是由 `UserDO` 拼接房间详情。
-* `use_state_after=true` 时，必须输出 `state_after` 而不是旧式 `state`。
+* `collectSince()` 必须先给出单一 `upper_bound_user_stream_pos`；本次响应中的 user-scoped 与 room-scoped 数据都必须以该边界为上限。
+* `next_batch` 只能在所有 user-domain 片段与所有房间投影都成功组装后前推到 `upper_bound_user_stream_pos`。
 * 若任一房间投影失败，则本次 `/sync` 不得推进 `next_batch`。
 * to-device、device lists、one-time key count 和 fallback key types 都必须来自与 `since` 同一用户流快照边界。
+
+### 9.2 Initial / Incremental 语义
+
+* `since` 缺失表示 initial sync；实现必须在单一 `upper_bound_user_stream_pos` 上返回用户当前可见的 joined / invited / knocked / left-but-not-forgotten 房间视图与当前用户域快照。
+* `since` 存在表示 incremental sync；实现只能返回满足 `stream_pos > since_pos && stream_pos <= upper_bound_user_stream_pos` 的增量。
+* token 解析失败、版本不兼容、设备或用户作用域不匹配时，必须在进入 long poll 前失败，并且不得前移任何 session ack 状态。
+
+### 9.3 房间投影最小形态与 membership 可见性
+
+`RoomDO.projectForSync()` 在适用字段上至少必须能输出：
+
+* `room_id`
+* `membership_bucket`
+* `timeline_events`
+* `limited`
+* `prev_batch`
+* `state_payload`
+* `ephemeral`
+* `account_data`
+* `unread_notifications`
+* `summary`
+
+membership 到 `/sync` bucket 的映射必须固定为：
+
+* `join` -> `rooms.join`
+* `invite` -> `rooms.invite`，且只返回 stripped invite state
+* `knock` -> `rooms.knock`，且只返回 stripped knock state
+* `leave` / `ban` -> `rooms.leave`，直到客户端执行 forget
+* forgotten rooms 不得再出现在任何 bucket 中
+
+若同一房间在 `(since, upper_bound]` 窗口内跨多个 membership bucket 迁移，响应中必须只出现最终 bucket；为解释最终 bucket 所必需的 timeline / state 仍必须一并返回。
+
+### 9.4 `limited` 与 `prev_batch`
+
+* 当服务端因为 `timeline.limit`、repair gap、backfill 边界或可见性压缩而省略了更早但本应可见的 timeline 事件时，房间投影必须设置 `limited = true`。
+* 只要返回了 `timeline.events`，就必须返回 `prev_batch`；其中 `prev_batch` 必须绑定 `DATA-ID-002`，由 `RoomDO` 签发为 opaque cursor，且能独立支持向后分页，不依赖 mutable waiter state。
+* 当 `limited = true` 时，`prev_batch` 必须指向“最老一条已返回 timeline event 之前”的房间位置。
+* 当没有返回 timeline events 时，`prev_batch` 可以省略。
+
+### 9.5 Filter 应用、`full_state` 与 `use_state_after`
+
+* `UserDO` 必须先应用 user-scoped filter 分支，例如 account data、presence、to-device、device lists；`RoomDO` 必须应用 room-scoped filter 分支，例如 room include/exclude、timeline、state、ephemeral。
+* `full_state = true` 时，joined 房间必须返回 `upper_bound_user_stream_pos` 对应时刻的完整当前可见状态，并仍受 filter 的 state 约束。
+* `use_state_after = true` 时，joined 房间必须输出 `state_after`，其含义是“应用本次返回的 timeline events 之后的当前状态”；否则必须输出 legacy `state` 载荷。
+* 同一房间在同一次 `/sync` 响应中不得混用 `state` 与 `state_after`。
+* unread / notification counts 必须使用 `upper_bound_user_stream_pos` 时刻的 push-rules snapshot 计算，而不是使用响应开始时或结束时的漂移视图。
+* 任一房间投影失败都必须使整个 `/sync` 失败并保持 `next_batch` 不前移；禁止返回“部分房间成功、部分房间失败”的 `200` 响应，必须返回明确错误并允许客户端按相同 `since` 安全重试。
 
 ## 10. 失败、重试与成本控制
 
@@ -302,7 +377,7 @@
 | account data / tags / read-unread markers | `IF-CS-015` | `IF-INT-USER-002` | `DATA-USER-006`,`DATA-USER-007` |
 | push rules | `IF-CS-018` | none | `DATA-USER-013` |
 | presence | `IF-CS-016` | `IF-INT-USER-002` | `DATA-USER-009`,`DATA-USER-010` |
-| to-device | `IF-CS-041` | `IF-INT-USER-003` | `DATA-USER-008`,`DATA-USER-010` |
+| to-device | `IF-CS-041` | `IF-INT-USER-005` | `DATA-USER-008`,`DATA-USER-010` |
 | keys / cross-signing / backup | `IF-CS-042`-`045` | `IF-INT-USER-004` | `DATA-USER-003`,`004`,`005`,`011`,`DATA-R2-006` |
 | `/sync` | `IF-CS-020` | `IF-INT-USER-002`,`IF-INT-ROOM-002` | `DATA-ID-001`,`DATA-USER-010` |
 

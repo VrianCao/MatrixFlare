@@ -64,10 +64,44 @@
 | `device_id` | Matrix protocol | no | 在 `user_id` 范围内唯一。 |
 | `next_batch` | `UserDO` | yes | 对客户端完全 opaque；内部至少编码版本与 `user_stream_pos`。 |
 | `prev_batch` | `RoomDO` | yes | 房间分页游标必须可独立验证，不依赖 mutable server state。 |
+| `request_fingerprint` | route owner | yes | 所有需要幂等折叠的写请求都必须基于规范化请求形状生成稳定哈希。 |
+| `canonical_filter_hash` | `UserDO` | yes | stored filter 与 inline filter 都必须先得到同一 canonical hash，再参与 dedupe 与 `filter_id` 生成。 |
 | access token | `UserDO` | yes | 只存 hash，不存明文。 |
 | refresh token | `UserDO` | yes | 只存 hash；刷新后按策略轮换。 |
+| `idempotency_key` | operator client | no | 控制面写请求必须显式提供；唯一性至少绑定到 `operator_principal_id` 与 target scope。 |
 | Queue job id | producer | yes | 必须可从业务幂等键稳定推导或双向映射。 |
 | federation txn id | `RemoteServerDO` | no | 同一重试必须复用同一 `txn_id`。 |
+
+### 4.1 非事件 JSON 的 Canonicalization 规则
+
+房间事件的 canonical JSON 继续完全遵循对应 room version 的 Matrix 规则；除此之外，本系统对 filter、push-rule overrides、控制面请求体、导出 manifest 等“非事件 JSON”统一采用以下规则：
+
+* 规范 canonical form 使用 RFC 8785 JCS。
+* 输入 JSON 中若出现重复 key、非有限数字、语义不明确的 number 编码，必须在进入权威路径前拒绝。
+* canonical bytes 一律使用 UTF-8；哈希输入必须是这些 bytes，而不是语言运行时对象的内存表示。
+* 同一逻辑对象不得同时保留“原始 JSON 串”和“canonical JSON 串”两个会影响幂等或签名判断的权威版本；权威版本只能是 canonical bytes。
+
+### 4.2 请求指纹与控制面幂等规则
+
+`request_fingerprint` 必须以 canonical object 再哈希的方式生成，而不是拼接自由文本。最小输入集合如下：
+
+* HTTP method
+* route template，而不是实例化后的完整 URL
+* 已认证 principal 标识
+* 语义相关 query 参数的 canonical object
+* canonical request body bytes 的 hash
+* content type / schema version
+
+规范默认算法：
+
+* `request_fingerprint = base64url(sha256(JCS(normalized_request_object)))`
+* `canonical_filter_hash = base64url(sha256(JCS(filter_json)))`
+
+控制面 `idempotency_key` 的裁决规则：
+
+* 唯一键至少是 `{operator_principal_id,idempotency_key,target_scope}`
+* 若同一唯一键再次提交且 `request_fingerprint` 相同，则必须折叠到同一作业或返回同一终态结果
+* 若同一唯一键再次提交但 `request_fingerprint` 不同，则必须显式拒绝为 idempotency conflict
 
 ## 5. 真相面与派生面边界
 
@@ -173,13 +207,14 @@
 | --- | --- | --- | --- |
 | `/.well-known/matrix/client` | `gateway-worker` | none | 静态或低频配置；可缓存。 |
 | `/.well-known/matrix/server` | `gateway-worker` | none | 联邦发现关键入口。 |
-| `/_matrix/client/versions` | `gateway-worker` | none | 公开能力声明。 |
+| `/_matrix/client/*/versions` | `gateway-worker` | none | 公开能力声明。 |
 | `/_matrix/client/*` 用户域 | `gateway-worker` | `UserDO` | 登录、刷新、设备、账号数据、keys、to-device。 |
 | `/_matrix/client/*` 房间写路径 | `gateway-worker` | `UserDO` then `RoomDO` | 先鉴权与设备确认，再房间裁决。 |
 | `/_matrix/client/v3/sync` | `gateway-worker` | `UserDO` + `RoomDO` | Worker 持有 poll，按需投影房间。 |
 | `/_matrix/federation/*` 入站事务 | `gateway-worker` | `RoomDO` / `UserDO` / `RemoteServerDO` | 先联邦验签，再分发。 |
 | `/_matrix/media/*` | `gateway-worker` | R2 + D1 projection + `UserDO` quota | 上传下载都在 Worker 入口。 |
 | `/_matrix/key/*` | `gateway-worker` | signing material service | 与联邦和客户端 keys 相关。 |
+| `/_ops/*` on management domain | `ops-worker` | D1 control plane + `jobs-worker` + scoped DO calls | 只允许 Access 保护的管理域进入；不属于 Matrix 公网 API。 |
 
 ## 10. 路由规范
 
@@ -187,6 +222,7 @@
 * 所有房间写请求都必须在 `UserDO` 完成会话/设备校验后进入 `RoomDO`。
 * 所有远端联邦交易必须先在 edge 完成 `Authorization: X-Matrix` 验证。
 * 所有媒体下载必须优先走 Worker -> R2 binding，不得把 D1 查询作为下载前置单点。
+* 所有控制面请求都必须只经管理域的 `ops-worker` 进入，并在鉴权、scope 与 idempotency 通过后才可触发后台作业或 scoped DO 调用。
 
 ## 11. 完成标准
 

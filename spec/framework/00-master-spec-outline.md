@@ -53,7 +53,7 @@
 
 ### 8. Registers and Appendices
 
-主责分册：`90-open-questions.md`、`91-decision-log.md`、`92-appendices.md`
+主责分册：`spec/open-questions/README.md`、`spec/decisions/README.md`、`92-appendices.md`
 
 ## 3. 单体章节到分册映射
 
@@ -80,8 +80,8 @@
 | 23-24 + 9.9 | `42-deployment-migration-and-recovery.md` | 运维控制面、部署、迁移、修复、恢复一起定义 |
 | 25 | `43-testing-and-compliance.md` | 测试与合规独立成册 |
 | 全部分册的验证与证据横切层 | `44-verification-and-evidence-register.md` | 发布门禁、证据包、可验证真相统一收口 |
-| 26 | `90-open-questions.md` | 未决问题从正文剥离 |
-| 27 | `91-decision-log.md` | 决策日志从正文剥离 |
+| 26 | `spec/open-questions/README.md` | 未决问题从正文剥离 |
+| 27 | `spec/decisions/README.md` | 决策日志从正文剥离 |
 | 28 | `92-appendices.md` | 附录独立维护 |
 
 ## 4. 阅读顺序
@@ -91,7 +91,7 @@
 3. `20-25` 架构与契约基础层
 4. `30` 协议域分册
 5. `40-44` 安全、运营、交付、验证分册
-6. `90` 系列寄存器与附录
+6. `spec/open-questions/`、`spec/decisions/` 与附录
 
 ## 5. 回填顺序
 
@@ -99,7 +99,7 @@
 2. 再填 `10-14` 治理控制层。
 3. 再填 `20-25` 架构、数据、契约、流程基础层。
 4. 再按客户端、房间、联邦、媒体、派生能力的顺序填 `30` 系列。
-5. 最后填 `40-44` 与 `90` 系列。
+5. 最后填 `40-44`、`spec/open-questions/`、`spec/decisions/` 与附录。
 
 ## 6. 主文档后续必须包含的摘要块
 
