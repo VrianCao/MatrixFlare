@@ -179,6 +179,8 @@
 ### 5.5 To-Device
 
 * to-device 消息权威表是 `DATA-USER-008`。
+* `PUT /sendToDevice/{eventType}/{txnId}` 的幂等裁决必须持久化在 `DATA-USER-016`；同一 `{sender_user_id,event_type,txn_id}` 加同一 canonical request hash 重试时，必须返回与首次提交等价的成功结果。
+* 若同一 `{sender_user_id,event_type,txn_id}` 对应不同 canonical request hash，必须返回 deterministic idempotency conflict，不得重复入队。
 * to-device 投递顺序以目标设备视角按照 `user_stream_pos` 递增。
 * 当客户端发起新的 `/sync?since=X` 时，`UserDO` 才可以认定该 session 已经观察到 `X` 之前的用户流，从而清理对该 session 已确认的 to-device 记录。
 * 对长期离线 session，允许按保留策略进行 TTL 清理，但必须记录为协议可见的丢弃策略，不得静默假定已送达。
@@ -249,6 +251,7 @@
 * one-time key count
 * fallback key types
 * receipt / typing 聚合更新
+* 由 `RoomDO` durable outbox 成功交付并被 `UserDO` durable append 的房间 fanout
 
 ### 7.4 `/sync` 请求标准化
 
@@ -378,15 +381,15 @@ membership 到 `/sync` bucket 的映射必须固定为：
 
 | Capability | Public IF | Internal IF | Primary Data |
 | --- | --- | --- | --- |
-| register/login/logout/refresh | `IF-CS-010`-`013` | `IF-INT-USER-001` | `DATA-USER-001` |
-| capabilities / filters | `IF-CS-002`-`004` | none | `DATA-USER-014` |
+| register/login/logout/refresh | `IF-CS-010`,`IF-CS-011`,`IF-CS-012`,`IF-CS-013` | `IF-INT-USER-001` | `DATA-USER-001` |
+| capabilities / filters | `IF-CS-002`,`IF-CS-003`,`IF-CS-004` | none | `DATA-USER-014` |
 | profile | `IF-CS-017` | none | `DATA-USER-012` |
 | device management | `IF-CS-040` | `IF-INT-USER-001` | `DATA-USER-002`,`DATA-USER-003` |
 | account data / tags / read-unread markers | `IF-CS-015` | `IF-INT-USER-002` | `DATA-USER-006`,`DATA-USER-007` |
 | push rules | `IF-CS-018` | none | `DATA-USER-013` |
 | presence | `IF-CS-016` | `IF-INT-USER-002` | `DATA-USER-009`,`DATA-USER-010` |
 | to-device | `IF-CS-041` | `IF-INT-USER-005` | `DATA-USER-008`,`DATA-USER-010` |
-| keys / cross-signing / backup | `IF-CS-042`-`045` | `IF-INT-USER-004` | `DATA-USER-003`,`004`,`005`,`011`,`DATA-R2-006` |
+| keys / cross-signing / backup | `IF-CS-042`,`IF-CS-043`,`IF-CS-044`,`IF-CS-045` | `IF-INT-USER-004` | `DATA-USER-003`,`DATA-USER-004`,`DATA-USER-005`,`DATA-USER-011`,`DATA-R2-006` |
 | `/sync` | `IF-CS-020` | `IF-INT-USER-002`,`IF-INT-ROOM-002` | `DATA-ID-001`,`DATA-USER-010` |
 
 ## 12. 完成标准

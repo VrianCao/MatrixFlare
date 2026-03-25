@@ -60,7 +60,7 @@
 5. 执行 room-version-specific `authCheck()`。
 6. 应用 redaction、relation 与 membership 规则。
 7. 为通过事件分配新的 `room_pos`。
-8. 写入 `DATA-ROOM-001` 至 `DATA-ROOM-010`。
+8. 写入 `DATA-ROOM-001`、`DATA-ROOM-002`、`DATA-ROOM-003`、`DATA-ROOM-004`、`DATA-ROOM-005`、`DATA-ROOM-006`、`DATA-ROOM-007`、`DATA-ROOM-008`、`DATA-ROOM-009`、`DATA-ROOM-010`，并在适用时更新 `DATA-ROOM-011` 与 `DATA-ROOM-012`。
 9. 生成本地 fanout 与联邦出站意图。
 
 ### 3.3 失败语义
@@ -113,8 +113,9 @@ membership 变更规则：
 
 ### 5.3 计算预算
 
-* 对大房间或长 auth chain，state resolution 必须分阶段执行并设置 CPU 预算。
-* 若单次 resolution 超出预算，应保存中间状态或降级为异步补偿，而不是让 `gateway-worker` 长时间阻塞。
+* 对大房间或长 auth chain，state resolution 必须设置明确 CPU 预算。
+* 对本地客户端与 Application Service 发起的写入，`admitEvent()` 必须在单次调用内同步完成 resolution 并给出终态；若超出预算，必须 deterministic 拒绝，不得进入未定义的 pending admission。
+* 只有联邦缺事件恢复路径才允许通过 `waiting-missing` 分支延后重新准入；该分支必须以缺失上下文为前提，而不是把“预算不够”当作等待理由。
 
 ## 6. 房间版本策略
 
@@ -204,7 +205,11 @@ room version `12` 的以下差异必须封装在策略层：
 
 * `RoomDO -> UserDO` 必须使用 `IF-INT-USER-003 appendRoomFanout(delta)`。
 * fanout 交接幂等键必须至少包含 `{room_id,room_pos,user_id}`。
+* `RoomDO` 在提交事件成功后，必须先把每个本地用户目标写入 `DATA-ROOM-011` durable outbox，再发起 `appendRoomFanout(delta)`。
+* `appendRoomFanout(delta)` 返回的 ack 必须表示对应 delta 已被 `UserDO` durable append 到 `DATA-USER-010`；只有收到 durable ack 后，`RoomDO` 才可回收该 outbox item。
 * `UserDO` 仅在成功写入用户流后才认为该用户已看见此房间变化。
+* 对单用户 fanout 失败，`RoomDO` 必须保留 outbox item 并按 at-least-once 语义重试；`UserDO` 必须按 `{room_id,room_pos,user_id}` 幂等吸收重复交付。
+* repair/rebuild 流程必须能够基于 `DATA-ROOM-011` 与 `DATA-USER-010` 重新核对并补齐缺失 fanout，确保 `/sync` token 语义不依赖易失内存。
 
 ## 9. Ephemeral 房间状态
 
@@ -256,10 +261,10 @@ forget 只影响客户端可见性，不删除房间真相。
 
 | Capability | Public IF | Internal IF | Primary Data |
 | --- | --- | --- | --- |
-| create/join/leave/invite/ban/knock | `IF-CS-030`,`IF-CS-031` | `IF-INT-ROOM-001` | `DATA-ROOM-001`,`007` |
-| send state / message | `IF-CS-032`,`IF-CS-033` | `IF-INT-ROOM-001` | `DATA-ROOM-001`-`008` |
-| paginate / members / relations / threads / timestamp lookup | `IF-CS-034` | `IF-INT-ROOM-003` | `DATA-ROOM-001`,`002` |
-| room sync projection | via `IF-CS-020` | `IF-INT-ROOM-002` | `DATA-ROOM-005`-`010` |
+| create/join/leave/invite/ban/knock | `IF-CS-030`,`IF-CS-031` | `IF-INT-ROOM-001` | `DATA-ROOM-001`,`DATA-ROOM-007` |
+| send state / message | `IF-CS-032`,`IF-CS-033` | `IF-INT-ROOM-001` | `DATA-ROOM-001`,`DATA-ROOM-002`,`DATA-ROOM-003`,`DATA-ROOM-004`,`DATA-ROOM-005`,`DATA-ROOM-006`,`DATA-ROOM-007`,`DATA-ROOM-008` |
+| paginate / members / relations / threads / timestamp lookup | `IF-CS-034` | `IF-INT-ROOM-003` | `DATA-ROOM-001`,`DATA-ROOM-002` |
+| room sync projection | via `IF-CS-020` | `IF-INT-ROOM-002` | `DATA-ROOM-005`,`DATA-ROOM-006`,`DATA-ROOM-007`,`DATA-ROOM-008`,`DATA-ROOM-009`,`DATA-ROOM-010` |
 
 ## 13. 完成标准
 

@@ -31,7 +31,7 @@
 
 | TEST-ID | Test Scope | Environment | Gate Profiles | Notes |
 | --- | --- | --- | --- | --- |
-| `TEST-GOV-001` | source baseline, traceability, ID integrity lint | CI | `L1-L3` | 校验 `REQ/MX/CF/IF/DATA/FLOW/STATE/TEST/EVID` 链接完整性、无未登记引用、无 compatibility page 误用为权威正文。 |
+| `TEST-GOV-001` | source baseline, traceability, ID integrity lint | CI | `L1-L3` | 校验 `REQ/MX/CF/IF/DATA/FLOW/STATE/TEST/EVID` 链接完整性、无未登记引用、无 ID 区间/后缀缩写、无缺失 pinned source snapshot 的 `CF-ID` 被当作 `Draft-Normative`、无 compatibility page 误用为权威正文。 |
 | `TEST-CS-001` | discovery, capabilities, registration, login, refresh, logout, profile surfaces and profile propagation basics | CI + staging | `L1-L3` | 必须覆盖 `/capabilities`、profile `keyName` 语义与 profile change propagation 基线。 |
 | `TEST-CS-002` | filter lifecycle, `/sync` initial/incremental/limited/`full_state`/`use_state_after`, `include_leave`, lazy-load members, account data, push rules, and notification counts | CI + staging | `L1-L3` | 重点验证 token 单调性、filter determinism、leave-room visibility、member lazy-load 以及通知计数语义。 |
 | `TEST-CS-003` | devices, to-device, key upload/query/claim, backup metadata | CI + staging | `L1-L3` | 必须验证 one-time key at-most-once。 |

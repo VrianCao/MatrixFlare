@@ -29,11 +29,11 @@
 
 | FLOW-ID | Name | Owning Spec | Participants | Trigger | Success Path | Failure / Retry Path |
 | --- | --- | --- | --- | --- | --- | --- |
-| `FLOW-CS-SEND-EVENT` | local event send | `31` | client, `gateway-worker`, `UserDO`, `RoomDO` | `PUT /rooms/.../send` | `RoomDO` 准入、提交、fanout | 校验失败原子拒绝 |
+| `FLOW-CS-SEND-EVENT` | local event send | `31` | client, `gateway-worker`, `UserDO`, `RoomDO` | `PUT /rooms/.../send` | `RoomDO` 幂等裁决、准入、提交、fanout | 校验失败原子拒绝；同 `txnId` 重试要么返回同结果，要么 deterministic conflict |
 | `FLOW-CS-ROOM-MEMBERSHIP` | membership mutation | `31` | client, `gateway-worker`, `UserDO`, `RoomDO`, optional federation | join/invite/leave/ban/knock | 生成 membership event 并走同一准入管道 | 联邦握手失败不得伪造本地成功 |
 | `FLOW-CS-ROOM-QUERY` | room history and state query | `31` | client, `gateway-worker`, `RoomDO` | `/messages`, `/context`, `/event`, `/state`, `/members`, `/joined_members`, `/relations`, `/threads`, `/timestamp_to_event` | 按 cursor、关系索引、时间定位与可见性规则返回房间读结果 | cursor 无效、时间定位失败或可见性不满足时 fail-closed，不得改写真相 |
 | `FLOW-ROOM-EVENT-ADMISSION` | unified room admission | `31` | `gateway-worker`, `RoomDO`, `UserDO`, `RemoteServerDO` | local/fed/AS event ingress | 统一 auth/state resolution/commit | 失败不产生 partial state |
-| `FLOW-ROOM-LOCAL-FANOUT` | local user fanout | `31` | `RoomDO`, `UserDO`, `jobs-worker` | room commit success | 写用户流、推送索引任务 | 单用户失败可补偿重试 |
+| `FLOW-ROOM-LOCAL-FANOUT` | local user fanout | `31` | `RoomDO`, `UserDO`, `jobs-worker` | room commit success | `RoomDO` 写 durable outbox，`UserDO` durable append 到用户流并返回 ack，随后 GC outbox 并推送索引任务 | 单用户失败必须保留 outbox 并补偿重试；必要时进入 repair |
 
 ### 2.3 联邦域
 
@@ -66,6 +66,7 @@
 | `STATE-DEVICE-LIFECYCLE` | device lifecycle | `30` | device | provisioned, active, soft-deleted, hard-deleted | device key invalidation |
 | `STATE-SYNC-WAITER` | sync waiter | `30` | worker-held long poll | opened, waiting, woken, assembling, returned, aborted | wake channel loss and deploy interruption |
 | `STATE-ROOM-EVENT-ADMISSION` | room event admission | `31` | event | received, validated, waiting-missing, auth-checked, committed, rejected, soft-failed | missing event repair and deterministic rejection |
+| `STATE-ROOM-FANOUT-DELIVERY` | room-to-user fanout delivery | `31` | room fanout item | pending, delivering, acked, retrying, repaired, dead-letter | durable outbox drain and `/sync` visibility correctness |
 | `STATE-ROOM-MEMBERSHIP` | membership | `31` | room/user membership | leave, invite, join, knock, ban, forgotten | edge-case transitions and visibility |
 | `STATE-REMOTE-SERVER-RETRY` | outbound retry | `32` | remote txn | queued, sending, backoff, ready, dead-letter, drained | retry schedule stability |
 | `STATE-MEDIA-CACHE-OBJECT` | remote media cache object | `33` | cached media | miss, fetching, present, stale, purging, deleted | partial fetch cleanup |

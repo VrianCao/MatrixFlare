@@ -1,25 +1,24 @@
 # Matrix Homeserver Cloudflare Spec Framework
 
-状态：Outline  
-范围：仅规划企业级开发 Spec 框架，不填充实现正文  
+状态：Draft-Normative
+范围：企业级开发 Spec 框架与主文档入口
 适用对象：架构、协议、平台、基础设施、测试、交付团队
 
 ## 1. 框架目标
 
-本目录定义 Matrix homeserver on Cloudflare 的企业级开发文档骨架。
+本目录定义 Matrix homeserver on Cloudflare 的企业级开发规范框架与责任分册入口。
 
-当前阶段只做三件事：
+当前状态已经不是“只规划骨架”，而是：
 
-1. 固定主文档与分册的边界；
-2. 固定章节编号、阅读顺序、回填顺序；
-3. 固定每份分册后续必须回答的问题、必须附带的图表与验收门槛。
+1. 主文档与分册边界已固定；
+2. 多数责任分册已进入 `Draft-Normative`，可直接作为实现输入；
+3. 尚未闭合的能力面必须显式登记到 `spec/open-questions/` 或 `Deferred` / `Required-Conditional` 寄存器中。
 
-本阶段明确不做以下事情：
+当前仍不做以下事情：
 
-* 不填充协议实现细节；
-* 不填充 Cloudflare 资源参数；
-* 不给出接口级、表结构级、状态机级正文内容；
-* 不把现有研究结论复制进骨架。
+* 不把历史研究稿继续当作现行真相；
+* 不允许未挂 `MX/CF/IF/DATA/FLOW/TEST/EVID` 的新行为混入正文；
+* 不允许主入口再演化成第二份并列单体 Spec。
 
 ## 2. 组织原则
 
@@ -61,7 +60,7 @@
 * [91-decision-log.md](./91-decision-log.md)：兼容索引页，指向权威决策目录。
 * [92-appendices.md](./92-appendices.md)：术语、附录、补充材料入口。
 
-## 4. 回填顺序
+## 4. 演进顺序
 
 1. 先填 [00-master-spec-outline.md](./00-master-spec-outline.md) 的主文档总览与章节摘要。
 2. 再填 `10-14` 治理控制层，先把范围、权威模型、协议覆盖、平台约束、追溯规则钉死。
@@ -70,7 +69,7 @@
 5. 再填 `40-44` 安全、运营、交付、验证分册。
 6. 最后持续维护 `spec/open-questions/`、`spec/decisions/` 与附录。
 
-## 5. 后续回填输入
+## 5. 历史输入
 
 后续填充本框架时，优先使用以下本地材料作为整理输入，但不得把它们直接当作最终规范正文：
 

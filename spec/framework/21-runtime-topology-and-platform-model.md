@@ -27,7 +27,7 @@
 * 异步处理与重建由 `jobs-worker` 执行。
 * Access 保护的管理面由 `ops-worker` 执行。
 * 所有权威业务状态由 DO 类承载。
-* 所有 Worker-to-Worker 通信必须使用 Service Bindings。
+* 所有 Worker-to-Worker 通信必须使用 Service Bindings，且调用必须被显式 `await`。
 * 所有 Worker-to-DO 通信默认使用 DO RPC；只有 upgrade 或协议透传场景才允许 HTTP `fetch()`。
 
 ## 3. Worker 角色模型
@@ -54,6 +54,7 @@
 * `gateway-worker -> jobs-worker`：仅用于异步任务投递、非权威查询聚合、后台补偿触发。
 * `gateway-worker -> ops-worker`：禁止普通业务调用。
 * `ops-worker -> jobs-worker`：允许用于重建、导出、批量校验。
+* 任一需要 fire-and-forget 语义的异步派发必须走 Queues 或其他显式 durable mechanism；禁止依赖未 `await` 的 Service Binding 调用。
 
 ## 4. Durable Object 类模型
 
@@ -113,8 +114,10 @@
 
 * `gateway-worker` 默认 CPU 限额按热路径设计在 `30s` 默认值之内；只有特殊导出或诊断入口才允许更高上限。引用：`CF-WKR-003`。
 * 所有大对象读取与转发必须使用 stream，不得完整读入内存。引用：`CF-WKR-004`。
+* 若通过 `fetch`、R2、KV、Queues 或 D1 打开连接后不再需要响应体，必须显式取消或尽快读尽，以释放 `6` 个 simultaneous open connections 预算。引用：`CF-WKR-006`。
 * 内部 RPC 链必须限制为浅层拓扑：`gateway -> DO` 或 `gateway -> jobs -> DO`，禁止多跳扇出图。引用：`CF-WKR-009`。
 * Service Binding 调用计入 subrequest 与 `32` 次 Worker invocation 上限，但不计入 simultaneous open connections；不得再把内部 Worker 调用误算进 `6` 个连接预算。引用：`CF-WKR-009`,`CF-WKR-010`。
+* Service Binding RPC 只适用于明确需要结果的同步内部调用；任何未 `await` 的绑定调用都视为错误实现。引用：`CF-WKR-009`,`CF-WKR-010`。
 
 ### 7.2 DO 使用规则
 

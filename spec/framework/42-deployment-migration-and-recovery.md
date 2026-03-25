@@ -166,6 +166,12 @@ DO 内部 SQLite schema 演进规则：
 * continuous recovery checkpoint export：自动、分 shard、增量，仅要求 dirty shard 在 RPO 窗口内把最新权威 watermark 刷到恢复介质；
 * operator full export bundle：显式控制面作业，冻结 registry snapshot，并产出可审计、可完整验证的 bundle 以供 namespace restore。
 
+#### 11.2.0 Shard Registry 基线
+
+* 全量导出、恢复 completeness 与巡检必须以 `DATA-OPS-010` shard registry 为基线，而不是依赖运行时“扫描到哪些 shard”。
+* 任一路径只要会首次创建可导出的 `UserDO`、`RoomDO`、`RemoteServerDO` 或 control-plane shard，就必须在对外返回成功前完成 `DATA-OPS-010` upsert。
+* full export 在开始切分 shard 工作前，必须先把 `DATA-OPS-010` 冻结为 `DATA-OPS-011` registry snapshot，并在后续所有 manifest 中引用该 snapshot 的 hash。
+
 #### 11.2.1 Continuous Recovery Checkpoint Export
 
 * 只有 source watermark 自上次 complete checkpoint 之后发生推进的 dirty shard，才要求进入恢复导出；idle shard 不得被强制每 `15` 分钟重导一次。

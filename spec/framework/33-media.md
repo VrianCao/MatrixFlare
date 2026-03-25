@@ -115,14 +115,14 @@
 
 ## 8. URL Preview 策略
 
-* URL preview 默认关闭。
+* URL preview 当前 profile 为 `Deferred`，默认关闭。
 * 若启用，必须通过专用隔离抓取器执行，并满足：
   * 禁止私网与 metadata IP
   * 限制响应大小与跳转层数
   * 限制 MIME 与解析器
   * 结果缓存仅为派生缓存
 
-本分册只定义安全边界，不要求首版 GA 开启该能力。
+本分册只定义安全边界；在 dedicated contracts 落地前，不允许对外宣称支持该能力。
 
 ## 9. 配额与滥用控制
 

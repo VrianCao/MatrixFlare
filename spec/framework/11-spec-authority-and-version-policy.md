@@ -30,7 +30,8 @@
 
 * `spec/framework/00-master-spec-outline.md` 负责定义主入口与章节主责。
 * `10-44` 分册负责定义各责任域的规范性内容。
-* `spec/decisions/`、`spec/open-questions/` 与 `92-appendices.md` 负责承载决策、问题与附录，不直接定义产品行为。
+* `spec/decisions/` 与 `spec/open-questions/` 负责承载决策与问题。
+* `92-appendices.md` 只允许承载被主责分册显式引用的 version-pinned normative baseline artifacts、术语与补充索引；附录不得自行引入未被主责分册接纳的新产品行为。
 * `90-open-questions.md` 与 `91-decision-log.md` 仅为兼容索引页，不再是权威寄存器。
 
 ### 2.2.1 真相层级表
@@ -40,7 +41,7 @@
 | `AUTH-L0` | Matrix / Cloudflare 官方来源 | 外部事实来源 |
 | `AUTH-L1` | `00` 主文档骨架与 `10-14` 治理控制层 | 内部治理真相 |
 | `AUTH-L2` | `20-44` 责任分册 | 内部设计与实现真相 |
-| `AUTH-L3` | `spec/decisions/`、`spec/open-questions/`、`92-appendices.md` | 支持性与审计性真相 |
+| `AUTH-L3` | `spec/decisions/`、`spec/open-questions/`、`92-appendices.md` | 支持性、审计性与被显式引用的 baseline 真相 |
 | `AUTH-L4` | `research/`、`notes/`、遗留单体 Spec | 非规范输入 |
 
 ### 2.3 非规范性材料
@@ -95,6 +96,7 @@
 
 * `research/sources/` 是可读缓存，不自动构成现行真相。
 * 任一关键事实进入现行规范前，必须在规范正文中重新表述，并指向外部来源和本地台账位置。
+* 若某 `CF-ID` 或其他平台事实声称已进入 `Draft-Normative`，但在 `research/sources/` 中不存在对应 pinned snapshot，则该事实不得被视为可审计的本地基线。
 
 ### 4.4 来源巡检寄存器
 

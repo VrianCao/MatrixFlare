@@ -122,7 +122,7 @@
 | public rooms and hierarchy | `IF-CS-052`,`IF-FED-006` | `IF-INT-WKR-001` | `DATA-D1-003` |
 | appservice queries | `IF-AS-001` | none | `DATA-D1-005` |
 | appservice delivery | `IF-AS-002` | `IF-QUE-003` | `DATA-D1-005` |
-| rebuild/reindex | none | `IF-INT-WKR-002`,`IF-QUE-004` | `DATA-OPS-001`,`002` |
+| rebuild/reindex | none | `IF-INT-WKR-002`,`IF-QUE-004` | `DATA-OPS-001`,`DATA-OPS-002` |
 
 ## 11. 完成标准
 

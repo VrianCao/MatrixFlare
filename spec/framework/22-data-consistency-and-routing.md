@@ -103,6 +103,16 @@
 * 若同一唯一键再次提交且 `request_fingerprint` 相同，则必须折叠到同一作业或返回同一终态结果
 * 若同一唯一键再次提交但 `request_fingerprint` 不同，则必须显式拒绝为 idempotency conflict
 
+### 4.3 客户端 `txnId` 幂等规则
+
+客户端写路径中的 `txnId` 不是“尽力而为提示”，而是权威幂等键的一部分。规范固定如下：
+
+* `PUT /_matrix/client/*/rooms/{roomId}/send/{eventType}/{txnId}`、`PUT /_matrix/client/*/rooms/{roomId}/state/{eventType}/{stateKey}`、`PUT /_matrix/client/*/rooms/{roomId}/redact/{eventId}/{txnId}` 必须通过 `DATA-ROOM-012` 持久化裁决；其中没有显式 `txnId` 的状态写路径，必须以 route template + canonical request hash 进入同一裁决表。
+* `PUT /_matrix/client/*/sendToDevice/{eventType}/{txnId}` 必须通过 `DATA-USER-016` 持久化裁决。
+* 同一幂等键再次提交且 canonical request hash 相同，必须返回与首次提交等价的成功结果。
+* 同一幂等键再次提交但 canonical request hash 不同，必须返回 deterministic idempotency conflict；不得静默覆盖。
+* 幂等裁决记录的保留期必须至少覆盖客户端、边缘重试和部署中断恢复窗口；过期清理只能在保证不会影响协议正确性的前提下进行。
+
 ## 5. 真相面与派生面边界
 
 ### 5.1 Room 真相面
@@ -207,7 +217,7 @@
 | --- | --- | --- | --- |
 | `/.well-known/matrix/client` | `gateway-worker` | none | 静态或低频配置；可缓存。 |
 | `/.well-known/matrix/server` | `gateway-worker` | none | 联邦发现关键入口。 |
-| `/_matrix/client/*/versions` | `gateway-worker` | none | 公开能力声明。 |
+| `/_matrix/client/versions` | `gateway-worker` | none | 公开能力声明。 |
 | `/_matrix/client/*` 用户域 | `gateway-worker` | `UserDO` | 登录、刷新、设备、账号数据、keys、to-device。 |
 | `/_matrix/client/*` 房间写路径 | `gateway-worker` | `UserDO` then `RoomDO` | 先鉴权与设备确认，再房间裁决。 |
 | `/_matrix/client/v3/sync` | `gateway-worker` | `UserDO` + `RoomDO` | Worker 持有 poll，按需投影房间。 |

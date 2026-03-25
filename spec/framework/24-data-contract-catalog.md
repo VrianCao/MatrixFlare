@@ -46,6 +46,7 @@
 | `DATA-USER-013` | table | push rules overrides / enablement | authoritative | `UserDO` | DO SQLite | `{scope,kind,rule_id}` | per-user serial | user export | 默认规则来自 Matrix `v1.17` 基线；这里只存用户覆盖、顺序和 enabled 状态。 |
 | `DATA-USER-014` | table | stored filters | authoritative | `UserDO` | DO SQLite | `filter_id` | per-user serial | user export | 存 canonical filter JSON、filter hash 和创建版本。 |
 | `DATA-USER-015` | table | pending media upload grants | authoritative | `UserDO` | DO SQLite | `pending_upload_id` | per-user serial | none | 记录上传配额检查结果、允许的 MIME/尺寸、TTL 与 finalize 状态；R2 写失败或超时必须可撤销。 |
+| `DATA-USER-016` | table | to-device txn dedupe registry | authoritative | `UserDO` | DO SQLite | `txn_dedupe_key` | per-user serial | user export | 用于 `PUT /sendToDevice/{eventType}/{txnId}` 幂等裁决；最小唯一键至少绑定 `{sender_user_id,event_type,txn_id}`，并持久化 canonical request hash、结果摘要与终态。 |
 
 ## 4. `RoomDO` 数据契约
 
@@ -61,6 +62,8 @@
 | `DATA-ROOM-008` | table | forward extremities | authoritative | `RoomDO` | DO SQLite | `event_id` | per-room serial | replay | 状态解析输入。 |
 | `DATA-ROOM-009` | table | receipts current view | authoritative | `RoomDO` | DO SQLite | `{receipt_type,user_id,thread_id}` | per-room serial | none | 只保留最新值。 |
 | `DATA-ROOM-010` | table | typing current view | authoritative | `RoomDO` | DO SQLite | `user_id` | per-room serial | none | 由 alarm 过期。 |
+| `DATA-ROOM-011` | table | local fanout outbox | authoritative | `RoomDO` | DO SQLite | `{room_pos,user_id}` | per-room serial | replay + repair | 记录待交付到 `UserDO` 的本地 fanout 单元、最近尝试时间、尝试次数、最后 ack 水位与终态；只有在收到 `UserDO` 的 durable append ack 后才可 GC。 |
+| `DATA-ROOM-012` | table | client event txn dedupe registry | authoritative | `RoomDO` | DO SQLite | `txn_dedupe_key` | per-room serial | replay | 用于客户端房间写路径幂等裁决；最小唯一键至少绑定 `{user_id,device_id,room_id,route_template,txn_id_or_request_hash}`，并持久化 canonical request hash、返回 `event_id` 或错误终态。 |
 
 ## 5. `RemoteServerDO` 数据契约
 
@@ -71,6 +74,7 @@
 | `DATA-FED-003` | table | inbound txn dedupe | authoritative | `RemoteServerDO` | DO SQLite | `{origin,txn_id}` | per-server serial | none | 用于重复提交幂等。 |
 | `DATA-FED-004` | table | gap repair backlog | authoritative | `RemoteServerDO` | DO SQLite | repair job id | per-server serial | repair manifest | 缺事件与缺状态恢复任务。 |
 | `DATA-FED-005` | cache/table | discovery and remote key cache | cache-derived | `RemoteServerDO` | DO SQLite + KV optional | `{server_name,key_id}` | cache semantics | refetch | 不能跳过官方发现流程。 |
+| `DATA-FED-006` | table | inbound txn result cache | authoritative | `RemoteServerDO` | DO SQLite | `{origin,txn_id}` | per-server serial | none | 持久化入站联邦事务的 canonical request hash、per-PDU 结果与 canonical response bytes；重复事务必须短路返回同一结果。 |
 
 ## 6. D1 Derived Data Contracts
 
@@ -141,6 +145,8 @@
 | `DATA-OPS-002` | manifest | rebuild checkpoint | authoritative-control-plane | `jobs-worker` | D1 / DO SQLite | `{job_id,shard}` | per job serial | manifest | 用于断点续跑。 |
 | `DATA-OPS-003` | manifest | repair decision log | authoritative-control-plane | `ops-worker` | D1 | `decision_id` | append-only | operator action | 记录人工修复与影响面。 |
 | `DATA-OPS-004` | log | audit event log + idempotency registry | authoritative-control-plane | `ops-worker` | D1 + R2 immutable export | `{event_id}` | append-only source + strongly consistent dedupe lookup | periodic export | 记录 `operator_principal_id`、auth mechanism、scope、request_id、idempotency_key、request_fingerprint、causation_id、result、affected objects；控制面写操作必须先落此契约。 |
+| `DATA-OPS-010` | table | shard registry | authoritative-control-plane | `ops-worker` | D1 | `{shard_type,shard_key}` | strong at primary / session consistent | export + restore | 全量导出、恢复与巡检使用的权威 shard 编目；最小字段至少包含 `shard_type`,`shard_key`,`created_at`,`last_seen_at`,`schema_version`,`disabled_at`；由 shard creator 按统一 upsert 形态写入，`ops-worker` 负责审计、巡检与 snapshot。 |
+| `DATA-OPS-011` | manifest | registry snapshot | authoritative-control-plane | `ops-worker` | D1 + R2 | `registry_snapshot_id` | per snapshot serial | `DATA-OPS-010` | full export 前冻结的 shard registry 视图；必须带 canonical hash、签名与导出时刻。 |
 
 ### 8.1 `DATA-OPS-004` 审计与幂等裁决规则
 
@@ -174,6 +180,15 @@
 * 若再次收到相同唯一键且 `request_fingerprint` 相同，必须返回同一 `job_id` 或同一终态结果
 * 若再次收到相同唯一键但 `request_fingerprint` 不同，必须返回 idempotency conflict，不得静默覆盖
 * 作业状态迁移必须继续追加 `audit_event`，而不是原地覆盖首条记录
+
+### 8.2 `DATA-OPS-010` / `DATA-OPS-011` Shard Registry 规则
+
+`DATA-OPS-010` 与 `DATA-OPS-011` 必须满足以下规则：
+
+* 任一路径只要会首次创建可导出的 `UserDO`、`RoomDO`、`RemoteServerDO` 或 control-plane shard，就必须在对外返回成功前完成对应 `DATA-OPS-010` upsert。
+* shard registry row 的 `schema_version` 必须反映该 shard 当前导出/恢复所需的最小 schema 解释版本。
+* `DATA-OPS-011` 只能由 full export 或显式巡检作业从 `DATA-OPS-010` 冻结生成；冻结后不得在同一 snapshot 中动态追加新发现 shard。
+* full export、restore preflight 与 completeness 校验必须引用 `DATA-OPS-011`，不得以“运行时扫描到多少 shard”为准。
 
 ## 9. 兼容与迁移规则
 

@@ -96,6 +96,8 @@
 
 * `MX`、`IF`、`DATA`、`FLOW`、`STATE`、`TEST`、`EVID` 字段中禁止使用 `reserved`、`future profile`、`session contracts`、`session flows` 等自然语言占位符代替 canonical ID。
 * 若某能力当前未定义对应契约，必须显式写 `none`，或把该能力降为 `Deferred` / `Unsupported` 并补充说明。
+* 任何 “ID 列表” 字段都必须使用逗号分隔的完整 canonical IDs，或使用对应寄存器明确允许的末尾 `*` 通配；禁止区间缩写、后缀缩写和隐式继承前缀的写法。
+* 本规则适用于 `REQ`、`MX`、`CF`、`IF`、`DATA`、`FLOW`、`STATE`、`TEST`、`EVID`、`DEC`、`OQ` 的所有寄存器、目录和证据字段；进入仓库前必须可被机器稳定解析。
 
 ## 6. 审查与合并门禁
 

@@ -1,6 +1,6 @@
 # Matrix Homeserver on Cloudflare
 
-状态：Formal Draft v0.1  
+状态：Archived historical draft
 日期：2026-03-24  
 目标：为运行在 Cloudflare Workers Paid Plan 上的 Matrix homeserver 提供可直接落地的企业级 Development Spec
 
@@ -8,7 +8,8 @@
 
 ### 1.1 Status
 
-本文件是正式开发规格说明书首版，已从研究备忘录升级为实现导向文档。  
+本文件是历史单体草稿，已被 `spec/framework/*` 分册体系取代。
+它保留审计与溯源价值，但不再是现行规范真相。
 它不是 Matrix 规范的替代品；它定义的是：
 
 * 以 Matrix `v1.17` 官方规范为协议基线的实现边界；

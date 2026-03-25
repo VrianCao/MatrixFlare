@@ -72,6 +72,7 @@
 
 * 重复的 `{origin,txn_id}` 必须稳定返回等价结果。
 * 同一事务内单个 PDU 的失败不得强制整批回滚；但重复提交时其结果必须可复现。
+* `{origin,txn_id}` 的去重不仅要记录“见过”，还必须通过 `DATA-FED-006` 持久化 canonical request hash 与 canonical response bytes；同键同内容重试必须短路返回缓存响应，同键不同内容必须显式冲突失败。
 
 ## 6. 出站事务
 
@@ -175,11 +176,11 @@
 | Capability | Public IF | Internal IF | Primary Data |
 | --- | --- | --- | --- |
 | discovery / well-known | `IF-PUB-002`,`IF-FED-001` | none | `DATA-FED-005`,`DATA-KV-002` |
-| inbound transactions | `IF-FED-002` | `IF-INT-FED-002`,`IF-INT-ROOM-001` | `DATA-FED-003`,`DATA-ROOM-001`-`010` |
-| outbound transactions | remote HTTP push | `IF-INT-FED-001`,`IF-ALARM-001` | `DATA-FED-001`,`002` |
-| join/leave/knock | `IF-FED-003` | `IF-INT-ROOM-001` | `DATA-FED-004`,`DATA-ROOM-001`-`010` |
+| inbound transactions | `IF-FED-002` | `IF-INT-FED-002`,`IF-INT-ROOM-001` | `DATA-FED-003`,`DATA-FED-006`,`DATA-ROOM-001`,`DATA-ROOM-002`,`DATA-ROOM-003`,`DATA-ROOM-004`,`DATA-ROOM-005`,`DATA-ROOM-006`,`DATA-ROOM-007`,`DATA-ROOM-008`,`DATA-ROOM-009`,`DATA-ROOM-010` |
+| outbound transactions | remote HTTP push | `IF-INT-FED-001`,`IF-ALARM-001` | `DATA-FED-001`,`DATA-FED-002` |
+| join/leave/knock | `IF-FED-003` | `IF-INT-ROOM-001` | `DATA-FED-004`,`DATA-ROOM-001`,`DATA-ROOM-002`,`DATA-ROOM-003`,`DATA-ROOM-004`,`DATA-ROOM-005`,`DATA-ROOM-006`,`DATA-ROOM-007`,`DATA-ROOM-008`,`DATA-ROOM-009`,`DATA-ROOM-010` |
 | repair/backfill | `IF-FED-004` | `IF-ALARM-001` | `DATA-FED-004` |
-| query surfaces | `IF-FED-006` | none | `DATA-USER-012`,`DATA-D1-003`,`DATA-ROOM-005`-`007` |
+| query surfaces | `IF-FED-006` | none | `DATA-USER-012`,`DATA-D1-003`,`DATA-ROOM-005`,`DATA-ROOM-006`,`DATA-ROOM-007` |
 
 ## 13. 完成标准
 
