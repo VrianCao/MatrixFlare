@@ -17,7 +17,7 @@
 当前仍不做以下事情：
 
 * 不把历史研究稿继续当作现行真相；
-* 不允许未挂 `MX/CF/IF/DATA/FLOW/TEST/EVID` 的新行为混入正文；
+* 不允许未挂 `REQ/MX/CF/IF/DATA/FLOW/TEST/EVID` 的新行为混入正文；
 * 不允许主入口再演化成第二份并列单体 Spec。
 
 ## 2. 组织原则
@@ -38,6 +38,7 @@
 * [12-matrix-protocol-compliance-profile.md](./12-matrix-protocol-compliance-profile.md)：Matrix 协议覆盖矩阵与实现支持面。
 * [13-cloudflare-platform-constraint-register.md](./13-cloudflare-platform-constraint-register.md)：Cloudflare 平台限制、行为与计费约束台账。
 * [14-traceability-and-change-control.md](./14-traceability-and-change-control.md)：需求、约束、契约、测试、证据的追溯与变更控制。
+* [15-source-observation-register.md](./15-source-observation-register.md)：Matrix 与 Cloudflare 上游来源观察、漂移结论与动作寄存器。
 * [20-system-context-and-principles.md](./20-system-context-and-principles.md)：系统上下文、信任边界、架构原则。
 * [21-runtime-topology-and-platform-model.md](./21-runtime-topology-and-platform-model.md)：Workers、Durable Objects、D1、KV、R2、Queues 拓扑与约束。
 * [22-data-consistency-and-routing.md](./22-data-consistency-and-routing.md)：数据模型、数据放置、一致性、路由边界。
@@ -63,7 +64,7 @@
 ## 4. 演进顺序
 
 1. 先填 [00-master-spec-outline.md](./00-master-spec-outline.md) 的主文档总览与章节摘要。
-2. 再填 `10-14` 治理控制层，先把范围、权威模型、协议覆盖、平台约束、追溯规则钉死。
+2. 再填 `10-15` 治理控制层，先把范围、权威模型、协议覆盖、平台约束、追溯规则与来源观察寄存器钉死。
 3. 再填 `20-25` 架构基础层，先把平台、数据、契约、流程骨架钉死。
 4. 之后按协议责任域回填 `30` 系列分册。
 5. 再填 `40-44` 安全、运营、交付、验证分册。

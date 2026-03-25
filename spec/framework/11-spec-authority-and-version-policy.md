@@ -29,7 +29,7 @@
 ### 2.2 内部规范权威
 
 * `spec/framework/00-master-spec-outline.md` 负责定义主入口与章节主责。
-* `10-44` 分册负责定义各责任域的规范性内容。
+* `10-44` 分册负责定义各责任域的规范性内容；其中 [15-source-observation-register.md](/root/Matrix/spec/framework/15-source-observation-register.md) 是上游观察基线的唯一权威寄存器。
 * `spec/decisions/` 与 `spec/open-questions/` 负责承载决策与问题。
 * `92-appendices.md` 只允许承载被主责分册显式引用的 version-pinned normative baseline artifacts、术语与补充索引；附录不得自行引入未被主责分册接纳的新产品行为。
 * `90-open-questions.md` 与 `91-decision-log.md` 仅为兼容索引页，不再是权威寄存器。
@@ -39,7 +39,7 @@
 | Authority Level | Artifact Class | Authority |
 | --- | --- | --- |
 | `AUTH-L0` | Matrix / Cloudflare 官方来源 | 外部事实来源 |
-| `AUTH-L1` | `00` 主文档骨架与 `10-14` 治理控制层 | 内部治理真相 |
+| `AUTH-L1` | `00` 主文档骨架与 `10-15` 治理控制层 | 内部治理真相 |
 | `AUTH-L2` | `20-44` 责任分册 | 内部设计与实现真相 |
 | `AUTH-L3` | `spec/decisions/`、`spec/open-questions/`、`92-appendices.md` | 支持性、审计性与被显式引用的 baseline 真相 |
 | `AUTH-L4` | `research/`、`notes/`、遗留单体 Spec | 非规范输入 |
@@ -82,7 +82,7 @@
 
 ### 4.1 Matrix 版本锁定
 
-* 当前观察到的 Matrix `latest` 页面在 2026-03-24 显示 `v1.17`。
+* 当前观察到的 Matrix `latest` 页面在 2026-03-25 显示 `v1.17`。
 * 本文档体系后续必须明确区分“实现基线版本”和“上游最新观察版本”。
 * `latest` 只能用于变更监测，不能替代固定版本的实现基线。
 
@@ -105,6 +105,8 @@
 | Source Family | Pinned Baseline | Observed Latest | Observation Date | Delta Summary | Action Required | Owner |
 | --- | --- | --- | --- | --- | --- | --- |
 | Matrix / Cloudflare product line | version or URL set in force | latest observed version / doc revision | YYYY-MM-DD | none / additive / breaking / unclear | no-op / review / decision / migration | role or team |
+
+该寄存器的唯一权威文件固定为 [15-source-observation-register.md](/root/Matrix/spec/framework/15-source-observation-register.md)。治理、发布与审计流程不得改用临时表格、issue comment 或外部 wiki 作为现行真相。
 
 ## 5. 规范语言与引用规则
 

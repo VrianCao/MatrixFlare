@@ -178,8 +178,142 @@ DO 内部 SQLite schema 演进规则：
 * dirty `RoomDO` shard 必须在“首次未导出 watermark 推进”后的 `15` 分钟内，把新增 archive segments 与对应 checkpoint manifest 刷到 R2。
 * dirty `UserDO` shard 必须在相同 `15` 分钟窗口内，把设备、账号数据、密钥与 backup metadata 的恢复快照或增量分片刷到 R2。
 * `RemoteServerDO` 与控制面 shard 若其权威状态参与 DR，也必须遵守同一 dirty-shard checkpoint cadence。
-* 每个 checkpoint manifest 都必须记录 `started_at`、`completed_at`、source watermark / serial、对象哈希列表、schema version、签名 key version 与 completeness state。
-* continuous checkpoint 不要求创建全局 `export_epoch`；它的职责是满足 RPO，而不是直接充当“单次全量 bundle”。
+* 每个 checkpoint manifest 都必须记录 `checkpoint_id`、`started_at`、`completed_at`、source watermark / serial、对象哈希列表、schema version、签名 key version 与 completeness state。
+* continuous checkpoint 不要求创建全局 `export_epoch`；它的职责是满足 RPO，而不是直接充当“单次全量 bundle”。checkpoint artifacts 必须使用 `checkpoint_id` 作为主标识，只有被 full export bundle 采纳时才额外挂接 `export_epoch`。
+
+#### 11.2.1.1 Shard Watermark 定义
+
+continuous checkpoint 与 full export 复用 checkpoint 时，`source watermark` 的最小语义固定如下：
+
+* `RoomDO`：`max_committed_room_pos`,`current_snapshot_id`,`forward_extremities_hash`
+* `UserDO`：`max_user_stream_pos`,`device_state_version`,`to_device_queue_highwater`
+* `RemoteServerDO`：`max_outbound_txn_seq`,`retry_schedule_version`,`inbound_txn_cache_version`
+* control-plane shard：`max_audit_event_seq` 或该 shard 的等价单调序号
+
+实现规则：
+
+* watermark 必须单调前进；任一 checkpoint 若出现回退，必须标记为 `incomplete` 并禁止用于 full export completeness。
+* full export 复用旧 checkpoint 时，必须验证其 watermark 不晚于本轮 cut 且未回退。
+* restore preflight 必须按 shard 类型解释 watermark，而不是把所有 shard 当作同一种整数序号。
+
+#### 11.2.1.2 Checkpoint Manifest Object Schema
+
+每个 checkpoint manifest 的 `objects[]` 项至少必须包含以下字段：
+
+* `object_id`
+* `object_kind`
+* `shard_type`
+* `shard_key`
+* `data_ids`
+* `required_for_restore`
+* `apply_phase`
+* `range_start`
+* `range_end`
+* `content_hash`
+* `codec`
+* `encryption_key_version`
+* `byte_size`
+* `record_count`
+
+约束：
+
+* `data_ids` 必须是 canonical `DATA-*` 显式枚举，不得写自然语言。
+* `apply_phase` 首版只允许 `truth-core`、`truth-aux`、`ephemeral-current`、`dedupe-and-outbox`、`control-plane` 五类。
+* `required_for_restore = false` 的对象可以加速恢复，但不得成为恢复正确性的唯一来源。
+
+#### 11.2.1.2.1 Object Codec and Range Semantics
+
+为避免“manifest 写了 `codec`/`range_*` 但实现自行脑补”，首版恢复对象格式再固定以下规则：
+
+* `objects[].codec` 只允许以下集合：
+  * `jcs-json`：单个 canonical JSON 文档，适用于 manifest-like、current-state-like、reference-set-like 对象。
+  * `jsonl-gzip`：UTF-8 LF-delimited canonical JSON records，经 `gzip` 压缩；适用于 append-only 或批量记录分段。
+* 除 `codec = jcs-json` 外，`record_count` 必须大于 `0`；`codec = jcs-json` 时 `record_count` 固定为 `1`。
+* `range_start` / `range_end` 必须使用与 shard/object 自然排序一致的 source order；禁止写“第几个文件”之类与恢复语义无关的局部序号。
+* append-only segment 的 `range_start` / `range_end` 必须是闭区间；同一 shard 同一 object kind 的两个 complete segment 不得声明相互重叠但 hash 不同的 coverage。
+* current-state-like 对象若只表达某个快照或当前值，`range_start` 与 `range_end` 必须相等，并等于该对象对应的 snapshot/version/watermark。
+* `range_start` / `range_end` 的类型必须在同一 `object_kind` 内保持稳定；不得同一 kind 有时写整数、有时写 JSON object。
+
+首版各主要对象的最小编码/范围约束如下：
+
+| Object Kind | Allowed Codec | `range_start` / `range_end` Unit | Notes |
+| --- | --- | --- | --- |
+| `room-events-metadata-segment` | `jsonl-gzip` | inclusive `room_pos` | 每条记录按 committed room order 排序。 |
+| `room-hot-event-json-segment` | `jsonl-gzip` | inclusive `room_pos` | 与 metadata segment 的 event 集必须可对齐。 |
+| `room-prev-edges-segment` | `jsonl-gzip` | inclusive `room_pos` | 以 child event 的 committed order 定位。 |
+| `room-auth-edges-segment` | `jsonl-gzip` | inclusive `room_pos` | 以 child event 的 committed order 定位。 |
+| `room-state-snapshot-segment` | `jsonl-gzip` | inclusive `snapshot_id` | 必须保持 snapshot chain 可恢复。 |
+| `room-membership-current` | `jcs-json` | single `snapshot_id` or membership version | 只表达 checkpoint cut 时的当前面。 |
+| `room-forward-extremities-current` | `jcs-json` | single `snapshot_id` | 与当前 snapshot 对齐。 |
+| `room-receipts-current` | `jcs-json` | single receipt version | 非权威核心，但范围仍须可解释。 |
+| `room-typing-current` | `jcs-json` | single typing version | 可恢复后按 TTL 再收敛。 |
+| `room-fanout-outbox-segment` | `jsonl-gzip` | inclusive `room_pos` | 每条记录必须能回链 `DATA-ROOM-011` 主键。 |
+| `room-client-txn-dedupe-segment` | `jsonl-gzip` | inclusive dedupe serial | 必须保持 public txn 重试裁决。 |
+| `room-archive-reference-set` | `jcs-json` | single checkpoint-local coverage descriptor | 只允许引用已存在且 hash 可验的 cold archive 对象。 |
+| `user-identity-and-session-segment` | `jsonl-gzip` | inclusive per-user entity serial | 顺序至少保证 session/device/key 依赖可恢复。 |
+| `user-profile-and-account-segment` | `jsonl-gzip` | inclusive profile/account serial | profile、presence、push-rules、filter 共享统一 cut。 |
+| `user-stream-and-todevice-segment` | `jsonl-gzip` | inclusive `user_stream_pos` | `/sync` 与 to-device 恢复以此为准。 |
+| `remote-outbound-queue-segment` | `jsonl-gzip` | inclusive `outbound_txn_seq` | 必须保持同远端排序。 |
+| `remote-inbound-txn-segment` | `jsonl-gzip` | inclusive inbound dedupe serial | 必须保持幂等结果缓存可恢复。 |
+| `remote-repair-and-cache-segment` | `jsonl-gzip` | inclusive repair/cache serial | discovery cache 可选，但格式必须稳定。 |
+| `ops-core-segment` | `jsonl-gzip` | inclusive control-plane audit/job serial | 控制面恢复必须可按 audit 顺序重放。 |
+
+#### 11.2.1.3 Required Checkpoint Object Sets
+
+| Shard Type | Required Object Kind | Covers DATA IDs | Required For Restore | Apply Phase | Notes |
+| --- | --- | --- | --- | --- | --- |
+| `RoomDO` | `room-events-metadata-segment` | `DATA-ROOM-001` | yes | `truth-core` | 必须覆盖自上次 complete checkpoint 之后新增或变更的 event metadata。 |
+| `RoomDO` | `room-hot-event-json-segment` | `DATA-ROOM-002` | yes | `truth-core` | 仅导出尚未由 `DATA-R2-004` 冷段权威覆盖的 canonical event JSON。 |
+| `RoomDO` | `room-prev-edges-segment` | `DATA-ROOM-003` | yes | `truth-core` | 恢复 DAG 必需。 |
+| `RoomDO` | `room-auth-edges-segment` | `DATA-ROOM-004` | yes | `truth-core` | 恢复 auth chain 必需。 |
+| `RoomDO` | `room-state-snapshot-segment` | `DATA-ROOM-005`,`DATA-ROOM-006` | yes | `truth-core` | 必须能恢复 current snapshot 与历史 snapshot 链。 |
+| `RoomDO` | `room-membership-current` | `DATA-ROOM-007` | yes | `truth-aux` | 恢复当前 membership 裁决面。 |
+| `RoomDO` | `room-forward-extremities-current` | `DATA-ROOM-008` | yes | `truth-aux` | 恢复后续 state resolution 输入。 |
+| `RoomDO` | `room-receipts-current` | `DATA-ROOM-009` | no | `ephemeral-current` | 可用房间 truth 重建 unread 相关派生，但为缩短恢复时间默认导出。 |
+| `RoomDO` | `room-typing-current` | `DATA-ROOM-010` | no | `ephemeral-current` | 恢复后允许按 TTL 重新收敛。 |
+| `RoomDO` | `room-fanout-outbox-segment` | `DATA-ROOM-011` | yes | `dedupe-and-outbox` | 保证 `/sync` 可见性不因恢复丢失 fanout。 |
+| `RoomDO` | `room-client-txn-dedupe-segment` | `DATA-ROOM-012` | yes | `dedupe-and-outbox` | 保证客户端重试幂等。 |
+| `RoomDO` | `room-archive-reference-set` | `DATA-R2-004` | yes | `truth-aux` | 必须列出本次 checkpoint 引用或新增的 cold segments；引用对象必须已存在并 hash 校验通过。 |
+| `UserDO` | `user-identity-and-session-segment` | `DATA-USER-001`,`DATA-USER-002`,`DATA-USER-003`,`DATA-USER-004`,`DATA-USER-005` | yes | `truth-core` | 会话、设备、密钥先于用户流恢复。 |
+| `UserDO` | `user-profile-and-account-segment` | `DATA-USER-006`,`DATA-USER-007`,`DATA-USER-009`,`DATA-USER-012`,`DATA-USER-013`,`DATA-USER-014`,`DATA-USER-015` | yes | `truth-aux` | 恢复 profile、presence、push-rules 与 filter。 |
+| `UserDO` | `user-stream-and-todevice-segment` | `DATA-USER-008`,`DATA-USER-010`,`DATA-USER-011`,`DATA-USER-016` | yes | `dedupe-and-outbox` | 保证 `/sync` token、to-device 和 key backup manifest 语义。 |
+| `RemoteServerDO` | `remote-outbound-queue-segment` | `DATA-FED-001`,`DATA-FED-002` | yes | `truth-core` | 恢复出站排序与退避。 |
+| `RemoteServerDO` | `remote-inbound-txn-segment` | `DATA-FED-003`,`DATA-FED-006` | yes | `dedupe-and-outbox` | 保证入站事务幂等与稳定响应。 |
+| `RemoteServerDO` | `remote-repair-and-cache-segment` | `DATA-FED-004`,`DATA-FED-005` | no | `truth-aux` | discovery cache 可重新拉取，但 gap repair backlog 默认导出。 |
+| `control-plane` | `ops-core-segment` | `DATA-D1-005`,`DATA-D1-006`,`DATA-OPS-001`,`DATA-OPS-002`,`DATA-OPS-003`,`DATA-OPS-004`,`DATA-OPS-010`,`DATA-OPS-011` | yes | `control-plane` | control-plane shard 的最小恢复集。 |
+
+#### 11.2.1.4 Restore Apply Order
+
+restore 必须按 `apply_phase` 执行，且至少满足以下顺序：
+
+1. `truth-core`
+2. `truth-aux`
+3. `ephemeral-current`
+4. `dedupe-and-outbox`
+5. `control-plane`
+
+额外规则：
+
+* `RoomDO` 不得在 `room-events-metadata-segment` / graph / snapshot 恢复前导入 `room-fanout-outbox-segment`。
+* `UserDO` 不得在 identity/session/keys 恢复前导入 `user-stream-and-todevice-segment`。
+* `RemoteServerDO` 不得在 outbound queue 恢复前恢复 retry schedule。
+* 任一 required object_kind 缺失时，该 shard checkpoint 必须标记为 `incomplete`，不得进入 full export completeness。
+
+#### 11.2.1.4.1 Restore Idempotency and Conflict Rules
+
+restore 作业必须允许因 Worker 重试、Queue 重试或分片恢复而重复应用同一对象，但不得把“重复应用”偷换成“静默覆盖冲突”。固定规则如下：
+
+* 同一 `object_id` 再次导入时，若 `content_hash`、`codec`、`range_start`、`range_end` 与首次导入完全一致，则视为 idempotent replay，允许短路为 success。
+* 同一 `object_id` 若出现不同 `content_hash`、不同 `codec` 或不同 range，必须立即 fail-closed；不得取“最后一个写入者”。
+* append-only segment 导入时，若目标命名空间已存在同主键记录：
+  * canonical payload 完全一致则允许跳过；
+  * canonical payload 不一致则必须标记 restore 冲突并终止当前 shard。
+* current-state-like 对象导入时，若目标当前值已存在：
+  * provenance 相同且 canonical payload 一致则允许跳过；
+  * provenance 不同或 payload 不同则必须视为 preflight/ordering 错误，不得覆盖。
+* `dedupe-and-outbox` phase 的对象不得在其引用的 `truth-core` / `truth-aux` truth 尚未恢复时导入；若引用 truth 缺失，必须失败而不是先落“悬空 outbox / dedupe”。
+* `control-plane` phase 对象若引用不存在的 `registry_snapshot_id`、`checkpoint_id` 或 `job_id`，必须失败并记录审计事件。
+* restore 成功后重新执行同一 shard job，得到的结果必须是 no-op 或显式 identical replay；不得因为重复运行生成新的权威主键或推进 source watermark。
 
 #### 11.2.2 Full Export Bundle
 
@@ -233,6 +367,7 @@ DO 内部 SQLite schema 演进规则：
 必须支持以下 scoped repair：
 
 * single room graph repair
+* room-to-user fanout reconcile / repair
 * single user device/keys repair
 * single remote server txn queue repair
 * remote media catalog repair

@@ -211,6 +211,15 @@ room version `12` 的以下差异必须封装在策略层：
 * 对单用户 fanout 失败，`RoomDO` 必须保留 outbox item 并按 at-least-once 语义重试；`UserDO` 必须按 `{room_id,room_pos,user_id}` 幂等吸收重复交付。
 * repair/rebuild 流程必须能够基于 `DATA-ROOM-011` 与 `DATA-USER-010` 重新核对并补齐缺失 fanout，确保 `/sync` token 语义不依赖易失内存。
 
+### 8.3 Fanout Reconcile / Repair 规则
+
+以 `FLOW-ROOM-FANOUT-REPAIR` 为准，fanout 修复裁决必须固定如下：
+
+* 若 `DATA-ROOM-011` 存在 pending item，且 `UserDO` 侧找不到对应 `{room_id,room_pos,user_id}` durable append，则必须重驱 `appendRoomFanout(delta)`，不得直接 GC。
+* 若 `DATA-ROOM-011` 仍为 pending，但 `UserDO` 已存在对应 durable append，则必须把该 outbox item 标记为 `acked` 并 GC，而不是再次投递。
+* 若房间事件 truth 已提交、目标用户仍属本地且应观察该房间变化，但 `DATA-ROOM-011` 与 `DATA-USER-010` 同时缺记录，则 repair 流程必须按房间 truth 重新生成 outbox item，并把该动作写入 `DATA-OPS-003/004`。
+* 任一 reconcile 都不得直接改写 `next_batch`；`/sync` 可见性只能通过重新建立或确认 durable fanout 达成。
+
 ## 9. Ephemeral 房间状态
 
 * typing 当前视图由 `DATA-ROOM-010` 持有，并由 `IF-ALARM-002` 过期。
@@ -237,9 +246,18 @@ room version `12` 的以下差异必须封装在策略层：
 
 ### 10.2 关系、线程与时间定位
 
-* `RoomDO` 必须维护足够的事件元数据，使 `/relations`、`/threads` 与 `/timestamp_to_event` 能在热路径上完成查询，而不是为每次请求重扫冷归档。
+* `RoomDO` 必须按 [24-data-contract-catalog.md](/root/Matrix/spec/framework/24-data-contract-catalog.md) 中 `DATA-ROOM-001` 最小形态维护显式 query metadata，使 `/relations`、`/threads` 与 `/timestamp_to_event` 能在热路径上完成查询，而不是为每次请求重扫冷归档。
 * `/relations` 与 `/threads` 的结果必须基于房间权威事件图和 relation metadata 计算，并应用与普通 timeline 相同的可见性与 redaction 规则。
 * `/timestamp_to_event` 必须按规范给出“相对目标 timestamp 与方向约束下的最近可见事件”；若不存在满足条件的可见事件，必须返回该 endpoint 允许的 no-result 语义，而不是猜测最近 `room_pos`。
+* `RoomDO` 对 `/messages`、`/context`、`/event`、`/state`、`/members`、`/joined_members`、`/relations`、`/threads`、`/timestamp_to_event` 的内部实现，不得拆成多个语义漂移的私有接口；所有 query kind 都必须统一经 `IF-INT-ROOM-003 queryRoom(readRequest)` 进入单一只读裁决面。
+
+### 10.3 冷归档读取规则
+
+* R2 冷归档只允许在 `RoomDO` 完成 event existence、membership boundary、history visibility 与 redaction 裁决之后，作为 canonical JSON 或 snapshot materialization 的字节来源。
+* 任一 cold-hit 读取都必须先通过 `DATA-ROOM-001` 中的精确 archive 指针定位到 `DATA-R2-004`；禁止在热路径中执行 R2 list、全段扫描或“遍历最近几个 segment 试试看”。
+* `/context` 必须先用权威 timeline 元数据确定 before/after 的 `room_pos` 窗口，再按需回填冷段 JSON；不得把冷段顺序直接当作 timeline 主排序。
+* `/event`、`/relations`、`/threads` 命中冷事件时，必须仍以 `DATA-ROOM-001` 中的 metadata 为主裁决可见性，R2 只提供 event body，不得反向覆盖权威 metadata。
+* 若冷归档对象缺失、hash 校验失败、或 metadata 指针无法定位到唯一对象，则该请求必须返回 typed integrity failure 并触发 repair signal；不得静默降级为“事件不存在”。
 
 ## 11. Membership 边界条件
 
@@ -263,7 +281,7 @@ forget 只影响客户端可见性，不删除房间真相。
 | --- | --- | --- | --- |
 | create/join/leave/invite/ban/knock | `IF-CS-030`,`IF-CS-031` | `IF-INT-ROOM-001` | `DATA-ROOM-001`,`DATA-ROOM-007` |
 | send state / message | `IF-CS-032`,`IF-CS-033` | `IF-INT-ROOM-001` | `DATA-ROOM-001`,`DATA-ROOM-002`,`DATA-ROOM-003`,`DATA-ROOM-004`,`DATA-ROOM-005`,`DATA-ROOM-006`,`DATA-ROOM-007`,`DATA-ROOM-008` |
-| paginate / members / relations / threads / timestamp lookup | `IF-CS-034` | `IF-INT-ROOM-003` | `DATA-ROOM-001`,`DATA-ROOM-002` |
+| paginate / context / event / state / members / relations / threads / timestamp lookup | `IF-CS-034` | `IF-INT-ROOM-003` | `DATA-ROOM-001`,`DATA-ROOM-002`,`DATA-ROOM-005`,`DATA-ROOM-006`,`DATA-ROOM-007`,`DATA-R2-004` |
 | room sync projection | via `IF-CS-020` | `IF-INT-ROOM-002` | `DATA-ROOM-005`,`DATA-ROOM-006`,`DATA-ROOM-007`,`DATA-ROOM-008`,`DATA-ROOM-009`,`DATA-ROOM-010` |
 
 ## 13. 完成标准

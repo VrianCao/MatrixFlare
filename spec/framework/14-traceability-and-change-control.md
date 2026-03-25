@@ -32,6 +32,7 @@
 * `90-open-questions.md` 与 `91-decision-log.md` 只允许作为目录跳转页；不得再被引用为 `DEC` / `OQ` 的权威正文。
 * 每个 `DEC` 至少包含：状态、结论、原因、影响的 `REQ/MX/CF/IF/DATA/TEST/EVID`、owner、批准日期、失效或复审日期。
 * Evidence waiver、规范冲突裁决和恢复例外都必须引用已存在的 `DEC-ID`，不得只写自然语言说明。
+* `OQ` 不得只因为“先降级成 Deferred / Conditional”就被标记为 `closed`；只有当其 `affected IDs` 已全部落为 canonical `IF/DATA/FLOW/TEST/EVID`，或被 `DEC-ID` 明确收敛为稳定产品边界时，才允许关闭。
 
 ## 3. 必须建立的双向链接
 
@@ -124,6 +125,19 @@
 | Source ID | Source Type | Target ID | Target Type | Link Reason | Owning Spec | Status |
 | --- | --- | --- | --- | --- | --- | --- |
 | `REQ-*` / `MX-*` / `CF-*` | requirement / coverage / constraint | `IF-*` / `DATA-*` / `TEST-*` / `EVID-*` / `DEC-*` | contract / test / evidence / decision | implements / constrains / verifies / changes | owning child spec | open / active / closed |
+
+### 7.2 机器可审计编码位置
+
+双向追溯的唯一机器权威编码固定为 `EVID-GOV-001` 产出的 traceability matrix 工件：
+
+* `evidence/common/EVID-GOV-001/<run_ts>/artifacts/traceability-matrix.csv`
+* `evidence/common/EVID-GOV-001/<run_ts>/artifacts/traceability-matrix.json`
+
+规则：
+
+* `IF` / `DATA` 目录表可以不内联 `Source IDs` 或 `TEST IDs` 列，前提是上述 matrix 能从现有 canonical 寄存器字段中确定性推导出反向链接。
+* `TEST-GOV-001` 必须在每次 CI 运行时重新生成该 matrix，并对断链、歧义链接、缺失反向边与未登记 ID 直接 fail。
+* 任何无法被上述 matrix 表达的链接需求，都不得仅存在于自然语言段落；必须先进入 canonical 寄存器字段或新增权威寄存器后，才可宣称闭环。
 
 ## 8. 完成标准
 

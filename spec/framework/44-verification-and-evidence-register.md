@@ -45,10 +45,11 @@
 
 | EVID-ID | Source IDs | Evidence Type | Generation Method | Environment | Frequency | Pass Criteria | Artifact Location | Retention | Owner |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `EVID-GOV-001` | `REQ-*`,`MX-*`,`CF-*`,`IF-*`,`DATA-*`,`FLOW-*`,`STATE-*`,`TEST-*`,`EVID-*` | governance | CI traceability report | CI | per commit | ID 链接完整、无断链、无未登记引用、无 compatibility page 被当作权威正文引用 | `evidence/common/EVID-GOV-001/` | release lifetime | architecture |
-| `EVID-CS-001` | `MX-CS-001`,`MX-CS-002`,`MX-CS-006`,`MX-CS-019` | integration/protocol | client-core CI + staging report | CI + staging | per release candidate | discovery/capabilities/session/profile 核心用例与 profile propagation 基线全通过 | `evidence/L1/EVID-CS-001/` | release lifetime | client protocol |
+| `EVID-GOV-001` | `REQ-*`,`MX-*`,`CF-*`,`IF-*`,`DATA-*`,`FLOW-*`,`STATE-*`,`TEST-*`,`EVID-*`,`DEC-*`,`OQ-*` | governance | CI traceability report | CI | per commit | ID 链接完整、无断链、无未登记引用、产出完整 traceability matrix、source observation register 已校验、无 compatibility page 被当作权威正文引用、无把仅靠 `Deferred` 降级而未经 `DEC` 或 contracts 收敛的 `OQ` 误标为 `closed` | `evidence/common/EVID-GOV-001/` | release lifetime | architecture |
+| `EVID-CS-001` | `MX-CS-001`,`MX-CS-002`,`MX-CS-003`,`MX-CS-005`,`MX-CS-006`,`MX-CS-019` | integration/protocol | client-core CI + staging report | CI + staging | per release candidate | discovery/capabilities/session/profile 核心用例与 profile propagation 基线全通过，且 `GET /login` / `GET /capabilities` 对 disabled login-token / 3PID surfaces 的宣告与真实 route truth 一致 | `evidence/L1/EVID-CS-001/` | release lifetime | client protocol |
 | `EVID-CS-002` | `MX-CS-004`,`MX-CS-006`,`MX-CS-007`,`MX-CS-010`,`MX-CS-015` | protocol | `/sync` conformance report | staging | per release candidate | filter lifecycle、`include_leave`、lazy-load members、initial/incremental/limited/`full_state`/`use_state_after`、push rules 与 notification counts 全通过 | `evidence/L1/EVID-CS-002/` | release lifetime | client protocol |
 | `EVID-CS-003` | `MX-CS-013`,`MX-CS-014` | protocol | devices/E2EE transport report | staging | per release candidate | key claim at-most-once 与 device-list 增量通过 | `evidence/L1/EVID-CS-003/` | release lifetime | client protocol |
+| `EVID-CS-004` | `MX-CS-003`,`MX-CS-005`,`MX-CS-012`,`MX-CS-016`,`MX-CS-018`,`MX-CS-020`,`MX-CS-021`,`MX-CS-022`,`MX-CS-023` | protocol/governance | deferred-route guard report | CI + staging | per release candidate | deferred/conditional/unsupported route stubs 返回固定 wire behavior、无 truth write、无 feature-flag 漂移，且 discoverability 面不会与 stub truth 冲突 | `evidence/L1/EVID-CS-004/` | release lifetime | client protocol + architecture |
 | `EVID-ROOM-001` | `MX-CS-008`,`MX-CS-009`,`MX-CS-010` | property/integration | room-core report | CI + staging | per release candidate | 本地房间行为和 fanout 全通过 | `evidence/L1/EVID-ROOM-001/` | release lifetime | room core |
 | `EVID-ROOM-002` | `MX-RV-011`,`MX-RV-012` | protocol/property | room-version report | CI + staging | per release candidate | `L1` 时 room version `12` 行为通过；`L2-L3` 时 room version `11/12` 差异行为通过 | `evidence/L1/EVID-ROOM-002/` | release lifetime | room core |
 | `EVID-FED-001` | `MX-FED-001`,`MX-FED-002`,`MX-FED-003`,`MX-FED-005`,`MX-FED-006`,`MX-FED-007` | federation | federation-core report | staging | per release candidate | 发现、验签、事务、握手，以及 query-surface auth/routing 全部通过 | `evidence/L2/EVID-FED-001/` | release lifetime | federation |
@@ -56,7 +57,7 @@
 | `EVID-MEDIA-001` | `MX-CS-011`,`MX-FED-008` | integration/load | media pipeline report | staging + pre-release | per release candidate | upload/download/thumbnail/remote cache 通过 | `evidence/L1/EVID-MEDIA-001/` | release lifetime | media |
 | `EVID-DER-001` | `MX-CS-017`,`MX-FED-006` | integration/rebuild | derived-data report | staging + pre-release | per release candidate | search、目录、rebuild 一致性通过 | `evidence/L1/EVID-DER-001/` | release lifetime | derived services |
 | `EVID-AS-001` | `MX-AS-001`,`MX-AS-002`,`MX-AS-003`,`MX-CS-017` | integration | appservice and derived-data report | staging | per release candidate when enabled | namespace、txn delivery、directory side-effects 通过 | `evidence/L3/EVID-AS-001/` | release lifetime | integrations |
-| `EVID-SEC-001` | `REQ-SEC-*`,`MX-CS-002`,`MX-FED-002` | security | security verification bundle | staging + pre-release | per release candidate | token revocation、secret handling、abuse guards 通过 | `evidence/common/EVID-SEC-001/` | release lifetime + 1 audit cycle | security |
+| `EVID-SEC-001` | `REQ-SEC-*`,`MX-CS-002`,`MX-CS-003`,`MX-CS-005`,`MX-CS-016`,`MX-FED-002` | security | security verification bundle | staging + pre-release | per release candidate | token revocation、secret handling、abuse guards 通过；若启用 SSO / 3PID / pushers，则对应条件能力也必须在同一 bundle 中通过 | `evidence/common/EVID-SEC-001/` | release lifetime + 1 audit cycle | security |
 | `EVID-OPS-001` | `REQ-OPS-010`,`REQ-OPS-011`,`REQ-OPS-012` | deploy | rollout compatibility report | pre-release | per release candidate | new/old version skew tests通过 | `evidence/common/EVID-OPS-001/` | release lifetime | platform |
 | `EVID-OPS-002` | `REQ-OPS-013`,`DATA-OPS-*` | recovery/drill | replay/rebuild/restore drill report | periodic drill | quarterly + pre-release for major releases | restore/rebuild 成功且 checkpoint/manifest 完整 | `evidence/L3/EVID-OPS-002/` | 2 years | platform + SRE |
 | `EVID-PERF-001` | `REQ-OPS-001`,`REQ-OPS-002`,`REQ-OPS-003`,`REQ-OPS-004`,`REQ-OPS-005` | load | performance benchmark report | pre-release | per release candidate | `/sync`、hot room、derived lag budgets达标 | `evidence/common/EVID-PERF-001/` | release lifetime | performance |
@@ -66,7 +67,7 @@
 
 | Profile ID | Canonical Name | Mandatory EVID IDs |
 | --- | --- | --- |
-| `L1` | `Local-Core` | `EVID-GOV-001`,`EVID-CS-001`,`EVID-CS-002`,`EVID-CS-003`,`EVID-ROOM-001`,`EVID-ROOM-002`,`EVID-MEDIA-001`,`EVID-DER-001`,`EVID-SEC-001`,`EVID-OPS-001`,`EVID-COST-001` |
+| `L1` | `Local-Core` | `EVID-GOV-001`,`EVID-CS-001`,`EVID-CS-002`,`EVID-CS-003`,`EVID-CS-004`,`EVID-ROOM-001`,`EVID-ROOM-002`,`EVID-MEDIA-001`,`EVID-DER-001`,`EVID-SEC-001`,`EVID-OPS-001`,`EVID-COST-001` |
 | `L2` | `Federation-Core` | `L1` + `EVID-FED-001`,`EVID-FED-002` |
 | `L3` | `Enterprise-Hardening` | `L2` + `EVID-AS-001` when enabled, `EVID-OPS-002`,`EVID-PERF-001` |
 

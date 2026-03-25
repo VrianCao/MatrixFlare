@@ -99,6 +99,10 @@
 
 ### 4.2 登录
 
+* `GET /_matrix/client/*/login` 必须始终可用，并由 `IF-CS-005` 输出当前真实支持的 login flow 集合。
+* `L1-L3` 基线下，`GET /login` 必须宣告 `m.login.password`；只有在 `MX-CS-003` 真正启用且 dedicated contracts 完整落地后，才允许宣告 `m.login.sso`。
+* `m.login.token` 只有在服务器同时支持对应的 login-token consumption 语义时才允许出现在 `GET /login`；当前默认关闭 `MX-CS-003` 时不得宣告。
+* `POST /login` 若收到未在 `GET /login` 中宣告的 login type，必须按 Matrix `v1.17` core login 规则返回 `400` + `M_UNKNOWN`，不得把“关闭的 flow”做成节点间漂移的任意错误。
 * 登录成功必须创建或恢复一个 device 关联的活动 session。
 * `login` 响应中的 access token 和 refresh token 必须绑定到同一 `session_id`。
 * 登录失败不得产生任何残留 session、device 或用户流副作用。
@@ -122,6 +126,8 @@
 * `GET /_matrix/client/*/capabilities` 的结果来自部署时配置与运行时策略，但其返回值必须与真实可写权限一致。
 * `m.profile_fields` 必须返回规范要求的 `enabled`，并按实际策略返回可选的 `allowed` / `disallowed` 列表。
 * 若 `m.profile_fields` 直接或间接禁止修改 `displayname` 或 `avatar_url`，则已废弃的 `m.set_displayname` / `m.set_avatar_url` 也必须同步返回 `enabled: false`。
+* 当 `MX-CS-005` 默认关闭时，`GET /_matrix/client/*/capabilities` 必须显式返回 `m.3pid_changes.enabled = false`，避免客户端按“未列出即默认可改”误判。
+* 当 `MX-CS-003` 默认关闭时，`GET /_matrix/client/*/capabilities` 必须显式返回 `m.get_login_token.enabled = false`。
 * `m.profile_fields`、`m.set_avatar_url`、`m.set_displayname`、room versions 等 capability 不得“宣称支持但写路径拒绝”。
 * stored filters 的权威表是 `DATA-USER-014`。
 * filter 创建时必须按 [22-data-consistency-and-routing.md](/root/Matrix/spec/framework/22-data-consistency-and-routing.md) 的非事件 JSON canonicalization 规则处理 JSON，再生成稳定 hash 和 `filter_id`；`filter_id` 不得以 `{` 开头。
@@ -130,6 +136,7 @@
 * Matrix `v1.17` filter 中与 `/sync` 响应结构直接相关的布尔开关必须明确实现：`include_leave`、`lazy_load_members`、`include_redundant_members`、`unread_thread_notifications`。未显式给出的布尔值按规范默认 `false` 处理。
 * `include_leave = false` 时，`rooms.leave` bucket 必须整体省略，即使本地真相仍保留 left / banned-but-not-forgotten 房间；只有在 `include_leave = true` 时，这些房间才允许出现在 `/sync`。
 * `include_redundant_members` 只有在启用 `lazy_load_members` 时才有意义；否则必须按 `false` 处理，不得制造与未启用 lazy-load 不同的成员事件输出。
+* capability truth 与 route truth 必须一致：若 `m.3pid_changes.enabled = false` 或 `m.get_login_token.enabled = false`，则对应公开路由必须继续落到 `IF-CS-060` / `IF-CS-059` 的 deterministic stub，而不是部分接通。
 
 ### 5.2 Profile Truth and Propagation
 
@@ -320,6 +327,7 @@
 * `next_batch` 只能在所有 user-domain 片段与所有房间投影都成功组装后前推到 `upper_bound_user_stream_pos`。
 * 若任一房间投影失败，则本次 `/sync` 不得推进 `next_batch`。
 * to-device、device lists、one-time key count 和 fallback key types 都必须来自与 `since` 同一用户流快照边界。
+* `RoomProjectionRequest` 至少必须包含 `user_id`,`room_id`,`room_pos`,`membership_bucket`,`filter_hash` 与本次 `/sync` 的 visibility context；不得只用 `{room_id,room_pos,filter_hash}` 这类可跨用户碰撞的键推导房间投影。
 
 ### 9.2 Initial / Incremental 语义
 
@@ -388,7 +396,7 @@ membership 到 `/sync` bucket 的映射必须固定为：
 | account data / tags / read-unread markers | `IF-CS-015` | `IF-INT-USER-002` | `DATA-USER-006`,`DATA-USER-007` |
 | push rules | `IF-CS-018` | none | `DATA-USER-013` |
 | presence | `IF-CS-016` | `IF-INT-USER-002` | `DATA-USER-009`,`DATA-USER-010` |
-| to-device | `IF-CS-041` | `IF-INT-USER-005` | `DATA-USER-008`,`DATA-USER-010` |
+| to-device | `IF-CS-041` | `IF-INT-USER-005` | `DATA-USER-008`,`DATA-USER-010`,`DATA-USER-016` |
 | keys / cross-signing / backup | `IF-CS-042`,`IF-CS-043`,`IF-CS-044`,`IF-CS-045` | `IF-INT-USER-004` | `DATA-USER-003`,`DATA-USER-004`,`DATA-USER-005`,`DATA-USER-011`,`DATA-R2-006` |
 | `/sync` | `IF-CS-020` | `IF-INT-USER-002`,`IF-INT-ROOM-002` | `DATA-ID-001`,`DATA-USER-010` |
 

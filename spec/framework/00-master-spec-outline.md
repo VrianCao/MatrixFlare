@@ -25,7 +25,7 @@
 
 ### 1. Document Control and Scope
 
-主责分册：`10-governance-and-references.md`、`11-spec-authority-and-version-policy.md`、`12-matrix-protocol-compliance-profile.md`、`13-cloudflare-platform-constraint-register.md`、`14-traceability-and-change-control.md`
+主责分册：`10-governance-and-references.md`、`11-spec-authority-and-version-policy.md`、`12-matrix-protocol-compliance-profile.md`、`13-cloudflare-platform-constraint-register.md`、`14-traceability-and-change-control.md`、`15-source-observation-register.md`
 
 ### 2. Executive Summary and Architecture Overview
 
@@ -64,6 +64,7 @@
 | 全部 Matrix 规范域 | `12-matrix-protocol-compliance-profile.md` | 建立协议覆盖矩阵，防止实现边界失控 |
 | 全部 Cloudflare 平台约束 | `13-cloudflare-platform-constraint-register.md` | 建立平台限制、行为、计费约束台账 |
 | 全部分册的追溯与变更流程 | `14-traceability-and-change-control.md` | 建立 requirement、constraint、contract、test、evidence 的闭环 |
+| 上游来源观察与漂移审计 | `15-source-observation-register.md` | 固定 Matrix / Cloudflare 观察日期、基线与后续动作 |
 | 6-7 | `20-system-context-and-principles.md` | 先定义系统上下文、边界、原则 |
 | 8-9 | `21-runtime-topology-and-platform-model.md` | 先定义 Cloudflare 拓扑、责任域分配、平台硬约束 |
 | 10-12 | `22-data-consistency-and-routing.md` | 先固定数据归属、一致性、路由规则 |
@@ -87,7 +88,7 @@
 ## 4. 阅读顺序
 
 1. 主文档
-2. `10-14` 治理控制层
+2. `10-15` 治理控制层
 3. `20-25` 架构与契约基础层
 4. `30` 协议域分册
 5. `40-44` 安全、运营、交付、验证分册
@@ -96,7 +97,7 @@
 ## 5. 回填顺序
 
 1. 先填主文档的文档控制、范围、章节摘要、分册摘要。
-2. 再填 `10-14` 治理控制层。
+2. 再填 `10-15` 治理控制层。
 3. 再填 `20-25` 架构、数据、契约、流程基础层。
 4. 再按客户端、房间、联邦、媒体、派生能力的顺序填 `30` 系列。
 5. 最后填 `40-44`、`spec/open-questions/`、`spec/decisions/` 与附录。

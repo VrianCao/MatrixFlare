@@ -24,6 +24,7 @@
 | `FLOW-CS-PROFILE-PROPAGATION` | profile update propagation | `30`,`31` | client, `gateway-worker`, `UserDO`, `RoomDO`, optional `jobs-worker` | `PUT` or `DELETE /_matrix/client/*/profile/{userId}/{keyName}` | 更新 profile 真相、发出 presence 增量、对已加入房间传播 membership refresh | 不得产生半更新；传播重试必须按 profile version 幂等 |
 | `FLOW-CS-SYNC-LONGPOLL` | sync long poll | `30` | client, `gateway-worker`, `UserDO`, `RoomDO` | `GET /sync` | Worker 持有请求，收到唤醒后组装响应 | 通道断开早返回；不得推进 token |
 | `FLOW-CS-SEND-TO-DEVICE` | send to-device | `30` | client, `gateway-worker`, `UserDO`, optional `RemoteServerDO` | `PUT /sendToDevice` | 写本地队列并派发远端 EDU | 远端失败不影响本地提交 |
+| `FLOW-CS-DISABLED-ROUTE` | explicit disabled/deferred client route | `12`,`23` | client, `gateway-worker` | deferred, disabled, or explicitly unsupported public client route | 返回固定 unsupported response，且不得产生任何 authority or side-effect write；若该能力在 `GET /login` 或 `GET /capabilities` 有 discoverability 面，则 discoverability 也必须同步维持 disabled truth | 实现漂移、误接通下游 handler、discoverability 与 route truth 不一致、或出现副作用都必须视为失败 |
 
 ### 2.2 房间域
 
@@ -31,9 +32,10 @@
 | --- | --- | --- | --- | --- | --- | --- |
 | `FLOW-CS-SEND-EVENT` | local event send | `31` | client, `gateway-worker`, `UserDO`, `RoomDO` | `PUT /rooms/.../send` | `RoomDO` 幂等裁决、准入、提交、fanout | 校验失败原子拒绝；同 `txnId` 重试要么返回同结果，要么 deterministic conflict |
 | `FLOW-CS-ROOM-MEMBERSHIP` | membership mutation | `31` | client, `gateway-worker`, `UserDO`, `RoomDO`, optional federation | join/invite/leave/ban/knock | 生成 membership event 并走同一准入管道 | 联邦握手失败不得伪造本地成功 |
-| `FLOW-CS-ROOM-QUERY` | room history and state query | `31` | client, `gateway-worker`, `RoomDO` | `/messages`, `/context`, `/event`, `/state`, `/members`, `/joined_members`, `/relations`, `/threads`, `/timestamp_to_event` | 按 cursor、关系索引、时间定位与可见性规则返回房间读结果 | cursor 无效、时间定位失败或可见性不满足时 fail-closed，不得改写真相 |
+| `FLOW-CS-ROOM-QUERY` | room history and state query | `31` | client, `gateway-worker`, `RoomDO` | `/messages`, `/context`, `/event`, `/state`, `/members`, `/joined_members`, `/relations`, `/threads`, `/timestamp_to_event` | `gateway-worker` 规范化为 `RoomReadRequest`，`RoomDO` 按 query kind、索引与归档指针裁决可见性后返回房间读结果 | cursor 无效、时间定位失败、冷归档缺段或可见性不满足时 fail-closed，不得改写真相 |
 | `FLOW-ROOM-EVENT-ADMISSION` | unified room admission | `31` | `gateway-worker`, `RoomDO`, `UserDO`, `RemoteServerDO` | local/fed/AS event ingress | 统一 auth/state resolution/commit | 失败不产生 partial state |
 | `FLOW-ROOM-LOCAL-FANOUT` | local user fanout | `31` | `RoomDO`, `UserDO`, `jobs-worker` | room commit success | `RoomDO` 写 durable outbox，`UserDO` durable append 到用户流并返回 ack，随后 GC outbox 并推送索引任务 | 单用户失败必须保留 outbox 并补偿重试；必要时进入 repair |
+| `FLOW-ROOM-FANOUT-REPAIR` | room-to-user fanout reconciliation | `31`,`42` | `ops-worker`, `jobs-worker`, `RoomDO`, `UserDO` | periodic audit or scoped repair | 以 `DATA-ROOM-011` 与 `DATA-USER-010` 交叉核对，重投缺失 append、补记 ack 或生成 repair 决议 | 发现归属不清、event truth 缺失或重复冲突时必须写 `DATA-OPS-003/004` 并 bounded retry |
 
 ### 2.3 联邦域
 

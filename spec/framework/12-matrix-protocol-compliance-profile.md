@@ -23,7 +23,7 @@
 ### 2.1 Matrix 基线
 
 * 当前实现基线：Matrix `v1.17`。
-* 当前观察到的 `latest`：`2026-03-24` 时为 `v1.17`。
+* 当前观察到的 `latest`：`2026-03-25` 时为 `v1.17`。
 * 协议支持声明一律以 `v1.17` versioned spec 为准，而不是 unversioned latest 页面。
 
 ### 2.2 发布 Profile
@@ -73,28 +73,28 @@
 | MX-ID | Protocol Family | Spec Version | Surface | Support Level | Owning Spec | Runtime Owner | IF IDs | DATA IDs | FLOW/STATE IDs | TEST IDs | EVID IDs | Release Profile | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `MX-CS-001` | Client-Server | `v1.17` | discovery, `/.well-known/matrix/client`, `/versions` | `Required-Core` | `30` | `gateway-worker` | `IF-PUB-001`,`IF-CS-001` | `DATA-KV-001` | `FLOW-CS-DISCOVERY` | `TEST-CS-001` | `EVID-CS-001` | `L1-L3` | 基线发现与能力声明。 |
-| `MX-CS-002` | Client-Server | `v1.17` | registration, login, refresh, logout, `whoami` | `Required-Core` | `30` | `gateway-worker`,`UserDO` | `IF-CS-010`,`IF-CS-011`,`IF-CS-012`,`IF-CS-013`,`IF-CS-014` | `DATA-USER-001`,`DATA-USER-002`,`DATA-ID-003`,`DATA-ID-004` | `FLOW-CS-REGISTER`,`FLOW-CS-LOGIN`,`FLOW-CS-REFRESH`,`STATE-USER-SESSION` | `TEST-CS-001`,`TEST-SEC-001` | `EVID-CS-001`,`EVID-SEC-001` | `L1-L3` | 不含 SSO。 |
-| `MX-CS-003` | Client-Server | `v1.17` | SSO redirect and identity-provider login | `Required-Conditional` | `30`,`40` | `gateway-worker`,`UserDO` | `none` | `none` | `none` | `TEST-CS-001`,`TEST-SEC-001` | `EVID-CS-001`,`EVID-SEC-001` | `L3` | 当前默认关闭；启用前必须先补齐专门的 SSO/OIDC 子规范与契约。 |
+| `MX-CS-002` | Client-Server | `v1.17` | registration, login discovery/exchange, refresh, logout, `whoami` | `Required-Core` | `30` | `gateway-worker`,`UserDO` | `IF-CS-005`,`IF-CS-010`,`IF-CS-011`,`IF-CS-012`,`IF-CS-013`,`IF-CS-014` | `DATA-USER-001`,`DATA-USER-002`,`DATA-ID-003`,`DATA-ID-004` | `FLOW-CS-REGISTER`,`FLOW-CS-LOGIN`,`FLOW-CS-REFRESH`,`STATE-USER-SESSION` | `TEST-CS-001`,`TEST-SEC-001` | `EVID-CS-001`,`EVID-SEC-001` | `L1-L3` | `GET /login` 必须只宣告当前真实支持的 flow；默认不宣称 SSO / login-token。 |
+| `MX-CS-003` | Client-Server | `v1.17` | SSO redirect, login-token issuance, and identity-provider login | `Required-Conditional` | `30`,`40` | `gateway-worker`,`UserDO` | `IF-CS-059` | `none` | `FLOW-CS-DISABLED-ROUTE` | `TEST-CS-001`,`TEST-CS-004`,`TEST-SEC-001` | `EVID-CS-001`,`EVID-CS-004`,`EVID-SEC-001` | `L3` | 包括 `GET /_matrix/client/*/login/sso/redirect*` 与 `POST /_matrix/client/v1/login/get_token`；当前默认关闭；启用前必须先补齐专门的 SSO/OIDC 子规范与契约。 |
 | `MX-CS-004` | Client-Server | `v1.17` | account data, tags, ignored users, direct rooms | `Required-Core` | `30` | `gateway-worker`,`UserDO` | `IF-CS-015` | `DATA-USER-006`,`DATA-USER-007`,`DATA-USER-010` | `FLOW-CS-SYNC-LONGPOLL` | `TEST-CS-002` | `EVID-CS-002` | `L1-L3` | 所有变更必须进入用户流。 |
-| `MX-CS-005` | Client-Server | `v1.17` | 3PID bind/unbind and identity-service-assisted flows | `Required-Conditional` | `30`,`40` | `gateway-worker`,`UserDO` | `none` | `none` | `none` | `TEST-CS-001`,`TEST-SEC-001` | `EVID-CS-001`,`EVID-SEC-001` | `L3` | 本系统不内建 Identity Service；若启用外部集成，必须先补齐专门子规范。 |
+| `MX-CS-005` | Client-Server | `v1.17` | 3PID bind/unbind and identity-service-assisted flows | `Required-Conditional` | `30`,`40` | `gateway-worker`,`UserDO` | `IF-CS-060` | `none` | `FLOW-CS-DISABLED-ROUTE` | `TEST-CS-001`,`TEST-CS-004`,`TEST-SEC-001` | `EVID-CS-001`,`EVID-CS-004`,`EVID-SEC-001` | `L3` | 包括 `/_matrix/client/*/account/3pid*` 路由族；本系统不内建 Identity Service；默认关闭时 capability 必须显式给出 `m.3pid_changes.enabled = false`。 |
 | `MX-CS-006` | Client-Server | `v1.17` | capabilities, filter create/get, and filter application to `/sync` | `Required-Core` | `30` | `gateway-worker`,`UserDO` | `IF-CS-002`,`IF-CS-003`,`IF-CS-004`,`IF-CS-020` | `DATA-ID-001`,`DATA-USER-014` | `FLOW-CS-DISCOVERY`,`FLOW-CS-SYNC-LONGPOLL` | `TEST-CS-001`,`TEST-CS-002` | `EVID-CS-001`,`EVID-CS-002` | `L1-L3` | capability 声明与实际写权限、filter 解析行为必须一致。 |
 | `MX-CS-007` | Client-Server | `v1.17` | `/sync` initial/incremental/long-poll/`use_state_after` | `Required-Core` | `30` | `gateway-worker`,`UserDO`,`RoomDO` | `IF-CS-020`,`IF-INT-USER-002`,`IF-INT-ROOM-002` | `DATA-ID-001`,`DATA-USER-010` | `FLOW-CS-SYNC-LONGPOLL`,`STATE-SYNC-WAITER` | `TEST-CS-002` | `EVID-CS-002` | `L1-L3` | 由 Worker 持有长轮询；`L3` 另外受 `TEST-PERF-001`/`EVID-PERF-001` 约束。 |
 | `MX-CS-008` | Client-Server | `v1.17` | room creation, membership, pagination, event retrieval, member listing, relations, threads, timestamp lookup | `Required-Core` | `31` | `gateway-worker`,`RoomDO`,`UserDO` | `IF-CS-030`,`IF-CS-031`,`IF-CS-034` | `DATA-ROOM-001`,`DATA-ROOM-002`,`DATA-ROOM-003`,`DATA-ROOM-004`,`DATA-ROOM-005`,`DATA-ROOM-006`,`DATA-ROOM-007`,`DATA-ROOM-008`,`DATA-ROOM-009`,`DATA-ROOM-010`,`DATA-ROOM-011` | `FLOW-CS-ROOM-MEMBERSHIP`,`FLOW-CS-ROOM-QUERY`,`STATE-ROOM-MEMBERSHIP` | `TEST-ROOM-001`,`TEST-ROOM-002` | `EVID-ROOM-001`,`EVID-ROOM-002` | `L1-L3` | 包括 join/invite/leave/knock/forget 的本地语义，以及只读房间查询面。 |
 | `MX-CS-009` | Client-Server | `v1.17` | room state send/get, timeline event send, redaction | `Required-Core` | `31` | `gateway-worker`,`RoomDO` | `IF-CS-032`,`IF-CS-033`,`IF-CS-034`,`IF-CS-035` | `DATA-ROOM-001`,`DATA-ROOM-002`,`DATA-ROOM-003`,`DATA-ROOM-004`,`DATA-ROOM-005`,`DATA-ROOM-006`,`DATA-ROOM-007`,`DATA-ROOM-008`,`DATA-ROOM-011`,`DATA-ROOM-012` | `FLOW-ROOM-EVENT-ADMISSION`,`FLOW-CS-ROOM-QUERY`,`STATE-ROOM-EVENT-ADMISSION` | `TEST-ROOM-001`,`TEST-ROOM-002` | `EVID-ROOM-001`,`EVID-ROOM-002` | `L1-L3` | room version 差异由 strategy 层裁决。 |
 | `MX-CS-010` | Client-Server | `v1.17` | typing, receipts, read markers, presence | `Required-Core` | `30`,`31` | `gateway-worker`,`UserDO`,`RoomDO` | `IF-CS-015`,`IF-CS-016`,`IF-CS-019`,`IF-CS-020` | `DATA-ROOM-009`,`DATA-ROOM-010`,`DATA-USER-009`,`DATA-USER-010` | `FLOW-CS-SYNC-LONGPOLL` | `TEST-CS-002`,`TEST-ROOM-001` | `EVID-CS-002`,`EVID-ROOM-001` | `L1-L3` | ephemeral 失败不得污染 timeline truth。 |
 | `MX-CS-011` | Client-Server | `v1.17` | media config, upload, download, thumbnail | `Required-Core` | `33` | `gateway-worker`,`UserDO`,R2 | `IF-CS-050`,`IF-CS-051` | `DATA-USER-015`,`DATA-R2-001`,`DATA-R2-003`,`DATA-D1-004` | `FLOW-CS-MEDIA-UPLOAD`,`FLOW-CS-MEDIA-DOWNLOAD` | `TEST-MEDIA-001` | `EVID-MEDIA-001` | `L1-L3` | 受 Cloudflare request body limit 约束。 |
-| `MX-CS-012` | Client-Server | `v1.17` | URL preview | `Deferred` | `33`,`40` | isolated preview worker | `none` | `none` | `none` | `TEST-GOV-001` | `EVID-GOV-001` | `L1-L3` | 包括 `GET /_matrix/client/v1/media/preview_url` 与已弃用的 `GET /_matrix/media/v3/preview_url`；在 dedicated IF/DATA/FLOW 与 SSRF 子规范落地前，不允许宣称支持。 |
+| `MX-CS-012` | Client-Server | `v1.17` | URL preview | `Deferred` | `33`,`40` | isolated preview worker | `IF-CS-058` | `none` | `FLOW-CS-DISABLED-ROUTE` | `TEST-CS-004` | `EVID-CS-004` | `L1-L3` | 包括 `GET /_matrix/client/v1/media/preview_url` 与已弃用的 `GET /_matrix/media/v3/preview_url`；在 dedicated IF/DATA/FLOW 与 SSRF 子规范落地前，不允许宣称支持。 |
 | `MX-CS-013` | Client-Server | `v1.17` | devices, to-device messaging | `Required-Core` | `30` | `gateway-worker`,`UserDO` | `IF-CS-040`,`IF-CS-041` | `DATA-USER-002`,`DATA-USER-008`,`DATA-USER-010`,`DATA-USER-016` | `FLOW-CS-SEND-TO-DEVICE`,`STATE-DEVICE-LIFECYCLE` | `TEST-CS-003` | `EVID-CS-003` | `L1-L3` | 每目标设备的投递必须线性化。 |
 | `MX-CS-014` | Client-Server | `v1.17` | E2EE transport: keys upload/query/claim, cross-signing, backup | `Required-Core` | `30` | `gateway-worker`,`UserDO`,R2 | `IF-CS-042`,`IF-CS-043`,`IF-CS-044`,`IF-CS-045`,`IF-INT-USER-004` | `DATA-USER-003`,`DATA-USER-004`,`DATA-USER-005`,`DATA-USER-011`,`DATA-R2-006` | `FLOW-CS-SYNC-LONGPOLL` | `TEST-CS-003` | `EVID-CS-003` | `L1-L3` | homeserver 只负责传输与存储边界。 |
 | `MX-CS-015` | Client-Server | `v1.17` | push rules, unread counters, and notification counts in `/sync` | `Required-Core` | `30`,`31` | `gateway-worker`,`UserDO`,`RoomDO` | `IF-CS-018`,`IF-CS-020` | `DATA-USER-013`,`DATA-USER-010`,`DATA-USER-006`,`DATA-USER-007`,`DATA-ROOM-007`,`DATA-ROOM-009` | `FLOW-CS-SYNC-LONGPOLL` | `TEST-CS-002` | `EVID-CS-002` | `L1-L3` | 默认规则来自 Matrix `v1.17`；只把用户覆盖持久化；本条只覆盖 `/sync` 内 notification counts，不隐含 `/_matrix/client/*/notifications` 路由。 |
-| `MX-CS-016` | Client-Server | `v1.17` | pushers and external push gateway integration | `Required-Conditional` | `30`,`40` | `gateway-worker`,`UserDO` | `none` | `none` | `none` | `TEST-SEC-002` | `EVID-SEC-001` | `L3` | 包括 `GET /_matrix/client/*/pushers` 与 `POST /_matrix/client/*/pushers/set`；本系统不内建 Push Gateway，默认关闭；启用前必须先补齐 dedicated contracts 与外部推送网关子规范。 |
+| `MX-CS-016` | Client-Server | `v1.17` | pushers and external push gateway integration | `Required-Conditional` | `30`,`40` | `gateway-worker`,`UserDO` | `IF-CS-055` | `none` | `FLOW-CS-DISABLED-ROUTE` | `TEST-CS-004`,`TEST-SEC-002` | `EVID-CS-004`,`EVID-SEC-001` | `L3` | 包括 `GET /_matrix/client/*/pushers` 与 `POST /_matrix/client/*/pushers/set`；本系统不内建 Push Gateway，默认关闭；启用前必须先补齐 dedicated contracts 与外部推送网关子规范。 |
 | `MX-CS-017` | Client-Server | `v1.17` | search, user directory, public rooms, client hierarchy | `Required-Core` | `34` | `gateway-worker`,`jobs-worker`,D1 | `IF-CS-052`,`IF-QUE-001` | `DATA-D1-001`,`DATA-D1-002`,`DATA-D1-003` | `FLOW-SEARCH-INDEX` | `TEST-DER-001` | `EVID-DER-001` | `L1-L3` | 仅覆盖 `search`、`user_directory`、`publicRooms` 与 `rooms/{roomId}/hierarchy`；alias/directory、`joined_rooms` 与 `room_summary` 由独立条目管理；`L3` 另外受 `TEST-OPS-002`/`EVID-OPS-002` 恢复门禁约束。 |
-| `MX-CS-018` | Client-Server | `v1.17` | reporting APIs and abuse-report submission | `Deferred` | `40` | `gateway-worker`,`ops-worker` | `none` | `none` | `none` | `TEST-GOV-001` | `EVID-GOV-001` | `L1-L3` | 包括 `POST /_matrix/client/*/rooms/{roomId}/report`、`POST /_matrix/client/*/rooms/{roomId}/report/{eventId}` 与 `POST /_matrix/client/*/users/{userId}/report`；需补齐运维处置流程与 abuse workflow 子规范后才能 GA。 |
+| `MX-CS-018` | Client-Server | `v1.17` | reporting APIs and abuse-report submission | `Deferred` | `40` | `gateway-worker`,`ops-worker` | `IF-CS-057` | `none` | `FLOW-CS-DISABLED-ROUTE` | `TEST-CS-004` | `EVID-CS-004` | `L1-L3` | 包括 `POST /_matrix/client/*/rooms/{roomId}/report`、`POST /_matrix/client/*/rooms/{roomId}/report/{eventId}` 与 `POST /_matrix/client/*/users/{userId}/report`；需补齐运维处置流程与 abuse workflow 子规范后才能 GA。 |
 | `MX-CS-019` | Client-Server | `v1.17` | profile APIs and profile-change propagation semantics | `Required-Core` | `30` | `gateway-worker`,`UserDO`,`RoomDO` | `IF-CS-017` | `DATA-USER-012`,`DATA-D1-002` | `FLOW-CS-PROFILE-PROPAGATION` | `TEST-CS-001` | `EVID-CS-001` | `L1-L3` | profile 真相独立于 account data；`displayname`/`avatar_url` 变更必须传播到 presence 和本地 membership refresh。 |
-| `MX-CS-020` | Client-Server | `v1.17` | third-party user/location lookup, admin `whois` | `Unsupported` | `40` | n/a | none | none | none | `TEST-GOV-001` | `EVID-GOV-001` | `L1-L3` | 当前产品范围不含此管理/身份服务面。 |
-| `MX-CS-021` | Client-Server | `v1.17` | joined rooms, room alias directory, room directory visibility, room summary | `Deferred` | `31`,`34` | `gateway-worker`,`RoomDO`,`jobs-worker`,D1 | `none` | `none` | `none` | `TEST-GOV-001` | `EVID-GOV-001` | `L1-L3` | 包括 `GET /_matrix/client/*/joined_rooms`、`GET/PUT/DELETE /_matrix/client/*/directory/room/{roomAlias}`、`GET /_matrix/client/*/rooms/{roomId}/aliases`、`GET/PUT /_matrix/client/*/directory/list/room/{roomId}`、`GET /_matrix/client/v1/room_summary/{roomIdOrAlias}`；在 dedicated contracts 落地前不得宣称支持。 |
-| `MX-CS-022` | Client-Server | `v1.17` | notifications listing endpoint | `Deferred` | `30`,`31` | `gateway-worker`,`UserDO`,`RoomDO` | `none` | `none` | `none` | `TEST-GOV-001` | `EVID-GOV-001` | `L1-L3` | 仅指 `GET /_matrix/client/*/notifications`；`/sync` 中 notification counts 已由 `MX-CS-015` 覆盖，本条在 dedicated contracts 落地前不得宣称支持。 |
-| `MX-CS-023` | Client-Server | `v1.17` | room upgrade | `Deferred` | `31` | `gateway-worker`,`RoomDO` | `none` | `none` | `none` | `TEST-GOV-001` | `EVID-GOV-001` | `L1-L3` | 指 `POST /_matrix/client/*/rooms/{roomId}/upgrade`；在 replacement room、state carry-over 与 alias/tombstone 子规范落地前不得宣称支持。 |
+| `MX-CS-020` | Client-Server | `v1.17` | third-party protocol/user/location lookup, admin `whois` | `Unsupported` | `34`,`40` | `gateway-worker` | `IF-CS-061` | `none` | `FLOW-CS-DISABLED-ROUTE` | `TEST-CS-004`,`TEST-GOV-001` | `EVID-CS-004`,`EVID-GOV-001` | `L1-L3` | 当前产品范围不含此管理/身份服务面；公开路由必须 deterministic reject，而不是静默缺失。 |
+| `MX-CS-021` | Client-Server | `v1.17` | joined rooms, room alias directory, room directory visibility, room summary | `Deferred` | `31`,`34` | `gateway-worker`,`RoomDO`,`jobs-worker`,D1 | `IF-CS-053` | `none` | `FLOW-CS-DISABLED-ROUTE` | `TEST-CS-004` | `EVID-CS-004` | `L1-L3` | 包括 `GET /_matrix/client/*/joined_rooms`、`GET/PUT/DELETE /_matrix/client/*/directory/room/{roomAlias}`、`GET /_matrix/client/*/rooms/{roomId}/aliases`、`GET/PUT /_matrix/client/*/directory/list/room/{roomId}`、`GET /_matrix/client/v1/room_summary/{roomIdOrAlias}`；在 dedicated contracts 落地前不得宣称支持。 |
+| `MX-CS-022` | Client-Server | `v1.17` | notifications listing endpoint | `Deferred` | `30`,`31` | `gateway-worker`,`UserDO`,`RoomDO` | `IF-CS-054` | `none` | `FLOW-CS-DISABLED-ROUTE` | `TEST-CS-004` | `EVID-CS-004` | `L1-L3` | 仅指 `GET /_matrix/client/*/notifications`；`/sync` 中 notification counts 已由 `MX-CS-015` 覆盖，本条在 dedicated contracts 落地前不得宣称支持。 |
+| `MX-CS-023` | Client-Server | `v1.17` | room upgrade | `Deferred` | `31` | `gateway-worker`,`RoomDO` | `IF-CS-056` | `none` | `FLOW-CS-DISABLED-ROUTE` | `TEST-CS-004` | `EVID-CS-004` | `L1-L3` | 指 `POST /_matrix/client/*/rooms/{roomId}/upgrade`；在 replacement room、state carry-over 与 alias/tombstone 子规范落地前不得宣称支持。 |
 
 ## 5. Federation Coverage
 
@@ -127,16 +127,19 @@
 
 ## 8. Unsupported / Deferred Register
 
-| Surface | Current Status | Rationale |
-| --- | --- | --- |
-| Legacy initial sync and deprecated event stream routes | `Deferred` | 进入 `Normative` 前需逐端点评估是否仍需兼容。 |
-| In-band identity service features | `Required-Conditional` | 依赖外部 identity integration，不属于本系统内建。 |
-| Push gateway delivery | `Required-Conditional` | 依赖外部 push 基础设施。 |
-| URL preview | `Deferred` | 默认关闭；在 dedicated contracts 与隔离抓取器子规范落地前不得宣称支持。 |
-| Joined rooms / room alias directory / room summary | `Deferred` | 尚未进入 dedicated contracts。 |
-| Notifications listing endpoint | `Deferred` | `/sync` 计数不等于 `/notifications` 列表语义。 |
-| Room upgrade | `Deferred` | replacement room 与迁移语义尚未钉死。 |
-| Admin-specific `whois` style surfaces | `Unsupported` | 不在当前产品范围。 |
+本表是由上方 `MX-*` 行派生出的摘要视图；不得与 `MX-*` 正文独立演化。`TEST-GOV-001` 必须把本表与对应 `MX-*` / `OQ-*` / `DEC-*` 一并做一致性校验。
+
+| Surface | Current Status | Related IDs | Rationale |
+| --- | --- | --- | --- |
+| Legacy initial sync and deprecated event stream routes | `Deferred` | `none` | 进入 `Normative` 前需逐端点评估是否仍需兼容。 |
+| In-band identity service features | `Required-Conditional` | `MX-CS-003`,`MX-CS-005`,`OQ-0001` | 依赖外部 identity integration，不属于本系统内建；当前只允许显式 stub。 |
+| Push gateway delivery | `Required-Conditional` | `MX-CS-016`,`OQ-0001` | 依赖外部 push 基础设施。 |
+| URL preview | `Deferred` | `MX-CS-012`,`OQ-0001` | 默认关闭；在 dedicated contracts 与隔离抓取器子规范落地前不得宣称支持。 |
+| Reporting APIs | `Deferred` | `MX-CS-018`,`OQ-0001` | abuse workflow 与运维处置子规范尚未钉死。 |
+| Joined rooms / room alias directory / room summary | `Deferred` | `MX-CS-021`,`OQ-0001` | 尚未进入 dedicated contracts。 |
+| Notifications listing endpoint | `Deferred` | `MX-CS-022`,`OQ-0001` | `/sync` 计数不等于 `/notifications` 列表语义。 |
+| Room upgrade | `Deferred` | `MX-CS-023`,`OQ-0001` | replacement room 与迁移语义尚未钉死。 |
+| Third-party lookup and admin `whois` surfaces | `Unsupported` | `MX-CS-020` | 不在当前产品范围；当前只允许 deterministic reject。 |
 
 ## 9. 合规声明规则
 

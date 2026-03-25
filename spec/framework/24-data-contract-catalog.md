@@ -46,7 +46,7 @@
 | `DATA-USER-013` | table | push rules overrides / enablement | authoritative | `UserDO` | DO SQLite | `{scope,kind,rule_id}` | per-user serial | user export | 默认规则来自 Matrix `v1.17` 基线；这里只存用户覆盖、顺序和 enabled 状态。 |
 | `DATA-USER-014` | table | stored filters | authoritative | `UserDO` | DO SQLite | `filter_id` | per-user serial | user export | 存 canonical filter JSON、filter hash 和创建版本。 |
 | `DATA-USER-015` | table | pending media upload grants | authoritative | `UserDO` | DO SQLite | `pending_upload_id` | per-user serial | none | 记录上传配额检查结果、允许的 MIME/尺寸、TTL 与 finalize 状态；R2 写失败或超时必须可撤销。 |
-| `DATA-USER-016` | table | to-device txn dedupe registry | authoritative | `UserDO` | DO SQLite | `txn_dedupe_key` | per-user serial | user export | 用于 `PUT /sendToDevice/{eventType}/{txnId}` 幂等裁决；最小唯一键至少绑定 `{sender_user_id,event_type,txn_id}`，并持久化 canonical request hash、结果摘要与终态。 |
+| `DATA-USER-016` | table | to-device txn dedupe registry | authoritative | `UserDO` | DO SQLite | `txn_dedupe_key` | per-user serial | user export | 用于 `PUT /sendToDevice/{eventType}/{txnId}` 幂等裁决；最小唯一键至少绑定 `{sender_user_id,event_type,txn_id}`，并持久化 canonical request hash、结果摘要与终态。若一次请求会命中多个目标设备/用户，则每个目标 `UserDO` 上都必须以同一 public txn key 与同一 canonical request hash 作局部裁决，不得把目标设备 ID 混入 public dedupe key。 |
 
 ## 4. `RoomDO` 数据契约
 
@@ -65,16 +65,53 @@
 | `DATA-ROOM-011` | table | local fanout outbox | authoritative | `RoomDO` | DO SQLite | `{room_pos,user_id}` | per-room serial | replay + repair | 记录待交付到 `UserDO` 的本地 fanout 单元、最近尝试时间、尝试次数、最后 ack 水位与终态；只有在收到 `UserDO` 的 durable append ack 后才可 GC。 |
 | `DATA-ROOM-012` | table | client event txn dedupe registry | authoritative | `RoomDO` | DO SQLite | `txn_dedupe_key` | per-room serial | replay | 用于客户端房间写路径幂等裁决；最小唯一键至少绑定 `{user_id,device_id,room_id,route_template,txn_id_or_request_hash}`，并持久化 canonical request hash、返回 `event_id` 或错误终态。 |
 
+### 4.1 `DATA-ROOM-001` 查询元数据最小形态
+
+`DATA-ROOM-001` 不允许只写成“有一些最小元数据”；首版至少必须能稳定表达以下字段族：
+
+* timeline / archive 指针：`room_pos`、`event_id`、`origin_server_ts`、`depth`、`archive_object_key_or_segment_id`、`archive_offset_or_index`
+* 事件裁决字段：`event_type`、`state_key_or_null`、`sender_user_id`、`contains_url_flag`、`soft_failed_flag`、`waiting_missing_flag`
+* redaction / membership / visibility 辅助字段：`redacts_event_id_or_null`、`membership_target_user_id_or_null`、`history_visibility_class`、`membership_visibility_class`
+* relation / thread 字段：`relates_to_event_id_or_null`、`relation_type_or_null`、`aggregation_event_type_or_null`、`thread_root_event_id_or_null`
+
+首版至少必须有以下可实现索引或等价查询键：
+
+* `event_id -> room_pos`
+* `room_pos` timeline 顺序键
+* `(origin_server_ts, room_pos)`：用于 `/timestamp_to_event`
+* `(relates_to_event_id, relation_type, aggregation_event_type, room_pos)`：用于 `/relations`
+* `(thread_root_event_id, room_pos)`：用于 `/threads`
+* `(membership_target_user_id, room_pos)` 或等价键：用于 membership 相关可见性裁决与上下文组装
+
+实现规则：
+
+* 上述字段允许做物理归并、派生列或覆盖索引，但不得要求热路径通过重扫 `DATA-R2-004` 推导。
+* 任何已冷化事件，只要仍可能被 `/event`、`/context`、`/relations`、`/threads` 或 `/timestamp_to_event` 命中，`DATA-ROOM-001` 就必须保留足以定位其 `DATA-R2-004` 对象的精确指针。
+* `archive_object_key_or_segment_id` 与 `archive_offset_or_index` 必须能让 `RoomDO` 直接按对象键 + 段内定位读取，不得依赖 R2 list/scan。
+* 若权威元数据存在但所指向的冷归档对象缺失或 hash 不匹配，必须按数据完整性故障处理并进入 repair，而不是把该事件当成普通 `404 not found`。
+
 ## 5. `RemoteServerDO` 数据契约
 
 | DATA-ID | Category | Logical Entity / Shape | Authority | Runtime Owner | Physical Store | Key / Pattern | Consistency | Recovery Source | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `DATA-FED-001` | table | outbound transactions | authoritative | `RemoteServerDO` | DO SQLite | `txn_id` | per-server serial | local truth replay | payload 一旦入队不可变。 |
 | `DATA-FED-002` | table | retry schedule | authoritative | `RemoteServerDO` | DO SQLite | `txn_id` | per-server serial | derived from queue | attempt count、next_retry_at。 |
-| `DATA-FED-003` | table | inbound txn dedupe | authoritative | `RemoteServerDO` | DO SQLite | `{origin,txn_id}` | per-server serial | none | 用于重复提交幂等。 |
+| `DATA-FED-003` | table | inbound txn dedupe marker | authoritative | `RemoteServerDO` | DO SQLite | `{origin,txn_id}` | per-server serial | none | 入站联邦事务的第一阶段 marker；至少记录 `request_hash`,`state(in_progress|finalized|conflict)`,`first_seen_at`,`finalized_at`。不得单独充当最终响应缓存。 |
 | `DATA-FED-004` | table | gap repair backlog | authoritative | `RemoteServerDO` | DO SQLite | repair job id | per-server serial | repair manifest | 缺事件与缺状态恢复任务。 |
 | `DATA-FED-005` | cache/table | discovery and remote key cache | cache-derived | `RemoteServerDO` | DO SQLite + KV optional | `{server_name,key_id}` | cache semantics | refetch | 不能跳过官方发现流程。 |
-| `DATA-FED-006` | table | inbound txn result cache | authoritative | `RemoteServerDO` | DO SQLite | `{origin,txn_id}` | per-server serial | none | 持久化入站联邦事务的 canonical request hash、per-PDU 结果与 canonical response bytes；重复事务必须短路返回同一结果。 |
+| `DATA-FED-006` | table | inbound txn result cache | authoritative | `RemoteServerDO` | DO SQLite | `{origin,txn_id}` | per-server serial | none | 入站联邦事务的第二阶段 finalized 结果；必须持久化 canonical request hash、per-PDU 结果与 canonical response bytes。只有在 `DATA-FED-006` durable write 完成后，`DATA-FED-003.state` 才可转为 `finalized`。 |
+
+### 5.1 `DATA-FED-003` / `DATA-FED-006` 入站事务两阶段规则
+
+入站 `PUT /_matrix/federation/*/send/{txnId}` 的幂等裁决必须固定为两阶段：
+
+1. `RemoteServerDO` 先对已验证的 transaction JSON 计算 `canonical_request_hash`，算法固定为 RFC 8785 JCS canonical JSON 的 UTF-8 bytes 上的 `sha256`。
+2. 首次看到 `{origin,txn_id}` 时，先在 `DATA-FED-003` 写入 `in_progress` marker 与 `canonical_request_hash`，再开始分发 PDU/EDU。
+3. 若同键重复到达且 `DATA-FED-006` 已存在：
+   * 同 hash：必须直接返回缓存的 canonical response；
+   * 不同 hash：必须返回 deterministic idempotency conflict。
+4. 只有当 canonical response bytes 已 durable 写入 `DATA-FED-006` 后，才允许把 `DATA-FED-003` 标记为 `finalized`。
+5. 任一失败重试都不得跳过 `DATA-FED-003` / `DATA-FED-006` 的状态校验，也不得只凭“见过这个 txn_id”就返回不完整响应。
 
 ## 6. D1 Derived Data Contracts
 
@@ -131,7 +168,7 @@
 | `DATA-R2-001` | object | local media object | authoritative | media subsystem | R2 | `media/local/{media_id}` | strong | none | 本地媒体对象真相。 |
 | `DATA-R2-002` | object | remote media cache object | authoritative-cache | media subsystem | R2 | `media/remote/{origin}/{media_id}` | strong | refetch remote | 可按策略驱逐重取。 |
 | `DATA-R2-003` | object | thumbnail object | derived | `jobs-worker` | R2 | `media/thumb/...` | strong | regenerate | 变体由 `{width,height,method}` 唯一决定。 |
-| `DATA-R2-004` | object | room cold archive segments | authoritative-cold | `RoomDO` + `jobs-worker` | R2 | `archive/rooms/{room_id}/...` | strong | replay source | RoomDO 热层保留索引；每个 segment 都必须被 manifest 引用并带内容哈希、sequence、`export_epoch` 与签名 key version。 |
+| `DATA-R2-004` | object | room cold archive segments | authoritative-cold | `RoomDO` + `jobs-worker` | R2 | `archive/rooms/{room_id}/...` | strong | replay source | RoomDO 热层保留索引；每个 segment 都必须被 checkpoint manifest 引用并带内容哈希、sequence、`checkpoint_id` 与签名 key version；若某 segment 被 full export bundle 收录，则对应 bundle manifest 另外记录其 `export_epoch`。 |
 | `DATA-R2-005` | object | export / recovery bundles | authoritative-ops | `ops-worker` | R2 | `exports/...` | strong | none | 仅控制面产生；bundle manifest 必须包含 schema version、内容哈希、签名、加密 key version 与 completeness 标记。 |
 | `DATA-R2-006` | object | encrypted room key backup segments | authoritative-opaque | `UserDO` | R2 | `backup/{user_id}/{backup_version}/...` | strong | user export | 服务端视为加密 opaque blob。 |
 | `DATA-KV-001` | keyspace | `/.well-known` cache | cache | `gateway-worker` | KV | `wellknown:*` | eventual | refetch | 可整前缀清空。 |

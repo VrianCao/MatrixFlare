@@ -12,6 +12,8 @@
 
 ## 2. 待填充章节
 
+除 `2.9` 外，本节当前各小节均为 `Placeholder/Informative` 入口，不得被当作现行规范基线引用；`TEST-GOV-001` 必须禁止正文把 `2.1-2.8` 当作 normative source。
+
 ### 2.1 Terminology and Acronyms
 
 ### 2.2 Source Packs and Research Artifacts

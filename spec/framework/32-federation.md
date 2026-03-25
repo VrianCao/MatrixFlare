@@ -63,16 +63,19 @@
 `PUT /_matrix/federation/*/send/{txnId}` 处理顺序必须为：
 
 1. 解析并验证 `Authorization: X-Matrix`。
-2. 定位 `origin` 对应 `RemoteServerDO` 并执行 `{origin,txn_id}` 去重。
-3. 将 PDUs 分发到对应 `RoomDO`。
-4. 将 EDUs 分发到 `UserDO` 或其他目标域。
-5. 汇总 per-PDU 处理结果并返回。
+2. 对已验证 transaction JSON 计算 `canonical_request_hash`，算法固定为 RFC 8785 JCS canonical JSON 的 UTF-8 bytes 上的 `sha256`。
+3. 定位 `origin` 对应 `RemoteServerDO`，先写入 `{origin,txn_id}` 的 `DATA-FED-003` in-progress marker，再执行去重裁决。
+4. 将 PDUs 分发到对应 `RoomDO`。
+5. 将 EDUs 分发到 `UserDO` 或其他目标域。
+6. 汇总 per-PDU 处理结果，durable 写入 `DATA-FED-006` canonical response cache。
+7. 仅在 `DATA-FED-006` durable 成功后，把 `DATA-FED-003` 转为 `finalized` 并返回。
 
 ### 5.2 幂等要求
 
 * 重复的 `{origin,txn_id}` 必须稳定返回等价结果。
 * 同一事务内单个 PDU 的失败不得强制整批回滚；但重复提交时其结果必须可复现。
 * `{origin,txn_id}` 的去重不仅要记录“见过”，还必须通过 `DATA-FED-006` 持久化 canonical request hash 与 canonical response bytes；同键同内容重试必须短路返回缓存响应，同键不同内容必须显式冲突失败。
+* `DATA-FED-003` 只负责 in-progress / finalized / conflict marker，不得被实现为“只有 marker 没有结果缓存”的简化模型。
 
 ## 6. 出站事务
 
