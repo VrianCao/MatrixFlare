@@ -87,7 +87,7 @@ DO 内部 SQLite schema 演进规则：
 * 对可重建派生表，允许采用 `additive -> dual write -> backfill -> read switch -> cleanup`。
 * 对权威控制面表，包括 `DATA-D1-005`,`DATA-D1-006` 与所有 D1-backed `DATA-OPS-*`，不得假设“drop and rebuild 即可恢复”；必须先完成兼容发布、导出验证与回滚路径验证，再允许 destructive cleanup。
 * 若启用 read replication，切换窗口内必须明确哪些读强制走 Sessions API。引用：`CF-D1-003`,`CF-D1-004`。
-* 任一 D1 backfill、rebuild 或控制面查询都必须显式遵守“单 invocation 最多 `1,000` 条 D1 queries”“单 SQL 最长 `30s`”“最多 `6` 个 D1 connections”的平台边界。引用：`CF-D1-007`,`CF-D1-008`,`CF-D1-009`。
+* 任一 D1 backfill、rebuild 或控制面查询都必须显式遵守“单 invocation 最多 `1,000` 条 D1 queries”“单 SQL 最长 `30s`”“最多 `6` 个 D1 connections”“单 row / string / BLOB 不超过 `2 MB`”“单 statement 不超过 `100 KB`”“每 query bound parameters 不超过 `100`”的平台边界。引用：`CF-D1-007`,`CF-D1-008`,`CF-D1-009`,`CF-D1-010`,`CF-D1-011`。
 * 对可重建派生表的 D1 rebuild，必须可完全由数据面真相和 R2 导出重建。
 
 ## 6. R2 / KV / Queue Evolution Rules
@@ -177,7 +177,7 @@ DO 内部 SQLite schema 演进规则：
 * 全量导出、恢复 completeness 与巡检必须以 `DATA-OPS-010` shard registry 为基线，而不是依赖运行时“扫描到哪些 shard”。
 * 任一路径只要会首次创建可导出的 `UserDO`、`RoomDO`、`RemoteServerDO` 或 control-plane shard，就必须先提交本地权威 truth，再在同一外部请求周期或后续由 durable 幂等映射/本地 pending-marker 驱动的重试路径中完成 `DATA-OPS-010` upsert；只有当该 post-commit success barrier durable 完成后，才允许返回 `terminal success`。
 * 若 shard identity 需要在首次写入时分配，则必须先 durable 持久化“外部幂等域 -> shard identity”映射，再允许返回 `retryable non-success` 或 `terminal success`；后续同一幂等请求只能复用该 identity。
-* 若 shard truth 已提交但 `DATA-OPS-010` upsert 失败，请求必须返回 `retryable non-success`；除同一幂等请求重试外，shard 自身还必须持久化 `registry_upsert_pending` 或等价标记，并通过内部 alarm/queue/repair loop 继续补齐缺失 registry row，而不得把 registry completeness 依赖于客户端重试。
+* 若 shard truth 已提交但 `DATA-OPS-010` upsert 失败，请求必须返回 `retryable non-success`；除同一幂等请求重试外，shard 自身还必须持久化 `registry_upsert_pending` 或等价标记，并通过内部 alarm/queue/repair loop 继续补齐缺失 registry row，而不得把 registry completeness 依赖于客户端重试。若依赖 DO alarm 驱动该补偿，必须按 single-slot + 最多 `6` 次平台自动重试建模，并在需要持续 liveness 时显式重新 `setAlarm()`。引用：`CF-DO-019`。
 * full export 在开始切分 shard 工作前，必须先把 `DATA-OPS-010` 冻结为 `DATA-OPS-011` registry snapshot，并在后续所有 manifest 中引用该 snapshot 的 hash。
 
 #### 11.2.1 Continuous Recovery Checkpoint Export
@@ -230,7 +230,8 @@ continuous checkpoint 与 full export 复用 checkpoint 时，`source watermark`
 * `required_for_restore = false` 的对象可以加速恢复，但不得成为恢复正确性的唯一来源。
 * `byte_size` 必须记录对象在压缩、加密与封装完成后的实际 R2 object 字节数。
 * 首版 checkpoint/export object 不得依赖 multipart object 语义；每个 `objects[]` 项必须对应一个可独立哈希校验的单一 R2 object。
-* 为保持 export、restore、retry 与流式处理边界稳定，首版工程护栏固定为 `byte_size <= 256 MiB`；接近上限前必须分段。该护栏刻意远低于 R2 single-part `5 GiB` 平台上限，以同时满足 `CF-R2-002`,`CF-WKR-003`,`CF-WKR-004`。
+* 同一 export/checkpoint object key 的重试不得并发重写；必须退避并带 jitter，避免触发 same-key `429`。引用：`CF-R2-006`。
+* 为保持 export、restore、retry 与流式处理边界稳定，首版工程护栏固定为 `byte_size <= 256 MiB`；接近上限前必须分段。该护栏刻意远低于 R2 single-part `4.995 GiB` 平台上限，以同时满足 `CF-R2-002`,`CF-WKR-003`,`CF-WKR-004`。
 * 若未来确需突破该护栏，必须先引入显式 multipart manifest 语义、恢复顺序规则与测试证据；当前 profile 不允许隐式超限对象。
 
 #### 11.2.1.2.1 Object Codec and Range Semantics

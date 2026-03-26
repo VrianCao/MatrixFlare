@@ -115,7 +115,7 @@
 
 * `gateway-worker` 默认 CPU 限额按热路径设计在 `30s` 默认值之内；只有特殊导出或诊断入口才允许更高上限。引用：`CF-WKR-003`。
 * 所有大对象读取与转发必须使用 stream，不得完整读入内存。引用：`CF-WKR-004`。
-* 若通过 `fetch`、R2、KV、Queues 或 D1 打开连接后不再需要响应体，必须显式取消或尽快读尽；网络 I/O 受 `CF-WKR-006` 约束，D1 并发连接另受 `CF-D1-009` 约束。
+* 若通过 `fetch`、R2、KV、Queues 或 D1 打开连接后不再需要响应体，必须显式取消或尽快读尽；并发连接预算必须统一纳入 `CF-WKR-006` 的连接压力模型，且 D1 还存在“每 invocation 最多 `6` 个到 D1 的连接”上限（`CF-D1-009`）。实现不得假设 D1 与其他 I/O 的连接预算彼此独立。
 * 内部 RPC 链必须限制为浅层拓扑：`gateway -> DO` 或 `gateway -> jobs -> DO`，禁止多跳扇出图。引用：`CF-WKR-009`。
 * Service Binding 调用计入 subrequest 与 `32` 次 Worker invocation 上限，调用本身不单独占用 open-connection slot；但由同一 top-level request 触发的全部 Worker 仍共享同一组 `6` 个 simultaneous open connections 预算。不得把拆分 Worker 当作扩大连接并发的手段。引用：`CF-WKR-009`,`CF-WKR-010`。
 * Service Binding RPC 只适用于明确需要结果的同步内部调用；任何未 `await` 的绑定调用都视为错误实现。引用：`CF-WKR-009`,`CF-WKR-010`。
@@ -126,6 +126,7 @@
 * 所有 DO 构造函数必须只做最小初始化，不得在构造阶段执行高成本扫描。引用：`CF-DO-004`,`CF-DO-009`。
 * DO schema 变更必须以向前兼容读 + 延迟回填或单独迁移完成。引用：`CF-DO-005`,`CF-DO-006`。
 * 大量批处理写入必须分批提交并施加背压。引用：`CF-DO-008`。
+* 每个 DO 只有一个 alarm slot；alarm 只有 at-least-once 语义，且平台自动重试最多 `6` 次。所有 alarm handler 都必须幂等，并在需要持续 liveness 时显式重新 `setAlarm()`。引用：`CF-DO-019`。
 * 本项目主权 DO 固定使用 SQLite-backed storage；其 key + value combined size 与 SQL string/BLOB/table row 都必须受 `2 MB` ceiling 约束，生成 SQL 语句必须受 `100 KB` 上限约束。任何 state snapshot、事件 JSON、去重缓存或 repair metadata 一旦接近上限，必须在逻辑层分片，而不是依赖单行大对象。引用：`CF-DO-015`,`CF-DO-016`。
 * DO 接收的单条 WebSocket message hard ceiling 为 `32 MiB`，且 DO/Worker isolate memory hard ceiling 为 `128 MB`；所有长连接协议、state resolution 辅助数据、restore/export assembly 与大结果集都必须按 chunk/stream 设计。引用：`CF-DO-017`,`CF-DO-018`。
 * 所有 authority handler 必须在业务处理早期触碰 durable storage，以强制 currentness 并尽早暴露 not-current 条件；禁止把“长时间只靠内存/WS attachment 且延迟首次存储访问”的逻辑当作安全的单实例串行路径。引用：`CF-DO-014`。

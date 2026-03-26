@@ -22,9 +22,16 @@
 * `Input Contract` 与 `Output Contract` 使用逻辑契约名，而不是实现语言类型名。
 * 若多个 Matrix 路由版本共用完全一致的语义、鉴权、错误模型，则允许合并为一个 route family。
 * `Route / Family` 必须枚举完整、可匹配的 canonical path 列表；禁止使用 `+` 拼接、相对片段或依赖读者脑补前缀的写法。
+* `Route / Family` 中的 `*` 只允许出现在 Matrix API 的版本段位置，例如 `/_matrix/client/*/...`；其规范含义是“匹配本项目 pinned Matrix `v1.17` 基线下该 route family 的全部明确版本化变体”，而不是任意 glob。
 * 出现在 `Input / Output` 列的逻辑契约名，若属于 Matrix 对外路由，则其权威 wire schema 来自钉死的 Matrix `v1.17` versioned spec；若属于本地 `/_ops`、内部 RPC、Queue、Alarm 或本地固定错误体，则必须在 [26-wire-schema-catalog.md](./26-wire-schema-catalog.md) 明确登记，同名不得承载两个不兼容 shape。
-* 任一跨 trust boundary 的接口都必须挂 `FLOW-ID`。
+* 任一跨 trust boundary 的接口都必须挂至少一个 `FLOW-*` canonical ID。
 * 任一会持久化或改变权威/派生状态的写接口都必须在本目录显式登记 `Primary DATA`；若确实不落盘，也必须显式写 `none`。
+
+### 2.1 Route Pattern Grammar
+
+* 任何包含 `*` 的 route family，都必须能在机器工件中展开为显式 path 列表。
+* `TEST-GOV-001` 生成的治理工件必须把每个 wildcard family 的实际展开结果写入审计快照；不得把未展开的 pattern 直接当作“已验证路由集合”。
+* 若同一 family 在 pinned Matrix `v1.17` 基线下同时包含多个明确版本变体，则展开结果必须把每个 path 单独列出，而不是保留 `*`。
 
 ## 3. Public HTTP Contracts
 
@@ -87,7 +94,7 @@
 | IF-ID | Type | Caller | Callee | Route / Family | Auth | Input / Output | Idempotency | Ordering / Retry | Error Model | Owning Spec | Primary DATA | FLOW |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `IF-CS-050` | HTTP | client | `gateway-worker` | `GET /_matrix/client/v1/media/config`, `GET /_matrix/media/*/config`, `POST /_matrix/media/*/create`, `POST /_matrix/media/*/upload`, `PUT /_matrix/media/*/upload/{serverName}/{mediaId}` | access token | `MediaConfigRequest` / `MediaConfigResponse` or `CreateUploadResponse` | pending upload id | create then upload ordered by upload id | Matrix errcode or 413 | `33` | `DATA-USER-015`,`DATA-R2-001` | `FLOW-CS-MEDIA-UPLOAD` |
-| `IF-CS-051` | HTTP | client | `gateway-worker` | `GET /_matrix/client/v1/media/download/{serverName}/{mediaId}`, `GET /_matrix/client/v1/media/download/{serverName}/{mediaId}/{fileName}`, `GET /_matrix/client/v1/media/thumbnail/{serverName}/{mediaId}`, `GET /_matrix/media/*/download/{serverName}/{mediaId}`, `GET /_matrix/media/*/download/{serverName}/{mediaId}/{fileName}`, `GET /_matrix/media/*/thumbnail/{serverName}/{mediaId}` | access token; compatibility `/_matrix/media/*` routes in current profile must apply the same auth gate and parameter semantics as `client/v1` routes | media locator / stream response | n/a | read-only | Matrix errcode | `33` | `DATA-R2-001`,`DATA-R2-002`,`DATA-R2-003` | `FLOW-CS-MEDIA-DOWNLOAD` |
+| `IF-CS-051` | HTTP | client | `gateway-worker` | `GET /_matrix/client/v1/media/download/{serverName}/{mediaId}`, `GET /_matrix/client/v1/media/download/{serverName}/{mediaId}/{fileName}`, `GET /_matrix/client/v1/media/thumbnail/{serverName}/{mediaId}`, `GET /_matrix/media/*/download/{serverName}/{mediaId}`, `GET /_matrix/media/*/download/{serverName}/{mediaId}/{fileName}`, `GET /_matrix/media/*/thumbnail/{serverName}/{mediaId}` | `client/v1` current routes require access token; deprecated `/_matrix/media/*/download` and `thumbnail` compatibility routes keep `v1.17` legacy unauthenticated semantics and must apply freeze gating instead of upgrading auth requirements | media locator / stream response | n/a | read-only | Matrix errcode | `33` | `DATA-R2-001`,`DATA-R2-002`,`DATA-R2-003` | `FLOW-CS-MEDIA-DOWNLOAD` |
 | `IF-CS-052` | HTTP | client | `gateway-worker` | `POST /_matrix/client/*/search`, `POST /_matrix/client/*/user_directory/search`, `GET/POST /_matrix/client/*/publicRooms`, `GET /_matrix/client/*/rooms/{roomId}/hierarchy` | none for `GET /publicRooms`; access token for `POST /publicRooms`, `search`, `user_directory/search`, `hierarchy` | query / result page | pagination token | D1 eventual consistency accepted; visibility fail-closed | Matrix errcode | `34` | `DATA-D1-001`,`DATA-D1-002`,`DATA-D1-003` | `FLOW-CS-SEARCH-QUERY` |
 
 补充约束：
@@ -106,7 +113,7 @@
 | `IF-CS-055` | HTTP | client | `gateway-worker` | `GET /_matrix/client/*/pushers`, `POST /_matrix/client/*/pushers/set` | access token | request / fixed unsupported response while push gateway integration is disabled | n/a | no side effects while disabled; retry-safe | fixed unsupported-route Matrix error | `30`,`40` | `none` | `FLOW-CS-DISABLED-ROUTE` |
 | `IF-CS-056` | HTTP | client | `gateway-worker` | `POST /_matrix/client/*/rooms/{roomId}/upgrade` | access token | request / fixed unsupported response | request fingerprint | no side effects while deferred; retry-safe | fixed unsupported-route Matrix error | `31` | `none` | `FLOW-CS-DISABLED-ROUTE` |
 | `IF-CS-057` | HTTP | client | `gateway-worker` | `POST /_matrix/client/*/rooms/{roomId}/report`, `POST /_matrix/client/*/rooms/{roomId}/report/{eventId}`, `POST /_matrix/client/*/users/{userId}/report` | access token | request / fixed unsupported response | request fingerprint | no side effects while deferred; retry-safe | fixed unsupported-route Matrix error | `40` | `none` | `FLOW-CS-DISABLED-ROUTE` |
-| `IF-CS-058` | HTTP | client | `gateway-worker` | `GET /_matrix/client/*/media/preview_url`, `GET /_matrix/media/*/preview_url` | access token or none per route family | request / fixed unsupported response | normalized preview request fingerprint | no outbound fetch; retry-safe | fixed unsupported-route Matrix error | `33`,`40` | `none` | `FLOW-CS-DISABLED-ROUTE` |
+| `IF-CS-058` | HTTP | client | `gateway-worker` | `GET /_matrix/client/*/media/preview_url`, `GET /_matrix/media/*/preview_url` | access token when feature enabled; current stub short-circuits before auth | request / fixed unsupported response | normalized preview request fingerprint | no outbound fetch; retry-safe | fixed unsupported-route Matrix error | `33`,`40` | `none` | `FLOW-CS-DISABLED-ROUTE` |
 | `IF-CS-059` | HTTP | client | `gateway-worker` | `GET /_matrix/client/*/login/sso/redirect`, `GET /_matrix/client/*/login/sso/redirect/{idpId}`, `POST /_matrix/client/v1/login/get_token` | none for redirect routes; access token + UIA when route exists | request / fixed unsupported response | redirect query fingerprint or UIA request fingerprint | no redirect side effects, no login-token issuance, retry-safe while disabled | fixed unsupported-route Matrix error | `30`,`40` | `none` | `FLOW-CS-DISABLED-ROUTE` |
 | `IF-CS-060` | HTTP | client | `gateway-worker` | `GET /_matrix/client/*/account/3pid`, `POST /_matrix/client/*/account/3pid`, `POST /_matrix/client/*/account/3pid/add`, `POST /_matrix/client/*/account/3pid/bind`, `POST /_matrix/client/*/account/3pid/delete`, `POST /_matrix/client/*/account/3pid/email/requestToken`, `POST /_matrix/client/*/account/3pid/msisdn/requestToken`, `POST /_matrix/client/*/account/3pid/unbind` | access token where route requires; none for requestToken routes | request / fixed unsupported response | canonical request fingerprint | no 3PID state mutation, no identity-service callout, retry-safe while disabled | fixed unsupported-route Matrix error | `30`,`40` | `none` | `FLOW-CS-DISABLED-ROUTE` |
 | `IF-CS-061` | HTTP | client | `gateway-worker` | `GET /_matrix/client/*/thirdparty/protocols`, `GET /_matrix/client/*/thirdparty/protocol/{protocol}`, `GET /_matrix/client/*/thirdparty/location`, `GET /_matrix/client/*/thirdparty/location/{protocol}`, `GET /_matrix/client/*/thirdparty/user`, `GET /_matrix/client/*/thirdparty/user/{protocol}`, `GET /_matrix/client/*/admin/whois/{userId}` | access token | request / fixed unsupported response | normalized query fingerprint | no appservice lookup, no admin/session disclosure, retry-safe | fixed unsupported-route Matrix error | `34`,`40` | `none` | `FLOW-CS-DISABLED-ROUTE` |
@@ -118,6 +125,7 @@
 Stub wire contract 固定如下：
 
 * `IF-CS-007`,`IF-CS-053`,`IF-CS-054`,`IF-CS-056`,`IF-CS-057`,`IF-CS-058`,`IF-CS-059`,`IF-CS-060`,`IF-CS-061`,`IF-CS-062`,`IF-CS-063`,`IF-CS-064`,`IF-CS-065` 必须返回 `404` + Matrix `M_UNRECOGNIZED` 错误体，不得产生任何副作用。
+* 对 `IF-CS-053` 到 `IF-CS-065` 的 stub routes，fixed stub contract 必须优先于 access-token 解析、UIA、provider callout 与其它下游 dispatch 执行；实现必须先返回固定 wire behavior，再谈未来启用后的原始鉴权语义。
 * 对所有上述 stub routes，fixed unsupported contract 必须优先于原始 endpoint auth / UIA / request-body 语义；实现必须在 access token 校验、UIA challenge、provider callout 或其它下游 dispatch 之前直接短路返回固定错误。
 * `IF-CS-055` 在 push gateway integration feature flag 关闭时也必须返回同一固定错误，即 `404` + Matrix `M_UNRECOGNIZED`；只有 dedicated contracts 落地并显式启用后，才允许替换该 stub。
 * `IF-CS-053`、`IF-CS-054` 与 `IF-CS-064` 覆盖的若干路由在 Matrix `v1.17` 中仍是 current surfaces；这些 stub 反映的是本项目的显式产品边界，而不是上游 deprecation 结论。
@@ -199,9 +207,9 @@ Federation explicit unsupported wire contract 固定如下：
 | `IF-QUE-005` | Queue | `ops-worker` / `jobs-worker` | `jobs-worker` | `export-shard-job` | internal | `ExportShardJob` | `{job_id,export_epoch,shard_type,shard_key}` | checkpointed replay order | poison/retry | `42` | `DATA-OPS-001`,`DATA-R2-005` | `FLOW-OPS-JOB-CONTROL` |
 | `IF-QUE-006` | Queue | `ops-worker` / `jobs-worker` | `jobs-worker` | `restore-shard-job` | internal | `RestoreShardJob` | `{job_id,checkpoint_id,apply_phase,shard_type,shard_key}` | checkpointed replay order | poison/retry | `42` | `DATA-OPS-001`,`DATA-R2-005` | `FLOW-OPS-JOB-CONTROL` |
 | `IF-QUE-007` | Queue | `ops-worker` / `jobs-worker` | `jobs-worker` | `repair-shard-job` | internal | `RepairShardJob` | `{job_id,repair_kind,scope_kind,scope_id}` | checkpointed replay order | poison/retry | `42` | `DATA-OPS-001`,`DATA-OPS-003` | `FLOW-OPS-JOB-CONTROL` |
-| `IF-ALARM-001` | Alarm | runtime | `RemoteServerDO` | `retryOutboundAlarm()` | DO internal | none / internal | alarm slot | per server serialized | internal retry | `32` | `DATA-FED-001`,`DATA-FED-002` | `FLOW-FED-OUTBOUND-TXN` |
-| `IF-ALARM-002` | Alarm | runtime | `RoomDO` | `expireTypingAlarm()` | DO internal | none / internal | room alarm slot | per room serialized | internal retry | `31` | `DATA-ROOM-010` | `FLOW-ROOM-LOCAL-FANOUT` |
-| `IF-ALARM-003` | Alarm | runtime | rebuild coordinator | `continueRebuildAlarm()` | DO internal | none / internal | job alarm slot | serialized by job | internal retry | `42` | `DATA-OPS-001`,`DATA-OPS-002` | `FLOW-REPLAY-REBUILD` |
+| `IF-ALARM-001` | Alarm | runtime | `RemoteServerDO` | `retryOutboundAlarm()` | DO internal | none / internal | alarm slot | per server serialized | platform retry (`~2s` exponential backoff, max `6`); handler must reschedule for longer liveness | `32` | `DATA-FED-001`,`DATA-FED-002` | `FLOW-FED-OUTBOUND-TXN` |
+| `IF-ALARM-002` | Alarm | runtime | `RoomDO` | `expireTypingAlarm()` | DO internal | none / internal | room alarm slot | per room serialized | platform retry (`~2s` exponential backoff, max `6`); handler must reschedule for longer liveness | `31` | `DATA-ROOM-010` | `FLOW-ROOM-LOCAL-FANOUT` |
+| `IF-ALARM-003` | Alarm | runtime | rebuild coordinator | `continueRebuildAlarm()` | DO internal | none / internal | job alarm slot | serialized by job | platform retry (`~2s` exponential backoff, max `6`); handler must reschedule for longer liveness | `42` | `DATA-OPS-001`,`DATA-OPS-002` | `FLOW-REPLAY-REBUILD` |
 
 ## 5. 版本与兼容规则
 

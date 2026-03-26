@@ -49,6 +49,21 @@
 * 一个或多个 `TEST`
 * 至少一个 `EVID`
 
+说明：
+
+* 各 owning spec 内的 `REQ` 表可以保持精简表头，但上述 `REQ -> IF/DATA/FLOW/STATE/TEST/EVID` 边必须完整进入 [7.2](#72-机器可审计编码位置) 规定的 traceability matrix。
+* 若某条 `REQ` 的双向链接无法从现有 canonical 寄存器字段、显式注释或权威 sidecar 确定性生成，则不得仅存在于自然语言段落；必须先补充可机审字段后，才可宣称闭环。
+
+### 3.1.1 `REQ` 的规范正文与机器权威
+
+* 每条 `REQ` 的规范正文只允许出现在 owning spec 的显式 `REQ` 表行中；该行至少必须包含 `REQ ID`、短名称/主题与 normative statement。
+* `TEST-GOV-001` / `EVID-GOV-001` 必须从全部 canonical `REQ` 表行生成 machine-readable requirement register；该 register 是 `REQ-*` wildcard 展开、`REQ` 反向追溯与 requirement 唯一性校验的唯一机器基线。
+* requirement register 工件路径固定为：
+  * `evidence/common/EVID-GOV-001/<run_ts>/artifacts/requirement-register.csv`
+  * `evidence/common/EVID-GOV-001/<run_ts>/artifacts/requirement-register.json`
+* requirement register 至少必须输出：`req_id`、`owning_spec`、`title`、`normative_statement`、`source_file`、`source_line`、`status`。
+* 若同一 `REQ ID` 在多个源位置出现，或出现在与 [11-spec-authority-and-version-policy.md](/root/Matrix/spec/framework/11-spec-authority-and-version-policy.md) 前缀归属不一致的正文位置，治理门禁必须直接 fail。
+
 ### 3.2 Constraint 链接规则
 
 每个 `CF` 必须能双向链接到：
@@ -116,6 +131,7 @@
 
 * `REQ -> MX -> Spec -> Runtime`
 * `REQ -> IF -> DATA`
+* `REQ -> FLOW/STATE`
 * `REQ -> TEST -> EVID`
 * `CF -> Impacted Spec -> Mitigation`
 * `DEC -> Impacted Requirement`
@@ -124,19 +140,22 @@
 
 | Source ID | Source Type | Target ID | Target Type | Link Reason | Owning Spec | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| `REQ-*` / `MX-*` / `CF-*` | requirement / coverage / constraint | `IF-*` / `DATA-*` / `TEST-*` / `EVID-*` / `DEC-*` | contract / test / evidence / decision | implements / constrains / verifies / changes | owning child spec | open / active / closed |
+| `REQ-*` / `MX-*` / `CF-*` | requirement / coverage / constraint | `IF-*` / `DATA-*` / `FLOW-*` / `STATE-*` / `TEST-*` / `EVID-*` / `DEC-*` | contract / flow / state-machine / test / evidence / decision | implements / constrains / models / verifies / changes | owning child spec | open / active / closed |
 
 ### 7.2 机器可审计编码位置
 
 双向追溯的唯一机器权威编码固定为 `EVID-GOV-001` 产出的 traceability matrix 工件：
 
+* `evidence/common/EVID-GOV-001/<run_ts>/artifacts/requirement-register.csv`
+* `evidence/common/EVID-GOV-001/<run_ts>/artifacts/requirement-register.json`
 * `evidence/common/EVID-GOV-001/<run_ts>/artifacts/traceability-matrix.csv`
 * `evidence/common/EVID-GOV-001/<run_ts>/artifacts/traceability-matrix.json`
 
 规则：
 
+* 所有 `REQ-*` wildcard、`Source IDs` 中涉及 `REQ-*` 的展开、以及从 `REQ` 出发的反向追溯，都必须先解析 requirement register，而不是扫描仓库文本。
 * `IF` / `DATA` 目录表可以不内联 `Source IDs` 或 `TEST IDs` 列，前提是上述 matrix 能从现有 canonical 寄存器字段中确定性推导出反向链接。
-* `TEST-GOV-001` 必须在每次 CI 运行时重新生成该 matrix，并对断链、歧义链接、缺失反向边与未登记 ID 直接 fail。
+* `TEST-GOV-001` 必须在每次 CI 运行时重新生成 requirement register 与 traceability matrix，并对断链、歧义链接、缺失反向边、重复 `REQ ID` 与未登记 ID 直接 fail。
 * 任何无法被上述 matrix 表达的链接需求，都不得仅存在于自然语言段落；必须先进入 canonical 寄存器字段或新增权威寄存器后，才可宣称闭环。
 
 ## 8. 完成标准

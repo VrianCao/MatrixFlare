@@ -31,7 +31,7 @@
 
 | TEST-ID | Test Scope | Environment | Gate Profiles | Notes |
 | --- | --- | --- | --- | --- |
-| `TEST-GOV-001` | source baseline, traceability, ID integrity lint | CI | `L1-L3` | 校验 `REQ/MX/CF/IF/DATA/FLOW/STATE/TEST/EVID/DEC/OQ` 链接完整性、生成并校验 machine-readable traceability matrix、`15-source-observation-register.md` 存在且日期/字段合法、无未登记引用、无 ID 区间/后缀缩写、无缺失 pinned source snapshot 的 `CF-ID` 被当作 `Draft-Normative`、无 compatibility page 误用为权威正文、无把仅靠 `Deferred` 降级而未经 `DEC` 或 contracts 收敛的 `OQ` 误标为 `closed`。 |
+| `TEST-GOV-001` | source baseline, traceability, ID integrity lint | CI | `L1-L3` | 校验 `REQ/MX/CF/IF/DATA/FLOW/STATE/TEST/EVID/DEC/OQ` 链接完整性，生成并校验 machine-readable requirement register、traceability matrix 与 wildcard route expansion 审计快照，确保每个 `REQ-ID` 只有一个 canonical source row、`15-source-observation-register.md` 存在且日期/字段合法、无未登记引用、无 ID 区间/后缀缩写、无缺失 pinned source snapshot 的 `CF-ID` 被当作 `Draft-Normative`、无 compatibility page 或 `92-appendices` 中 `2.1-2.8` placeholder/informative sections 被误用为权威正文、无把仅靠 `Deferred` 降级而未经 `DEC` 或 contracts 收敛的 `OQ` 误标为 `closed`。 |
 | `TEST-CS-001` | discovery, capabilities, registration availability, registration, login discovery/exchange, password change, account deactivation, refresh, logout, profile surfaces and profile propagation basics | CI + staging | `L1-L3` | 必须覆盖 `GET /login` flow advertisement、`GET /register/available` truth、`/capabilities` 中 `m.change_password` / `m.3pid_changes` / `m.get_login_token` truth、password change / deactivate 的 UIA 基线，并显式覆盖带 access token 与不带 access token 的 password-UIA 分支，以及 profile `keyName` 语义与 profile change propagation。 |
 | `TEST-CS-002` | filter lifecycle, `/sync` initial/incremental/limited/`full_state`/`use_state_after`, `include_leave`, lazy-load members, account data, push rules, and notification counts | CI + staging | `L1-L3` | 重点验证 token 单调性、filter determinism、leave-room visibility、member lazy-load 以及通知计数语义。 |
 | `TEST-CS-003` | devices, to-device, key upload/query/claim, backup metadata | CI + staging | `L1-L3` | 必须验证 one-time key at-most-once。 |
@@ -42,8 +42,8 @@
 | `TEST-FED-002` | inbound/outbound txn idempotency, federation user-device/key exchange, and join/leave/knock flows | staging | `L2-L3` | 必须验证 per-server ordering、`/user/devices` / `/user/keys/query` 正确性，以及 `/user/keys/claim` 的 one-time key at-most-once。 |
 | `TEST-FED-003` | missing event recovery, backfill, gap repair chaos | pre-release | `L2-L3` | 必须覆盖缺 `prev_events` / `auth_events`。 |
 | `TEST-FED-004` | explicit unsupported federation route guard behavior | CI + staging | `L2-L3` | 必须验证 `IF-FED-009`,`IF-FED-010` 返回固定 wire behavior、无副作用、无 identity/token/membership truth write，且不会因为 auth 差异产生 401/403/404/200 漂移。 |
-| `TEST-MEDIA-001` | local upload/download/thumbnail/quota | CI + staging | `L1-L3` | 必须验证 streaming 与 body limit handling。 |
-| `TEST-MEDIA-002` | remote media cache, timeout, retry, cache eviction | staging | `L2-L3` | 受连接上限约束。 |
+| `TEST-MEDIA-001` | local upload/download/thumbnail/quota | CI + staging | `L1-L3` | 必须验证 streaming、body limit handling、`/_matrix/client/v1/media/*` authenticated current surface，以及 deprecated `/_matrix/media/*/download` / `thumbnail` 的 legacy unauthenticated + freeze 行为；同时覆盖 animated thumbnail 变体不会污染 non-animated cache key。 |
+| `TEST-MEDIA-002` | remote media cache, timeout, retry, cache eviction | staging | `L2-L3` | 受连接上限约束；必须验证 deprecated unauthenticated media routes 在 freeze 之后对 cache miss 不会触发新的远端抓取，而 current authenticated routes 仍可正常抓取与缓存。 |
 | `TEST-DER-001` | search, user directory, public rooms derived consistency | CI + staging | `L1-L3` | 验证派生索引正确性与 rebuild 后一致性，并显式覆盖对等价请求时匿名 `GET /publicRooms` 与鉴权态 `POST /publicRooms` 的同语义 query dispatch / visibility fail-closed 行为；同时验证未带 access token 的 `POST /publicRooms` 被 deterministic 拒绝，而不是被降级为匿名查询。 |
 | `TEST-AS-001` | appservice namespace, query, transaction delivery and retry | staging | `L3 when enabled` | appservice 开启时才进入门禁。 |
 | `TEST-SEC-001` | token revocation, UIA challenge binding, secret handling, baseline abuse guards, federation auth failures | CI + staging | `L1-L3` | 重点验证 auth invalidation、`auth_version` 推进、route-bound UIA challenge 不可跨路由重放、secret boundaries，以及对始终开启的注册、登录、媒体、房间发送、搜索和本地公开入口的 baseline rate-limit / quota guard。 |
@@ -85,6 +85,7 @@
 ## 6. Protocol Compliance Testing
 
 * 所有协议合规测试必须直接从 Matrix `v1.17` versioned spec 生成。
+* 对使用 wildcard route family 的 contract，测试生成与治理工件都必须按 [23-interface-contract-catalog.md](/root/Matrix/spec/framework/23-interface-contract-catalog.md) 的 route pattern grammar 先展开为显式 path 列表，再做断言与审计。
 * 社区测试套件可以作为补充回归，但不能作为规范来源。
 * 对每个 `Required-Core` `MX-ID`，至少必须有一个 `TEST-ID` 和一个 `EVID-ID`。
 * push-rules 合规测试必须把运行时生成的 server-default baseline 与 [92-appendices.md](/root/Matrix/spec/framework/92-appendices.md) 中钉死的 `v1.17` 基线逐条比对，至少覆盖 `kind`、顺序、`rule_id`、`enabled`、conditions 和 actions。

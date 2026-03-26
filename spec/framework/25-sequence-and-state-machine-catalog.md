@@ -15,9 +15,9 @@
 
 ### 2.1 客户端与身份域
 
-| FLOW-ID | Name | Owning Spec | Participants | Trigger | Success Path | Failure / Retry Path |
+| FLOW ID | Name | Owning Spec | Participants | Trigger | Success Path | Failure / Retry Path |
 | --- | --- | --- | --- | --- | --- | --- |
-| `FLOW-CS-DISCOVERY` | client discovery | `30` | client, `gateway-worker` | `/.well-known` or `/versions` or `/capabilities` | 返回能力与 homeserver 元数据 | 静态错误或缓存回退 |
+| `FLOW-CS-DISCOVERY` | client discovery | `30` | client, `gateway-worker` | `GET /.well-known/matrix/client`, `GET /_matrix/client/versions`, or `GET /_matrix/client/*/capabilities` | 返回能力与 homeserver 元数据 | 静态错误或缓存回退 |
 | `FLOW-CS-UIA` | shared UIA challenge orchestration | `30`,`40` | client, `gateway-worker`, optional `UserDO` | `register`, `account/password`, `account/deactivate`, or other enabled UIA endpoint | 发行 route-bound challenge token、校验 stage、在最终提交前把 challenge 绑定到同一路由与同一主体 | challenge 过期、路由绑定不匹配、主体漂移或 completed stage 重放必须 fail-closed，不得落盘部分业务结果 |
 | `FLOW-CS-REGISTER` | registration | `30` | client, `gateway-worker`, `UserDO` | `POST /register` | 创建用户、初始设备、初始 session | 保持幂等错误响应，不做半创建 |
 | `FLOW-CS-LOGIN` | login | `30` | client, `gateway-worker`, `UserDO` | `POST /login` | 认证、创建设备 session、返回 token | 失败不创建任何 session |
@@ -32,7 +32,7 @@
 
 ### 2.2 房间域
 
-| FLOW-ID | Name | Owning Spec | Participants | Trigger | Success Path | Failure / Retry Path |
+| FLOW ID | Name | Owning Spec | Participants | Trigger | Success Path | Failure / Retry Path |
 | --- | --- | --- | --- | --- | --- | --- |
 | `FLOW-CS-SEND-EVENT` | local event send | `31` | client, `gateway-worker`, `UserDO`, `RoomDO` | `PUT /rooms/.../send` | `RoomDO` 幂等裁决、准入、提交、fanout | 校验失败原子拒绝；同 `txnId` 重试要么返回同结果，要么 deterministic conflict |
 | `FLOW-CS-ROOM-MEMBERSHIP` | membership mutation | `31` | client, `gateway-worker`, `UserDO`, `RoomDO`, optional federation | join/invite/leave/ban/knock | 生成 membership event 并走同一准入管道 | 联邦握手失败不得伪造本地成功 |
@@ -43,7 +43,7 @@
 
 ### 2.3 联邦域
 
-| FLOW-ID | Name | Owning Spec | Participants | Trigger | Success Path | Failure / Retry Path |
+| FLOW ID | Name | Owning Spec | Participants | Trigger | Success Path | Failure / Retry Path |
 | --- | --- | --- | --- | --- | --- | --- |
 | `FLOW-FED-DISCOVERY` | remote server discovery | `32` | `gateway-worker`, DNS, remote server | outbound federation call | 依 Matrix 发现流程得到目标地址 | 失败缓存按 TTL 失效并重试 |
 | `FLOW-FED-METADATA-SERVE` | federation metadata serve | `32` | remote server, `gateway-worker`, optional `RemoteServerDO` | remote request for `/.well-known/matrix/server`, `/_matrix/federation/*/version`, or server key material | 返回本地 discovery / version / signing-key metadata，并保持与当前发布 keyset 一致 | keyset 轮换窗口、缓存副本漂移或签名材料不可用时必须 fail-closed |
@@ -59,11 +59,11 @@
 
 ### 2.4 媒体与派生域
 
-| FLOW-ID | Name | Owning Spec | Participants | Trigger | Success Path | Failure / Retry Path |
+| FLOW ID | Name | Owning Spec | Participants | Trigger | Success Path | Failure / Retry Path |
 | --- | --- | --- | --- | --- | --- | --- |
 | `FLOW-CS-MEDIA-UPLOAD` | media upload | `33` | client, `gateway-worker`, `UserDO`, R2, D1 | upload request | 鉴权、配额、流式写 R2、写目录投影 | 失败回滚 pending upload binding |
-| `FLOW-CS-MEDIA-DOWNLOAD` | local media download | `33` | client, `gateway-worker`, R2 | media GET | 鉴权、查最小元数据、流式返回 | 对象缺失返回协议错误并记审计 |
-| `FLOW-CS-REMOTE-MEDIA-FETCH` | remote media cache | `33` | client, `gateway-worker`, remote server, R2 | cache miss | 拉取远端、写 R2、返回客户端 | 受并发上限和尺寸限制保护 |
+| `FLOW-CS-MEDIA-DOWNLOAD` | local media download | `33` | client, `gateway-worker`, R2 | media GET | 按 route family 执行 current authenticated read 或 deprecated compatibility legacy-freeze 裁决，查最小元数据并流式返回 | 对象缺失、鉴权不满足或 legacy freeze 裁决不满足时返回协议错误并记审计 |
+| `FLOW-CS-REMOTE-MEDIA-FETCH` | remote media cache | `33` | client, `gateway-worker`, remote server, R2 | current authenticated route cache miss，或 compatibility route 上允许抓取的 miss | 仅在请求路径允许远端抓取时拉取远端、写 R2、返回客户端 | deprecated unauthenticated compatibility route 在 freeze 之后对 cache miss 必须直接 `404 M_NOT_FOUND`，且不得触发新的远端抓取；其他路径仍受并发上限和尺寸限制保护 |
 | `FLOW-SEARCH-INDEX` | search/index update | `34` | `gateway-worker`, `RoomDO`, `UserDO`, `jobs-worker`, D1 | truth commit success or explicit derived-work enqueue | 按幂等键更新 D1 | 失败进入重建队列 |
 | `FLOW-AS-TXN-DELIVERY` | appservice delivery | `34` | `jobs-worker`, appservice, D1 control plane | truth commit success | 顺序投递 AS transaction | 失败重试且不影响主业务提交 |
 | `FLOW-OPS-JOB-CONTROL` | control-plane job control | `42`,`40` | operator, Cloudflare Access, `ops-worker`, `jobs-worker`, D1, R2, optional DOs | Access-protected `/_ops` request | 认证、scope 裁决、审计先落盘；若为 full export，必须先冻结 `DATA-OPS-010` 为 `DATA-OPS-011` 再 fanout shard 作业；随后创建/查询/取消作业 | duplicate idempotency key 折叠或冲突拒绝；manifest/hash/authz 失败必须 fail-closed |
@@ -71,7 +71,7 @@
 
 ## 3. 状态机目录
 
-| STATE-ID | Name | Owning Spec | Entity | Core States | Recovery Focus |
+| STATE ID | Name | Owning Spec | Entity | Core States | Recovery Focus |
 | --- | --- | --- | --- | --- | --- |
 | `STATE-USER-SESSION` | session lifecycle | `30` | access/refresh session | created, active, rotated, revoked, expired | token rotation and logout consistency |
 | `STATE-UIA-SESSION` | UIA challenge lifecycle | `30`,`40` | route-bound challenge token | issued, challenged, partially-completed, satisfied, expired, rejected | challenge replay, route binding, and stage completion safety |
@@ -98,7 +98,7 @@
 
 * 若某行为存在并发、重试、恢复、版本偏斜或缓存语义，则必须有图。
 * 若某对象具有生命周期、重试或多阶段处理，则必须有状态机。
-* 任一 `IF-ID` 若跨越信任边界或 authority handoff，必须至少挂一个 `FLOW-ID`。
+* 任一 `IF-ID` 若跨越信任边界或 authority handoff，必须至少挂一个 `FLOW-*` canonical ID。
 
 ## 6. 完成标准
 

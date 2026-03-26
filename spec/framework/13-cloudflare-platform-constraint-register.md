@@ -44,7 +44,7 @@
 | `CF-WKR-003` | Workers | limits | workers-limits | Paid | HTTP 请求 CPU time 默认 `30s`，可提升至 `5 min`。Queue consumer 与 DO alarm 的 wall time 上限为 `15 min`。 | 权威热路径必须远低于默认 CPU 上限；重建、缩略图、导出必须异步化。 | `13`,`21`,`30`,`31`,`33`,`42` |
 | `CF-WKR-004` | Workers | limits | workers-limits | Paid | 每个 isolate 内存上限 `128 MB`。 | 媒体、归档、联邦大响应必须流式处理，禁止整包缓冲。 | `21`,`33`,`41` |
 | `CF-WKR-005` | Workers | limits | workers-limits | Paid | 每次调用子请求默认上限 `10,000`，可配置提高，最高可达 `10M`。 | 不允许无界 fanout；`/sync`、联邦恢复、批量重建必须分片；压测和容量模型必须声明是否依赖提额配置。 | `21`,`30`,`31`,`32`,`41` |
-| `CF-WKR-006` | Workers | limits | workers-limits | Paid | 每个顶层请求最多 `6` 个 simultaneous open connections；`fetch`、KV、Cache、R2、Queues、TCP sockets 与 outbound WebSocket 都受此预算约束；超出时新的连接尝试会被排队，停滞连接可能被 runtime 关闭。 | 远端媒体抓取、联邦并发拉取、R2/KV/Queues/网络 I/O 并发必须受控；若不再需要响应体，必须显式取消以释放连接头寸。 | `21`,`32`,`33`,`41` |
+| `CF-WKR-006` | Workers | limits | workers-limits | Paid | 每个顶层请求最多 `6` 个 simultaneous open connections；`fetch`、KV、Cache、R2、Queues、TCP sockets 与 outbound WebSocket 都受此预算约束；超出时新的连接尝试会被排队，停滞连接可能被 runtime 关闭。 | 远端媒体抓取、联邦并发拉取、R2/KV/Queues/网络 I/O 并发必须受控；若不再需要响应体，必须显式取消以释放连接头寸；D1 连接压力另见 `CF-D1-009`，实现不得假设其与其他 I/O 预算彼此独立。 | `21`,`32`,`33`,`41` |
 | `CF-WKR-007` | Workers | limits | workers-limits | Account/Zone | 请求体上限取决于 Cloudflare plan，而不是 Workers plan：Free/Pro `100 MB`，Business `200 MB`，Enterprise 默认 `500 MB`。 | `m.upload.size` 必须取业务配置与 zone plan 上限中的较小值。 | `13`,`21`,`33`,`41` |
 | `CF-WKR-008` | Workers | limits | workers-limits | Paid | 压缩后 Worker bundle 上限 `10 MB`。 | 房间版本算法、媒体处理、搜索逻辑必须模块化，避免单 Worker 过胖。 | `21`,`31`,`33`,`34` |
 | `CF-WKR-009` | Service Bindings | limits | service-bindings | Paid | 单个顶层请求最多 `32` 次 Worker invocations；每次 Service Binding 调用都会计入。 | Worker 切分可以做，但调用链必须浅，不能把内部 RPC 设计成多跳网格。 | `21`,`23` |
@@ -62,6 +62,7 @@
 | `CF-WKR-021` | Workers Secrets | scope | workers-secrets | Paid | 默认 secrets 作用域是单个 Worker project / environment；若要跨多个 Worker 复用同一敏感材料，必须显式重复配置，或改用 account-level Secrets Store binding。 | 默认设计应避免多 Worker 共享同一 secret；若确需共享，必须把共享策略写进部署与轮换流程，不能依赖“另一个 Worker 自然可见”。 | `21`,`30`,`40`,`42` |
 | `CF-WKR-022` | Workers | limits | workers-limits | Paid | 单个 Worker 最多 `128` 个 environment variables（secrets + text variables）。 | 通过“拆分为多个 secrets”规避 `5 KB` 单值上限时，仍必须受总数上限约束；key rotation 与双版本并存设计不得假设 secrets 数量无限。 | `21`,`40`,`42` |
 | `CF-WKR-023` | Workers RPC / Service Bindings RPC / Durable Object RPC | limits | workers-rpc, do-rpc-stubs | Paid | 普通 serialized RPC message 的 hard ceiling 为 `32 MiB`；更大传输必须改用 stream-based transfer，而不是单条序列化消息。Durable Object method-call RPC 需按 DO stubs 指南回链到 Workers RPC 文档理解该 transport 约束。 | 所有内部 Worker/DO RPC 契约都必须分页、分段或改为 stream / R2 locator 设计；不得把大房间投影、导出段或审计结果一次性塞进单个 RPC 返回值。 | `21`,`23`,`26`,`30`,`31`,`32`,`42` |
+| `CF-WKR-024` | Workers | limits | workers-limits | Paid | Request header size 上限 `128 KB (total)`；response header size 上限 `128 KB (total)`。 | Access/JWT、联邦签名与任何 cookie/header 注入不得把 header 膨胀为大 payload；可增长的材料必须限制长度或改走 body/locator。 | `21`,`32`,`40` |
 
 ## 4. Durable Objects 约束
 
@@ -85,6 +86,7 @@
 | `CF-DO-016` | Durable Objects SQLite | limits | do-limits | Paid | 单条 SQL statement length 上限 `100 KB`。 | backfill、repair、导出与批量 upsert 必须受 statement size 约束并显式分批，禁止生成巨型 SQL。 | `21`,`31`,`32`,`42` |
 | `CF-DO-017` | Durable Objects WebSocket | limits | do-limits | Paid | DO 接收的单条 WebSocket message 大小上限为 `32 MiB`；该限制只针对 received messages。 | `/sync` 唤醒通道、运维长连接与任何 DO WebSocket 协议都必须限制入站消息大小；更大 payload 必须拆帧、分块或改走其他传输。 | `21`,`30`,`41` |
 | `CF-DO-018` | Durable Objects / Workers runtime | limits | do-limits, workers-limits | Paid | Durable Objects 运行在 Workers runtime 上；per-isolate memory hard ceiling 为 `128 MB`。 | state resolution、恢复、导出装配与大房间查询都必须流式化或分段；DO authority path 不得依赖大内存整包缓冲。 | `21`,`31`,`32`,`42` |
+| `CF-DO-019` | Durable Objects Alarms | semantics | do-alarms | Paid | 每个 DO 只有一个 alarm slot；alarm 具有 at-least-once 执行语义；当 `alarm()` 抛出未捕获异常时平台会自动重试，指数退避从约 `2s` 起，最多 `6` 次；重试耗尽后不会继续自动运行，直到下一次 `setAlarm()`。 | 所有 alarm 驱动的 retry/cleanup/rebuild 必须幂等；若需要持续 liveness，handler 必须 catch 异常并显式重新 `setAlarm()`，不得依赖“平台会一直重试”。 | `21`,`23`,`31`,`32`,`42` |
 
 ## 5. D1 约束
 
@@ -99,6 +101,8 @@
 | `CF-D1-007` | D1 | limits | d1-limits | Paid | 单次 Worker invocation 内最多执行 `1,000` 条 D1 queries。 | rebuild、search backfill 与控制面批处理必须显式分批，不能把大作业写成单 invocation 无界循环。 | `21`,`34`,`41`,`42` |
 | `CF-D1-008` | D1 | limits | d1-limits | Paid | 单条 SQL query 最长执行时间 `30s`。 | 目录 rebuild、审计查询与控制面报告必须避免超长 SQL；必要时拆成分页或多阶段 job。 | `34`,`41`,`42` |
 | `CF-D1-009` | D1 | limits | d1-limits | Paid | 每次 Worker invocation 最多同时打开 `6` 个到 D1 的连接。 | 任一把 D1 混入公开请求热路径、重建作业或多路派生查询的实现，都必须把 D1 连接并发显式纳入连接预算。 | `21`,`41`,`42` |
+| `CF-D1-010` | D1 | limits | d1-limits | Paid | 最大 string/BLOB/table row size 为 `2 MB`。 | 索引文档、审计 payload 与派生投影不得塞进单行；必要时拆分记录或外置到 R2，只在 D1 存 locator。 | `21`,`34`,`42` |
+| `CF-D1-011` | D1 | limits | d1-limits | Paid | 最大 SQL statement length `100 KB`；每 query 最大 bound parameters `100`。 | backfill/upsert/batch 必须按 statement 与 parameters 上限分批，禁止生成巨型 SQL 或超长 `IN`/`VALUES` 列表。 | `34`,`42` |
 
 ## 6. KV 约束
 
@@ -113,10 +117,12 @@
 | CF-ID | Product | Category | Official Source | Plan Scope | Constraint / Behavior | Design Impact | Owning Spec |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `CF-R2-001` | R2 | consistency | r2-consistency | Paid | R2 对对象写、读、删、列举都是强一致；写后全局立即可见。 | 本地媒体对象、缩略图、归档可直接依赖 R2 作为对象真相。 | `21`,`22`,`33`,`42` |
-| `CF-R2-002` | R2 | limits | r2-limits | Paid | 单次 single-part 上传上限 `5 GiB`；multipart 总对象可达 `4.995 TiB`。 | 标准 Matrix 上传只能通过 Worker 接入时，仍受 zone request body 限制。 | `21`,`33`,`41` |
+| `CF-R2-002` | R2 | limits | r2-limits | Paid | 单次 single-part 上传 hard ceiling 为 `4.995 GiB`；multipart 总对象可达 `4.995 TiB`。 | 标准 Matrix 上传只能通过 Worker 接入时，仍受 zone request body 限制。 | `21`,`33`,`41` |
 | `CF-R2-003` | R2 | pricing | r2-pricing | Paid | 通过 Workers API、S3 API、`r2.dev` 直取 R2 不收 Internet egress 费。 | 媒体读取主成本来自请求与存储，而不是 R2 对外带宽。 | `33`,`41` |
 | `CF-R2-004` | R2 + CDN | caching | r2-consistency | Paid | 若通过带缓存的域名公开对象，删除后缓存副本可能仍可见，需显式 purge。 | 认证媒体与远端缓存媒体不应依赖公共缓存域名作为唯一出口。 | `33`,`40` |
 | `CF-R2-005` | R2 | billing | r2-pricing | Paid | R2 Standard 含 storage `10 GB-month`、Class A `1M/月`、Class B `10M/月`；若使用 Infrequent Access，则无对应 included quota，并有 retrieval fee 与 `30` 天 minimum storage duration。 | 媒体和归档成本模型必须先区分 Standard 与 IA，再决定是否能使用包含量抵扣。 | `41` |
+| `CF-R2-006` | R2 | limits | r2-limits | Paid | 对同一 object key 的并发写入限制为 `1/s`；超限会返回 `429`。 | media finalize、导出与恢复写入必须避免并发 writer 争用同一 key；幂等重试必须带退避与 jitter。 | `33`,`42` |
+| `CF-R2-007` | R2 | endpoint | r2-limits | Paid | `r2.dev` endpoint 不 intended for production；存在可变 rate limit，超过数百 requests/second 时会被临时 throttling 并返回 `429`，吞吐也可能受限。 | 生产读取路径不得依赖 `r2.dev` 作为稳定 origin；如需公开域名，必须使用 custom domain + 明确 caching/purge 策略，或通过 Worker/R2 binding 提供出口。 | `33`,`41`,`42` |
 
 ## 8. Queues 约束
 
@@ -142,6 +148,7 @@
 * `gateway-worker` 可以安全持有 `/sync` 长轮询，但不得在连接断开后继续依赖原请求上下文。引用：`CF-WKR-001`,`CF-WKR-002`。
 * 所有权威真相必须落在以 DO SQLite 为核心的主权对象中，D1/KV 只能承担衍生或缓存角色。引用：`CF-DO-001`,`CF-DO-007`,`CF-D1-002`,`CF-KV-001`。
 * 所有 Worker/DO 内部接口都必须前后兼容，并为 DO migration 单独建立发布与回滚流程。引用：`CF-DO-005`,`CF-DO-006`,`CF-WKR-012`。
+* 所有 DO alarm 驱动的 retry、cleanup 与 rebuild 都必须按 single-slot + at-least-once + 最多 `6` 次自动重试建模；若要持续 liveness，handler 必须显式重新 `setAlarm()`。引用：`CF-DO-019`。
 * 所有 Worker-to-Worker 与 Worker-to-DO 的普通 RPC 契约都必须受 `32 MiB` serialized payload ceiling 约束；若可能超限，必须改为 stream 或 locator 模式。引用：`CF-WKR-023`。
 * 所有媒体上传能力都必须同时受 Matrix 协议能力声明和 Cloudflare zone request body 限制约束。引用：`CF-WKR-007`,`CF-R2-002`。
 * 所有 DO truth / repair / export 设计都必须同时尊重 `2 MB` row/value ceiling、`100 KB` SQL statement ceiling、`32 MiB` received WebSocket ceiling 与 `128 MB` runtime memory ceiling。引用：`CF-DO-015`,`CF-DO-016`,`CF-DO-017`,`CF-DO-018`。

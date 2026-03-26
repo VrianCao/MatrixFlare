@@ -37,6 +37,7 @@
 
 * `RoomDO` 成功提交后投递 `IF-QUE-001 search-index-job`。
 * `jobs-worker` 以 `event_id` 作为幂等键写入 `DATA-D1-001`。
+* 任一派生索引行若接近 D1 row size ceiling，必须把大 payload 外置到 R2 或拆分多行，只在 D1 保留 locator / searchable projection；不得把全文、审计副本或大 JSON 直接塞进单行。引用：`CF-D1-010`。
 * 删除、redaction、visibility 变化必须生成对应的补偿索引更新。
 
 ### 3.3 Query Service
@@ -50,6 +51,7 @@
 
 * 搜索索引必须支持全量重建和按房间重建。
 * 重建输入来自 `RoomDO` 真相与 R2 冷历史。
+* rebuild / backfill / bulk upsert 必须显式分批，保证每条 SQL statement 不超过 `100 KB`、每 query bound parameters 不超过 `100`，并避免把大作业实现成单次无界批量写。引用：`CF-D1-011`。
 * 重建进度由 `DATA-OPS-001` / `DATA-OPS-002` 持久化。
 
 ## 4. 用户目录
@@ -118,6 +120,7 @@
 
 * D1 的所有派生表都必须能从真相面重建。
 * 对派生表的任何手工修复都必须记录到 `DATA-OPS-003`。
+* D1 只保存查询所需的最小投影；超大派生 payload、重建中间产物或导出副本必须外置到 R2，再由 D1 保存 locator / watermark / checksum。引用：`CF-D1-010`,`CF-D1-011`。
 * 派生数据被删除时，不得影响公开 API 的真相正确性，只影响可查询性与滞后。
 
 ## 10. 派生域接口归属

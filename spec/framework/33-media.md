@@ -22,6 +22,7 @@
 * 媒体对象本体的权威存储是 R2。引用：`DATA-R2-001`,`DATA-R2-002`。
 * 媒体下载所需最小元数据必须能从 R2 object key 或 metadata 恢复，不得把 D1 作为下载前置单点。
 * D1 媒体目录只是查询、清理、审计、搜索辅助，不是对象真相。
+* 生产媒体出口不得依赖 `r2.dev`；authenticated media 与远端缓存媒体必须通过 Worker/R2 binding，或使用显式 custom domain + purge 策略提供出口。引用：`CF-R2-004`,`CF-R2-007`。
 
 ## 3. 本地上传路径
 
@@ -45,6 +46,7 @@
 
 * 写 R2 失败时必须撤销 `DATA-USER-015` pending upload grant。
 * finalize 失败时必须把对象标记为 orphan 待清理，不得直接把对象暴露给客户端；对应 pending grant 必须进入终态，避免无限重试。
+* 对同一 R2 object key 的 finalize/retry 不得并发写；必须退避并带 jitter，避免触发 same-key `429`。引用：`CF-R2-006`。
 
 ## 4. 本地下载路径
 
@@ -59,9 +61,9 @@
 | `GET /_matrix/client/v1/media/download/{serverName}/{mediaId}/{fileName}` | current | `Required-Core` via `IF-CS-051` | 与上条语义相同，但允许稳定 filename；必须要求 access token。 |
 | `GET /_matrix/client/v1/media/thumbnail/{serverName}/{mediaId}` | current | `Required-Core` via `IF-CS-051` | 客户端缩略图当前推荐路径；必须要求 access token。 |
 | `GET /_matrix/media/*/config` | deprecated compatibility surface | 继续支持并映射到与 `client/v1` 相同 truth | 在当前 profile 下不得弱化为匿名访问。 |
-| `GET /_matrix/media/*/download/{serverName}/{mediaId}` | deprecated compatibility surface | 继续支持并映射到与 `client/v1` 相同 truth | 不得把旧路径实现成另一套缓存/鉴权规则。 |
-| `GET /_matrix/media/*/download/{serverName}/{mediaId}/{fileName}` | deprecated compatibility surface | 继续支持并映射到与 `client/v1` 相同 truth | `fileName` 只影响下游展示/响应头，不改变对象定位。 |
-| `GET /_matrix/media/*/thumbnail/{serverName}/{mediaId}` | deprecated compatibility surface | 继续支持并映射到与 `client/v1` 相同 truth | 不得出现“新路径有缩略图、旧路径没有”的行为漂移。 |
+| `GET /_matrix/media/*/download/{serverName}/{mediaId}` | deprecated compatibility surface | 保留 `v1.17` legacy unauthenticated + freeze 语义 | 不得把旧路径强行升级成 authenticated media；对象若在 freeze 之后首次上传/缓存，则必须返回 `404 M_NOT_FOUND`。 |
+| `GET /_matrix/media/*/download/{serverName}/{mediaId}/{fileName}` | deprecated compatibility surface | 保留 `v1.17` legacy unauthenticated + freeze 语义 | `fileName` 只影响下游展示/响应头，不改变对象定位；对象若不具备 legacy unauth 访问资格，则必须返回 `404 M_NOT_FOUND`。 |
+| `GET /_matrix/media/*/thumbnail/{serverName}/{mediaId}` | deprecated compatibility surface | 保留 `v1.17` legacy unauthenticated + freeze 语义 | 不得出现“新路径有缩略图、旧路径没有”的行为漂移；对象若在 freeze 之后首次上传/缓存，则必须返回 `404 M_NOT_FOUND`。 |
 | `POST /_matrix/media/*/create` | current upload-reservation surface | `Required-Core` via `IF-CS-050` | 返回 `mxc://` 预留 ID，供后续 upload-by-ID 使用。 |
 | `POST /_matrix/media/*/upload` | current upload surface | `Required-Core` via `IF-CS-050` | 单阶段上传；仍受 Worker ingress body 上限约束。 |
 | `PUT /_matrix/media/*/upload/{serverName}/{mediaId}` | current upload-by-ID surface | `Required-Core` via `IF-CS-050` | 必须只接受由 `create` 预留出来的本地 MXC。 |
@@ -70,9 +72,11 @@
 ### 4.2 读取规则
 
 * `gateway-worker` 解析 MXC 定位本地对象。
-* 对客户端 `config`/`download`/`thumbnail` 路由必须要求 access token；compatibility `/_matrix/media/*` 路由在当前 profile 下也必须沿用同一鉴权要求。
+* `/_matrix/client/v1/media/{config,download,thumbnail}` current authenticated media 路由必须要求 access token。
+* deprecated `/_matrix/media/*/config` compatibility 路由仍要求 access token。
+* deprecated `/_matrix/media/*/download` 与 `/_matrix/media/*/thumbnail` compatibility 路由不得要求 access token；它们必须改按 immutable `legacy_unauth_media_freeze_at` 与对象 metadata 中的 `legacy_unauth_access_flag` 执行 legacy unauthenticated + freeze 裁决。
 * 优先通过 R2 binding 读取并流式返回。
-* `/_matrix/client/v1/media/*` current surface 与 `/_matrix/media/*` compatibility surface 必须共用同一对象真相、鉴权裁决、缓存命中与审计逻辑，不得按路径族分叉行为。
+* `/_matrix/client/v1/media/*` current surface 与 `/_matrix/media/*` compatibility surface 必须共用同一对象真相、参数解释、缓存命中与审计逻辑；但 deprecated `download` / `thumbnail` compatibility 路由的 legacy unauthenticated + freeze 裁决不得被“统一 auth gate”覆盖。
 * 若对象不存在但目录残留，返回协议错误并记审计事件。
 
 ### 4.3 Query 参数与下载语义
@@ -95,11 +99,12 @@
 远端媒体 miss 时：
 
 1. 解析远端 MXC。
-2. 执行远端发现与连接。
-3. 流式抓取远端媒体。
-4. 同步写入 `DATA-R2-002`。
-5. 投递 `IF-QUE-002`，异步写入媒体目录与需要的缩略图任务。
-6. 向客户端返回本次流。
+2. 若请求来自 deprecated unauthenticated `/_matrix/media/*/download` 或 `thumbnail` 路由，则必须先检查目标缓存对象是否已存在且 `legacy_unauth_access_flag = true`；若不满足，直接返回 `404 M_NOT_FOUND`，不得触发新的远端抓取。
+3. 执行远端发现与连接。
+4. 流式抓取远端媒体。
+5. 同步写入 `DATA-R2-002`，并把该缓存对象的 `legacy_unauth_access_flag` 固定为“是否在 freeze 前首次填充缓存”。
+6. 投递 `IF-QUE-002`，异步写入媒体目录与需要的缩略图任务。
+7. 向客户端返回本次流。
 
 ### 5.2 远端抓取护栏
 
@@ -112,6 +117,7 @@
 ### 6.1 生成规则
 
 * 缩略图 key 必须稳定编码源对象和变体参数。引用：`DATA-R2-003`。
+* 缩略图变体参数至少必须包含 `width`、`height`、`method` 与 `animated`；不得让 animated 与 non-animated 结果共用同一对象 key。引用：`DATA-R2-003`。
 * 同一变体的重复生成必须幂等。
 * 大对象或高成本变体优先异步生成，小变体可在预算内同步生成。
 

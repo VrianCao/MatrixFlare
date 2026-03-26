@@ -122,7 +122,7 @@
 | `DATA-D1-001` | table | search index rows | derived | `jobs-worker` | D1 | `event_id` | eventual | full reindex | 只索引可见文本与必要 filter 字段。 |
 | `DATA-D1-002` | table | user directory | derived | `jobs-worker` | D1 | `user_id` | eventual | rebuild from `UserDO` exports | 来源于 `DATA-USER-012` 与本地目录策略；受隐私与可发现性规则约束。 |
 | `DATA-D1-003` | table | public room directory | derived | `jobs-worker` | D1 | `room_id` | eventual | rebuild from `RoomDO` | 可见性随 join rules/public flag 更新；每行必须带来源 `room_serial` / visibility watermark，用于判断“可见性是否不确定”。 |
-| `DATA-D1-004` | table | media catalog | derived | `jobs-worker` | D1 | `mxc_uri` | eventual | R2 listing + finalize logs | 不能成为下载前置单点。 |
+| `DATA-D1-004` | table | media catalog | derived | `jobs-worker` | D1 | `mxc_uri` | eventual | R2 listing + finalize logs | 不能成为下载前置单点；若镜像 legacy unauth freeze 相关派生字段，只能作查询/审计辅助，不得替代 R2 object metadata 真值。 |
 | `DATA-D1-005` | table | appservice config / txn cursors | authoritative-control-plane | `ops-worker` / `jobs-worker` | D1 + secrets | `{appservice_id}` | strong at primary / session consistent | config backup | 控制面数据，不是房间或用户真相。 |
 | `DATA-D1-006` | table | operator authz policy | authoritative-control-plane | `ops-worker` | D1 + Cloudflare Access config | `principal_id` | strong at primary / session consistent | config backup | 记录人类/自动化 operator principal、Access binding、允许 scope、target scope 约束、失效时间与审计要求；不存 Access secret 本体。 |
 
@@ -167,9 +167,9 @@
 
 | DATA-ID | Category | Logical Entity / Shape | Authority | Runtime Owner | Physical Store | Key / Pattern | Consistency | Recovery Source | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `DATA-R2-001` | object | local media object | authoritative | media subsystem | R2 | `media/local/{media_id}` | strong | none | 本地媒体对象真相。 |
-| `DATA-R2-002` | object | remote media cache object | authoritative-cache | media subsystem | R2 | `media/remote/{origin}/{media_id}` | strong | refetch remote | 可按策略驱逐重取。 |
-| `DATA-R2-003` | object | thumbnail object | derived | `jobs-worker` | R2 | `media/thumb/...` | strong | regenerate | 变体由 `{width,height,method}` 唯一决定。 |
+| `DATA-R2-001` | object | local media object | authoritative | media subsystem | R2 | `media/local/{media_id}` | strong | none | 本地媒体对象真相；对象 metadata 至少必须包含 `first_ingested_at` 与 `legacy_unauth_access_flag`，用于 `/_matrix/media/*/download` / `thumbnail` 的 freeze 裁决；authenticated current routes 不受该 flag 限制。 |
+| `DATA-R2-002` | object | remote media cache object | authoritative-cache | media subsystem | R2 | `media/remote/{origin}/{media_id}` | strong | refetch remote | 可按策略驱逐重取；对象 metadata 至少必须包含 `first_cached_at` 与 `legacy_unauth_access_flag`。deprecated unauthenticated compatibility routes 只能服务 `legacy_unauth_access_flag = true` 的缓存对象，且在 freeze 之后对 cache miss 不得触发新的远端抓取。 |
+| `DATA-R2-003` | object | thumbnail object | derived | `jobs-worker` | R2 | `media/thumb/...` | strong | regenerate | 变体由 `{width,height,method,animated}` 唯一决定；若来源对象不具备 legacy unauth 访问资格，则 compatibility `/_matrix/media/*/thumbnail` 路由也不得借缩略图对象绕过 freeze。 |
 | `DATA-R2-004` | object | room cold archive segments | authoritative-cold | `RoomDO` + `jobs-worker` | R2 | `archive/rooms/{room_id}/...` | strong | replay source | RoomDO 热层保留索引；每个 segment 都必须被 checkpoint manifest 引用并带内容哈希、sequence、`checkpoint_id` 与签名 key version；若某 segment 被 full export bundle 收录，则对应 bundle manifest 另外记录其 `export_epoch`。 |
 | `DATA-R2-005` | object | export / recovery bundles | authoritative-ops | `ops-worker` | R2 | `exports/{export_epoch_or_import_batch}/{artifact_kind}/{scope_kind}/{scope_id_or_global}/{object_id}` | strong | none | 仅控制面产生；bundle manifest 必须包含 schema version、内容哈希、签名、加密 key version 与 completeness 标记。 |
 | `DATA-R2-006` | object | encrypted room key backup segments | authoritative-opaque | `UserDO` | R2 | `backup/{user_id}/{backup_version}/...` | strong | user export | 服务端视为加密 opaque blob。 |

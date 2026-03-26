@@ -36,7 +36,7 @@
 | Product scope | 单个 Matrix homeserver |
 | Cloudflare plan assumption | Workers Paid |
 | Tenancy assumption | 单部署单租户 |
-| Matrix observed latest on observation date | `v1.17` |
+| Matrix observed latest on observation date | 见 [15-source-observation-register.md](/root/Matrix/spec/framework/15-source-observation-register.md) |
 | Current implementation baseline target | Matrix `v1.17` |
 
 ## 3. 范围、目标与非目标
@@ -114,6 +114,7 @@
 Cloudflare 平台事实必须来自官方文档，并先进入 [13-cloudflare-platform-constraint-register.md](/root/Matrix/spec/framework/13-cloudflare-platform-constraint-register.md)。必须使用的来源族包括：
 
 * Workers pricing / limits / RPC / versions & deployments / placement / secrets
+* Workers logs / OpenTelemetry export
 * Durable Objects pricing / limits / lifecycle / RPC stubs / migrations / SQLite storage / websockets
 * D1 pricing / limits / read replication
 * KV consistency

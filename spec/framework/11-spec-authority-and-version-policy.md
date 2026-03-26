@@ -82,7 +82,7 @@
 
 ### 4.1 Matrix 版本锁定
 
-* 当前观察到的 Matrix `latest` 页面在 2026-03-26 显示 `v1.17`。
+* Matrix `latest` 的最近一次观察结果、观察日期与 delta 结论，统一以 [15-source-observation-register.md](/root/Matrix/spec/framework/15-source-observation-register.md) 为准。
 * 本文档体系后续必须明确区分“实现基线版本”和“上游最新观察版本”。
 * `latest` 只能用于变更监测，不能替代固定版本的实现基线。
 
@@ -125,17 +125,24 @@
 
 ### 6.1 Requirement IDs
 
-* `REQ-GOV-*`
-* `REQ-ARCH-*`
-* `REQ-PLAT-*`
-* `REQ-CS-*`
-* `REQ-ROOM-*`
-* `REQ-FED-*`
-* `REQ-MEDIA-*`
-* `REQ-AS-*`
-* `REQ-SEC-*`
-* `REQ-OPS-*`
-* `REQ-TEST-*`
+| Prefix | Canonical Owning Spec | Rule |
+| --- | --- | --- |
+| `REQ-GOV-*` | `10` | governance、范围、发布前提与全局假设。 |
+| `REQ-ARCH-*` | `20` | 跨责任域架构原则与不变量。 |
+| `REQ-PLAT-*` | `21` | 预留给运行时/平台层 requirement；在首条 canonical row 出现前不得被引用。 |
+| `REQ-CS-*` | `30` | 预留给客户端身份、会话、`/sync` 等责任域 requirement。 |
+| `REQ-ROOM-*` | `31` | 预留给房间处理与 room version 责任域 requirement。 |
+| `REQ-FED-*` | `32` | 预留给联邦责任域 requirement。 |
+| `REQ-MEDIA-*` | `33` | 预留给媒体责任域 requirement。 |
+| `REQ-AS-*` | `34` | 预留给搜索、目录、appservice 等派生域 requirement。 |
+| `REQ-SEC-*` | `40` | 安全与滥用防护 requirement。 |
+| `REQ-OPS-*` | `41`,`42` | `41` 承载观测/性能/成本 requirement，`42` 承载部署/迁移/恢复 requirement；具体 canonical source row 以治理工件生成的 requirement register 为准。 |
+| `REQ-TEST-*` | `43` | 预留给测试治理 requirement。 |
+
+补充规则：
+
+* `REQ` 的规范正文只允许出现在上表 owning spec 的显式 `REQ` 表行中；其他文档只能引用。
+* 对于仍处于“预留”状态的 prefix，在对应 owning spec 出现首条 canonical row 之前，`TEST`、`EVID`、traceability matrix 与 `Source IDs` 都不得把该 prefix 当作已存在 requirement 集。
 
 ### 6.2 Constraint / Contract / Data / Flow / Test IDs
 
@@ -178,9 +185,9 @@
 * 是否修改了主责分册正文；
 * 是否修改了 `MX-ID` 或 `CF-ID`；
 * 是否修改了 `IF-ID` 或 `DATA-ID`；
-* 是否修改了 `FLOW-ID` 或 `STATE-ID`；
-* 是否修改了 `TEST-ID` 与 `EVID-ID`；
-* 是否需要新增 `DEC-ID` 或 `OQ-ID`。
+* 是否修改了 `FLOW ID` 或 `STATE ID`；
+* 是否修改了 `TEST ID` 与 `EVID ID`；
+* 是否需要新增 `DEC ID` 或 `OQ ID`。
 
 ### 7.3 冲突解决规则
 

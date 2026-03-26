@@ -53,6 +53,7 @@
 * 每个联邦请求都必须先验证 `origin`、签名、key 有效期和目标 server name。
 * 验签失败不得进入 `RoomDO` 或 `UserDO`。
 * 远端 key cache 命中只能优化性能，不能绕过过期与重拉取逻辑。
+* `Authorization: X-Matrix`、`Cf-Access-Jwt-Assertion`、`Idempotency-Key` 与其它安全相关 headers 都必须受 Workers `128 KB (total)` request/response header ceiling 约束；不得把可增长的声明、签名材料、manifest 或审计上下文膨胀到 header 中。引用：`CF-WKR-024`。
 
 ### 3.3 运维认证规则
 
@@ -68,6 +69,7 @@
 * `CF-Access-Client-Id` / `CF-Access-Client-Secret` 只被视为 Access 边缘策略的入站凭据，不得被 `ops-worker` 当作应用层 bearer secret 直接信任。
 * `Cf-Access-Authenticated-User-Email`、common-name 等 Access 注入头只能用于日志和展示，不得单独作为授权依据。
 * 不得把 `CF_Authorization` cookie 当成唯一身份源；只有在 `Cf-Access-Jwt-Assertion` 缺失且已存在显式 `DEC-ID` 豁免时，才允许讨论替代路径。默认实现必须 fail-closed。引用：`CF-NET-004`。
+* Access JWT、service-token ingress headers、cookie 与任何附加 auth metadata 的组合也必须遵守 Workers header 总量上限；若未来引入额外 claims 或转发链路，不得依赖“header 无限大”假设。引用：`CF-WKR-024`。
 
 #### 3.3.2 `ops-worker` JWT 验证与裁决步骤
 

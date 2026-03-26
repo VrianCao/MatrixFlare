@@ -221,7 +221,7 @@
 
 * 联邦发现设计必须明确兼容 `443`/`8443` + `/.well-known`，不得把 `8448` 作为部署前提。引用：`CF-NET-001`。
 * 所有联邦入站和出站实现都必须容忍 Worker/DO 版本偏斜。引用：`CF-DO-005`。
-* 联邦长恢复与大 backfill 不能在单次公网请求里完成，必须拆成 `RemoteServerDO` + alarm/queue 工作。引用：`CF-WKR-003`。
+* 联邦长恢复与大 backfill 不能在单次公网请求里完成，必须拆成 `RemoteServerDO` + alarm/queue 工作。引用：`CF-WKR-003`,`CF-DO-019`。
 
 ## 14. 联邦域接口归属
 

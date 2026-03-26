@@ -226,7 +226,7 @@
 | `/_matrix/client/*` 房间写路径 | `gateway-worker` | `UserDO` then `RoomDO` | 先鉴权与设备确认，再房间裁决。 |
 | `/_matrix/client/v3/sync` | `gateway-worker` | `UserDO` + `RoomDO` | Worker 持有 poll，按需投影房间。 |
 | `/_matrix/federation/*` 入站事务 | `gateway-worker` | `RoomDO` / `UserDO` / `RemoteServerDO` | 先联邦验签，再分发。 |
-| `/_matrix/media/*` | `gateway-worker` | R2 + D1 projection + `UserDO` quota | 上传下载都在 Worker 入口。 |
+| `/_matrix/media/*` | `gateway-worker` | R2 + D1 projection + `UserDO` quota | 所有 current/compatibility media 路由都在 Worker 入口；其中 deprecated unauthenticated `download` / `thumbnail` compatibility 路由仍在该入口执行 legacy freeze 裁决。 |
 | `/_matrix/key/*` | `gateway-worker` | signing material service | 与联邦和客户端 keys 相关。 |
 | `/_ops/*` on management domain | `ops-worker` | D1 control plane + `jobs-worker` + scoped DO calls | 只允许 Access 保护的管理域进入；不属于 Matrix 公网 API。 |
 
