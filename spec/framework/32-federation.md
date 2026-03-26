@@ -33,8 +33,8 @@
 
 1. 若 `server_name` 已显式带端口，则直接使用该主机与端口。
 2. 否则检查 `/.well-known/matrix/server` 是否存在委派。
-3. 否则检查 SRV 记录。
-4. 若仍无结果，则回退到直接连接 `server_name:8448`。
+3. 若 `/.well-known` 返回 delegated host 且该值未显式带端口，则必须先查 `_matrix-fed._tcp.<delegated_host>`；若不存在，再查 `_matrix._tcp.<delegated_host>`；两者都不存在时才回退到 `<delegated_host>:8448`。
+4. 若没有 `/.well-known` 委派，则必须先查 `_matrix-fed._tcp.<server_name>`；若不存在，再查 `_matrix._tcp.<server_name>`；两者都不存在时才回退到 `server_name:8448`。
 
 ### 3.2 本地入站暴露规则
 
@@ -64,7 +64,7 @@
 `PUT /_matrix/federation/*/send/{txnId}` 处理顺序必须为：
 
 1. 解析并验证 `Authorization: X-Matrix`。
-2. 对已验证 transaction JSON 计算 `canonical_request_hash`，算法固定为 RFC 8785 JCS canonical JSON 的 UTF-8 bytes 上的 `sha256`。
+2. 对已验证 transaction JSON 计算 `dedupe_request_hash`。该 hash 仅用于本地入站事务幂等裁决，算法固定为对 transaction JSON 应用 RFC 8785 JCS 后取 UTF-8 bytes 的 `sha256`；它不是 Matrix 事件 canonical JSON、签名或事件哈希规则的一部分。
 3. 定位 `origin` 对应 `RemoteServerDO`，先写入 `{origin,txn_id}` 的 `DATA-FED-003` in-progress marker，再执行去重裁决。
 4. 将 PDUs 分发到对应 `RoomDO`。
 5. 将 EDUs 分发到 `UserDO` 或其他目标域。
@@ -75,7 +75,7 @@
 
 * 重复的 `{origin,txn_id}` 必须稳定返回等价结果。
 * 同一事务内单个 PDU 的失败不得强制整批回滚；但重复提交时其结果必须可复现。
-* `{origin,txn_id}` 的去重不仅要记录“见过”，还必须通过 `DATA-FED-006` 持久化 canonical request hash 与 canonical response bytes；同键同内容重试必须短路返回缓存响应，同键不同内容必须显式冲突失败。
+* `{origin,txn_id}` 的去重不仅要记录“见过”，还必须通过 `DATA-FED-006` 持久化 `dedupe_request_hash` 与 canonical response bytes；同键同内容重试必须短路返回缓存响应，同键不同内容必须显式冲突失败。
 * `DATA-FED-003` 只负责 in-progress / finalized / conflict marker，不得被实现为“只有 marker 没有结果缓存”的简化模型。
 
 ## 6. 出站事务
@@ -211,6 +211,9 @@
 ## 12. 联邦媒体
 
 * 远端媒体拉取属于媒体域功能，但其远端发现与出站连接约束受本分册管理。
+* 联邦媒体 serve 路由固定为 `GET /_matrix/federation/v1/media/download/{mediaId}` 与 `GET /_matrix/federation/v1/media/thumbnail/{mediaId}`；两者都必须要求 `X-Matrix` 鉴权，不得错接到客户端 `/_matrix/media/*` 路由族。
+* `download/{mediaId}` 必须遵循 Matrix `v1.17` 联邦媒体响应语义；若返回 `200`，内容类型必须是 `multipart/mixed`，其中第一部分为元数据 JSON，第二部分为媒体字节或带 `Location` 的重定向部件。
+* `thumbnail/{mediaId}` 的 query 语义必须与客户端 thumbnail surface 对齐，至少固定 `width`、`height`、`method`、`animated`、`timeout_ms` 的解释。
 * 单个请求中的远端抓取并发必须显式受限，以避免触碰 `6` 个 open connections 上限。引用：`CF-WKR-006`。
 * 远端媒体一旦成功拉取，必须落 R2 并生成本地缓存元数据，再返回给客户端。
 

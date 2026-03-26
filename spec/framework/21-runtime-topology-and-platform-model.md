@@ -119,12 +119,15 @@
 * 内部 RPC 链必须限制为浅层拓扑：`gateway -> DO` 或 `gateway -> jobs -> DO`，禁止多跳扇出图。引用：`CF-WKR-009`。
 * Service Binding 调用计入 subrequest 与 `32` 次 Worker invocation 上限，调用本身不单独占用 open-connection slot；但由同一 top-level request 触发的全部 Worker 仍共享同一组 `6` 个 simultaneous open connections 预算。不得把拆分 Worker 当作扩大连接并发的手段。引用：`CF-WKR-009`,`CF-WKR-010`。
 * Service Binding RPC 只适用于明确需要结果的同步内部调用；任何未 `await` 的绑定调用都视为错误实现。引用：`CF-WKR-009`,`CF-WKR-010`。
+* 任一 Service Binding RPC 或 DO RPC 若使用普通 serialized payload，则 request/response hard ceiling 固定为 `32 MiB`；可能超限的数据必须改成 cursor/page、byte-oriented stream，或先落 R2 再只传 locator，不得把大房间投影、导出对象或审计结果一次性塞进单个 RPC 返回值。引用：`CF-WKR-023`。
 
 ### 7.2 DO 使用规则
 
 * 所有 DO 构造函数必须只做最小初始化，不得在构造阶段执行高成本扫描。引用：`CF-DO-004`,`CF-DO-009`。
 * DO schema 变更必须以向前兼容读 + 延迟回填或单独迁移完成。引用：`CF-DO-005`,`CF-DO-006`。
 * 大量批处理写入必须分批提交并施加背压。引用：`CF-DO-008`。
+* 本项目主权 DO 固定使用 SQLite-backed storage；其 key + value combined size 与 SQL string/BLOB/table row 都必须受 `2 MB` ceiling 约束，生成 SQL 语句必须受 `100 KB` 上限约束。任何 state snapshot、事件 JSON、去重缓存或 repair metadata 一旦接近上限，必须在逻辑层分片，而不是依赖单行大对象。引用：`CF-DO-015`,`CF-DO-016`。
+* DO 接收的单条 WebSocket message hard ceiling 为 `32 MiB`，且 DO/Worker isolate memory hard ceiling 为 `128 MB`；所有长连接协议、state resolution 辅助数据、restore/export assembly 与大结果集都必须按 chunk/stream 设计。引用：`CF-DO-017`,`CF-DO-018`。
 * 所有 authority handler 必须在业务处理早期触碰 durable storage，以强制 currentness 并尽早暴露 not-current 条件；禁止把“长时间只靠内存/WS attachment 且延迟首次存储访问”的逻辑当作安全的单实例串行路径。引用：`CF-DO-014`。
 
 ### 7.3 D1 / KV / R2 使用规则

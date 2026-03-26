@@ -64,16 +64,16 @@
 
 #### 3.3.1 接受的 Access 身份传输形态
 
-* `ops-worker` 只接受通过 Cloudflare Access 成功鉴权后附带的 Access JWT 作为应用层身份依据；规范首选 `CF-Access-Jwt-Assertion`。
+* `ops-worker` 只接受通过 Cloudflare Access 成功鉴权后附带的 Access JWT 作为应用层身份依据；规范首选 `Cf-Access-Jwt-Assertion`。
 * `CF-Access-Client-Id` / `CF-Access-Client-Secret` 只被视为 Access 边缘策略的入站凭据，不得被 `ops-worker` 当作应用层 bearer secret 直接信任。
 * `Cf-Access-Authenticated-User-Email`、common-name 等 Access 注入头只能用于日志和展示，不得单独作为授权依据。
-* 不得把 `CF_Authorization` cookie 当成唯一身份源；只有在 `CF-Access-Jwt-Assertion` 缺失且已存在显式 `DEC-ID` 豁免时，才允许讨论替代路径。默认实现必须 fail-closed。引用：`CF-NET-004`。
+* 不得把 `CF_Authorization` cookie 当成唯一身份源；只有在 `Cf-Access-Jwt-Assertion` 缺失且已存在显式 `DEC-ID` 豁免时，才允许讨论替代路径。默认实现必须 fail-closed。引用：`CF-NET-004`。
 
 #### 3.3.2 `ops-worker` JWT 验证与裁决步骤
 
 `ops-worker` 对每个管理面请求必须按以下固定顺序处理：
 
-1. 读取 `CF-Access-Jwt-Assertion`，缺失则直接返回 `401`。
+1. 读取 `Cf-Access-Jwt-Assertion`，缺失则直接返回 `401`。
 2. 使用 Access team domain 的 `/cdn-cgi/access/certs` JWK/cert 集按 JWT `kid` 验证签名；实现必须缓存当前和上一个有效 key，并在 `kid` miss 时先强制刷新一次 JWK 集再裁决。不得把单一 `public_cert` 硬编码为唯一信任根。引用：`CF-NET-005`。
 3. 校验 `iss`、`aud`、`exp`、`nbf`、`sub`；任一失败都必须返回 `401`。
 4. 以 `{iss,aud,stable_subject}` 映射 `DATA-D1-006 principal_id`；其中 human 默认取 JWT `sub`，service principal 必须取部署时明确登记的“稳定服务主体 claim 优先级列表”中的首个命中项；若没有稳定 claim 命中，则必须返回 `401/403`，不得退化为展示性邮箱或空 `sub`。

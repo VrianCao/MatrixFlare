@@ -123,7 +123,9 @@ membership 变更规则：
 
 * 新建房间默认 room version 为 `12`。
 * 面向联邦 GA 前，必须稳定支持 room version `11` 与 `12`。
-* `createRoom` 必须允许显式请求 `11`；当请求未显式指定版本时，项目策略默认选 `12`，这是本实现决策，而不是对 Matrix 推荐默认值的转述。
+* `createRoom` 必须允许显式请求 `11`；当请求未显式指定版本时，项目策略默认选 `12`，并与 Matrix `v1.17` 对新房间默认 room version 的推荐值保持一致。
+* 若客户端请求不支持的 room version，必须 deterministic 返回 `400` + Matrix `M_UNSUPPORTED_ROOM_VERSION`，不得退化成隐式降级到 `11`/`12` 或一般性 `M_BAD_JSON`。
+* 若联邦 join/invite/knock 或其他 room-version-sensitive 语义遇到本实现不支持的 room version，必须以 Matrix federation 错误 `M_INCOMPATIBLE_ROOM_VERSION` 拒绝，且不得产生 partial state 或半创建房间。
 
 ### 6.2 版本差异封装
 
@@ -134,6 +136,7 @@ room version `11` 的以下差异必须封装在策略层：
 * `m.room.redaction` 被 redaction 后必须保留 `content.redacts`。
 * `m.room.power_levels` 被 redaction 后必须保留 `content.invite`。
 * `m.room.member` 的 `third_party_invite` 在 redaction 后只允许保留其 `signed` 子键。
+* auth events selection 中必须选入 `m.room.create`；若 `auth_events` 缺少 `m.room.create`，或选入集合与该版本要求不符，则必须拒绝。
 * `m.room.redaction` 的可发送性按普通事件 auth rules 裁决，不再把 redact level 直接塞进 auth rule 快捷分支。
 
 room version `12` 的以下差异必须封装在策略层：
@@ -152,6 +155,7 @@ room version `12` 的以下差异必须封装在策略层：
 
 ### 6.3 老版本与未来版本
 
+* Matrix `v1.17` 仍将更老的 room versions 标记为 stable，但当前 profile 只保证 `11/12`；这意味着当前联邦能力对既有旧版本房间有明确边界，任何更广覆盖都必须通过独立 strategy、测试与发布门禁显式放开。
 * 旧稳定版本可在 profile 中按条件支持，但必须通过独立 strategy 实现。
 * 新版本引入时，只允许新增 strategy，不允许修改既有版本行为。
 
@@ -217,7 +221,7 @@ room version `12` 的以下差异必须封装在策略层：
 
 * 若 `DATA-ROOM-011` 存在 pending item，且 `UserDO` 侧找不到对应 `{room_id,room_pos,user_id}` durable append，则必须重驱 `appendRoomFanout(delta)`，不得直接 GC。
 * 若 `DATA-ROOM-011` 仍为 pending，但 `UserDO` 已存在对应 durable append，则必须把该 outbox item 标记为 `acked` 并 GC，而不是再次投递。
-* 若房间事件 truth 已提交、目标用户仍属本地且应观察该房间变化，但 `DATA-ROOM-011` 与 `DATA-USER-010` 同时缺记录，则 repair 流程必须按房间 truth 重新生成 outbox item，并把该动作写入 `DATA-OPS-003/004`。
+* 若房间事件 truth 已提交、目标用户仍属本地且应观察该房间变化，但 `DATA-ROOM-011` 与 `DATA-USER-010` 同时缺记录，则 repair 流程必须按房间 truth 重新生成 outbox item，并把该动作写入 `DATA-OPS-003`,`DATA-OPS-004`。
 * 任一 reconcile 都不得直接改写 `next_batch`；`/sync` 可见性只能通过重新建立或确认 durable fanout 达成。
 
 ## 9. Ephemeral 房间状态

@@ -352,6 +352,8 @@
 
 ## 6. 内部 RPC 与异步作业 Payload
 
+* 除显式采用 stream 或 locator 的契约外，任何内部 RPC request/response 的普通 serialized payload 都必须小于等于 `32 MiB`；更大的数据必须分页、分段或外置到 R2 后只传 locator。引用：`CF-WKR-023`。
+
 ### 6.1 通用 ACK 类型
 
 #### `Ack`
@@ -454,7 +456,7 @@
 | `sender_user_id` | string | 发送者 |
 | `event_type` | string | to-device 类型 |
 | `txn_id` | string | 公共事务键 |
-| `canonical_request_hash` | string | 请求 hash |
+| `request_fingerprint` | string | 与 3.4 共享定义一致 |
 | `messages` | object | `target_user_id -> target_device_id -> content` |
 
 #### `RoomFanoutDelta`
@@ -592,7 +594,7 @@
 | --- | --- | --- |
 | `origin` | string | 远端服务器名 |
 | `txn_id` | string | 远端事务 ID |
-| `canonical_request_hash` | string | 已验证后 transaction body 的 hash |
+| `dedupe_request_hash` | string | 已验证后 transaction body 的内部去重 hash；按 RFC 8785 JCS 计算，不得与 Matrix 事件 canonical JSON 概念混用 |
 | `received_at` | string | RFC 3339 UTC |
 | `pdu_count` | integer | PDU 数量 |
 | `edu_count` | integer | EDU 数量 |

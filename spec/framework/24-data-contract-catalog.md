@@ -47,7 +47,7 @@
 | `DATA-USER-013` | table | push rules overrides / enablement | authoritative | `UserDO` | DO SQLite | `{scope,kind,rule_id}` | per-user serial | user export | 默认规则来自 Matrix `v1.17` 基线；这里只存用户覆盖、顺序和 enabled 状态。 |
 | `DATA-USER-014` | table | stored filters | authoritative | `UserDO` | DO SQLite | `filter_id` | per-user serial | user export | 存 canonical filter JSON、filter hash 和创建版本。 |
 | `DATA-USER-015` | table | pending media upload grants | authoritative | `UserDO` | DO SQLite | `pending_upload_id` | per-user serial | none | 记录上传配额检查结果、允许的 MIME/尺寸、TTL 与 finalize 状态；R2 写失败或超时必须可撤销。 |
-| `DATA-USER-016` | table | to-device txn dedupe registry | authoritative | `UserDO` | DO SQLite | `txn_dedupe_key` | per-user serial | user export | 用于 `PUT /sendToDevice/{eventType}/{txnId}` 幂等裁决；最小唯一键至少绑定 `{sender_user_id,event_type,txn_id}`，并持久化 canonical request hash、结果摘要与终态。若一次请求会命中多个目标设备/用户，则每个目标 `UserDO` 上都必须以同一 public txn key 与同一 canonical request hash 作局部裁决，不得把目标设备 ID 混入 public dedupe key。 |
+| `DATA-USER-016` | table | to-device txn dedupe registry | authoritative | `UserDO` | DO SQLite | `txn_dedupe_key` | per-user serial | user export | 用于 `PUT /sendToDevice/{eventType}/{txnId}` 幂等裁决；最小唯一键至少绑定 `{sender_user_id,event_type,txn_id}`，并持久化 `request_fingerprint`、结果摘要与终态。若一次请求会命中多个目标设备/用户，则每个目标 `UserDO` 上都必须以同一 public txn key 与同一 `request_fingerprint` 作局部裁决，不得把目标设备 ID 混入 public dedupe key。 |
 | `DATA-USER-017` | table | user principal / auth profile | authoritative | `UserDO` | DO SQLite | `singleton` | per-user serial | user export | 本地用户主记录；至少包含 `user_id`、`localpart`、`user_type`、`password_hash_or_null`、`password_login_enabled`、`created_at`、`deactivated_at_or_null`、`erase_requested_flag`、`auth_version` 与注册来源元数据。`auth_version` 必须在 password change、account deactivate 等会影响后续认证裁决的写路径上单调递增。 |
 
 ## 4. `RoomDO` 数据契约
@@ -65,7 +65,7 @@
 | `DATA-ROOM-009` | table | receipts current view | authoritative | `RoomDO` | DO SQLite | `{receipt_type,user_id,thread_id}` | per-room serial | none | 只保留最新值。 |
 | `DATA-ROOM-010` | table | typing current view | authoritative | `RoomDO` | DO SQLite | `user_id` | per-room serial | none | 由 alarm 过期。 |
 | `DATA-ROOM-011` | table | local fanout outbox | authoritative | `RoomDO` | DO SQLite | `{room_pos,user_id}` | per-room serial | replay + repair | 记录待交付到 `UserDO` 的本地 fanout 单元、最近尝试时间、尝试次数、最后 ack 水位与终态；只有在收到 `UserDO` 的 durable append ack 后才可 GC。 |
-| `DATA-ROOM-012` | table | client event txn dedupe registry | authoritative | `RoomDO` | DO SQLite | `txn_dedupe_key` | per-room serial | replay | 用于客户端房间写路径幂等裁决；最小唯一键至少绑定 `{user_id,device_id,room_id,route_template,txn_id_or_request_hash}`，并持久化 canonical request hash、返回 `event_id` 或错误终态。 |
+| `DATA-ROOM-012` | table | client event txn dedupe registry | authoritative | `RoomDO` | DO SQLite | `txn_dedupe_key` | per-room serial | replay | 用于客户端房间写路径幂等裁决；最小唯一键至少绑定 `{user_id,device_id,room_id,route_template,txn_id_or_request_hash}`，并持久化 `request_fingerprint`、返回 `event_id` 或错误终态。 |
 
 ### 4.1 `DATA-ROOM-001` 查询元数据最小形态
 
@@ -98,17 +98,17 @@
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `DATA-FED-001` | table | outbound transactions | authoritative | `RemoteServerDO` | DO SQLite | `txn_id` | per-server serial | local truth replay | payload 一旦入队不可变。 |
 | `DATA-FED-002` | table | retry schedule | authoritative | `RemoteServerDO` | DO SQLite | `txn_id` | per-server serial | derived from queue | attempt count、next_retry_at。 |
-| `DATA-FED-003` | table | inbound txn dedupe marker | authoritative | `RemoteServerDO` | DO SQLite | `{origin,txn_id}` | per-server serial | none | 入站联邦事务的第一阶段 marker；至少记录 `request_hash`,`state(in_progress|finalized|conflict)`,`first_seen_at`,`finalized_at`。不得单独充当最终响应缓存。 |
+| `DATA-FED-003` | table | inbound txn dedupe marker | authoritative | `RemoteServerDO` | DO SQLite | `{origin,txn_id}` | per-server serial | none | 入站联邦事务的第一阶段 marker；至少记录 `dedupe_request_hash`,`state(in_progress|finalized|conflict)`,`first_seen_at`,`finalized_at`。不得单独充当最终响应缓存。 |
 | `DATA-FED-004` | table | gap repair backlog | authoritative | `RemoteServerDO` | DO SQLite | repair job id | per-server serial | repair manifest | 缺事件与缺状态恢复任务。 |
 | `DATA-FED-005` | cache/table | discovery and remote key cache | cache-derived | `RemoteServerDO` | DO SQLite + KV optional | `{server_name,key_id}` | cache semantics | refetch | 不能跳过官方发现流程。 |
-| `DATA-FED-006` | table | inbound txn result cache | authoritative | `RemoteServerDO` | DO SQLite | `{origin,txn_id}` | per-server serial | none | 入站联邦事务的第二阶段 finalized 结果；必须持久化 canonical request hash、per-PDU 结果与 canonical response bytes。只有在 `DATA-FED-006` durable write 完成后，`DATA-FED-003.state` 才可转为 `finalized`。 |
+| `DATA-FED-006` | table | inbound txn result cache | authoritative | `RemoteServerDO` | DO SQLite | `{origin,txn_id}` | per-server serial | none | 入站联邦事务的第二阶段 finalized 结果；必须持久化 `dedupe_request_hash`、per-PDU 结果与 canonical response bytes。只有在 `DATA-FED-006` durable write 完成后，`DATA-FED-003.state` 才可转为 `finalized`。 |
 
 ### 5.1 `DATA-FED-003` / `DATA-FED-006` 入站事务两阶段规则
 
 入站 `PUT /_matrix/federation/*/send/{txnId}` 的幂等裁决必须固定为两阶段：
 
-1. `RemoteServerDO` 先对已验证的 transaction JSON 计算 `canonical_request_hash`，算法固定为 RFC 8785 JCS canonical JSON 的 UTF-8 bytes 上的 `sha256`。
-2. 首次看到 `{origin,txn_id}` 时，先在 `DATA-FED-003` 写入 `in_progress` marker 与 `canonical_request_hash`，再开始分发 PDU/EDU。
+1. `RemoteServerDO` 先对已验证的 transaction JSON 计算 `dedupe_request_hash`。该 hash 仅用于本地入站事务幂等裁决，算法固定为对 transaction JSON 应用 RFC 8785 JCS 后取 UTF-8 bytes 的 `sha256`；它不是 Matrix 事件 canonical JSON、签名或事件哈希规则的一部分。
+2. 首次看到 `{origin,txn_id}` 时，先在 `DATA-FED-003` 写入 `in_progress` marker 与 `dedupe_request_hash`，再开始分发 PDU/EDU。
 3. 若同键重复到达且 `DATA-FED-006` 已存在：
    * 同 hash：必须直接返回缓存的 canonical response；
    * 不同 hash：必须返回 deterministic idempotency conflict。

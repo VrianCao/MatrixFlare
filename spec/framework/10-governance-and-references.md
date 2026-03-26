@@ -24,7 +24,7 @@
 ### 2.1 当前包状态
 
 * 当前文档系统目标：定义一个运行于 Cloudflare Workers Paid Plan 的 Matrix homeserver 企业级 Development Spec。
-* 当前实现基线观察日期：`2026-03-25`。
+* 当前实现基线观察日期：`2026-03-26`。
 * 在本文档系统内，任何标记为 `Draft-Normative` 或 `Normative` 的分册，都是其责任边界内的实现真相。
 * `research/`、`notes/`、遗留单体 Spec 仅作为输入材料，不是现行真相。
 
@@ -113,13 +113,14 @@
 
 Cloudflare 平台事实必须来自官方文档，并先进入 [13-cloudflare-platform-constraint-register.md](/root/Matrix/spec/framework/13-cloudflare-platform-constraint-register.md)。必须使用的来源族包括：
 
-* Workers pricing / limits / versions & deployments / placement / secrets
-* Durable Objects pricing / limits / lifecycle / migrations / SQLite storage / websockets
+* Workers pricing / limits / RPC / versions & deployments / placement / secrets
+* Durable Objects pricing / limits / lifecycle / RPC stubs / migrations / SQLite storage / websockets
 * D1 pricing / limits / read replication
 * KV consistency
 * R2 pricing / limits / consistency
 * Queues pricing
 * Network ports
+* Cloudflare Access application paths / JWT validation / service tokens
 
 ### 6.3 本地快照
 

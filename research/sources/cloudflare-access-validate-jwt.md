@@ -1,7 +1,7 @@
 # Cloudflare Access Validate JWT Snapshot
 
 Source URL: `https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/authorization-cookie/validating-json/`
-Observed date: `2026-03-25`
+Observed date: `2026-03-26`
 
 ## Key facts captured
 

@@ -228,6 +228,10 @@ continuous checkpoint 与 full export 复用 checkpoint 时，`source watermark`
 * `data_ids` 必须是 canonical `DATA-*` 显式枚举，不得写自然语言。
 * `apply_phase` 首版只允许 `truth-core`、`truth-aux`、`ephemeral-current`、`dedupe-and-outbox`、`control-plane` 五类。
 * `required_for_restore = false` 的对象可以加速恢复，但不得成为恢复正确性的唯一来源。
+* `byte_size` 必须记录对象在压缩、加密与封装完成后的实际 R2 object 字节数。
+* 首版 checkpoint/export object 不得依赖 multipart object 语义；每个 `objects[]` 项必须对应一个可独立哈希校验的单一 R2 object。
+* 为保持 export、restore、retry 与流式处理边界稳定，首版工程护栏固定为 `byte_size <= 256 MiB`；接近上限前必须分段。该护栏刻意远低于 R2 single-part `5 GiB` 平台上限，以同时满足 `CF-R2-002`,`CF-WKR-003`,`CF-WKR-004`。
+* 若未来确需突破该护栏，必须先引入显式 multipart manifest 语义、恢复顺序规则与测试证据；当前 profile 不允许隐式超限对象。
 
 #### 11.2.1.2.1 Object Codec and Range Semantics
 

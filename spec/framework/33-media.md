@@ -50,18 +50,43 @@
 
 ### 4.1 路由
 
-必须支持：
+客户端媒体路由矩阵固定如下：
 
-* 当前 Matrix 客户端媒体下载路径
-* 必要的兼容历史媒体路径
-* 缩略图路径
+| Route Family | Upstream Status in `v1.17` | Current Spec Behavior | Notes |
+| --- | --- | --- | --- |
+| `GET /_matrix/client/v1/media/config` | current | `Required-Core` via `IF-CS-050` | 作为 authenticated media 之后的 current config surface；必须要求 access token。 |
+| `GET /_matrix/client/v1/media/download/{serverName}/{mediaId}` | current | `Required-Core` via `IF-CS-051` | 客户端下载当前推荐路径；必须要求 access token。 |
+| `GET /_matrix/client/v1/media/download/{serverName}/{mediaId}/{fileName}` | current | `Required-Core` via `IF-CS-051` | 与上条语义相同，但允许稳定 filename；必须要求 access token。 |
+| `GET /_matrix/client/v1/media/thumbnail/{serverName}/{mediaId}` | current | `Required-Core` via `IF-CS-051` | 客户端缩略图当前推荐路径；必须要求 access token。 |
+| `GET /_matrix/media/*/config` | deprecated compatibility surface | 继续支持并映射到与 `client/v1` 相同 truth | 在当前 profile 下不得弱化为匿名访问。 |
+| `GET /_matrix/media/*/download/{serverName}/{mediaId}` | deprecated compatibility surface | 继续支持并映射到与 `client/v1` 相同 truth | 不得把旧路径实现成另一套缓存/鉴权规则。 |
+| `GET /_matrix/media/*/download/{serverName}/{mediaId}/{fileName}` | deprecated compatibility surface | 继续支持并映射到与 `client/v1` 相同 truth | `fileName` 只影响下游展示/响应头，不改变对象定位。 |
+| `GET /_matrix/media/*/thumbnail/{serverName}/{mediaId}` | deprecated compatibility surface | 继续支持并映射到与 `client/v1` 相同 truth | 不得出现“新路径有缩略图、旧路径没有”的行为漂移。 |
+| `POST /_matrix/media/*/create` | current upload-reservation surface | `Required-Core` via `IF-CS-050` | 返回 `mxc://` 预留 ID，供后续 upload-by-ID 使用。 |
+| `POST /_matrix/media/*/upload` | current upload surface | `Required-Core` via `IF-CS-050` | 单阶段上传；仍受 Worker ingress body 上限约束。 |
+| `PUT /_matrix/media/*/upload/{serverName}/{mediaId}` | current upload-by-ID surface | `Required-Core` via `IF-CS-050` | 必须只接受由 `create` 预留出来的本地 MXC。 |
+| `GET /_matrix/client/v1/media/preview_url` + `GET /_matrix/media/*/preview_url` | current + deprecated compatibility surface | `Deferred` via `IF-CS-058` | preview 功能当前统一 stub，不得误宣称支持。 |
 
 ### 4.2 读取规则
 
 * `gateway-worker` 解析 MXC 定位本地对象。
-* 根据媒体策略决定是否需要鉴权。
+* 对客户端 `config`/`download`/`thumbnail` 路由必须要求 access token；compatibility `/_matrix/media/*` 路由在当前 profile 下也必须沿用同一鉴权要求。
 * 优先通过 R2 binding 读取并流式返回。
+* `/_matrix/client/v1/media/*` current surface 与 `/_matrix/media/*` compatibility surface 必须共用同一对象真相、鉴权裁决、缓存命中与审计逻辑，不得按路径族分叉行为。
 * 若对象不存在但目录残留，返回协议错误并记审计事件。
+
+### 4.3 Query 参数与下载语义
+
+* client download 路由与其 compatibility 路由必须至少固定 `allow_redirect`、`allow_remote`、`timeout_ms` 三个 query 参数语义：
+  * `allow_redirect = true` 时，服务端可返回 `307/308`；未显式设为 `true` 时，必须直接返回媒体内容本体，而不是重定向。
+  * `allow_remote` 缺省为 `true`；当其为 `false` 时，服务端不得主动抓取远端媒体。
+  * `timeout_ms` 缺省为 `20000`，表示客户端愿意等待开始接收数据的最长时间；服务端可以更早返回，也应施加实现侧最大值。
+* client thumbnail 路由与其 compatibility 路由必须固定以下参数语义：
+  * `width`、`height` 为 required；
+  * `method` 只允许 `crop` 或 `scale`；
+  * `animated` 缺省时服务端 SHOULD NOT 返回 animated thumbnail；`animated = false` 时 MUST NOT 返回 animated thumbnail；`animated = true` 且源对象不可动画化时，行为必须退化为 `false`；
+  * `allow_remote` 与 `timeout_ms` 的语义与 download 路由一致。
+* current `client/v1` 路由与 deprecated compatibility 路由的 query 参数解释必须严格一致；不得出现“旧路由忽略 `allow_remote` / `timeout_ms` / `animated`，新路由才生效”的实现分叉。
 
 ## 5. 远端媒体缓存
 

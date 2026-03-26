@@ -187,7 +187,7 @@
 * `GET /_matrix/client/*/sync` 的 `filter` 查询参数必须按首字符解释：若首字符是 `{`，则视为 inline JSON filter string；否则视为此前创建的 stored `filter_id`。
 * `/sync` 对 stored filter 和 inline filter 的解释都必须确定；相同 `{since,filter}` 不得因部署节点不同而产生语义分叉。
 * Matrix `v1.17` filter 中与 `/sync` 响应结构直接相关的布尔开关必须明确实现：`include_leave`、`lazy_load_members`、`include_redundant_members`、`unread_thread_notifications`。未显式给出的布尔值按规范默认 `false` 处理。
-* `include_leave = false` 时，`rooms.leave` bucket 必须整体省略，即使本地真相仍保留 left / banned-but-not-forgotten 房间；只有在 `include_leave = true` 时，这些房间才允许出现在 `/sync`。
+* `include_leave = false` 时，本实现固定选择整体省略 `rooms.leave` bucket，而不是返回空 bucket；即使本地真相仍保留 left / banned-but-not-forgotten 房间，只有在 `include_leave = true` 时，这些房间才允许出现在 `/sync`。
 * `include_redundant_members` 只有在启用 `lazy_load_members` 时才有意义；否则必须按 `false` 处理，不得制造与未启用 lazy-load 不同的成员事件输出。
 * capability truth 与 route truth 必须一致：若 `m.change_password.enabled = false`、`m.3pid_changes.enabled = false` 或 `m.get_login_token.enabled = false`，则对应公开路由必须继续维持相同真值，不得出现 capability 与 route handler 漂移。
 
@@ -239,8 +239,8 @@
 ### 5.5 To-Device
 
 * to-device 消息权威表是 `DATA-USER-008`。
-* `PUT /sendToDevice/{eventType}/{txnId}` 的幂等裁决必须持久化在 `DATA-USER-016`；同一 `{sender_user_id,event_type,txn_id}` 加同一 canonical request hash 重试时，必须返回与首次提交等价的成功结果。
-* 若同一 `{sender_user_id,event_type,txn_id}` 对应不同 canonical request hash，必须返回 deterministic idempotency conflict，不得重复入队。
+* `PUT /sendToDevice/{eventType}/{txnId}` 的幂等裁决必须持久化在 `DATA-USER-016`；同一 `{sender_user_id,event_type,txn_id}` 加同一 `request_fingerprint` 重试时，必须返回与首次提交等价的成功结果。
+* 若同一 `{sender_user_id,event_type,txn_id}` 对应不同 `request_fingerprint`，必须返回 deterministic idempotency conflict，不得重复入队。
 * to-device 投递顺序以目标设备视角按照 `user_stream_pos` 递增。
 * 当客户端发起新的 `/sync?since=X` 时，`UserDO` 才可以认定该 session 已经观察到 `X` 之前的用户流，从而清理对该 session 已确认的 to-device 记录。
 * 对长期离线 session，允许按保留策略进行 TTL 清理，但必须记录为协议可见的丢弃策略，不得静默假定已送达。

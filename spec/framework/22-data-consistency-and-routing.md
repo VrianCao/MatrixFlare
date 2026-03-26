@@ -111,10 +111,10 @@
 
 客户端写路径中的 `txnId` 不是“尽力而为提示”，而是权威幂等键的一部分。规范固定如下：
 
-* `PUT /_matrix/client/*/rooms/{roomId}/send/{eventType}/{txnId}`、`PUT /_matrix/client/*/rooms/{roomId}/state/{eventType}/{stateKey}`、`PUT /_matrix/client/*/rooms/{roomId}/redact/{eventId}/{txnId}` 必须通过 `DATA-ROOM-012` 持久化裁决；其中没有显式 `txnId` 的状态写路径，必须以 route template + canonical request hash 进入同一裁决表。
+* `PUT /_matrix/client/*/rooms/{roomId}/send/{eventType}/{txnId}`、`PUT /_matrix/client/*/rooms/{roomId}/state/{eventType}/{stateKey}`、`PUT /_matrix/client/*/rooms/{roomId}/redact/{eventId}/{txnId}` 必须通过 `DATA-ROOM-012` 持久化裁决；其中没有显式 `txnId` 的状态写路径，必须以 route template + `request_fingerprint` 进入同一裁决表。
 * `PUT /_matrix/client/*/sendToDevice/{eventType}/{txnId}` 必须通过 `DATA-USER-016` 持久化裁决。
-* 同一幂等键再次提交且 canonical request hash 相同，必须返回与首次提交等价的成功结果。
-* 同一幂等键再次提交但 canonical request hash 不同，必须返回 deterministic idempotency conflict；不得静默覆盖。
+* 同一幂等键再次提交且 `request_fingerprint` 相同，必须返回与首次提交等价的成功结果。
+* 同一幂等键再次提交但 `request_fingerprint` 不同，必须返回 deterministic idempotency conflict；不得静默覆盖。
 * 幂等裁决记录的保留期必须至少覆盖客户端、边缘重试和部署中断恢复窗口；过期清理只能在保证不会影响协议正确性的前提下进行。
 
 ## 5. 真相面与派生面边界

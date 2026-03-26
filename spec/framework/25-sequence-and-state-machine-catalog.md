@@ -39,7 +39,7 @@
 | `FLOW-CS-ROOM-QUERY` | room history and state query | `31` | client, `gateway-worker`, `RoomDO` | `/messages`, `/context`, `/event`, `/state`, `/members`, `/joined_members`, `/relations`, `/threads`, `/timestamp_to_event` | `gateway-worker` 规范化为 `RoomReadRequest`，`RoomDO` 按 query kind、索引与归档指针裁决可见性后返回房间读结果 | cursor 无效、时间定位失败、冷归档缺段或可见性不满足时 fail-closed，不得改写真相 |
 | `FLOW-ROOM-EVENT-ADMISSION` | unified room admission | `31` | `gateway-worker`, `RoomDO`, `UserDO`, `RemoteServerDO` | local/fed/AS event ingress | 统一 auth/state resolution/commit | 失败不产生 partial state |
 | `FLOW-ROOM-LOCAL-FANOUT` | local user fanout | `31` | `RoomDO`, `UserDO`, `jobs-worker` | room commit success | `RoomDO` 写 durable outbox，`UserDO` durable append 到用户流并返回 ack，随后 GC outbox 并推送索引任务 | 单用户失败必须保留 outbox 并补偿重试；必要时进入 repair |
-| `FLOW-ROOM-FANOUT-REPAIR` | room-to-user fanout reconciliation | `31`,`42` | `ops-worker`, `jobs-worker`, `RoomDO`, `UserDO` | periodic audit or scoped repair | 以 `DATA-ROOM-011` 与 `DATA-USER-010` 交叉核对，重投缺失 append、补记 ack 或生成 repair 决议 | 发现归属不清、event truth 缺失或重复冲突时必须写 `DATA-OPS-003/004` 并 bounded retry |
+| `FLOW-ROOM-FANOUT-REPAIR` | room-to-user fanout reconciliation | `31`,`42` | `ops-worker`, `jobs-worker`, `RoomDO`, `UserDO` | periodic audit or scoped repair | 以 `DATA-ROOM-011` 与 `DATA-USER-010` 交叉核对，重投缺失 append、补记 ack 或生成 repair 决议 | 发现归属不清、event truth 缺失或重复冲突时必须写 `DATA-OPS-003`,`DATA-OPS-004` 并 bounded retry |
 
 ### 2.3 联邦域
 
