@@ -43,6 +43,7 @@
 
 * `IF-CS-052` 是 derived read path，不是 indexing path。
 * `gateway-worker` 对 `search`、`user_directory/search`、`publicRooms` 与 client `hierarchy` 的请求，必须走统一只读 query dispatch。
+* 对具有相同 `filter`、`include_all_networks`、分页参数与 network 范围输入的等价请求，匿名 `GET /publicRooms` 与鉴权态 `POST /publicRooms` 必须共用同一 query family、同一分页/token 规则与同一可见性裁决来源；区别只能体现在 caller identity 与 visibility context，而不能体现在另起一套弱化语义。
 * 任何可见性不确定场景都必须回退 truth 或 fail-closed；不得因为索引存在就直接暴露结果。
 
 ### 3.4 Rebuild

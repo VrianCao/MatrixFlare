@@ -88,7 +88,7 @@
 | Store | Role | Allowed Uses | Forbidden Uses |
 | --- | --- | --- | --- |
 | DO SQLite | authoritative | 用户、房间、远端服务器真相；幂等；游标；状态机持久化 | 大对象媒体本体；全局全文搜索 |
-| D1 | derived query plane | 搜索、目录、媒体目录、AS 控制面、审计索引、统计 | 房间当前状态真相、会话真相、联邦事务真相 |
+| D1 | derived query plane + authoritative control-plane metadata | 搜索、目录、媒体目录、AS 控制面、operator authz、审计/registry/job metadata、统计 | 房间当前状态真相、会话真相、联邦事务真相、任何需要数据面主权对象串行裁决的业务真相 |
 | R2 | blob / cold / archive | 媒体对象、缩略图、冷历史、导出、灾备包 | 强一致事务协调 |
 | KV | cache | `/.well-known` 缓存、远端 key 缓存副本、非关键能力缓存 | 会话撤销、房间状态、媒体存在性真相 |
 | Queues | async fanout | 索引、缩略图、导出、重建、补偿任务 | 权威事务提交 |

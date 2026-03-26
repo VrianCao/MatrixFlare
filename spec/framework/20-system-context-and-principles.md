@@ -45,7 +45,7 @@
 | --- | --- | --- | --- |
 | `BND-001` Public Edge | `gateway-worker` | 客户端、远端 homeserver、AS | 所有公开流量必须先在 edge 层完成基础鉴权、限流、路由、协议版本校验。 |
 | `BND-002` Worker-to-DO | `UserDO` / `RoomDO` / `RemoteServerDO` | `gateway-worker` / `jobs-worker` / `ops-worker` | 内部调用可信但不自由；必须遵守显式 RPC/HTTP 契约与版本兼容规则。 |
-| `BND-003` Authoritative vs Derived | DO SQLite 真相面 | D1/KV/R2 衍生与缓存面 | 派生面不得反向决定真相。 |
+| `BND-003` Data-Plane Truth vs Sidecar Planes | DO SQLite 数据面真相 | D1 衍生面与控制面侧车、KV 缓存、R2 对象/归档 | 衍生面不得反向决定数据面真相；控制面元数据也不得替代房间、用户或联邦数据面的权威裁决。 |
 | `BND-004` Operator Boundary | `ops-worker` | 公网与普通客户端 | 控制面默认不暴露公网；如需暴露，必须额外认证与审计。 |
 | `BND-005` Secret Boundary | Worker secrets / 签名密钥 | 普通业务代码与日志 | 任何密钥材料都不得以明文进入日志、D1、KV。 |
 
@@ -58,7 +58,7 @@
 3. `UserDO(user_id)` 是用户主权状态机。
 4. `RoomDO(room_id)` 是房间主权状态机。
 5. `RemoteServerDO(server_name)` 是远端服务器出站联邦状态机。
-6. D1 只承载衍生查询面。
+6. D1 承载可重建衍生查询面与少量权威控制面元数据，但不承载数据面业务真相。
 7. R2 承载对象数据与冷数据。
 8. KV 只承载可陈旧缓存。
 9. `jobs-worker` 只做异步衍生与补偿，不做权威提交。
@@ -76,12 +76,19 @@
 | `REQ-ARCH-004` | 提交前不等待外部 I/O | 权威写路径在提交前不得依赖远端网络、D1、KV、Queues 或 R2 的成功。 |
 | `REQ-ARCH-005` | 可恢复优先 | 任何衍生副作用失败都必须可通过重放、重建或补偿修复。 |
 
+补充约束：
+
+* `DATA-OPS-010` shard registry upsert 只能是 post-commit success barrier，而不能成为 pre-commit authority dependency：必须先提交本地权威 truth，再执行 registry upsert。
+* `terminal success` 只指“权威 truth 已提交，且该请求要求的 post-commit success barrier 也已 durable 完成”后的最终成功响应。
+* `retryable non-success` 只指“权威 truth 已提交，但 post-commit success barrier 尚未完成”时返回的可重试非成功结果；它不得要求回滚 truth，也不得允许调用方通过重试创建第二份 truth。
+* 若 shard truth 已提交但 registry upsert 失败，请求不得回滚已提交 truth；必须返回 `retryable non-success`，并要求后续同一幂等请求或持久化的内部重试路径收敛到同一 shard identity，补齐缺失的 registry row，而不是创建第二份 truth。
+
 ### 5.2 存储原则
 
 | REQ-ID | Principle | Normative Statement |
 | --- | --- | --- |
 | `REQ-ARCH-006` | DO SQLite 承载真相 | 需要强一致、串行裁决的数据必须优先放在 DO SQLite。 |
-| `REQ-ARCH-007` | D1 仅作衍生查询面 | D1 不得承载房间当前状态、设备会话真相或联邦幂等真相。 |
+| `REQ-ARCH-007` | D1 不承载数据面业务真相 | D1 可以承载可重建衍生面与少量权威控制面元数据，但不得承载房间当前状态、设备会话真相、联邦幂等真相或任何需要由数据面主权对象串行裁决的业务事实。 |
 | `REQ-ARCH-008` | KV 仅作缓存 | KV 不得被视为即时一致或权威来源。 |
 | `REQ-ARCH-009` | R2 承载对象与冷历史 | 大对象、冷数据、归档必须移出 DO 热路径。 |
 

@@ -92,6 +92,12 @@
 | `retryable` | boolean | 是否建议调用方自动重试 |
 | `details` | object or null | 可选结构化细节；不得泄漏 secret 或 token 材料 |
 
+适用规则：
+
+* [23-interface-contract-catalog.md](./23-interface-contract-catalog.md) 中所有 `typed ops error` 及其带显式 HTTP status 后缀的变体，都必须实例化为 `OpsErrorResponse`。
+* 若 `Error Model` 写成 `typed ops error; 401/403/404/409/422` 之类形式，分号后的状态集合只约束允许返回的 HTTP status；响应体 shape 仍固定为 `OpsErrorResponse`。
+* `OpsErrorResponse.code` 与 HTTP status 的默认映射固定如下：`unauthorized -> 401`，`forbidden -> 403`，`not_found -> 404`，`idempotency_conflict -> 409`，`precondition_failed -> 409`，`validation_failed -> 422`，`rate_limited -> 429`，`internal -> 500` 或 `503`（仅当 `retryable = true` 时允许 `503`）。
+
 ### 4.4 `InternalErrorEnvelope`
 
 | Field | Type | Rule |
@@ -103,8 +109,8 @@
 
 适用规则：
 
-* [23-interface-contract-catalog.md](./23-interface-contract-catalog.md) 中所有 “typed auth/cursor/query/projection/delivery/internal error” 默认都实例化为该 envelope。
-* `code` 的枚举集合由对应 owning spec 负责定义；若未定义，不得声称是 “typed error”。
+* [23-interface-contract-catalog.md](./23-interface-contract-catalog.md) 中所有 “typed auth/cursor/query/projection/delivery/internal error” 与 `retryable internal error` 默认都实例化为该 envelope。
+* `code` 的枚举集合默认由本分册给出 canonical baseline；若 owning spec 需要进一步收紧或扩展，必须显式写出新增/删减后的集合。若两者都未定义，不得声称是 “typed error”。
 
 #### 最小 `code` vocabulary
 
@@ -117,11 +123,34 @@
 * key claim / to-device 类：`unsupported_algorithm`,`already_claimed`,`target_not_local`,`idempotency_conflict`
 * federation internal 类：`duplicate_txn`,`payload_mismatch`,`retry_scheduled`
 * control-plane / worker internal 类：`unsupported_schema_version`,`backpressure`,`job_conflict`,`not_current`
+* media upload lifecycle 类：`quota_exceeded`,`pending_upload_limit_exceeded`,`upload_expired`,`pending_upload_missing`,`object_missing`
 
 规则：
 
 * owning spec 可以在不改变既有语义的前提下扩展枚举，但不得重载以上 code 的含义。
-* 若某接口只允许上述子集之一，必须在 owning spec 中显式点名适用子集。
+* 若 owning spec 未进一步收紧，默认适用下面的 “Error Model -> Allowed Codes” 绑定表。
+
+#### 默认 `Error Model` 绑定表
+
+| Error Model label in `23` | Allowed `code` set |
+| --- | --- |
+| `typed auth error` | `invalid_token`,`expired_session`,`deactivated_account`,`unknown_session` |
+| `typed cursor error` | `invalid_cursor`,`cursor_from_future`,`filter_mismatch` |
+| `typed auth/state error` | `auth_forbidden`,`state_conflict`,`missing_prev`,`soft_failed` |
+| `typed projection error` | `visibility_denied`,`archive_missing`,`invalid_range` |
+| `typed query error` | `visibility_denied`,`archive_missing`,`invalid_range` |
+| `typed conflict/not-found` | `unsupported_algorithm`,`already_claimed`,`target_not_local` |
+| `typed delivery error` | `unsupported_algorithm`,`target_not_local`,`idempotency_conflict` |
+| `typed duplicate error / idempotency conflict` | `duplicate_txn`,`payload_mismatch` |
+| `retryable internal error` | `retry_scheduled`,`backpressure`,`not_current` |
+| `typed internal error` | `unsupported_schema_version`,`backpressure`,`job_conflict`,`not_current` |
+| `typed quota error` | `quota_exceeded`,`pending_upload_limit_exceeded` |
+| `typed finalize error` | `upload_expired`,`pending_upload_missing`,`object_missing` |
+
+补充规则：
+
+* 若 [23-interface-contract-catalog.md](./23-interface-contract-catalog.md) 中 `Error Model` 使用 `A / B` 这类复合写法，则允许的 `code` 集合是各分量标签映射结果的并集。
+* 裸写的 `idempotency conflict` 只允许 `idempotency_conflict`。
 
 ## 5. 控制面 HTTP Payload
 

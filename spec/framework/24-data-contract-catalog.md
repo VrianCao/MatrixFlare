@@ -184,7 +184,7 @@
 | `DATA-OPS-002` | manifest | rebuild checkpoint | authoritative-control-plane | `jobs-worker` | D1 / DO SQLite | `{job_id,shard}` | per job serial | manifest | 用于断点续跑。 |
 | `DATA-OPS-003` | manifest | repair decision log | authoritative-control-plane | `ops-worker` | D1 | `decision_id` | append-only | operator action | 记录人工修复与影响面。 |
 | `DATA-OPS-004` | log | audit event log + idempotency registry | authoritative-control-plane | `ops-worker` | D1 + R2 immutable export | `{event_id}` | append-only source + strongly consistent dedupe lookup | periodic export | 记录 `operator_principal_id`、auth mechanism、scope、request_id、idempotency_key、request_fingerprint、causation_id、result、affected objects；控制面写操作必须先落此契约。 |
-| `DATA-OPS-010` | table | shard registry | authoritative-control-plane | `ops-worker` | D1 | `{shard_type,shard_key}` | strong at primary / session consistent | export + restore | 全量导出、恢复与巡检使用的权威 shard 编目；最小字段至少包含 `shard_type`,`shard_key`,`created_at`,`last_seen_at`,`schema_version`,`disabled_at`；由 shard creator 按统一 upsert 形态写入，`ops-worker` 负责审计、巡检与 snapshot。 |
+| `DATA-OPS-010` | table | shard registry | authoritative-control-plane | `ops-worker`,`UserDO`,`RoomDO`,`RemoteServerDO` | D1 | `{shard_type,shard_key}` | strong at primary / session consistent | export + restore | 全量导出、恢复与巡检使用的权威 shard 编目；最小字段至少包含 `shard_type`,`shard_key`,`created_at`,`last_seen_at`,`schema_version`,`disabled_at`；live shard 只允许 upsert 自身身份行，`ops-worker` 负责审计、disable/repair、巡检与 snapshot。 |
 | `DATA-OPS-011` | manifest | registry snapshot | authoritative-control-plane | `ops-worker` | D1 + R2 | `registry_snapshot_id` | per snapshot serial | `DATA-OPS-010` | full export 前冻结的 shard registry 视图；必须带 canonical hash、签名与导出时刻。 |
 
 ### 8.1 `DATA-OPS-004` 审计与幂等裁决规则
@@ -224,8 +224,14 @@
 
 `DATA-OPS-010` 与 `DATA-OPS-011` 必须满足以下规则：
 
-* 任一路径只要会首次创建可导出的 `UserDO`、`RoomDO`、`RemoteServerDO` 或 control-plane shard，就必须在对外返回成功前完成对应 `DATA-OPS-010` upsert。
+* 任一路径只要会首次创建可导出的 `UserDO`、`RoomDO`、`RemoteServerDO` 或 control-plane shard，就必须先提交本地权威 truth，再在同一外部请求周期或后续由 durable 幂等映射/本地 pending-marker 驱动的重试路径中完成对应 `DATA-OPS-010` upsert；该 upsert 是 post-commit success barrier，而不是 pre-commit authority dependency。
+* `shard_type` 首版 vocabulary 固定为 `UserDO`、`RoomDO`、`RemoteServerDO`、`control-plane`；`shard_key` 必须是该类型下的 canonical identity string，不得使用临时随机标签或可变显示名。
+* 若 shard identity 可直接由稳定业务键推出，例如 `user_id`、既有 `room_id`、`server_name` 或显式 control-plane scope key，则同一幂等请求必须天然收敛到同一 `{shard_type,shard_key}`。
+* 若 shard identity 需要在首次写入时分配，例如创建新 `room_id` 或其它新 shard key，则 shard creator 必须先把“外部幂等域 -> 已分配 shard identity”的映射 durable 持久化，再允许返回 `retryable non-success` 或 `terminal success`；后续同一幂等请求只能复用该已分配 identity。
+* 若本地 shard truth 已提交但 `DATA-OPS-010` upsert 失败，请求必须返回 `retryable non-success`，且 shard 自身必须在本地权威存储中持久化 `registry_upsert_pending` 或等价标记，并通过 alarm、queue 或受审计的内部重试作业持续补齐缺失 registry row；客户端是否重试不得成为 registry completeness 的唯一修复路径。
 * shard registry row 的 `schema_version` 必须反映该 shard 当前导出/恢复所需的最小 schema 解释版本。
+* `DATA-OPS-010` upsert 的 merge 语义固定如下：`created_at` 只允许插入时写入、冲突时保持原值；`last_seen_at` 只能单调前进到较大值；`schema_version` 只能单调前进、不得回退；`disabled_at` 只允许由 `ops-worker` 设置或推进，live shard self-upsert 不得清空、回退或覆盖非空 `disabled_at`。
+* live shard 只允许 upsert 自己的 identity row；`ops-worker` 可以在 restore、repair、disable、snapshot 或审计流程中写任何 row。除 `ops-worker` 按受审计 repair/restore 路径执行外，任何组件都不得替其它 live shard 代写 registry 行。
 * `DATA-OPS-011` 只能由 full export 或显式巡检作业从 `DATA-OPS-010` 冻结生成；冻结后不得在同一 snapshot 中动态追加新发现 shard。
 * full export、restore preflight 与 completeness 校验必须引用 `DATA-OPS-011`，不得以“运行时扫描到多少 shard”为准。
 

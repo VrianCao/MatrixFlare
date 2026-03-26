@@ -83,10 +83,12 @@ DO 内部 SQLite schema 演进规则：
 
 ## 5. D1 Schema Evolution
 
-* D1 只承载派生面，因此允许采用 `additive -> dual write -> backfill -> read switch -> cleanup`。
+* D1 在本系统中同时承载两类数据：可重建派生面，以及少量权威控制面元数据。
+* 对可重建派生表，允许采用 `additive -> dual write -> backfill -> read switch -> cleanup`。
+* 对权威控制面表，包括 `DATA-D1-005`,`DATA-D1-006` 与所有 D1-backed `DATA-OPS-*`，不得假设“drop and rebuild 即可恢复”；必须先完成兼容发布、导出验证与回滚路径验证，再允许 destructive cleanup。
 * 若启用 read replication，切换窗口内必须明确哪些读强制走 Sessions API。引用：`CF-D1-003`,`CF-D1-004`。
 * 任一 D1 backfill、rebuild 或控制面查询都必须显式遵守“单 invocation 最多 `1,000` 条 D1 queries”“单 SQL 最长 `30s`”“最多 `6` 个 D1 connections”的平台边界。引用：`CF-D1-007`,`CF-D1-008`,`CF-D1-009`。
-* D1 rebuild 必须可完全由真相面和 R2 导出重建。
+* 对可重建派生表的 D1 rebuild，必须可完全由数据面真相和 R2 导出重建。
 
 ## 6. R2 / KV / Queue Evolution Rules
 
@@ -173,7 +175,9 @@ DO 内部 SQLite schema 演进规则：
 #### 11.2.0 Shard Registry 基线
 
 * 全量导出、恢复 completeness 与巡检必须以 `DATA-OPS-010` shard registry 为基线，而不是依赖运行时“扫描到哪些 shard”。
-* 任一路径只要会首次创建可导出的 `UserDO`、`RoomDO`、`RemoteServerDO` 或 control-plane shard，就必须在对外返回成功前完成 `DATA-OPS-010` upsert。
+* 任一路径只要会首次创建可导出的 `UserDO`、`RoomDO`、`RemoteServerDO` 或 control-plane shard，就必须先提交本地权威 truth，再在同一外部请求周期或后续由 durable 幂等映射/本地 pending-marker 驱动的重试路径中完成 `DATA-OPS-010` upsert；只有当该 post-commit success barrier durable 完成后，才允许返回 `terminal success`。
+* 若 shard identity 需要在首次写入时分配，则必须先 durable 持久化“外部幂等域 -> shard identity”映射，再允许返回 `retryable non-success` 或 `terminal success`；后续同一幂等请求只能复用该 identity。
+* 若 shard truth 已提交但 `DATA-OPS-010` upsert 失败，请求必须返回 `retryable non-success`；除同一幂等请求重试外，shard 自身还必须持久化 `registry_upsert_pending` 或等价标记，并通过内部 alarm/queue/repair loop 继续补齐缺失 registry row，而不得把 registry completeness 依赖于客户端重试。
 * full export 在开始切分 shard 工作前，必须先把 `DATA-OPS-010` 冻结为 `DATA-OPS-011` registry snapshot，并在后续所有 manifest 中引用该 snapshot 的 hash。
 
 #### 11.2.1 Continuous Recovery Checkpoint Export

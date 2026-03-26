@@ -27,13 +27,16 @@
 * `per-user` 强串行主权；
 * `per-remote-server` 强串行出站；
 * `global derived views` 最终一致。
+* `global control-plane metadata` 可放在 D1，但只允许承载运维、授权、审计与恢复编目等侧车真相。
 
 因此：
 
-* 真相面由 DO SQLite 持有；
+* 数据面真相由 DO SQLite 持有；
 * 衍生面由 D1/R2 manifests/Queues 持有；
+* 控制面权威元数据可由 D1 持有，但不得替代 DO SQLite 的数据面权威；
 * 缓存面由 KV 或内存态持有；
-* 不允许任何派生面反向裁决真相。
+* 不允许任何派生面反向裁决真相；
+* 不允许任何控制面元数据反向裁决房间、用户或联邦数据面真相。
 
 ## 3. 核心实体目录
 
