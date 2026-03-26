@@ -113,13 +113,15 @@
 
 ### 7.1 Worker 使用规则
 
-* `gateway-worker` 默认 CPU 限额按热路径设计在 `30s` 默认值之内；只有特殊导出或诊断入口才允许更高上限。引用：`CF-WKR-003`。
+* `gateway-worker` 热路径必须按显式配置的 CPU limit 设计，而不是假设“默认一定是 `30s`”；若 Worker 继承了 migrated legacy limit（例如 `50 ms`），发布门禁必须先显式修正，再允许进入生产。只有特殊导出或诊断入口才允许更高上限。引用：`CF-WKR-003`。
 * 所有大对象读取与转发必须使用 stream，不得完整读入内存。引用：`CF-WKR-004`。
+* 所有 Worker 的 global scope 初始化都必须满足 `1s` startup limit；禁止在 top-level 执行大 schema 生成、全量配置扫描、巨型依赖初始化或其他重 CPU 工作。启动时间必须通过 `startup_time_ms` 门禁观测。引用：`CF-WKR-025`。
 * 若通过 `fetch`、R2、KV、Queues 或 D1 打开连接后不再需要响应体，必须显式取消或尽快读尽；并发连接预算必须统一纳入 `CF-WKR-006` 的连接压力模型，且 D1 还存在“每 invocation 最多 `6` 个到 D1 的连接”上限（`CF-D1-009`）。实现不得假设 D1 与其他 I/O 的连接预算彼此独立。
 * 内部 RPC 链必须限制为浅层拓扑：`gateway -> DO` 或 `gateway -> jobs -> DO`，禁止多跳扇出图。引用：`CF-WKR-009`。
 * Service Binding 调用计入 subrequest 与 `32` 次 Worker invocation 上限，调用本身不单独占用 open-connection slot；但由同一 top-level request 触发的全部 Worker 仍共享同一组 `6` 个 simultaneous open connections 预算。不得把拆分 Worker 当作扩大连接并发的手段。引用：`CF-WKR-009`,`CF-WKR-010`。
 * Service Binding RPC 只适用于明确需要结果的同步内部调用；任何未 `await` 的绑定调用都视为错误实现。引用：`CF-WKR-009`,`CF-WKR-010`。
 * 任一 Service Binding RPC 或 DO RPC 若使用普通 serialized payload，则 request/response hard ceiling 固定为 `32 MiB`；可能超限的数据必须改成 cursor/page、byte-oriented stream，或先落 R2 再只传 locator，不得把大房间投影、导出对象或审计结果一次性塞进单个 RPC 返回值。引用：`CF-WKR-023`。
+* runtime update 明确记录有 `30s` grace；deployment 切换与其他平台中断不保证同等待遇。因此所有长轮询、长流与大媒体转发都必须把“中断后客户端重试”当作标准路径，而不是依赖统一 grace。引用：`CF-WKR-001`。
 
 ### 7.2 DO 使用规则
 

@@ -12,7 +12,7 @@
 
 1. 主文档与分册边界已固定；
 2. 多数责任分册已进入 `Draft-Normative`，可直接作为实现输入；
-3. 尚未闭合的能力面必须显式登记到 `spec/open-questions/` 或 `Deferred` / `Required-Conditional` 寄存器中。
+3. 尚未闭合的能力面必须显式登记到 `spec/open-questions/` 或 `Deferred` / `Required-Conditional` / `Stub-Only` / `Unsupported` 寄存器中。
 
 当前仍不做以下事情：
 

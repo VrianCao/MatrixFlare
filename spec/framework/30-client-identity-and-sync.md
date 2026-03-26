@@ -195,12 +195,16 @@
 
 * profile truth 的权威表是 `DATA-USER-012`，独立于 account data。
 * `v1.17` 基线下，必须支持 `displayname`、`avatar_url`、`m.tz` 以及 policy 允许的 namespaced custom fields。
+* `GET /_matrix/client/*/profile/{userId}` 在 disclosure 已被允许时，必须返回该用户当前可公开的完整 profile truth 子集；除 `displayname`、`avatar_url` 外，还必须包含已设置的 `m.tz` 与 policy 允许公开的 namespaced custom fields。
 * `PUT /_matrix/client/*/profile/{userId}/{keyName}` 的请求体必须是“恰好一个属性”的 JSON object，且该属性名必须与 URL 中的 `keyName` 完全一致。
 * `keyName` 只允许 `displayname`、`avatar_url`、`m.tz` 或满足 namespaced grammar 的自定义字段；`displayname` 必须是 string，`avatar_url` 必须是 MXC URI，`m.tz` 必须是 IANA 时区标识。
 * `keyName` 的 UTF-8 字节长度必须不超过 `255`；超限必须返回 `M_KEY_TOO_LARGE`。
 * 自定义 namespaced key 的 value 允许是任意合法 JSON 值；只有 `displayname`、`avatar_url`、`m.tz` 三类规范字段受额外类型约束。
-* 请求体不是合法 JSON 时必须返回 `M_NOT_JSON`；请求体是合法 JSON 但缺少与 `keyName` 对应的属性、存在额外顶层属性、或值形状不符合该字段约束时，必须返回 `M_MISSING_PARAM` 或 `M_BAD_JSON` 中被本实现固定选定并测试覆盖的那一个，不得随节点漂移。
+* `GET /_matrix/client/*/profile/{userId}/{keyName}` 必须接受与写路径相同的 `keyName` 集合；当 disclosure 已被允许时，若该字段存在则返回“恰好一个同名属性”的 object，若字段不存在则返回 `404 M_NOT_FOUND`。
+* 请求体无法按 JSON object 成功解析时，必须返回与该 endpoint contract 对齐的固定 `400` 输入错误；首选 `M_BAD_JSON`，不得再把 `M_NOT_JSON` 写成本实现的唯一 MUST。
+* 请求体是合法 JSON object 但缺少与 `keyName` 对应的属性、存在额外顶层属性、`keyName` 不满足允许集合/grammar、或值形状不符合该字段约束时，必须按本实现固定映射返回 `M_MISSING_PARAM`、`M_BAD_JSON` 或 `M_INVALID_PARAM` 中与该类输入错误绑定的那一个；推荐分别对“缺少目标属性”“body 形状错误”“非法 keyName”使用 `M_MISSING_PARAM`、`M_BAD_JSON`、`M_INVALID_PARAM`，并由测试覆盖，不得随节点漂移。
 * 服务端可以拒绝 `null` 值；若接受 `null`，则必须按 `null` 存储，而不是把它解释成删除。删除字段只能走 `DELETE /_matrix/client/*/profile/{userId}/{keyName}`。
+* `DELETE /_matrix/client/*/profile/{userId}/{keyName}` 必须接受与写路径相同的 `keyName` grammar，并保持幂等：字段存在时删除它，字段不存在时仍返回成功；`displayname` 或 `avatar_url` 被删除时，必须触发与写入这两个字段相同的 propagation 路径。
 * 更新后的 total profile document 必须小于 `64 KiB`；超限时必须按协议返回 `M_PROFILE_TOO_LARGE`。
 * successful profile write 必须先原子更新 `DATA-USER-012`，再启动传播路径。
 * 每次成功的 profile truth 变更都必须在同一事务里生成新的、单调递增的 `profile_version`；该版本号是 profile propagation、重放与去重的唯一排序键。
@@ -208,7 +212,10 @@
   * 带新 profile 值的 presence 增量；
   * 对该用户当前已加入的每个本地房间生成新的 `m.room.member` `join` refresh 事件。
 * 传播可以异步分片执行以适应 Cloudflare 限制，但必须按 `{user_id,profile_version,room_id}` 幂等，并且不得丢失较新的 profile 版本。
-* public profile read 与 federation profile query 都必须应用 Matrix 可见性规则；无权读取时只能返回协议允许的 `403/404`，不得泄漏字段存在性。
+* public profile read 与 federation profile query 都必须先执行可见性 / disclosure policy 裁决，再执行 existence 裁决。
+* client public profile read 可以公开 `m.tz` 与 policy 允许的 namespaced custom fields；federation `query/profile` 仍受 server-server `v1.17` 限制，只允许 `displayname` / `avatar_url`。
+* 当 homeserver 策略是不愿披露目标用户或字段是否存在时，例如 profile lookup disabled、目录/隐私策略禁止 disclosure，必须返回 `403 M_FORBIDDEN`。
+* 只有在 disclosure 已被允许、但目标 user 或 field 实际不存在时，才允许返回 `404 M_NOT_FOUND`；不得把 policy denial 伪装成 `404`，也不得在 `403` 与 `404` 之间随机漂移。
 
 ### 5.3 Account Data
 

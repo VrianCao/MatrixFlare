@@ -162,9 +162,10 @@
 
 * `publicRooms`、`hierarchy` 与 `query/directory` 可以以 `DATA-D1-003` 作为 fast path，但任何可见性不确定场景都必须 fail-closed，而不是把潜在私有房间暴露给远端。
 * “可见性不确定” 至少包括：目录行缺失但 `RoomDO` 明确存在、目录行的 source watermark 落后于当前房间真相、目录 rebuild 正在进行、或决定公开性所需的 join rules / history visibility / world readable / published 标记任一缺失。
-* 遇到可见性不确定时，实现只能执行两种动作：回退读取 `RoomDO` 真相后再裁决，或直接返回 endpoint 允许的 `403/404`；不得猜测公开，也不得返回未经确认的部分结果。
+* 遇到可见性不确定时，实现只能执行两种动作：回退读取 `RoomDO` 真相后再裁决，或直接返回 endpoint 定义的 fail-closed 错误；不得猜测公开，也不得返回未经确认的部分结果。对 `query/profile`，该 fail-closed 错误选择必须遵守下文固定的 `403 M_FORBIDDEN` / `404 M_NOT_FOUND` 规则。
 * 对具有相同 `filter`、`include_all_networks`、分页参数与 network 范围输入的等价请求，`publicRooms` 的 `GET` 与 `POST` 变体只允许共用同一可见性裁决真相，不允许因请求方法差异而走不同 truth path。
-* `query/profile` 必须读取本地 `DATA-USER-012` profile truth，并应用 Matrix 允许的 profile 可见性规则；`field` 只允许 `displayname` 或 `avatar_url`，响应也只允许返回这两个字段。
+* `query/profile` 必须读取本地 `DATA-USER-012` profile truth，并应用与 [30-client-identity-and-sync.md](./30-client-identity-and-sync.md) 相同的 profile 可见性规则；`field` 只允许 `displayname` 或 `avatar_url`，响应也只允许返回这两个字段。
+* `query/profile` 的错误选择必须固定：当本 homeserver 不愿披露目标用户或字段是否存在时返回 `403 M_FORBIDDEN`；只有在 disclosure 已被允许、但目标 user 或 field 实际不存在时才允许返回 `404 M_NOT_FOUND`。
 * `query/profile`、`/user/devices/{userId}`、`/user/keys/query` 与 `/user/keys/claim` 只允许远端请求本 homeserver 本地用户；任一非本地域用户都必须显式拒绝，而不是转发或回环到其它远端。
 * `query/{queryType}` 只允许显式登记并实现的 query types；未知 query type 必须返回明确联邦错误，不得透传到 client handler。
 * 所有联邦查询都必须先完成 `X-Matrix` 验签与目标 server name 检查，再进入只读 dispatch。

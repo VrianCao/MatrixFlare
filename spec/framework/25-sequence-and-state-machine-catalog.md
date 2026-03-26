@@ -24,7 +24,7 @@
 | `FLOW-CS-PASSWORD-CHANGE` | password change | `30`,`40` | client, `gateway-worker`, `UserDO` | `POST /account/password` | 先完成 UIA，再原子更新 password credential / `auth_version`，并按 `logout_devices` 裁决其他 session 与 device | 任一 UIA、credential 校验或 session/device 后处理失败都不得留下半更新密码状态 |
 | `FLOW-CS-ACCOUNT-DEACTIVATE` | account deactivation | `30`,`40` | client, `gateway-worker`, `UserDO`, optional `jobs-worker` | `POST /account/deactivate` | 先完成 UIA，再原子标记 deactivated、撤销登录能力、清理本地非事件数据，并返回稳定 `id_server_unbind_result` | 任一失败都不得出现“密码已失效但账户未停用”或“停用已提交但仍可登录”的裂脑状态 |
 | `FLOW-CS-REFRESH` | refresh token | `30` | client, `gateway-worker`, `UserDO` | `POST /refresh` | 校验 refresh token、轮换 session | refresh 重放必须失败或返回已轮换结果 |
-| `FLOW-CS-PROFILE-PROPAGATION` | profile update propagation | `30`,`31` | client, `gateway-worker`, `UserDO`, `RoomDO`, optional `jobs-worker` | `PUT` or `DELETE /_matrix/client/*/profile/{userId}/{keyName}` | 更新 profile 真相、发出 presence 增量、对已加入房间传播 membership refresh | 不得产生半更新；传播重试必须按 profile version 幂等 |
+| `FLOW-CS-PROFILE-PROPAGATION` | profile update propagation | `30`,`31` | client, `gateway-worker`, `UserDO`, `RoomDO`, optional `jobs-worker` | `PUT` or `DELETE /_matrix/client/*/profile/{userId}/{keyName}` | 更新 profile 真相；仅当 `keyName ∈ {displayname,avatar_url}` 时发出 presence 增量并对已加入房间传播 membership refresh | 不得产生半更新；传播重试必须按 profile version 幂等 |
 | `FLOW-CS-SYNC-LONGPOLL` | sync long poll | `30` | client, `gateway-worker`, `UserDO`, `RoomDO` | `GET /sync` | Worker 持有请求，收到唤醒后组装响应 | 通道断开早返回；不得推进 token |
 | `FLOW-CS-SEND-TO-DEVICE` | send to-device | `30` | client, `gateway-worker`, `UserDO`, optional `RemoteServerDO` | `PUT /sendToDevice` | 写本地队列并派发远端 EDU | 远端失败不影响本地提交 |
 | `FLOW-CS-SEARCH-QUERY` | search and derived read query | `34` | client, `gateway-worker`, D1, optional `RoomDO`, optional `UserDO` | `/search`, `/user_directory/search`, `publicRooms`, or client hierarchy request | 读取 D1 derived plane 并在可见性不确定时回退 truth 或 fail-closed | derived 滞后、目录 watermark 落后或可见性不确定时不得猜测公开结果 |
@@ -83,10 +83,10 @@
 | `STATE-REMOTE-SERVER-RETRY` | outbound retry | `32` | remote txn | queued, sending, backoff, ready, dead-letter, drained | retry schedule stability |
 | `STATE-MEDIA-CACHE-OBJECT` | remote media cache object | `33` | cached media | miss, fetching, present, stale, purging, deleted | partial fetch cleanup |
 | `STATE-APPSERVICE-TXN` | appservice txn | `34` | appservice delivery | queued, sending, acked, retrying, poison | exactly-once illusion via idempotency |
-| `STATE-REBUILD-JOB` | rebuild job | `42`,`34` | replay/reindex job | pending, scanning, applying, checkpointed, completed, failed, canceled | resumability |
-| `STATE-EXPORT-JOB` | export job | `42` | export bundle | pending, materializing, uploading, finalized, failed | partial export cleanup |
-| `STATE-RESTORE-JOB` | restore job | `42` | restore/import job | pending, validating, importing, cutover-ready, cutover, completed, failed, canceled | manifest validation and cutover safety |
-| `STATE-REPAIR-JOB` | repair job | `42` | scoped repair job | pending, scanning, applying, verifying, completed, failed, canceled | bounded blast radius and re-verification |
+| `STATE-REBUILD-JOB` | rebuild job | `42`,`34` | replay/reindex job | pending, scanning, applying, checkpointed, cancel_requested, completed, failed, canceled | resumability |
+| `STATE-EXPORT-JOB` | export job | `42` | export bundle | pending, materializing, uploading, cancel_requested, finalized, failed, canceled | partial export cleanup |
+| `STATE-RESTORE-JOB` | restore job | `42` | restore/import job | pending, validating, importing, cutover-ready, cutover, cancel_requested, completed, failed, canceled | manifest validation and cutover safety |
+| `STATE-REPAIR-JOB` | repair job | `42` | scoped repair job | pending, scanning, applying, verifying, cancel_requested, completed, failed, canceled | bounded blast radius and re-verification |
 
 ## 4. 图示规范
 

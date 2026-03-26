@@ -19,7 +19,8 @@
 
 ## 2. 权威边界与 Join 规则
 
-* [23-interface-contract-catalog.md](./23-interface-contract-catalog.md) 中 `Input Contract` / `Output Contract` 列使用的逻辑契约名，是本分册的 canonical join key。
+* [23-interface-contract-catalog.md](./23-interface-contract-catalog.md) 中 `Input Contract` / `Output Contract` 列若写的是显式逻辑契约名，则该名称是本分册的 canonical join key。
+* 若 `23` 中某个 `Input / Output` 单元格写的是 Matrix 官方 route family shorthand（例如 `request`、`query`、`room query`），则其 authority 直接回链到钉死的 Matrix `v1.17` route family，而不是把这些通用词当作本分册中的本地 schema 名。
 * 若某逻辑契约对应 Matrix client-server / server-server / appservice 官方公开路由，则其权威 wire schema 仍来自钉死的 Matrix `v1.17` versioned spec；本分册只定义本项目额外收紧、固定 stub 或 route-family 归一化规则。
 * 若某逻辑契约对应本地 `/_ops`、内部 RPC、Queue、Alarm 或固定错误体，则本分册是唯一 schema authority。
 * 同一逻辑契约名不得在不同接口上承载两个不兼容 shape；若确有破坏性演进，必须引入新契约名或新 `schema_version` 主版本。
@@ -169,7 +170,7 @@
 | --- | --- | --- |
 | `job_id` | string | 全局唯一控制面作业 ID |
 | `job_type` | string | `export`,`restore`,`rebuild`,`repair` |
-| `state` | string | `accepted`,`queued`,`running`,`succeeded`,`failed`,`cancel_requested`,`cancelled` |
+| `state` | string | `accepted`,`queued`,`running`,`succeeded`,`failed`,`cancel_requested`,`canceled` |
 | `scope` | `TargetScope` | 本次作业目标范围 |
 | `accepted_at` | string | RFC 3339 UTC |
 | `request_fingerprint` | string | canonical request hash |
@@ -200,7 +201,7 @@
 * `succeeded`：内部状态 `completed` 或 `finalized`
 * `failed`：内部状态 `failed`
 * `cancel_requested`：内部状态 `cancel_requested`
-* `cancelled`：内部状态 `canceled` 或 `cancelled`
+* `canceled`：内部状态 `canceled`
 
 约束：
 
@@ -309,7 +310,7 @@
 | --- | --- | --- |
 | `job_id` | string | 被取消作业 ID |
 | `previous_state` | string | 取消前状态 |
-| `new_state` | string | `cancel_requested` 或 `cancelled` |
+| `new_state` | string | `cancel_requested` 或 `canceled` |
 | `accepted_at` | string | RFC 3339 UTC |
 
 ### 5.11 `AppserviceNamespaceRule`

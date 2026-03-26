@@ -79,6 +79,14 @@
 * `/_matrix/client/v1/media/*` current surface 与 `/_matrix/media/*` compatibility surface 必须共用同一对象真相、参数解释、缓存命中与审计逻辑；但 deprecated `download` / `thumbnail` compatibility 路由的 legacy unauthenticated + freeze 裁决不得被“统一 auth gate”覆盖。
 * 若对象不存在但目录残留，返回协议错误并记审计事件。
 
+### 4.2.1 Legacy Unauthenticated Freeze Policy
+
+* Matrix `v1.17` 只定义了 deprecated compatibility 下载/缩略图 surface 的 legacy unauthenticated 行为模型；`legacy_unauth_media_freeze_at` 则是本项目引入的 deployment-scoped 本地产品策略时间点，不是上游协议事实。
+* `legacy_unauth_media_freeze_at` 一旦在某个 environment 生效，就必须视为该 environment 的 immutable policy cut；除经审计的迁移/重建流程外，不得在运行中前后拨动它来改变对象可见性。
+* 对本地媒体对象，legacy unauthenticated 资格必须由 `DATA-R2-001.first_ingested_at < legacy_unauth_media_freeze_at` 固化为 `legacy_unauth_access_flag`。
+* 对远端缓存媒体对象，legacy unauthenticated 资格必须由 `DATA-R2-002.first_cached_at < legacy_unauth_media_freeze_at` 固化为 `legacy_unauth_access_flag`。
+* compatibility `/_matrix/media/*/download` 与 `thumbnail` 路由只允许读取已固化的 `legacy_unauth_access_flag`；不得在读路径现场重算，也不得因为后来 policy 变化而回写既有对象 metadata。
+
 ### 4.3 Query 参数与下载语义
 
 * client download 路由与其 compatibility 路由必须至少固定 `allow_redirect`、`allow_remote`、`timeout_ms` 三个 query 参数语义：

@@ -101,6 +101,7 @@
 * 若启用 OTel export，必须明确是否把数据同时持久化到 Cloudflare dashboard。
 * Cloudflare OTel `persist` 默认是 `true`；若只需要外部 sink，应设为 `false`。引用：`CF-WKR-018`。
 * OTel export 当前只作为 logs/traces 出口，不替代 metrics 采集。引用：`CF-WKR-018`。
+* tracing 的 included quota、overage price 与 retention 当前在 Cloudflare 文档间存在冲突；在 `OQ-0002` 关闭前，成本面板必须把 trace spans 与 log events 分开计量，禁止把任一数字硬编码为已澄清真相。引用：`CF-WKR-017`。
 
 ## 6. Cost Observability
 
@@ -133,7 +134,7 @@
 | R2 | storage `10 GB-month`, Class A `1M`, Class B `10M` | `CF-R2-005` |
 | KV | reads `10M / month`, writes `1M / month`, deletes `1M / month`, list requests `1M / month`, storage `1 GB` | `CF-KV-003` |
 | Queues | `1M ops / month` | `CF-QUE-001` |
-| OTel export | `10M` logs + `10M` traces events / month when enabled | `CF-WKR-018` |
+| OTel export | tracing quota/pricing/retention currently unresolved across Cloudflare docs; keep trace spans and exported logs separately parameterized until `OQ-0002` closes | `CF-WKR-017`,`CF-WKR-018` |
 
 ### 6.3 Cost Model Rules
 
@@ -144,6 +145,7 @@
 * Durable Objects WebSocket 的入站消息计费必须单独建模；其 request fee 按 `20:1` 折算为 billing requests。WebSocket 建连会形成 request，出站发送不会形成对等 DO request 计数，入站 protocol ping 不计入 websocket message requests，但这些路径仍会占用网络与 CPU 预算。引用：`CF-DO-013`。
 * Queues 成本必须按 write / read / delete 三类操作分别计数，并按每 `64 KB` payload chunk 换算（`KB = 1000 bytes`）；每条消息还隐含约 `100` bytes 平台元数据；retry 会额外产生 read op，DLQ 写入会额外产生 write op，过期消息只产生 write+delete；batch 只改变吞吐与调用频率，不会把多条消息折叠成一次计费。引用：`CF-QUE-001`。
 * 若为冷归档采用 R2 Infrequent Access，成本模型必须额外纳入 retrieval fee、`30` 天 minimum storage duration 与“无 included quota”的事实；默认 Included Quotas Matrix 只适用于 R2 Standard。引用：`CF-R2-005`。
+* 当 deployment 启用 Cloudflare traces 或 OTel export 时，成本模型必须分别暴露 `trace_span_count`、`exported_log_event_count` 与 `persist_enabled`，并在 `OQ-0002` 关闭前禁止默认把 trace spans 自动并入 Workers Logs quota。引用：`CF-WKR-017`,`CF-WKR-018`。
 
 ## 7. Primary Load Drivers
 

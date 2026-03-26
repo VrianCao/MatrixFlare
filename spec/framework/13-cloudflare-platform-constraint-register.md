@@ -39,9 +39,9 @@
 
 | CF-ID | Product | Category | Official Source | Plan Scope | Constraint / Behavior | Design Impact | Owning Spec |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `CF-WKR-001` | Workers | lifecycle | workers-limits | Paid | 入站 HTTP 请求在客户端保持连接期间没有固定 wall-time cap，但 runtime update / deployment / platform restart 仍可能中断 in-flight requests；Cloudflare 对此类中断给出的 grace period 是 `30s`。 | `/_matrix/client/v3/sync` 可以由 Worker 持有长轮询，但必须把平台中断视为正常早返回原因。 | `21`,`30`,`42` |
+| `CF-WKR-001` | Workers | lifecycle | workers-limits | Paid | 入站 HTTP 请求在客户端保持连接期间没有固定 wall-time cap。Cloudflare 只对 runtime update 明确记录了 in-flight request 的 `30s` grace period；deployment 切换或其他平台中断会影响 in-flight requests，但文档未承诺同样的 grace。 | `/_matrix/client/v3/sync` 可以由 Worker 持有长轮询，但必须把 runtime update、deployment 切换与其他平台中断都视为正常早返回原因；实现不得把 `30s` grace 泛化成“所有中断都保证有 30 秒”。 | `21`,`30`,`42` |
 | `CF-WKR-002` | Workers | lifecycle | workers-limits | Paid | 客户端断开后，请求相关任务会被取消；`waitUntil()` 最多额外延长 `30s`。 | 长轮询、媒体转发、联邦拉取都必须把客户端断开视为正常终止原因。 | `21`,`30`,`32`,`33` |
-| `CF-WKR-003` | Workers | limits | workers-limits | Paid | HTTP 请求 CPU time 默认 `30s`，可提升至 `5 min`。Queue consumer 与 DO alarm 的 wall time 上限为 `15 min`。 | 权威热路径必须远低于默认 CPU 上限；重建、缩略图、导出必须异步化。 | `13`,`21`,`30`,`31`,`33`,`42` |
+| `CF-WKR-003` | Workers | limits | workers-limits, workers-pricing | Paid | 在 Workers `Standard` usage model 下，HTTP 请求 CPU time 默认 `30s`，可提升至 `5 min`。Cloudflare 定价文档同时说明，迁移自 legacy Bundled 的既有 Worker 可能仍保留自动 `50 ms` CPU limit，直到显式修改。Queue consumer 与 DO alarm 的 wall time 上限为 `15 min`。 | 权威热路径必须远低于显式配置的 CPU 上限；发布门禁必须验证并记录每个 Worker 的实际 CPU limit，不得假设“默认就是 30 秒”；重建、缩略图、导出必须异步化。 | `13`,`21`,`30`,`31`,`33`,`42` |
 | `CF-WKR-004` | Workers | limits | workers-limits | Paid | 每个 isolate 内存上限 `128 MB`。 | 媒体、归档、联邦大响应必须流式处理，禁止整包缓冲。 | `21`,`33`,`41` |
 | `CF-WKR-005` | Workers | limits | workers-limits | Paid | 每次调用子请求默认上限 `10,000`，可配置提高，最高可达 `10M`。 | 不允许无界 fanout；`/sync`、联邦恢复、批量重建必须分片；压测和容量模型必须声明是否依赖提额配置。 | `21`,`30`,`31`,`32`,`41` |
 | `CF-WKR-006` | Workers | limits | workers-limits | Paid | 每个顶层请求最多 `6` 个 simultaneous open connections；`fetch`、KV、Cache、R2、Queues、TCP sockets 与 outbound WebSocket 都受此预算约束；超出时新的连接尝试会被排队，停滞连接可能被 runtime 关闭。 | 远端媒体抓取、联邦并发拉取、R2/KV/Queues/网络 I/O 并发必须受控；若不再需要响应体，必须显式取消以释放连接头寸；D1 连接压力另见 `CF-D1-009`，实现不得假设其与其他 I/O 预算彼此独立。 | `21`,`32`,`33`,`41` |
@@ -53,9 +53,9 @@
 | `CF-WKR-012` | Worker deployments | deployment | workers-versions-deployments | Paid | Worker 版本与部署是分离概念；新版本可先上传后再部署；单个 deployment 可同时承载 `1` 或 `2` 个 Worker versions。`wrangler versions upload` 不支持携带 Durable Object migrations；涉及 DO migration 时必须改用 `wrangler deploy`。 | 生产发布必须使用 versions/deployments，而不是隐式“每改即发”；任何跨请求签名 token 或兼容契约都必须容忍 rollout 期间的双版本并存；带 DO migration 的发布流程不能假设“先 upload 再 deploy”。 | `21`,`30`,`40`,`42` |
 | `CF-WKR-013` | Workers Secrets | security | workers-secrets | Paid | Secrets 是加密绑定，Cloudflare 明确要求不要用 `vars` 存放敏感信息。 | 所有密钥、token、凭据都必须放入 secrets/Secrets Store。 | `40`,`42` |
 | `CF-WKR-014` | Workers Secrets | deployment | workers-secrets | Paid | `wrangler secret put/delete` 会创建新 Worker version 并立即部署；渐进发布应改用 `wrangler versions secret put/delete`。 | secret rotation 必须纳入版本化部署流程。 | `40`,`42` |
-| `CF-WKR-015` | Workers Logs | billing/retention | workers-pricing, workers-logs | Paid | Workers Logs 含 `20M` log events/月，保留 `7` 天；单条日志最大 `256 KB`，超限会被截断，并由平台把 `$cloudflare.truncated` 设为 `true`。 | 生产必须设计日志采样、摘要化与截断识别策略；应用与证据管道不得把被截断事件当作完整记录。 | `41` |
+| `CF-WKR-015` | Workers Logs | billing/retention | workers-pricing, workers-logs | Paid | Workers Logs 含 `20M` log events/月，保留 `7` 天；单条 Workers Logs event 最大 `256 KB`，超限会被截断，并由平台把 `$cloudflare.truncated` 设为 `true`。 | 生产必须设计日志采样、摘要化与截断识别策略；应用与证据管道不得把被截断事件当作完整记录。 | `41` |
 | `CF-WKR-016` | Service Bindings | billing | workers-pricing | Paid under Standard pricing | 只有在 Workers `Standard` usage model 下，经 Service Binding 调用另一 Worker 才不产生额外 Worker request fee；legacy `Bundled/Unbound` 不适用；在 `Standard` 下，计费 CPU 是 caller 与 callee 的总 CPU 时间。 | 任何成本模型只要用到 Service Binding request fee 优惠，都必须先声明 deployment 采用 `Standard` usage model，并把调用链上的总 CPU 一并计费。 | `21`,`41` |
-| `CF-WKR-017` | OpenTelemetry | billing | workers-opentelemetry | Paid | OTel 导出 logs/traces 各含 `10M` events/月，超额按量计费。 | 启用 OTel 时必须进入成本面板。 | `41` |
+| `CF-WKR-017` | OpenTelemetry / Traces | billing | workers-opentelemetry, workers-traces | Paid | Cloudflare observability 文档当前对 tracing quota/pricing 存在冲突：OTel export 页面写明自 `2026-03-01` 起 traces 与 logs 各含 `10M` events/月、超额 `$0.05 / million`；Traces 页面则写 traces spans 与 Workers Logs 共享 event quota/pricing/retention。当前本地基线不能把 tracing 的精确 included quota、overage price 或 retention 视为已澄清事实。 | 启用 traces / OTel 时，成本模型与门禁必须把 trace span volume 单独参数化，并回链 `OQ-0002`；在 Cloudflare 口径收敛前，禁止把某一组 tracing 计费数字硬编码为确定真相。 | `15`,`41` |
 | `CF-WKR-018` | OpenTelemetry | behavior | workers-opentelemetry | Paid | OTel export `persist` 默认为 `true`，会同时导出并存入 Cloudflare dashboard；可设 `false` 仅发外部 sink。 | 必须显式决定是否接受双重留存与相应计费。 | `41` |
 | `CF-WKR-019` | Workers | billing | workers-pricing | Paid under Standard pricing | 在 Workers `Standard` usage model 下，Workers Paid 基础费 `$5/月`，含 `10M` requests/月 与 `30M` CPU ms/月。 | 任何使用该包含量的成本估算都必须先声明 deployment 采用 `Standard` usage model，再做抵扣。 | `41` |
 | `CF-WKR-020` | Workers | limits | workers-limits | Paid | 单个 environment variable / secret value 大小上限 `5 KB`。 | 任何以 secret 形式注入 Worker 的活跃 keyring、签名根映射或其他安全配置都必须受 `5 KB` 上限约束；若超限，必须改用 Secrets Store 或拆分为多个 versioned secrets。 | `21`,`24`,`30`,`40`,`42` |
@@ -63,6 +63,7 @@
 | `CF-WKR-022` | Workers | limits | workers-limits | Paid | 单个 Worker 最多 `128` 个 environment variables（secrets + text variables）。 | 通过“拆分为多个 secrets”规避 `5 KB` 单值上限时，仍必须受总数上限约束；key rotation 与双版本并存设计不得假设 secrets 数量无限。 | `21`,`40`,`42` |
 | `CF-WKR-023` | Workers RPC / Service Bindings RPC / Durable Object RPC | limits | workers-rpc, do-rpc-stubs | Paid | 普通 serialized RPC message 的 hard ceiling 为 `32 MiB`；更大传输必须改用 stream-based transfer，而不是单条序列化消息。Durable Object method-call RPC 需按 DO stubs 指南回链到 Workers RPC 文档理解该 transport 约束。 | 所有内部 Worker/DO RPC 契约都必须分页、分段或改为 stream / R2 locator 设计；不得把大房间投影、导出段或审计结果一次性塞进单个 RPC 返回值。 | `21`,`23`,`26`,`30`,`31`,`32`,`42` |
 | `CF-WKR-024` | Workers | limits | workers-limits | Paid | Request header size 上限 `128 KB (total)`；response header size 上限 `128 KB (total)`。 | Access/JWT、联邦签名与任何 cookie/header 注入不得把 header 膨胀为大 payload；可增长的材料必须限制长度或改走 body/locator。 | `21`,`32`,`40` |
+| `CF-WKR-025` | Workers | limits | workers-limits | Paid | Worker 必须在 `1s` 内完成 global scope（top-level code）解析与执行；超限时部署校验会失败，Wrangler 会报告 `startup_time_ms`，并可能返回 `Script startup exceeded CPU time limit (10021)`。 | 所有 Worker 必须避免重型 top-level 初始化；发布门禁必须记录 `startup_time_ms` 并在接近 `1s` ceiling 前 fail-closed，而不是等线上流量触发问题。 | `21`,`42` |
 
 ## 4. Durable Objects 约束
 
@@ -103,6 +104,7 @@
 | `CF-D1-009` | D1 | limits | d1-limits | Paid | 每次 Worker invocation 最多同时打开 `6` 个到 D1 的连接。 | 任一把 D1 混入公开请求热路径、重建作业或多路派生查询的实现，都必须把 D1 连接并发显式纳入连接预算。 | `21`,`41`,`42` |
 | `CF-D1-010` | D1 | limits | d1-limits | Paid | 最大 string/BLOB/table row size 为 `2 MB`。 | 索引文档、审计 payload 与派生投影不得塞进单行；必要时拆分记录或外置到 R2，只在 D1 存 locator。 | `21`,`34`,`42` |
 | `CF-D1-011` | D1 | limits | d1-limits | Paid | 最大 SQL statement length `100 KB`；每 query 最大 bound parameters `100`。 | backfill/upsert/batch 必须按 statement 与 parameters 上限分批，禁止生成巨型 SQL 或超长 `IN`/`VALUES` 列表。 | `34`,`42` |
+| `CF-D1-012` | D1 | recovery | d1-limits | Paid | D1 Time Travel restore operations 受每数据库 `10 restores / 10 minutes` 速率限制。 | DR、repair 与演练 runbook 必须序列化或退避 D1 restores；不得把 Time Travel restore 写成无界重试循环。 | `42` |
 
 ## 6. KV 约束
 

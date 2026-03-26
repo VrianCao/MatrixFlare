@@ -71,6 +71,10 @@
   URL: <https://developers.cloudflare.com/workers/observability/exporting-opentelemetry-data/>
   本地快照: `research/sources/cloudflare-workers-opentelemetry.md`
 
+* Workers Traces
+  URL: <https://developers.cloudflare.com/workers/observability/traces/>
+  本地快照: `research/sources/cloudflare-workers-traces.html`
+
 * Workers Compatibility Flags
   URL: <https://developers.cloudflare.com/workers/configuration/compatibility-flags/>
   本地快照: `research/sources/cloudflare-workers-compatibility-flags.md`

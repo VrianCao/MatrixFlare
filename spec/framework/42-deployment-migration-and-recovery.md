@@ -35,6 +35,8 @@
   * Worker version IDs
   * active deployment composition
   * compatibility date
+  * 每个 Worker 的显式 CPU limit 配置
+  * `startup_time_ms` 或等价启动校验结果
   * enabled flags / feature gates
 
 ## 3. Backward Compatibility Rules
@@ -162,6 +164,7 @@ DO 内部 SQLite schema 演进规则：
 ### 11.1 DR 基线
 
 * D1 在 Workers Paid 上有 `30` 天 Time Travel / point-in-time recovery。引用：`CF-D1-005`。该值属于平台事实断言，发布与年度治理审查时必须重新核对。
+* D1 Time Travel restore 还受每数据库 `10 restores / 10 minutes` 速率限制。引用：`CF-D1-012`。DR 演练、repair 与自动化恢复必须把该限速写入 backoff / queue 规则，禁止无界重试。
 * DO 权威状态没有等价内建 PITR，必须由应用层导出补足。引用：`CF-DO-004`。
 * 生产默认 DR 目标为 `RPO <= 15 min`、`RTO <= 8 h`，适用于单 homeserver 部署在支持规模内的全量 namespace 恢复。
 
