@@ -54,6 +54,31 @@ Required behavior:
 * do not treat a terse prompt as permission to skip research, Spec mapping, verification, debugging, or required follow-up edits
 * if the requested work cannot be fully closed, continue until the exact blocker is identified, evidenced, and written down in the correct artifact instead of silently delivering an incomplete result
 
+## Sub Agents Review Discipline
+
+For any task that implies completion, agents must add a `Sub Agents Review` pass after verification and before declaring the task done.
+
+Purpose:
+
+* force an adversarial second pass that looks for bugs, regressions, Spec drift, missing traceability, missing tests, and dishonest completion claims
+* turn review findings into a concrete repair queue before the task is considered complete
+
+Execution rule:
+
+* generate at least one focused Sub Agent review for the current slice
+* for broad, risky, or cross-cutting changes, use multiple Sub Agents with disjoint scopes such as Spec compliance, runtime ownership, regression risk, and test/evidence coverage
+* give each Sub Agent the exact `TODO.md` item, owning Spec, relevant `REQ-*` / `MX-*` / `CF-*` / `IF-*` / `DATA-*` / `FLOW-*` / `STATE-*` / `TEST-*` / `EVID-*`, changed files, and the precise review question
+* require review output to cite concrete files, lines, contracts, invariants, or missing tests whenever possible
+* treat Sub Agent findings as review input, not as authority; confirm every finding against the actual files and Spec before acting
+
+Repair rule:
+
+* if a finding is confirmed, fix it, rerun verification, and then rerun `Sub Agents Review`
+* if a finding exposes a missing prerequisite or Spec gap, update the Spec stack, `DEC-*` / `OQ-*`, and `TODO.md` before continuing implementation
+* if a finding is rejected, document the reason in the correct artifact or change record so the dismissal is auditable
+* do not declare completion while unresolved confirmed findings remain
+* if the execution environment cannot actually spawn Sub Agents, state that limitation explicitly and perform the closest adversarial self-review available, but treat that as a fallback rather than the default process
+
 ## Mission
 
 AI agents working in this repository must help move the project through this loop:
@@ -62,9 +87,11 @@ AI agents working in this repository must help move the project through this loo
 2. facts are promoted into the Spec system
 3. code is implemented strictly from the Spec
 4. behavior is verified against `TEST-*` and `EVID-*`
-5. bugs and drift are fed back into Spec or code, then the loop repeats
+5. `Sub Agents Review` audits the slice for bugs, regressions, Spec drift, missing tests/evidence, and dishonest completion claims
+6. confirmed review findings are repaired or routed into the correct artifact updates
+7. the loop repeats until no unresolved confirmed findings remain
 
-Do not skip the Spec step.
+Do not skip the Spec step or the review step.
 
 ## Non-Negotiables
 
@@ -365,9 +392,30 @@ At minimum:
 
 If there is no toolchain yet, create the smallest honest validation path instead of inventing a fake one.
 
-### 6. Close The Loop
+### 6. Sub Agents Review
 
-If verification fails, classify the failure:
+Sub Agents review is mandatory after verification and before a task can be considered complete.
+
+At minimum:
+
+* generate at least one focused Sub Agent review for the implemented slice
+* ask for bugs, regressions, Spec drift, runtime ownership violations, missing tests/evidence, and TODO dishonesty
+* validate every finding against the actual files, Spec, and tests before acting
+
+For wider changes:
+
+* split review scopes across multiple Sub Agents instead of asking one reviewer to cover everything
+* keep each review prompt concrete and tied to the exact changed files and traceability set
+
+If Sub Agents are unavailable in the current execution environment:
+
+* state that limitation explicitly
+* perform the closest adversarial self-review available
+* still follow the same repair loop below
+
+### 7. Repair And Re-Run
+
+If verification or `Sub Agents Review` finds a problem, classify the failure:
 
 * Spec wrong
 * code wrong
@@ -385,7 +433,13 @@ Then update the correct artifact:
 * source observation register
 * `TODO.md`
 
-## Analysis -> Research -> Development -> Verification -> Debug Loop
+After each repair:
+
+* rerun the relevant verification
+* rerun `Sub Agents Review`
+* continue the loop until confirmed findings are closed or a hard blocker is documented honestly in the correct artifact
+
+## Analysis -> Research -> Development -> Verification -> Sub Agents Review -> Repair Loop
 
 Use this loop continuously:
 
@@ -399,11 +453,14 @@ Use this loop continuously:
    Implement only from the Spec.
 5. Verification
    Test behavior against release-profile expectations.
-6. Debug
-   Feed mismatches back into Spec or code.
-7. Repeat
+6. Sub Agents Review
+   Generate one or more focused Sub Agents to review the slice and produce concrete findings.
+7. Repair
+   Validate findings, fix confirmed issues, or update the correct artifact when the issue is in the Spec, tests, platform assumptions, or product boundary.
+8. Repeat
+   Continue `Verification -> Sub Agents Review -> Repair` until the task is actually complete or a hard blocker is documented honestly.
 
-The loop is not complete until the mismatch is explained and the correct artifact is updated.
+The loop is not complete until every mismatch is explained, the correct artifact is updated, and review findings have either been fixed or formally resolved.
 
 This loop is mandatory for any request that implies completion, including terse prompts. Agents must continue looping until the full user request is actually satisfied or a hard blocker is demonstrated.
 
@@ -416,6 +473,8 @@ A development task is not done when code compiles. It is done when:
 * the corresponding `TODO.md` item has been updated honestly
 * implementation respects runtime ownership and storage boundaries
 * relevant tests exist or are updated
+* verification has passed and at least one `Sub Agents Review` pass has been completed
+* confirmed review findings are fixed or written down as the blocker in the correct artifact
 * unsupported/stub-only boundaries remain correct
 * any newly discovered ambiguity is captured as `DEC-*` or `OQ-*`
 * any claimed profile impact is honest
