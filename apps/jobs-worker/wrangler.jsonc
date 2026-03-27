@@ -1,0 +1,87 @@
+{
+  "name": "matrix-jobs-worker",
+  "main": "src/index.mjs",
+  "compatibility_date": "2026-03-26",
+  "vars": {
+    "ENVIRONMENT_NAME": "environment_name-placeholder",
+    "MATRIX_SERVER_NAME": "matrix_server_name-placeholder",
+    "RELEASE_PROFILE": "L1",
+    "WORKER_VERSION_ID": "dev",
+    "DEPLOYMENT_ID": "local-dev",
+    "LOG_LEVEL": "info",
+    "CPU_LIMIT_CLASS": "default",
+    "MANAGEMENT_API_BASE_URL": "management_api_base_url-placeholder",
+    "FF_FEDERATION": "false",
+    "FF_MEDIA_REMOTE_FETCH": "false",
+    "FF_APPSERVICE_API": "false",
+    "FF_OTEL_EXPORT": "false",
+    "FF_OTEL_PERSIST": "true"
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "USER_DO",
+        "class_name": "UserDO",
+        "script_name": "matrix-gateway-worker"
+      },
+      {
+        "name": "ROOM_DO",
+        "class_name": "RoomDO",
+        "script_name": "matrix-gateway-worker"
+      },
+      {
+        "name": "REMOTE_SERVER_DO",
+        "class_name": "RemoteServerDO",
+        "script_name": "matrix-gateway-worker"
+      }
+    ]
+  },
+  "queues": {
+    "consumers": [
+      {
+        "queue": "matrix-search-index-job"
+      },
+      {
+        "queue": "matrix-media-thumbnail-job"
+      },
+      {
+        "queue": "matrix-appservice-txn-job"
+      },
+      {
+        "queue": "matrix-rebuild-shard-job"
+      },
+      {
+        "queue": "matrix-export-shard-job"
+      },
+      {
+        "queue": "matrix-restore-shard-job"
+      },
+      {
+        "queue": "matrix-repair-shard-job"
+      }
+    ]
+  },
+  "d1_databases": [
+    {
+      "binding": "MATRIX_CONTROL_D1",
+      "database_name": "matrix-control-and-derived",
+      "database_id": "00000000-0000-0000-0000-000000000001"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "MATRIX_MEDIA_BUCKET",
+      "bucket_name": "matrix-media"
+    },
+    {
+      "binding": "MATRIX_ARCHIVE_BUCKET",
+      "bucket_name": "matrix-archive"
+    }
+  ],
+  "kv_namespaces": [
+    {
+      "binding": "MATRIX_EDGE_CACHE",
+      "id": "00000000000000000000000000000001"
+    }
+  ]
+}

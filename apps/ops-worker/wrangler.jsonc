@@ -1,0 +1,58 @@
+{
+  "name": "matrix-ops-worker",
+  "main": "src/index.mjs",
+  "compatibility_date": "2026-03-26",
+  "vars": {
+    "ENVIRONMENT_NAME": "environment_name-placeholder",
+    "MATRIX_SERVER_NAME": "matrix_server_name-placeholder",
+    "RELEASE_PROFILE": "L1",
+    "WORKER_VERSION_ID": "dev",
+    "DEPLOYMENT_ID": "local-dev",
+    "LOG_LEVEL": "info",
+    "CPU_LIMIT_CLASS": "default",
+    "MANAGEMENT_API_BASE_URL": "management_api_base_url-placeholder",
+    "ACCESS_TEAM_DOMAIN": "access_team_domain-placeholder",
+    "ACCESS_AUDIENCE": "access_audience-placeholder",
+    "FF_APPSERVICE_API": "false",
+    "FF_OTEL_EXPORT": "false",
+    "FF_OTEL_PERSIST": "true"
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "USER_DO",
+        "class_name": "UserDO",
+        "script_name": "matrix-gateway-worker"
+      },
+      {
+        "name": "ROOM_DO",
+        "class_name": "RoomDO",
+        "script_name": "matrix-gateway-worker"
+      },
+      {
+        "name": "REMOTE_SERVER_DO",
+        "class_name": "RemoteServerDO",
+        "script_name": "matrix-gateway-worker"
+      }
+    ]
+  },
+  "services": [
+    {
+      "binding": "JOBS_WORKER",
+      "service": "matrix-jobs-worker"
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "MATRIX_CONTROL_D1",
+      "database_name": "matrix-control-and-derived",
+      "database_id": "00000000-0000-0000-0000-000000000001"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "MATRIX_ARCHIVE_BUCKET",
+      "bucket_name": "matrix-archive"
+    }
+  ]
+}

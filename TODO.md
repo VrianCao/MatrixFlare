@@ -113,7 +113,7 @@
 
 ### 01.01 建立三个 Worker 与三个主权 DO 的代码骨架
 
-- [ ] 建立 `gateway-worker`、`jobs-worker`、`ops-worker`、`UserDO`、`RoomDO`、`RemoteServerDO` 基础工程。
+- [x] 建立 `gateway-worker`、`jobs-worker`、`ops-worker`、`UserDO`、`RoomDO`、`RemoteServerDO` 基础工程。
   Spec refs: `20`,`21`
   产出:
   Worker 入口、DO class 占位、Service Binding / Queue / storage 绑定声明。
@@ -122,7 +122,7 @@
 
 ### 01.02 固定环境配置与 secrets 装载模型
 
-- [ ] 建立显式环境变量、secret、feature gate、compatibility date 管理层。
+- [x] 建立显式环境变量、secret、feature gate、compatibility date 管理层。
   Spec refs: `10` `REQ-GOV-004`, `13` `CF-WKR-013`~`CF-WKR-022`, `40` 5
   产出:
   配置加载模块、环境 schema、secret 访问封装。
@@ -131,7 +131,7 @@
 
 ### 01.03 建立共享错误模型与 wire schema 类型
 
-- [ ] 为 `MatrixUnrecognizedErrorBody`、`MatrixUnknownTokenErrorBody`、`OpsErrorResponse`、`InternalErrorEnvelope` 建立共享类型与序列化逻辑。
+- [x] 为 `MatrixUnrecognizedErrorBody`、`MatrixUnknownTokenErrorBody`、`OpsErrorResponse`、`InternalErrorEnvelope` 建立共享类型与序列化逻辑。
   Spec refs: `26` 4
   产出:
   `packages/contracts/` 中的错误体类型、编码器、解码器。
@@ -140,7 +140,7 @@
 
 ### 01.04 实现 canonicalization 与 request fingerprint
 
-- [ ] 实现 RFC 8785 JCS canonicalization、`request_fingerprint`、`canonical_filter_hash`。
+- [x] 实现 RFC 8785 JCS canonicalization、`request_fingerprint`、`canonical_filter_hash`。
   Spec refs: `22` 4.1-4.3
   产出:
   共享 canonicalization 库与哈希工具。
@@ -149,7 +149,7 @@
 
 ### 01.05 实现 correlation ID / structured log 基础设施
 
-- [ ] 建立 `request_id`、`causation_id`、`job_id`、`txn_id` 的关联模型和结构化日志输出。
+- [x] 建立 `request_id`、`causation_id`、`job_id`、`txn_id` 的关联模型和结构化日志输出。
   Spec refs: `41` 2-5
   产出:
   统一 logger、中间件、日志字段 schema。
@@ -158,7 +158,7 @@
 
 ### 01.06 建立基础测试框架
 
-- [ ] 建立 local / CI integration / staging / pre-release 的测试目录与测试运行入口。
+- [x] 建立 local / CI integration / staging / pre-release 的测试目录与测试运行入口。
   Spec refs: `43` 2, 5
   产出:
   测试目录、测试 bootstrap、环境选择逻辑。

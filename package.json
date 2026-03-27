@@ -1,5 +1,5 @@
 {
-  "name": "matrix-phase-00-governance",
+  "name": "matrix-runtime-foundations",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -9,7 +9,12 @@
   "scripts": {
     "dev": "node packages/spec-tools/src/cli.mjs dev",
     "lint": "node packages/spec-tools/src/cli.mjs governance-check",
-    "test": "node --test tests/local/**/*.test.mjs",
+    "test": "node packages/testing/src/cli.mjs local",
+    "test:local": "node packages/testing/src/cli.mjs local",
+    "test:integration": "node packages/testing/src/cli.mjs ci-integration",
+    "test:staging": "node packages/testing/src/cli.mjs staging",
+    "test:pre-release": "node packages/testing/src/cli.mjs pre-release",
+    "test:all": "node packages/testing/src/cli.mjs all",
     "build": "node packages/spec-tools/src/cli.mjs build",
     "governance:scan": "node packages/spec-tools/src/cli.mjs scan-ids",
     "governance:check": "node packages/spec-tools/src/cli.mjs governance-check",

@@ -1,0 +1,116 @@
+{
+  "name": "matrix-gateway-worker",
+  "main": "src/index.mjs",
+  "compatibility_date": "2026-03-26",
+  "vars": {
+    "ENVIRONMENT_NAME": "environment_name-placeholder",
+    "MATRIX_SERVER_NAME": "matrix_server_name-placeholder",
+    "RELEASE_PROFILE": "L1",
+    "WORKER_VERSION_ID": "dev",
+    "DEPLOYMENT_ID": "local-dev",
+    "LOG_LEVEL": "info",
+    "CPU_LIMIT_CLASS": "default",
+    "MATRIX_PUBLIC_BASE_URL": "matrix_public_base_url-placeholder",
+    "MANAGEMENT_API_BASE_URL": "management_api_base_url-placeholder",
+    "MATRIX_MEDIA_MAX_UPLOAD_BYTES": 104857600,
+    "FF_FEDERATION": "false",
+    "FF_MEDIA_REMOTE_FETCH": "false",
+    "FF_APPSERVICE_API": "false",
+    "FF_OTEL_EXPORT": "false",
+    "FF_OTEL_PERSIST": "true",
+    "FF_SSO_LOGIN": "false",
+    "FF_LOGIN_TOKEN": "false",
+    "FF_THREEPID_CHANGES": "false",
+    "FF_URL_PREVIEW": "false",
+    "FF_PUSH_GATEWAY": "false",
+    "FF_REQUEST_TOKEN_BOOTSTRAP": "false",
+    "FF_TURN_CREDENTIALS": "false"
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "USER_DO",
+        "class_name": "UserDO"
+      },
+      {
+        "name": "ROOM_DO",
+        "class_name": "RoomDO"
+      },
+      {
+        "name": "REMOTE_SERVER_DO",
+        "class_name": "RemoteServerDO"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "phase-01-runtime-skeleton",
+      "new_sqlite_classes": [
+        "UserDO",
+        "RoomDO",
+        "RemoteServerDO"
+      ]
+    }
+  ],
+  "services": [
+    {
+      "binding": "JOBS_WORKER",
+      "service": "matrix-jobs-worker"
+    }
+  ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "SEARCH_INDEX_QUEUE",
+        "queue": "matrix-search-index-job"
+      },
+      {
+        "binding": "MEDIA_THUMBNAIL_QUEUE",
+        "queue": "matrix-media-thumbnail-job"
+      },
+      {
+        "binding": "APPSERVICE_TXN_QUEUE",
+        "queue": "matrix-appservice-txn-job"
+      },
+      {
+        "binding": "REBUILD_SHARD_QUEUE",
+        "queue": "matrix-rebuild-shard-job"
+      },
+      {
+        "binding": "EXPORT_SHARD_QUEUE",
+        "queue": "matrix-export-shard-job"
+      },
+      {
+        "binding": "RESTORE_SHARD_QUEUE",
+        "queue": "matrix-restore-shard-job"
+      },
+      {
+        "binding": "REPAIR_SHARD_QUEUE",
+        "queue": "matrix-repair-shard-job"
+      }
+    ]
+  },
+  "d1_databases": [
+    {
+      "binding": "MATRIX_CONTROL_D1",
+      "database_name": "matrix-control-and-derived",
+      "database_id": "00000000-0000-0000-0000-000000000001"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "MATRIX_MEDIA_BUCKET",
+      "bucket_name": "matrix-media"
+    },
+    {
+      "binding": "MATRIX_ARCHIVE_BUCKET",
+      "bucket_name": "matrix-archive"
+    }
+  ],
+  "kv_namespaces": [
+    {
+      "binding": "MATRIX_EDGE_CACHE",
+      "id": "00000000000000000000000000000001"
+    }
+  ]
+}
