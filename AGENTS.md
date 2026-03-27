@@ -401,6 +401,56 @@ A development task is not done when code compiles. It is done when:
 * any newly discovered ambiguity is captured as `DEC-*` or `OQ-*`
 * any claimed profile impact is honest
 
+## CodeGraphContext For Large-Repo Navigation
+
+This repository is expected to grow large enough that file-by-file search alone will become inefficient. Use CodeGraphContext (`cgc`) as the preferred code-graph navigation tool when it is available.
+
+Purpose:
+
+* accelerate symbol lookup, caller/callee tracing, inheritance inspection, and impact analysis
+* reduce missed cross-file dependencies before edits or reviews
+* supplement `rg`, direct file reads, and Spec review, not replace them
+
+Authority rule:
+
+* `spec/framework/`, source files, tests, and control documents remain authoritative
+* `cgc` is a discovery and navigation aid only
+* never implement behavior from graph output alone; confirm against the actual files and required Spec stack
+* if `cgc` output conflicts with source or Spec, trust the source and Spec, then re-index
+
+Initialization and freshness:
+
+1. verify the tool is available with `command -v cgc`
+2. check whether the repository is already indexed with `cgc list`
+3. if `/root/Matrix` is missing from the graph, or the graph is stale, run `cgc index /root/Matrix`
+4. for long-lived sessions or large refactors, prefer `cgc watch /root/Matrix` so graph state updates incrementally as files change
+5. do not assume `watch` survives process restart; restart it explicitly when needed
+
+When agents should use `cgc`:
+
+* before changing shared functions, handlers, or storage code, trace callers and callees
+* before refactors, estimate blast radius across modules and symbols
+* when entering an unfamiliar code area, find the concrete owning files and related symbols quickly
+* during review/debug work, find indirect dependencies that plain text search may miss
+* when the repo becomes large enough that repeated recursive grep is noisy or incomplete
+
+Baseline commands:
+
+* `cgc list`
+* `cgc index /root/Matrix`
+* `cgc watch /root/Matrix`
+* `cgc find pattern "RoomDO"`
+* `cgc analyze callers some_function`
+* `cgc analyze calls some_function`
+* `cgc analyze tree SomeClass`
+
+Query discipline:
+
+* after using `cgc`, open the actual files before editing
+* still follow the required Spec read order before implementation
+* for code review, bug fixing, and large edits, use `cgc` early, then validate findings with `rg` and direct reads
+* do not treat custom graph queries as merge-ready evidence without file-level verification
+
 ## Practical Rules For A Spec-Heavy Repository
 
 Today this repository is still mostly documentation. Therefore:
