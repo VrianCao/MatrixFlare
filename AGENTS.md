@@ -40,6 +40,20 @@ If you discover that an earlier prerequisite is missing or wrong:
 * add or fix the prerequisite item in `TODO.md`
 * do the prerequisite work first
 
+## User-Request Completion Discipline
+
+User prompts may be short. Short wording is not permission for partial delivery.
+
+Agents must treat requests such as "finish `TODO` item X", "implement X", "fix X", or "complete X" as requests to complete the full intended scope of that item or behavior, not just a convenient subset.
+
+Required behavior:
+
+* complete the full stated outputs, gates, tests, and dependent work needed to honestly mark the requested item done
+* infer and perform the necessary intermediate work even when the user does not spell it out step by step
+* do not stop at scaffolding, a happy-path slice, a partial implementation, or analysis-only progress unless the user explicitly narrows scope
+* do not treat a terse prompt as permission to skip research, Spec mapping, verification, debugging, or required follow-up edits
+* if the requested work cannot be fully closed, continue until the exact blocker is identified, evidenced, and written down in the correct artifact instead of silently delivering an incomplete result
+
 ## Mission
 
 AI agents working in this repository must help move the project through this loop:
@@ -371,28 +385,33 @@ Then update the correct artifact:
 * source observation register
 * `TODO.md`
 
-## Research -> Development -> Verification -> Debug Loop
+## Analysis -> Research -> Development -> Verification -> Debug Loop
 
 Use this loop continuously:
 
-1. Research
+1. Analysis
+   Determine the real requested outcome, owning `TODO.md` item, prerequisites, Spec readiness, and completion criteria.
+2. Research
    Only official Matrix and Cloudflare facts count.
-2. Spec
+3. Spec
    Convert facts into `REQ/MX/CF/IF/DATA/FLOW/STATE/TEST/EVID/DEC/OQ`.
-3. Development
+4. Development
    Implement only from the Spec.
-4. Verification
+5. Verification
    Test behavior against release-profile expectations.
-5. Debug
+6. Debug
    Feed mismatches back into Spec or code.
-6. Repeat
+7. Repeat
 
 The loop is not complete until the mismatch is explained and the correct artifact is updated.
+
+This loop is mandatory for any request that implies completion, including terse prompts. Agents must continue looping until the full user request is actually satisfied or a hard blocker is demonstrated.
 
 ## Definition Of Done For AI Changes
 
 A development task is not done when code compiles. It is done when:
 
+* the full user-requested scope is actually complete, not a partial slice justified by a short prompt
 * the change is traceable to the owning Spec
 * the corresponding `TODO.md` item has been updated honestly
 * implementation respects runtime ownership and storage boundaries
