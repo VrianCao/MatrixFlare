@@ -1,0 +1,21 @@
+{
+  "name": "matrix-phase-00-governance",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "node packages/spec-tools/src/cli.mjs dev",
+    "lint": "node packages/spec-tools/src/cli.mjs governance-check",
+    "test": "node --test tests/local/**/*.test.mjs",
+    "build": "node packages/spec-tools/src/cli.mjs build",
+    "governance:scan": "node packages/spec-tools/src/cli.mjs scan-ids",
+    "governance:check": "node packages/spec-tools/src/cli.mjs governance-check",
+    "governance:requirement-register": "node packages/spec-tools/src/cli.mjs requirement-register",
+    "governance:traceability-matrix": "node packages/spec-tools/src/cli.mjs traceability-matrix",
+    "governance:expand-routes": "node packages/spec-tools/src/cli.mjs expand-routes",
+    "governance:evidence": "node packages/spec-tools/src/cli.mjs governance-evidence"
+  }
+}

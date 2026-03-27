@@ -53,6 +53,7 @@
 
 * 各 owning spec 内的 `REQ` 表可以保持精简表头，但上述 `REQ -> IF/DATA/FLOW/STATE/TEST/EVID` 边必须完整进入 [7.2](#72-机器可审计编码位置) 规定的 traceability matrix。
 * 若某条 `REQ` 的双向链接无法从现有 canonical 寄存器字段、显式注释或权威 sidecar 确定性生成，则不得仅存在于自然语言段落；必须先补充可机审字段后，才可宣称闭环。
+* 当前仓库用于补齐 `REQ` 闭环的权威 sidecar 路径固定为 `spec/framework/14-requirement-traceability-sidecar.json`；其中每个 `req_id` 至少必须显式列出 `runtime_owners`、`if_ids`、`data_ids`、`flow_state_ids`、`test_ids`、`evid_ids`。
 
 ### 3.1.1 `REQ` 的规范正文与机器权威
 
@@ -154,6 +155,7 @@
 规则：
 
 * 所有 `REQ-*` wildcard、`Source IDs` 中涉及 `REQ-*` 的展开、以及从 `REQ` 出发的反向追溯，都必须先解析 requirement register，而不是扫描仓库文本。
+* `spec/framework/14-requirement-traceability-sidecar.json` 是当前仓库 `REQ -> runtime/IF/DATA/FLOW/STATE/TEST/EVID` 边的唯一权威输入；`TEST-GOV-001` 必须校验其与 canonical IDs、requirement register 和 traceability matrix 一致。
 * `IF` / `DATA` 目录表可以不内联 `Source IDs` 或 `TEST IDs` 列，前提是上述 matrix 能从现有 canonical 寄存器字段中确定性推导出反向链接。
 * `TEST-GOV-001` 必须在每次 CI 运行时重新生成 requirement register 与 traceability matrix，并对断链、歧义链接、缺失反向边、重复 `REQ ID` 与未登记 ID 直接 fail。
 * 任何无法被上述 matrix 表达的链接需求，都不得仅存在于自然语言段落；必须先进入 canonical 寄存器字段或新增权威寄存器后，才可宣称闭环。

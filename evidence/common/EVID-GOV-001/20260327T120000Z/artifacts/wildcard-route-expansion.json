@@ -1,0 +1,2112 @@
+{
+  "generated_at": "2026-03-27T00:56:00.862Z",
+  "row_count": 158,
+  "rows": [
+    {
+      "if_id": "IF-AS-001",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 151,
+      "route_pattern": "/_matrix/app/*/ping",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/app/v1/ping"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/app/v1/ping"
+      ]
+    },
+    {
+      "if_id": "IF-AS-001",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 151,
+      "route_pattern": "/_matrix/app/*/rooms/{roomAlias}",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/app/v1/rooms/{roomAlias}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/app/v1/rooms/{roomAlias}"
+      ]
+    },
+    {
+      "if_id": "IF-AS-001",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 151,
+      "route_pattern": "/_matrix/app/*/thirdparty/location/{protocol}",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/app/unstable/thirdparty/location/{location}",
+        "/_matrix/app/v1/thirdparty/location/{location}",
+        "/_matrix/app/v1/thirdparty/location/{protocol}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/app/unstable/thirdparty/location/{location}",
+        "GET /_matrix/app/v1/thirdparty/location/{location}",
+        "GET /_matrix/app/v1/thirdparty/location/{protocol}"
+      ]
+    },
+    {
+      "if_id": "IF-AS-001",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 151,
+      "route_pattern": "/_matrix/app/*/thirdparty/protocol/{protocol}",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/app/unstable/thirdparty/protocol/{protocol}",
+        "/_matrix/app/v1/thirdparty/protocol/{protocol}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/app/unstable/thirdparty/protocol/{protocol}",
+        "GET /_matrix/app/v1/thirdparty/protocol/{protocol}"
+      ]
+    },
+    {
+      "if_id": "IF-AS-001",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 151,
+      "route_pattern": "/_matrix/app/*/thirdparty/user/{protocol}",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/app/unstable/thirdparty/user/{user}",
+        "/_matrix/app/v1/thirdparty/user/{protocol}",
+        "/_matrix/app/v1/thirdparty/user/{user}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/app/unstable/thirdparty/user/{user}",
+        "GET /_matrix/app/v1/thirdparty/user/{protocol}",
+        "GET /_matrix/app/v1/thirdparty/user/{user}"
+      ]
+    },
+    {
+      "if_id": "IF-AS-001",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 151,
+      "route_pattern": "/_matrix/app/*/users/{userId}",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/app/v1/users/{userId}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/app/v1/users/{userId}"
+      ]
+    },
+    {
+      "if_id": "IF-CS-002",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 46,
+      "route_pattern": "/_matrix/client/*/capabilities",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v3/capabilities"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/capabilities"
+      ]
+    },
+    {
+      "if_id": "IF-CS-003",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 49,
+      "route_pattern": "/_matrix/client/*/user/{userId}/filter",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/user/{userId}/filter"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/user/{userId}/filter"
+      ]
+    },
+    {
+      "if_id": "IF-CS-004",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 50,
+      "route_pattern": "/_matrix/client/*/user/{userId}/filter/{filterId}",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v3/user/{userId}/filter/{filterId}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/user/{userId}/filter/{filterId}"
+      ]
+    },
+    {
+      "if_id": "IF-CS-005",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 47,
+      "route_pattern": "/_matrix/client/*/login",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v3/login"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/login"
+      ]
+    },
+    {
+      "if_id": "IF-CS-006",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 56,
+      "route_pattern": "/_matrix/client/*/account/password",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/account/password"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/account/password"
+      ]
+    },
+    {
+      "if_id": "IF-CS-007",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 57,
+      "route_pattern": "/_matrix/client/*/account/password/email/requestToken",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/account/password/email/requestToken"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/account/password/email/requestToken"
+      ]
+    },
+    {
+      "if_id": "IF-CS-007",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 57,
+      "route_pattern": "/_matrix/client/*/account/password/msisdn/requestToken",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/account/password/msisdn/requestToken"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/account/password/msisdn/requestToken"
+      ]
+    },
+    {
+      "if_id": "IF-CS-007",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 57,
+      "route_pattern": "/_matrix/client/*/register/email/requestToken",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/register/email/requestToken"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/register/email/requestToken"
+      ]
+    },
+    {
+      "if_id": "IF-CS-007",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 57,
+      "route_pattern": "/_matrix/client/*/register/msisdn/requestToken",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/register/msisdn/requestToken"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/register/msisdn/requestToken"
+      ]
+    },
+    {
+      "if_id": "IF-CS-008",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 58,
+      "route_pattern": "/_matrix/client/*/account/deactivate",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/account/deactivate"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/account/deactivate"
+      ]
+    },
+    {
+      "if_id": "IF-CS-009",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 48,
+      "route_pattern": "/_matrix/client/*/register/available",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v3/register/available"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/register/available"
+      ]
+    },
+    {
+      "if_id": "IF-CS-010",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 59,
+      "route_pattern": "/_matrix/client/*/register",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/register"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/register"
+      ]
+    },
+    {
+      "if_id": "IF-CS-011",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 60,
+      "route_pattern": "/_matrix/client/*/login",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/login"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/login"
+      ]
+    },
+    {
+      "if_id": "IF-CS-012",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 61,
+      "route_pattern": "/_matrix/client/*/refresh",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/refresh"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/refresh"
+      ]
+    },
+    {
+      "if_id": "IF-CS-013",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 62,
+      "route_pattern": "/_matrix/client/*/logout",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/logout"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/logout"
+      ]
+    },
+    {
+      "if_id": "IF-CS-013",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 62,
+      "route_pattern": "/_matrix/client/*/logout/all",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/logout/all"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/logout/all"
+      ]
+    },
+    {
+      "if_id": "IF-CS-014",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 63,
+      "route_pattern": "/_matrix/client/*/account/whoami",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v3/account/whoami"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/account/whoami"
+      ]
+    },
+    {
+      "if_id": "IF-CS-015",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 64,
+      "route_pattern": "/_matrix/client/*/rooms/{roomId}/read_markers",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/rooms/{roomId}/read_markers"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/rooms/{roomId}/read_markers"
+      ]
+    },
+    {
+      "if_id": "IF-CS-015",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 64,
+      "route_pattern": "/_matrix/client/*/user/{userId}/account_data/{type}",
+      "methods": "GET,PUT",
+      "expanded_paths": [
+        "/_matrix/client/v3/user/{userId}/account_data/{type}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/user/{userId}/account_data/{type}",
+        "PUT /_matrix/client/v3/user/{userId}/account_data/{type}"
+      ]
+    },
+    {
+      "if_id": "IF-CS-015",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 64,
+      "route_pattern": "/_matrix/client/*/user/{userId}/rooms/{roomId}/account_data/{type}",
+      "methods": "GET,PUT",
+      "expanded_paths": [
+        "/_matrix/client/v3/user/{userId}/rooms/{roomId}/account_data/{type}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/user/{userId}/rooms/{roomId}/account_data/{type}",
+        "PUT /_matrix/client/v3/user/{userId}/rooms/{roomId}/account_data/{type}"
+      ]
+    },
+    {
+      "if_id": "IF-CS-015",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 64,
+      "route_pattern": "/_matrix/client/*/user/{userId}/rooms/{roomId}/tags",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v3/user/{userId}/rooms/{roomId}/tags"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/user/{userId}/rooms/{roomId}/tags"
+      ]
+    },
+    {
+      "if_id": "IF-CS-015",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 64,
+      "route_pattern": "/_matrix/client/*/user/{userId}/rooms/{roomId}/tags/{tag}",
+      "methods": "PUT,DELETE",
+      "expanded_paths": [
+        "/_matrix/client/v3/user/{userId}/rooms/{roomId}/tags/{tag}"
+      ],
+      "expanded_routes": [
+        "PUT /_matrix/client/v3/user/{userId}/rooms/{roomId}/tags/{tag}",
+        "DELETE /_matrix/client/v3/user/{userId}/rooms/{roomId}/tags/{tag}"
+      ]
+    },
+    {
+      "if_id": "IF-CS-016",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 65,
+      "route_pattern": "/_matrix/client/*/presence/{userId}/status",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v3/presence/{userId}/status"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/presence/{userId}/status"
+      ]
+    },
+    {
+      "if_id": "IF-CS-016",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 65,
+      "route_pattern": "/_matrix/client/*/presence/{userId}/status",
+      "methods": "PUT",
+      "expanded_paths": [
+        "/_matrix/client/v3/presence/{userId}/status"
+      ],
+      "expanded_routes": [
+        "PUT /_matrix/client/v3/presence/{userId}/status"
+      ]
+    },
+    {
+      "if_id": "IF-CS-017",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 66,
+      "route_pattern": "/_matrix/client/*/profile/{userId}",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v3/profile/{userId}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/profile/{userId}"
+      ]
+    },
+    {
+      "if_id": "IF-CS-017",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 66,
+      "route_pattern": "/_matrix/client/*/profile/{userId}/{keyName}",
+      "methods": "GET,PUT,DELETE",
+      "expanded_paths": [
+        "/_matrix/client/v3/profile/{userId}/{keyName}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/profile/{userId}/{keyName}",
+        "PUT /_matrix/client/v3/profile/{userId}/{keyName}",
+        "DELETE /_matrix/client/v3/profile/{userId}/{keyName}"
+      ]
+    },
+    {
+      "if_id": "IF-CS-018",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 67,
+      "route_pattern": "/_matrix/client/*/pushrules/",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v3/pushrules"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/pushrules"
+      ]
+    },
+    {
+      "if_id": "IF-CS-018",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 67,
+      "route_pattern": "/_matrix/client/*/pushrules/global/",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v3/pushrules/global"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/pushrules/global"
+      ]
+    },
+    {
+      "if_id": "IF-CS-018",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 67,
+      "route_pattern": "/_matrix/client/*/pushrules/global/{kind}/{ruleId}",
+      "methods": "GET,PUT,DELETE",
+      "expanded_paths": [
+        "/_matrix/client/v3/pushrules/global/{kind}/{ruleId}",
+        "/_matrix/client/v3/pushrules/global/content/SSByZWFsbHkgbGlrZSBjYWtl",
+        "/_matrix/client/v3/pushrules/global/content/U3BvbmdlIGNha2UgaXMgYmVzdA",
+        "/_matrix/client/v3/pushrules/global/override/U2VlIHlvdSBpbiBUaGUgRHVrZQ"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/pushrules/global/{kind}/{ruleId}",
+        "GET /_matrix/client/v3/pushrules/global/content/SSByZWFsbHkgbGlrZSBjYWtl",
+        "GET /_matrix/client/v3/pushrules/global/content/U3BvbmdlIGNha2UgaXMgYmVzdA",
+        "GET /_matrix/client/v3/pushrules/global/override/U2VlIHlvdSBpbiBUaGUgRHVrZQ",
+        "PUT /_matrix/client/v3/pushrules/global/{kind}/{ruleId}",
+        "PUT /_matrix/client/v3/pushrules/global/content/SSByZWFsbHkgbGlrZSBjYWtl",
+        "PUT /_matrix/client/v3/pushrules/global/content/U3BvbmdlIGNha2UgaXMgYmVzdA",
+        "PUT /_matrix/client/v3/pushrules/global/override/U2VlIHlvdSBpbiBUaGUgRHVrZQ",
+        "DELETE /_matrix/client/v3/pushrules/global/{kind}/{ruleId}",
+        "DELETE /_matrix/client/v3/pushrules/global/content/SSByZWFsbHkgbGlrZSBjYWtl",
+        "DELETE /_matrix/client/v3/pushrules/global/content/U3BvbmdlIGNha2UgaXMgYmVzdA",
+        "DELETE /_matrix/client/v3/pushrules/global/override/U2VlIHlvdSBpbiBUaGUgRHVrZQ"
+      ]
+    },
+    {
+      "if_id": "IF-CS-018",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 67,
+      "route_pattern": "/_matrix/client/*/pushrules/global/{kind}/{ruleId}/actions",
+      "methods": "GET,PUT",
+      "expanded_paths": [
+        "/_matrix/client/v3/pushrules/global/{kind}/{ruleId}/actions"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/pushrules/global/{kind}/{ruleId}/actions",
+        "PUT /_matrix/client/v3/pushrules/global/{kind}/{ruleId}/actions"
+      ]
+    },
+    {
+      "if_id": "IF-CS-018",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 67,
+      "route_pattern": "/_matrix/client/*/pushrules/global/{kind}/{ruleId}/enabled",
+      "methods": "GET,PUT",
+      "expanded_paths": [
+        "/_matrix/client/v3/pushrules/global/{kind}/{ruleId}/enabled"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/pushrules/global/{kind}/{ruleId}/enabled",
+        "PUT /_matrix/client/v3/pushrules/global/{kind}/{ruleId}/enabled"
+      ]
+    },
+    {
+      "if_id": "IF-CS-019",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 68,
+      "route_pattern": "/_matrix/client/*/rooms/{roomId}/receipt/{receiptType}/{eventId}",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/rooms/{roomId}/receipt/{receiptType}/{eventId}"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/rooms/{roomId}/receipt/{receiptType}/{eventId}"
+      ]
+    },
+    {
+      "if_id": "IF-CS-019",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 68,
+      "route_pattern": "/_matrix/client/*/rooms/{roomId}/typing/{userId}",
+      "methods": "PUT",
+      "expanded_paths": [
+        "/_matrix/client/v3/rooms/{roomId}/typing/{userId}"
+      ],
+      "expanded_routes": [
+        "PUT /_matrix/client/v3/rooms/{roomId}/typing/{userId}"
+      ]
+    },
+    {
+      "if_id": "IF-CS-020",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 69,
+      "route_pattern": "/_matrix/client/*/sync",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v3/sync"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/sync"
+      ]
+    },
+    {
+      "if_id": "IF-CS-030",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 75,
+      "route_pattern": "/_matrix/client/*/createRoom",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/createRoom"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/createRoom"
+      ]
+    },
+    {
+      "if_id": "IF-CS-031",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 76,
+      "route_pattern": "/_matrix/client/*/join/{roomIdOrAlias}",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/join/{roomIdOrAlias}"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/join/{roomIdOrAlias}"
+      ]
+    },
+    {
+      "if_id": "IF-CS-031",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 76,
+      "route_pattern": "/_matrix/client/*/knock/{roomIdOrAlias}",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/knock/{roomIdOrAlias}"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/knock/{roomIdOrAlias}"
+      ]
+    },
+    {
+      "if_id": "IF-CS-031",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 76,
+      "route_pattern": "/_matrix/client/*/rooms/{roomId}/ban",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/rooms/{roomId}/ban"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/rooms/{roomId}/ban"
+      ]
+    },
+    {
+      "if_id": "IF-CS-031",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 76,
+      "route_pattern": "/_matrix/client/*/rooms/{roomId}/forget",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/rooms/{roomId}/forget"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/rooms/{roomId}/forget"
+      ]
+    },
+    {
+      "if_id": "IF-CS-031",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 76,
+      "route_pattern": "/_matrix/client/*/rooms/{roomId}/invite",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/rooms/{roomId}/invite"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/rooms/{roomId}/invite"
+      ]
+    },
+    {
+      "if_id": "IF-CS-031",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 76,
+      "route_pattern": "/_matrix/client/*/rooms/{roomId}/join",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/rooms/{roomId}/join"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/rooms/{roomId}/join"
+      ]
+    },
+    {
+      "if_id": "IF-CS-031",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 76,
+      "route_pattern": "/_matrix/client/*/rooms/{roomId}/kick",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/rooms/{roomId}/kick"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/rooms/{roomId}/kick"
+      ]
+    },
+    {
+      "if_id": "IF-CS-031",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 76,
+      "route_pattern": "/_matrix/client/*/rooms/{roomId}/leave",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/rooms/{roomId}/leave"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/rooms/{roomId}/leave"
+      ]
+    },
+    {
+      "if_id": "IF-CS-031",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 76,
+      "route_pattern": "/_matrix/client/*/rooms/{roomId}/unban",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/rooms/{roomId}/unban"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/rooms/{roomId}/unban"
+      ]
+    },
+    {
+      "if_id": "IF-CS-032",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 77,
+      "route_pattern": "/_matrix/client/*/rooms/{roomId}/send/{eventType}/{txnId}",
+      "methods": "PUT",
+      "expanded_paths": [
+        "/_matrix/client/v3/rooms/{roomId}/send/{eventType}/{txnId}"
+      ],
+      "expanded_routes": [
+        "PUT /_matrix/client/v3/rooms/{roomId}/send/{eventType}/{txnId}"
+      ]
+    },
+    {
+      "if_id": "IF-CS-033",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 78,
+      "route_pattern": "/_matrix/client/*/rooms/{roomId}/state/{eventType}/{stateKey}",
+      "methods": "PUT",
+      "expanded_paths": [
+        "/_matrix/client/v3/rooms/{roomId}/state/{eventType}/{stateKey}"
+      ],
+      "expanded_routes": [
+        "PUT /_matrix/client/v3/rooms/{roomId}/state/{eventType}/{stateKey}"
+      ]
+    },
+    {
+      "if_id": "IF-CS-034",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 79,
+      "route_pattern": "/_matrix/client/*/rooms/{roomId}/context/{eventId}",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v3/rooms/{roomId}/context/{eventId}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/rooms/{roomId}/context/{eventId}"
+      ]
+    },
+    {
+      "if_id": "IF-CS-034",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 79,
+      "route_pattern": "/_matrix/client/*/rooms/{roomId}/event/{eventId}",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v3/rooms/{roomId}/event/{eventId}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/rooms/{roomId}/event/{eventId}"
+      ]
+    },
+    {
+      "if_id": "IF-CS-034",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 79,
+      "route_pattern": "/_matrix/client/*/rooms/{roomId}/joined_members",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v3/rooms/{roomId}/joined_members"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/rooms/{roomId}/joined_members"
+      ]
+    },
+    {
+      "if_id": "IF-CS-034",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 79,
+      "route_pattern": "/_matrix/client/*/rooms/{roomId}/members",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v3/rooms/{roomId}/members"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/rooms/{roomId}/members"
+      ]
+    },
+    {
+      "if_id": "IF-CS-034",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 79,
+      "route_pattern": "/_matrix/client/*/rooms/{roomId}/messages",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v3/rooms/{roomId}/messages"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/rooms/{roomId}/messages"
+      ]
+    },
+    {
+      "if_id": "IF-CS-034",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 79,
+      "route_pattern": "/_matrix/client/*/rooms/{roomId}/relations/{eventId}",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v1/rooms/{roomId}/relations/{eventId}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v1/rooms/{roomId}/relations/{eventId}"
+      ]
+    },
+    {
+      "if_id": "IF-CS-034",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 79,
+      "route_pattern": "/_matrix/client/*/rooms/{roomId}/relations/{eventId}/{relType}",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v1/rooms/{roomId}/relations/{eventId}/{relType}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v1/rooms/{roomId}/relations/{eventId}/{relType}"
+      ]
+    },
+    {
+      "if_id": "IF-CS-034",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 79,
+      "route_pattern": "/_matrix/client/*/rooms/{roomId}/relations/{eventId}/{relType}/{eventType}",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v1/rooms/{roomId}/relations/{eventId}/{relType}/{eventType}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v1/rooms/{roomId}/relations/{eventId}/{relType}/{eventType}"
+      ]
+    },
+    {
+      "if_id": "IF-CS-034",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 79,
+      "route_pattern": "/_matrix/client/*/rooms/{roomId}/state",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v3/rooms/{roomId}/state"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/rooms/{roomId}/state"
+      ]
+    },
+    {
+      "if_id": "IF-CS-034",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 79,
+      "route_pattern": "/_matrix/client/*/rooms/{roomId}/state/{eventType}/{stateKey}",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v3/rooms/{roomId}/state/{eventType}/{stateKey}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/rooms/{roomId}/state/{eventType}/{stateKey}"
+      ]
+    },
+    {
+      "if_id": "IF-CS-034",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 79,
+      "route_pattern": "/_matrix/client/*/rooms/{roomId}/threads",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v1/rooms/{roomId}/threads"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v1/rooms/{roomId}/threads"
+      ]
+    },
+    {
+      "if_id": "IF-CS-034",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 79,
+      "route_pattern": "/_matrix/client/*/rooms/{roomId}/timestamp_to_event",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v1/rooms/{roomId}/timestamp_to_event"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v1/rooms/{roomId}/timestamp_to_event"
+      ]
+    },
+    {
+      "if_id": "IF-CS-035",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 80,
+      "route_pattern": "/_matrix/client/*/rooms/{roomId}/redact/{eventId}/{txnId}",
+      "methods": "PUT",
+      "expanded_paths": [
+        "/_matrix/client/v3/rooms/{roomId}/redact/{eventId}/{txnId}"
+      ],
+      "expanded_routes": [
+        "PUT /_matrix/client/v3/rooms/{roomId}/redact/{eventId}/{txnId}"
+      ]
+    },
+    {
+      "if_id": "IF-CS-040",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 86,
+      "route_pattern": "/_matrix/client/*/delete_devices",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/delete_devices"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/delete_devices"
+      ]
+    },
+    {
+      "if_id": "IF-CS-040",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 86,
+      "route_pattern": "/_matrix/client/*/devices",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v3/devices"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/devices"
+      ]
+    },
+    {
+      "if_id": "IF-CS-040",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 86,
+      "route_pattern": "/_matrix/client/*/devices/{deviceId}",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v3/devices/{deviceId}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/devices/{deviceId}"
+      ]
+    },
+    {
+      "if_id": "IF-CS-040",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 86,
+      "route_pattern": "/_matrix/client/*/devices/{deviceId}",
+      "methods": "PUT",
+      "expanded_paths": [
+        "/_matrix/client/v3/devices/{deviceId}"
+      ],
+      "expanded_routes": [
+        "PUT /_matrix/client/v3/devices/{deviceId}"
+      ]
+    },
+    {
+      "if_id": "IF-CS-040",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 86,
+      "route_pattern": "/_matrix/client/*/devices/{deviceId}",
+      "methods": "DELETE",
+      "expanded_paths": [
+        "/_matrix/client/v3/devices/{deviceId}"
+      ],
+      "expanded_routes": [
+        "DELETE /_matrix/client/v3/devices/{deviceId}"
+      ]
+    },
+    {
+      "if_id": "IF-CS-041",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 87,
+      "route_pattern": "/_matrix/client/*/sendToDevice/{eventType}/{txnId}",
+      "methods": "PUT",
+      "expanded_paths": [
+        "/_matrix/client/v3/sendToDevice/{eventType}/{txnId}"
+      ],
+      "expanded_routes": [
+        "PUT /_matrix/client/v3/sendToDevice/{eventType}/{txnId}"
+      ]
+    },
+    {
+      "if_id": "IF-CS-042",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 88,
+      "route_pattern": "/_matrix/client/*/keys/upload",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/keys/upload"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/keys/upload"
+      ]
+    },
+    {
+      "if_id": "IF-CS-043",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 89,
+      "route_pattern": "/_matrix/client/*/keys/query",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/keys/query"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/keys/query"
+      ]
+    },
+    {
+      "if_id": "IF-CS-044",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 90,
+      "route_pattern": "/_matrix/client/*/keys/claim",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/keys/claim"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/keys/claim"
+      ]
+    },
+    {
+      "if_id": "IF-CS-045",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 91,
+      "route_pattern": "/_matrix/client/*/room_keys/keys",
+      "methods": "GET,PUT",
+      "expanded_paths": [
+        "/_matrix/client/v3/room_keys/keys"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/room_keys/keys",
+        "PUT /_matrix/client/v3/room_keys/keys"
+      ]
+    },
+    {
+      "if_id": "IF-CS-045",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 91,
+      "route_pattern": "/_matrix/client/*/room_keys/keys/{roomId}",
+      "methods": "GET,PUT,DELETE",
+      "expanded_paths": [
+        "/_matrix/client/v3/room_keys/keys/{roomId}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/room_keys/keys/{roomId}",
+        "PUT /_matrix/client/v3/room_keys/keys/{roomId}",
+        "DELETE /_matrix/client/v3/room_keys/keys/{roomId}"
+      ]
+    },
+    {
+      "if_id": "IF-CS-045",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 91,
+      "route_pattern": "/_matrix/client/*/room_keys/keys/{roomId}/{sessionId}",
+      "methods": "GET,PUT,DELETE",
+      "expanded_paths": [
+        "/_matrix/client/v3/room_keys/keys/{roomId}/{sessionId}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/room_keys/keys/{roomId}/{sessionId}",
+        "PUT /_matrix/client/v3/room_keys/keys/{roomId}/{sessionId}",
+        "DELETE /_matrix/client/v3/room_keys/keys/{roomId}/{sessionId}"
+      ]
+    },
+    {
+      "if_id": "IF-CS-045",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 91,
+      "route_pattern": "/_matrix/client/*/room_keys/version",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/room_keys/version"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/room_keys/version"
+      ]
+    },
+    {
+      "if_id": "IF-CS-045",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 91,
+      "route_pattern": "/_matrix/client/*/room_keys/version",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v3/room_keys/version"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/room_keys/version"
+      ]
+    },
+    {
+      "if_id": "IF-CS-045",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 91,
+      "route_pattern": "/_matrix/client/*/room_keys/version/{version}",
+      "methods": "GET,PUT,DELETE",
+      "expanded_paths": [
+        "/_matrix/client/v3/room_keys/version/{version}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/room_keys/version/{version}",
+        "PUT /_matrix/client/v3/room_keys/version/{version}",
+        "DELETE /_matrix/client/v3/room_keys/version/{version}"
+      ]
+    },
+    {
+      "if_id": "IF-CS-050",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 97,
+      "route_pattern": "/_matrix/media/*/config",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/media/v3/config"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/media/v3/config"
+      ]
+    },
+    {
+      "if_id": "IF-CS-050",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 97,
+      "route_pattern": "/_matrix/media/*/create",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/media/v1/create"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/media/v1/create"
+      ]
+    },
+    {
+      "if_id": "IF-CS-050",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 97,
+      "route_pattern": "/_matrix/media/*/upload",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/media/v3/upload"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/media/v3/upload"
+      ]
+    },
+    {
+      "if_id": "IF-CS-050",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 97,
+      "route_pattern": "/_matrix/media/*/upload/{serverName}/{mediaId}",
+      "methods": "PUT",
+      "expanded_paths": [
+        "/_matrix/media/v3/upload/{serverName}/{mediaId}"
+      ],
+      "expanded_routes": [
+        "PUT /_matrix/media/v3/upload/{serverName}/{mediaId}"
+      ]
+    },
+    {
+      "if_id": "IF-CS-051",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 98,
+      "route_pattern": "/_matrix/media/*/download/{serverName}/{mediaId}",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/media/v3/download/{serverName}/{mediaId}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/media/v3/download/{serverName}/{mediaId}"
+      ]
+    },
+    {
+      "if_id": "IF-CS-051",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 98,
+      "route_pattern": "/_matrix/media/*/download/{serverName}/{mediaId}/{fileName}",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/media/v3/download/{serverName}/{mediaId}/{fileName}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/media/v3/download/{serverName}/{mediaId}/{fileName}"
+      ]
+    },
+    {
+      "if_id": "IF-CS-051",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 98,
+      "route_pattern": "/_matrix/media/*/thumbnail/{serverName}/{mediaId}",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/media/v3/thumbnail/{serverName}/{mediaId}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/media/v3/thumbnail/{serverName}/{mediaId}"
+      ]
+    },
+    {
+      "if_id": "IF-CS-052",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 99,
+      "route_pattern": "/_matrix/client/*/publicRooms",
+      "methods": "GET,POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/publicRooms"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/publicRooms",
+        "POST /_matrix/client/v3/publicRooms"
+      ]
+    },
+    {
+      "if_id": "IF-CS-052",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 99,
+      "route_pattern": "/_matrix/client/*/rooms/{roomId}/hierarchy",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v1/rooms/{roomId}/hierarchy"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v1/rooms/{roomId}/hierarchy"
+      ]
+    },
+    {
+      "if_id": "IF-CS-052",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 99,
+      "route_pattern": "/_matrix/client/*/search",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/search"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/search"
+      ]
+    },
+    {
+      "if_id": "IF-CS-052",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 99,
+      "route_pattern": "/_matrix/client/*/user_directory/search",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/user_directory/search"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/user_directory/search"
+      ]
+    },
+    {
+      "if_id": "IF-CS-053",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 112,
+      "route_pattern": "/_matrix/client/*/directory/list/room/{roomId}",
+      "methods": "GET,PUT",
+      "expanded_paths": [
+        "/_matrix/client/v3/directory/list/room/{roomId}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/directory/list/room/{roomId}",
+        "PUT /_matrix/client/v3/directory/list/room/{roomId}"
+      ]
+    },
+    {
+      "if_id": "IF-CS-053",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 112,
+      "route_pattern": "/_matrix/client/*/directory/room/{roomAlias}",
+      "methods": "GET,PUT,DELETE",
+      "expanded_paths": [
+        "/_matrix/client/v3/directory/room/{roomAlias}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/directory/room/{roomAlias}",
+        "PUT /_matrix/client/v3/directory/room/{roomAlias}",
+        "DELETE /_matrix/client/v3/directory/room/{roomAlias}"
+      ]
+    },
+    {
+      "if_id": "IF-CS-053",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 112,
+      "route_pattern": "/_matrix/client/*/joined_rooms",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v3/joined_rooms"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/joined_rooms"
+      ]
+    },
+    {
+      "if_id": "IF-CS-053",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 112,
+      "route_pattern": "/_matrix/client/*/room_summary/{roomIdOrAlias}",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v1/room_summary/{roomIdOrAlias}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v1/room_summary/{roomIdOrAlias}"
+      ]
+    },
+    {
+      "if_id": "IF-CS-053",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 112,
+      "route_pattern": "/_matrix/client/*/rooms/{roomId}/aliases",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v3/rooms/{roomId}/aliases"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/rooms/{roomId}/aliases"
+      ]
+    },
+    {
+      "if_id": "IF-CS-054",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 113,
+      "route_pattern": "/_matrix/client/*/notifications",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v3/notifications"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/notifications"
+      ]
+    },
+    {
+      "if_id": "IF-CS-055",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 114,
+      "route_pattern": "/_matrix/client/*/pushers",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v3/pushers"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/pushers"
+      ]
+    },
+    {
+      "if_id": "IF-CS-055",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 114,
+      "route_pattern": "/_matrix/client/*/pushers/set",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/pushers/set"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/pushers/set"
+      ]
+    },
+    {
+      "if_id": "IF-CS-056",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 115,
+      "route_pattern": "/_matrix/client/*/rooms/{roomId}/upgrade",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/rooms/{roomId}/upgrade"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/rooms/{roomId}/upgrade"
+      ]
+    },
+    {
+      "if_id": "IF-CS-057",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 116,
+      "route_pattern": "/_matrix/client/*/rooms/{roomId}/report",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/rooms/{roomId}/report"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/rooms/{roomId}/report"
+      ]
+    },
+    {
+      "if_id": "IF-CS-057",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 116,
+      "route_pattern": "/_matrix/client/*/rooms/{roomId}/report/{eventId}",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/rooms/{roomId}/report/{eventId}"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/rooms/{roomId}/report/{eventId}"
+      ]
+    },
+    {
+      "if_id": "IF-CS-057",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 116,
+      "route_pattern": "/_matrix/client/*/users/{userId}/report",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/users/{userId}/report"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/users/{userId}/report"
+      ]
+    },
+    {
+      "if_id": "IF-CS-058",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 117,
+      "route_pattern": "/_matrix/client/*/media/preview_url",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v1/media/preview_url"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v1/media/preview_url"
+      ]
+    },
+    {
+      "if_id": "IF-CS-058",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 117,
+      "route_pattern": "/_matrix/media/*/preview_url",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/media/v3/preview_url"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/media/v3/preview_url"
+      ]
+    },
+    {
+      "if_id": "IF-CS-059",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 118,
+      "route_pattern": "/_matrix/client/*/login/sso/redirect",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v3/login/sso/redirect"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/login/sso/redirect"
+      ]
+    },
+    {
+      "if_id": "IF-CS-059",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 118,
+      "route_pattern": "/_matrix/client/*/login/sso/redirect/{idpId}",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v3/login/sso/redirect/{idpId}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/login/sso/redirect/{idpId}"
+      ]
+    },
+    {
+      "if_id": "IF-CS-060",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 119,
+      "route_pattern": "/_matrix/client/*/account/3pid",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v3/account/3pid"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/account/3pid"
+      ]
+    },
+    {
+      "if_id": "IF-CS-060",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 119,
+      "route_pattern": "/_matrix/client/*/account/3pid",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/account/3pid"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/account/3pid"
+      ]
+    },
+    {
+      "if_id": "IF-CS-060",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 119,
+      "route_pattern": "/_matrix/client/*/account/3pid/add",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/account/3pid/add"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/account/3pid/add"
+      ]
+    },
+    {
+      "if_id": "IF-CS-060",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 119,
+      "route_pattern": "/_matrix/client/*/account/3pid/bind",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/account/3pid/bind"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/account/3pid/bind"
+      ]
+    },
+    {
+      "if_id": "IF-CS-060",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 119,
+      "route_pattern": "/_matrix/client/*/account/3pid/delete",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/account/3pid/delete"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/account/3pid/delete"
+      ]
+    },
+    {
+      "if_id": "IF-CS-060",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 119,
+      "route_pattern": "/_matrix/client/*/account/3pid/email/requestToken",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/account/3pid/email/requestToken"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/account/3pid/email/requestToken"
+      ]
+    },
+    {
+      "if_id": "IF-CS-060",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 119,
+      "route_pattern": "/_matrix/client/*/account/3pid/msisdn/requestToken",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/account/3pid/msisdn/requestToken"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/account/3pid/msisdn/requestToken"
+      ]
+    },
+    {
+      "if_id": "IF-CS-060",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 119,
+      "route_pattern": "/_matrix/client/*/account/3pid/unbind",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/account/3pid/unbind"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/account/3pid/unbind"
+      ]
+    },
+    {
+      "if_id": "IF-CS-061",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 120,
+      "route_pattern": "/_matrix/client/*/admin/whois/{userId}",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v3/admin/whois/{userId}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/admin/whois/{userId}"
+      ]
+    },
+    {
+      "if_id": "IF-CS-061",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 120,
+      "route_pattern": "/_matrix/client/*/thirdparty/location",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v3/thirdparty/location"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/thirdparty/location"
+      ]
+    },
+    {
+      "if_id": "IF-CS-061",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 120,
+      "route_pattern": "/_matrix/client/*/thirdparty/location/{protocol}",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v3/thirdparty/location/{protocol}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/thirdparty/location/{protocol}"
+      ]
+    },
+    {
+      "if_id": "IF-CS-061",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 120,
+      "route_pattern": "/_matrix/client/*/thirdparty/protocol/{protocol}",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v3/thirdparty/protocol/{protocol}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/thirdparty/protocol/{protocol}"
+      ]
+    },
+    {
+      "if_id": "IF-CS-061",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 120,
+      "route_pattern": "/_matrix/client/*/thirdparty/protocols",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v3/thirdparty/protocols"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/thirdparty/protocols"
+      ]
+    },
+    {
+      "if_id": "IF-CS-061",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 120,
+      "route_pattern": "/_matrix/client/*/thirdparty/user",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v3/thirdparty/user"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/thirdparty/user"
+      ]
+    },
+    {
+      "if_id": "IF-CS-061",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 120,
+      "route_pattern": "/_matrix/client/*/thirdparty/user/{protocol}",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v3/thirdparty/user/{protocol}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/thirdparty/user/{protocol}"
+      ]
+    },
+    {
+      "if_id": "IF-CS-062",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 121,
+      "route_pattern": "/_matrix/client/*/user/{userId}/openid/request_token",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/client/v3/user/{userId}/openid/request_token"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/client/v3/user/{userId}/openid/request_token"
+      ]
+    },
+    {
+      "if_id": "IF-CS-063",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 122,
+      "route_pattern": "/_matrix/client/*/voip/turnServer",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v3/voip/turnServer"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/voip/turnServer"
+      ]
+    },
+    {
+      "if_id": "IF-CS-064",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 123,
+      "route_pattern": "/_matrix/client/*/events",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v3/events"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/events"
+      ]
+    },
+    {
+      "if_id": "IF-CS-064",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 123,
+      "route_pattern": "/_matrix/client/*/events/{eventId}",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v3/events/{eventId}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/events/{eventId}"
+      ]
+    },
+    {
+      "if_id": "IF-CS-064",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 123,
+      "route_pattern": "/_matrix/client/*/initialSync",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v3/initialSync"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/initialSync"
+      ]
+    },
+    {
+      "if_id": "IF-CS-064",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 123,
+      "route_pattern": "/_matrix/client/*/rooms/{roomId}/initialSync",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/client/v3/rooms/{roomId}/initialSync"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/client/v3/rooms/{roomId}/initialSync"
+      ]
+    },
+    {
+      "if_id": "IF-FED-001",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 141,
+      "route_pattern": "/_matrix/federation/*/version",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/federation/v1/version"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/federation/v1/version"
+      ]
+    },
+    {
+      "if_id": "IF-FED-001",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 141,
+      "route_pattern": "/_matrix/key/*/query",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/key/v2/query"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/key/v2/query"
+      ]
+    },
+    {
+      "if_id": "IF-FED-001",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 141,
+      "route_pattern": "/_matrix/key/*/server",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/key/v2/server"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/key/v2/server"
+      ]
+    },
+    {
+      "if_id": "IF-FED-002",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 142,
+      "route_pattern": "/_matrix/federation/*/send/{txnId}",
+      "methods": "PUT",
+      "expanded_paths": [
+        "/_matrix/federation/v1/send/{txnId}"
+      ],
+      "expanded_routes": [
+        "PUT /_matrix/federation/v1/send/{txnId}"
+      ]
+    },
+    {
+      "if_id": "IF-FED-003",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 143,
+      "route_pattern": "/_matrix/federation/*/invite/{roomId}/{eventId}",
+      "methods": "PUT",
+      "expanded_paths": [
+        "/_matrix/federation/v1/invite/{roomId}/{eventId}",
+        "/_matrix/federation/v2/invite/{roomId}/{eventId}"
+      ],
+      "expanded_routes": [
+        "PUT /_matrix/federation/v1/invite/{roomId}/{eventId}",
+        "PUT /_matrix/federation/v2/invite/{roomId}/{eventId}"
+      ]
+    },
+    {
+      "if_id": "IF-FED-003",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 143,
+      "route_pattern": "/_matrix/federation/*/make_join/{roomId}/{userId}",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/federation/v1/make_join/{roomId}/{userId}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/federation/v1/make_join/{roomId}/{userId}"
+      ]
+    },
+    {
+      "if_id": "IF-FED-003",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 143,
+      "route_pattern": "/_matrix/federation/*/make_knock/{roomId}/{userId}",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/federation/v1/make_knock/{roomId}/{userId}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/federation/v1/make_knock/{roomId}/{userId}"
+      ]
+    },
+    {
+      "if_id": "IF-FED-003",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 143,
+      "route_pattern": "/_matrix/federation/*/make_leave/{roomId}/{userId}",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/federation/v1/make_leave/{roomId}/{userId}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/federation/v1/make_leave/{roomId}/{userId}"
+      ]
+    },
+    {
+      "if_id": "IF-FED-003",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 143,
+      "route_pattern": "/_matrix/federation/*/send_join/{roomId}/{eventId}",
+      "methods": "PUT",
+      "expanded_paths": [
+        "/_matrix/federation/v1/send_join/{roomId}/{eventId}",
+        "/_matrix/federation/v2/send_join/{roomId}/{eventId}"
+      ],
+      "expanded_routes": [
+        "PUT /_matrix/federation/v1/send_join/{roomId}/{eventId}",
+        "PUT /_matrix/federation/v2/send_join/{roomId}/{eventId}"
+      ]
+    },
+    {
+      "if_id": "IF-FED-003",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 143,
+      "route_pattern": "/_matrix/federation/*/send_knock/{roomId}/{eventId}",
+      "methods": "PUT",
+      "expanded_paths": [
+        "/_matrix/federation/v1/send_knock/{roomId}/{eventId}"
+      ],
+      "expanded_routes": [
+        "PUT /_matrix/federation/v1/send_knock/{roomId}/{eventId}"
+      ]
+    },
+    {
+      "if_id": "IF-FED-003",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 143,
+      "route_pattern": "/_matrix/federation/*/send_leave/{roomId}/{eventId}",
+      "methods": "PUT",
+      "expanded_paths": [
+        "/_matrix/federation/v1/send_leave/{roomId}/{eventId}",
+        "/_matrix/federation/v2/send_leave/{roomId}/{eventId}"
+      ],
+      "expanded_routes": [
+        "PUT /_matrix/federation/v1/send_leave/{roomId}/{eventId}",
+        "PUT /_matrix/federation/v2/send_leave/{roomId}/{eventId}"
+      ]
+    },
+    {
+      "if_id": "IF-FED-004",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 144,
+      "route_pattern": "/_matrix/federation/*/backfill/{roomId}",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/federation/v1/backfill/{roomId}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/federation/v1/backfill/{roomId}"
+      ]
+    },
+    {
+      "if_id": "IF-FED-004",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 144,
+      "route_pattern": "/_matrix/federation/*/event_auth/{roomId}/{eventId}",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/federation/v1/event_auth/{roomId}/{eventId}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/federation/v1/event_auth/{roomId}/{eventId}"
+      ]
+    },
+    {
+      "if_id": "IF-FED-004",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 144,
+      "route_pattern": "/_matrix/federation/*/event/{eventId}",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/federation/v1/event/{eventId}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/federation/v1/event/{eventId}"
+      ]
+    },
+    {
+      "if_id": "IF-FED-004",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 144,
+      "route_pattern": "/_matrix/federation/*/get_missing_events/{roomId}",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/federation/v1/get_missing_events/{roomId}"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/federation/v1/get_missing_events/{roomId}"
+      ]
+    },
+    {
+      "if_id": "IF-FED-004",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 144,
+      "route_pattern": "/_matrix/federation/*/state_ids/{roomId}",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/federation/v1/state_ids/{roomId}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/federation/v1/state_ids/{roomId}"
+      ]
+    },
+    {
+      "if_id": "IF-FED-004",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 144,
+      "route_pattern": "/_matrix/federation/*/state/{roomId}",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/federation/v1/state/{roomId}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/federation/v1/state/{roomId}"
+      ]
+    },
+    {
+      "if_id": "IF-FED-004",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 144,
+      "route_pattern": "/_matrix/federation/*/timestamp_to_event/{roomId}",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/federation/v1/timestamp_to_event/{roomId}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/federation/v1/timestamp_to_event/{roomId}"
+      ]
+    },
+    {
+      "if_id": "IF-FED-006",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 146,
+      "route_pattern": "/_matrix/federation/*/hierarchy/{roomId}",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/federation/v1/hierarchy/{roomId}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/federation/v1/hierarchy/{roomId}"
+      ]
+    },
+    {
+      "if_id": "IF-FED-006",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 146,
+      "route_pattern": "/_matrix/federation/*/publicRooms",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/federation/v1/publicRooms"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/federation/v1/publicRooms"
+      ]
+    },
+    {
+      "if_id": "IF-FED-006",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 146,
+      "route_pattern": "/_matrix/federation/*/publicRooms",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/federation/v1/publicRooms"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/federation/v1/publicRooms"
+      ]
+    },
+    {
+      "if_id": "IF-FED-006",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 146,
+      "route_pattern": "/_matrix/federation/*/query/{queryType}",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/federation/v1/query/{queryType}",
+        "/_matrix/federation/v1/query/directory",
+        "/_matrix/federation/v1/query/profile"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/federation/v1/query/{queryType}",
+        "GET /_matrix/federation/v1/query/directory",
+        "GET /_matrix/federation/v1/query/profile"
+      ]
+    },
+    {
+      "if_id": "IF-FED-006",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 146,
+      "route_pattern": "/_matrix/federation/*/query/directory",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/federation/v1/query/directory"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/federation/v1/query/directory"
+      ]
+    },
+    {
+      "if_id": "IF-FED-006",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 146,
+      "route_pattern": "/_matrix/federation/*/query/profile",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/federation/v1/query/profile"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/federation/v1/query/profile"
+      ]
+    },
+    {
+      "if_id": "IF-FED-007",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 147,
+      "route_pattern": "/_matrix/federation/*/user/devices/{userId}",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/federation/v1/user/devices/{userId}"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/federation/v1/user/devices/{userId}"
+      ]
+    },
+    {
+      "if_id": "IF-FED-007",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 147,
+      "route_pattern": "/_matrix/federation/*/user/keys/query",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/federation/v1/user/keys/query"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/federation/v1/user/keys/query"
+      ]
+    },
+    {
+      "if_id": "IF-FED-008",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 148,
+      "route_pattern": "/_matrix/federation/*/user/keys/claim",
+      "methods": "POST",
+      "expanded_paths": [
+        "/_matrix/federation/v1/user/keys/claim"
+      ],
+      "expanded_routes": [
+        "POST /_matrix/federation/v1/user/keys/claim"
+      ]
+    },
+    {
+      "if_id": "IF-FED-009",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 149,
+      "route_pattern": "/_matrix/federation/*/openid/userinfo",
+      "methods": "GET",
+      "expanded_paths": [
+        "/_matrix/federation/v1/openid/userinfo"
+      ],
+      "expanded_routes": [
+        "GET /_matrix/federation/v1/openid/userinfo"
+      ]
+    },
+    {
+      "if_id": "IF-FED-010",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 150,
+      "route_pattern": "/_matrix/federation/*/3pid/onbind",
+      "methods": "PUT",
+      "expanded_paths": [
+        "/_matrix/federation/v1/3pid/onbind"
+      ],
+      "expanded_routes": [
+        "PUT /_matrix/federation/v1/3pid/onbind"
+      ]
+    },
+    {
+      "if_id": "IF-FED-010",
+      "source_file": "spec/framework/23-interface-contract-catalog.md",
+      "source_line": 150,
+      "route_pattern": "/_matrix/federation/*/exchange_third_party_invite/{roomId}",
+      "methods": "PUT",
+      "expanded_paths": [
+        "/_matrix/federation/v1/exchange_third_party_invite/{roomId}"
+      ],
+      "expanded_routes": [
+        "PUT /_matrix/federation/v1/exchange_third_party_invite/{roomId}"
+      ]
+    }
+  ]
+}

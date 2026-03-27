@@ -1,0 +1,35 @@
+name: Governance
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  governance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Lint governance
+        run: npm run lint
+
+      - name: Run local tests
+        run: npm test
+
+      - name: Build placeholder entrypoints
+        run: npm run build
+
+      - name: Write EVID-GOV-001 artifacts
+        if: always()
+        run: npm run governance:evidence
+
+      - name: Upload governance artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evid-gov-001
+          path: evidence/common/EVID-GOV-001

@@ -38,6 +38,7 @@
 * [12-matrix-protocol-compliance-profile.md](./12-matrix-protocol-compliance-profile.md)：Matrix 协议覆盖矩阵与实现支持面。
 * [13-cloudflare-platform-constraint-register.md](./13-cloudflare-platform-constraint-register.md)：Cloudflare 平台限制、行为与计费约束台账。
 * [14-traceability-and-change-control.md](./14-traceability-and-change-control.md)：需求、约束、契约、测试、证据的追溯与变更控制。
+* `14-requirement-traceability-sidecar.json`：`REQ -> runtime/IF/DATA/FLOW/STATE/TEST/EVID` 的权威机器侧边车输入。
 * [15-source-observation-register.md](./15-source-observation-register.md)：Matrix 与 Cloudflare 上游来源观察、漂移结论与动作寄存器。
 * [20-system-context-and-principles.md](./20-system-context-and-principles.md)：系统上下文、信任边界、架构原则。
 * [21-runtime-topology-and-platform-model.md](./21-runtime-topology-and-platform-model.md)：Workers、Durable Objects、D1、KV、R2、Queues 拓扑与约束。

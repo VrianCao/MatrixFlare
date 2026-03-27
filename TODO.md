@@ -55,7 +55,7 @@
 
 ### 00.01 建立基础工程和脚本入口
 
-- [ ] 建立最小可运行的工程骨架与统一脚本入口。
+- [x] 建立最小可运行的工程骨架与统一脚本入口。
   Spec refs: `10`,`11`,`14`,`21`,`42`
   产出:
   `package.json` 或等价任务入口、基础目录结构、统一 `dev/test/lint/build` 占位脚本。
@@ -64,7 +64,7 @@
 
 ### 00.02 实现 Spec 解析与 ID 扫描工具
 
-- [ ] 编写 `packages/spec-tools/`，扫描 `spec/framework/`、`spec/decisions/`、`spec/open-questions/` 中的 canonical IDs。
+- [x] 编写 `packages/spec-tools/`，扫描 `spec/framework/`、`spec/decisions/`、`spec/open-questions/` 中的 canonical IDs。
   Spec refs: `11`,`14`,`43`,`44`
   产出:
   ID 扫描器、canonical ID 校验器、引用提取器。
@@ -73,7 +73,7 @@
 
 ### 00.03 实现 `requirement-register` 生成器
 
-- [ ] 从 owning spec 中的 `REQ` 表行生成 machine-readable requirement register。
+- [x] 从 owning spec 中的 `REQ` 表行生成 machine-readable requirement register。
   Spec refs: `14` 3.1.1, `43` `TEST-GOV-001`, `44` `EVID-GOV-001`
   产出:
   `requirement-register.csv`、`requirement-register.json` 生成器。
@@ -82,7 +82,7 @@
 
 ### 00.04 实现 `traceability-matrix` 生成器
 
-- [ ] 从 Spec 中生成双向 traceability matrix。
+- [x] 从 Spec 中生成双向 traceability matrix。
   Spec refs: `14` 7.1-7.2, `43` `TEST-GOV-001`, `44` `EVID-GOV-001`
   产出:
   `traceability-matrix.csv`、`traceability-matrix.json` 生成器。
@@ -91,7 +91,7 @@
 
 ### 00.05 实现 wildcard route family 展开器
 
-- [ ] 实现 `/_matrix/.../*/...` route family 的 pinned `v1.17` 显式展开与审计快照。
+- [x] 实现 `/_matrix/.../*/...` route family 的 pinned `v1.17` 显式展开与审计快照。
   Spec refs: `23` 2, 2.1, `43` 6, `44` 2.3
   产出:
   wildcard route expansion 工具和审计产物。
@@ -100,7 +100,7 @@
 
 ### 00.06 完成 `TEST-GOV-001` / `EVID-GOV-001`
 
-- [ ] 建立治理 CI 门禁并能落证据。
+- [x] 建立治理 CI 门禁并能落证据。
   Spec refs: `43` `TEST-GOV-001`, `44` `EVID-GOV-001`, `evidence/common/EVID-GOV-001/README.md`
   产出:
   生成 `summary.md`、requirement register、traceability matrix、wildcard expansion 审计快照。

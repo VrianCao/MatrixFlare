@@ -1,0 +1,341 @@
+{
+  "version": 1,
+  "requirements": {
+    "REQ-ARCH-001": {
+      "runtime_owners": ["UserDO", "RoomDO", "RemoteServerDO"],
+      "if_ids": ["IF-INT-USER-001", "IF-INT-ROOM-001", "IF-INT-FED-001"],
+      "data_ids": ["DATA-USER-017", "DATA-ROOM-001", "DATA-FED-001"],
+      "flow_state_ids": ["FLOW-CS-LOGIN", "FLOW-ROOM-EVENT-ADMISSION", "FLOW-FED-OUTBOUND-TXN"],
+      "test_ids": ["TEST-GOV-001", "TEST-OPS-001"],
+      "evid_ids": ["EVID-GOV-001", "EVID-OPS-001"]
+    },
+    "REQ-ARCH-002": {
+      "runtime_owners": ["UserDO", "RoomDO", "RemoteServerDO"],
+      "if_ids": ["IF-INT-USER-001", "IF-INT-ROOM-001", "IF-INT-FED-002"],
+      "data_ids": ["DATA-USER-017", "DATA-ROOM-001", "DATA-FED-003"],
+      "flow_state_ids": ["FLOW-CS-LOGIN", "FLOW-ROOM-EVENT-ADMISSION", "FLOW-FED-INBOUND-TXN"],
+      "test_ids": ["TEST-GOV-001", "TEST-OPS-001"],
+      "evid_ids": ["EVID-GOV-001", "EVID-OPS-001"]
+    },
+    "REQ-ARCH-003": {
+      "runtime_owners": ["gateway-worker", "RoomDO", "jobs-worker"],
+      "if_ids": ["IF-CS-032", "IF-FED-002", "IF-INT-ROOM-001"],
+      "data_ids": ["DATA-ROOM-001", "DATA-ROOM-002", "DATA-ROOM-007"],
+      "flow_state_ids": ["FLOW-ROOM-EVENT-ADMISSION", "FLOW-FED-INBOUND-TXN", "FLOW-AS-TXN-DELIVERY"],
+      "test_ids": ["TEST-ROOM-001", "TEST-FED-002", "TEST-AS-001"],
+      "evid_ids": ["EVID-ROOM-001", "EVID-FED-001", "EVID-AS-001"]
+    },
+    "REQ-ARCH-004": {
+      "runtime_owners": ["UserDO", "RoomDO", "RemoteServerDO"],
+      "if_ids": ["IF-INT-ROOM-001", "IF-INT-USER-005", "IF-INT-FED-002"],
+      "data_ids": ["DATA-ROOM-001", "DATA-USER-016", "DATA-FED-003"],
+      "flow_state_ids": ["FLOW-ROOM-EVENT-ADMISSION", "FLOW-CS-SEND-TO-DEVICE", "FLOW-FED-INBOUND-TXN"],
+      "test_ids": ["TEST-GOV-001", "TEST-ROOM-001", "TEST-FED-002"],
+      "evid_ids": ["EVID-GOV-001", "EVID-ROOM-001", "EVID-FED-001"]
+    },
+    "REQ-ARCH-005": {
+      "runtime_owners": ["jobs-worker", "ops-worker", "RoomDO", "UserDO"],
+      "if_ids": ["IF-OPS-004", "IF-OPS-005", "IF-INT-WKR-002"],
+      "data_ids": ["DATA-OPS-002", "DATA-OPS-003", "DATA-ROOM-011"],
+      "flow_state_ids": ["FLOW-REPLAY-REBUILD", "FLOW-ROOM-FANOUT-REPAIR"],
+      "test_ids": ["TEST-GOV-001", "TEST-OPS-002"],
+      "evid_ids": ["EVID-GOV-001", "EVID-OPS-002"]
+    },
+    "REQ-ARCH-006": {
+      "runtime_owners": ["UserDO", "RoomDO", "RemoteServerDO"],
+      "if_ids": ["IF-INT-USER-001", "IF-INT-ROOM-001", "IF-INT-FED-002"],
+      "data_ids": ["DATA-USER-017", "DATA-ROOM-001", "DATA-FED-003"],
+      "flow_state_ids": ["FLOW-CS-LOGIN", "FLOW-ROOM-EVENT-ADMISSION", "FLOW-FED-INBOUND-TXN"],
+      "test_ids": ["TEST-GOV-001", "TEST-OPS-001"],
+      "evid_ids": ["EVID-GOV-001", "EVID-OPS-001"]
+    },
+    "REQ-ARCH-007": {
+      "runtime_owners": ["gateway-worker", "jobs-worker", "ops-worker"],
+      "if_ids": ["IF-CS-052", "IF-FED-006", "IF-OPS-008"],
+      "data_ids": ["DATA-D1-001", "DATA-D1-002", "DATA-D1-003"],
+      "flow_state_ids": ["FLOW-SEARCH-INDEX", "FLOW-FED-QUERY"],
+      "test_ids": ["TEST-GOV-001", "TEST-DER-001"],
+      "evid_ids": ["EVID-GOV-001", "EVID-DER-001"]
+    },
+    "REQ-ARCH-008": {
+      "runtime_owners": ["gateway-worker", "RemoteServerDO"],
+      "if_ids": ["IF-PUB-001", "IF-FED-001"],
+      "data_ids": ["DATA-KV-001", "DATA-KV-002", "DATA-FED-005"],
+      "flow_state_ids": ["FLOW-CS-DISCOVERY", "FLOW-FED-METADATA-SERVE"],
+      "test_ids": ["TEST-GOV-001"],
+      "evid_ids": ["EVID-GOV-001"]
+    },
+    "REQ-ARCH-009": {
+      "runtime_owners": ["gateway-worker", "jobs-worker", "ops-worker"],
+      "if_ids": ["IF-CS-051", "IF-FED-005", "IF-OPS-003"],
+      "data_ids": ["DATA-R2-001", "DATA-R2-004", "DATA-R2-005"],
+      "flow_state_ids": ["FLOW-CS-MEDIA-DOWNLOAD", "FLOW-FED-MEDIA-SERVE", "FLOW-OPS-JOB-CONTROL"],
+      "test_ids": ["TEST-MEDIA-001", "TEST-OPS-002"],
+      "evid_ids": ["EVID-MEDIA-001", "EVID-OPS-002"]
+    },
+    "REQ-ARCH-010": {
+      "runtime_owners": ["RoomDO"],
+      "if_ids": ["IF-CS-032", "IF-CS-033", "IF-INT-ROOM-001"],
+      "data_ids": ["DATA-ROOM-001", "DATA-ROOM-011", "DATA-ROOM-012"],
+      "flow_state_ids": ["FLOW-ROOM-EVENT-ADMISSION", "STATE-ROOM-EVENT-ADMISSION"],
+      "test_ids": ["TEST-ROOM-001", "TEST-ROOM-002"],
+      "evid_ids": ["EVID-ROOM-001", "EVID-ROOM-002"]
+    },
+    "REQ-ARCH-011": {
+      "runtime_owners": ["UserDO"],
+      "if_ids": ["IF-INT-USER-001", "IF-INT-USER-002", "IF-INT-USER-005"],
+      "data_ids": ["DATA-USER-001", "DATA-USER-008", "DATA-USER-010"],
+      "flow_state_ids": ["FLOW-CS-SYNC-LONGPOLL", "FLOW-CS-SEND-TO-DEVICE", "STATE-USER-SESSION"],
+      "test_ids": ["TEST-CS-002", "TEST-CS-003"],
+      "evid_ids": ["EVID-CS-002", "EVID-CS-003"]
+    },
+    "REQ-ARCH-012": {
+      "runtime_owners": ["RemoteServerDO"],
+      "if_ids": ["IF-INT-FED-001", "IF-ALARM-001"],
+      "data_ids": ["DATA-FED-001", "DATA-FED-002"],
+      "flow_state_ids": ["FLOW-FED-OUTBOUND-TXN", "STATE-REMOTE-SERVER-RETRY"],
+      "test_ids": ["TEST-FED-002", "TEST-FED-003"],
+      "evid_ids": ["EVID-FED-001", "EVID-FED-002"]
+    },
+    "REQ-ARCH-013": {
+      "runtime_owners": ["jobs-worker", "gateway-worker"],
+      "if_ids": ["IF-CS-052", "IF-INT-WKR-001", "IF-QUE-001"],
+      "data_ids": ["DATA-D1-001", "DATA-D1-002", "DATA-D1-003"],
+      "flow_state_ids": ["FLOW-SEARCH-INDEX", "FLOW-CS-SEARCH-QUERY"],
+      "test_ids": ["TEST-DER-001"],
+      "evid_ids": ["EVID-DER-001"]
+    },
+    "REQ-ARCH-014": {
+      "runtime_owners": ["gateway-worker", "RoomDO", "jobs-worker"],
+      "if_ids": ["IF-CS-020", "IF-INT-ROOM-001", "IF-CS-052"],
+      "data_ids": ["DATA-ID-001", "DATA-ROOM-001", "DATA-D1-001"],
+      "flow_state_ids": ["FLOW-CS-SYNC-LONGPOLL", "FLOW-ROOM-EVENT-ADMISSION", "FLOW-SEARCH-INDEX"],
+      "test_ids": ["TEST-GOV-001", "TEST-COST-001"],
+      "evid_ids": ["EVID-GOV-001", "EVID-COST-001"]
+    },
+    "REQ-ARCH-015": {
+      "runtime_owners": ["gateway-worker", "UserDO"],
+      "if_ids": ["IF-CS-020", "IF-INT-USER-002"],
+      "data_ids": ["DATA-ID-001", "DATA-USER-010"],
+      "flow_state_ids": ["FLOW-CS-SYNC-LONGPOLL", "STATE-SYNC-WAITER"],
+      "test_ids": ["TEST-CS-002", "TEST-PERF-001"],
+      "evid_ids": ["EVID-CS-002", "EVID-PERF-001"]
+    },
+    "REQ-ARCH-016": {
+      "runtime_owners": ["UserDO", "RoomDO", "RemoteServerDO"],
+      "if_ids": ["IF-INT-USER-001", "IF-INT-ROOM-001", "IF-INT-FED-001"],
+      "data_ids": ["DATA-USER-017", "DATA-ROOM-001", "DATA-FED-001"],
+      "flow_state_ids": ["FLOW-CS-LOGIN", "FLOW-ROOM-EVENT-ADMISSION", "FLOW-FED-OUTBOUND-TXN"],
+      "test_ids": ["TEST-GOV-001", "TEST-PERF-001"],
+      "evid_ids": ["EVID-GOV-001", "EVID-PERF-001"]
+    },
+    "REQ-ARCH-017": {
+      "runtime_owners": ["gateway-worker", "jobs-worker", "ops-worker", "UserDO", "RoomDO", "RemoteServerDO"],
+      "if_ids": ["IF-INT-USER-001", "IF-INT-ROOM-001", "IF-INT-WKR-002"],
+      "data_ids": ["DATA-OPS-001", "DATA-USER-017", "DATA-ROOM-001"],
+      "flow_state_ids": ["FLOW-OPS-JOB-CONTROL"],
+      "test_ids": ["TEST-GOV-001", "TEST-OPS-001"],
+      "evid_ids": ["EVID-GOV-001", "EVID-OPS-001"]
+    },
+    "REQ-ARCH-018": {
+      "runtime_owners": ["RoomDO"],
+      "if_ids": ["IF-CS-030", "IF-INT-ROOM-001"],
+      "data_ids": ["DATA-ROOM-001", "DATA-ROOM-005", "DATA-ROOM-008"],
+      "flow_state_ids": ["FLOW-ROOM-EVENT-ADMISSION"],
+      "test_ids": ["TEST-ROOM-002"],
+      "evid_ids": ["EVID-ROOM-002"]
+    },
+    "REQ-ARCH-019": {
+      "runtime_owners": ["gateway-worker", "ops-worker", "RemoteServerDO"],
+      "if_ids": ["IF-CS-020", "IF-FED-001", "IF-OPS-001"],
+      "data_ids": ["DATA-ID-001", "DATA-FED-005", "DATA-OPS-001"],
+      "flow_state_ids": ["FLOW-CS-SYNC-LONGPOLL", "FLOW-FED-METADATA-SERVE"],
+      "test_ids": ["TEST-GOV-001", "TEST-COST-001"],
+      "evid_ids": ["EVID-GOV-001", "EVID-COST-001"]
+    },
+    "REQ-GOV-001": {
+      "runtime_owners": ["gateway-worker", "UserDO", "RoomDO", "RemoteServerDO"],
+      "if_ids": ["IF-PUB-001", "IF-PUB-002", "IF-FED-001"],
+      "data_ids": ["DATA-KV-001", "DATA-FED-005", "DATA-USER-017"],
+      "flow_state_ids": ["FLOW-CS-DISCOVERY", "FLOW-FED-METADATA-SERVE"],
+      "test_ids": ["TEST-GOV-001"],
+      "evid_ids": ["EVID-GOV-001"]
+    },
+    "REQ-GOV-002": {
+      "runtime_owners": ["UserDO", "RoomDO", "RemoteServerDO"],
+      "if_ids": ["IF-INT-USER-001", "IF-INT-ROOM-001", "IF-INT-FED-001"],
+      "data_ids": ["DATA-USER-017", "DATA-ROOM-001", "DATA-FED-001"],
+      "flow_state_ids": ["FLOW-CS-LOGIN", "FLOW-ROOM-EVENT-ADMISSION", "FLOW-FED-OUTBOUND-TXN"],
+      "test_ids": ["TEST-GOV-001", "TEST-SEC-001"],
+      "evid_ids": ["EVID-GOV-001", "EVID-SEC-001"]
+    },
+    "REQ-GOV-003": {
+      "runtime_owners": ["gateway-worker", "jobs-worker", "ops-worker"],
+      "if_ids": ["IF-OPS-001", "IF-OPS-003"],
+      "data_ids": ["DATA-OPS-001", "DATA-R2-005"],
+      "flow_state_ids": ["FLOW-OPS-JOB-CONTROL"],
+      "test_ids": ["TEST-GOV-001", "TEST-COST-001"],
+      "evid_ids": ["EVID-GOV-001", "EVID-COST-001"]
+    },
+    "REQ-GOV-004": {
+      "runtime_owners": ["gateway-worker", "jobs-worker", "ops-worker"],
+      "if_ids": ["IF-OPS-001", "IF-INT-WKR-002", "IF-INT-WKR-003"],
+      "data_ids": ["DATA-OPS-001", "DATA-OPS-004"],
+      "flow_state_ids": ["FLOW-OPS-JOB-CONTROL"],
+      "test_ids": ["TEST-GOV-001", "TEST-OPS-001"],
+      "evid_ids": ["EVID-GOV-001", "EVID-OPS-001"]
+    },
+    "REQ-GOV-005": {
+      "runtime_owners": ["ops-worker", "jobs-worker"],
+      "if_ids": ["IF-OPS-001", "IF-OPS-006"],
+      "data_ids": ["DATA-OPS-001", "DATA-OPS-004"],
+      "flow_state_ids": ["FLOW-OPS-JOB-CONTROL"],
+      "test_ids": ["TEST-GOV-001", "TEST-OPS-001"],
+      "evid_ids": ["EVID-GOV-001", "EVID-OPS-001"]
+    },
+    "REQ-GOV-006": {
+      "runtime_owners": ["ops-worker", "jobs-worker"],
+      "if_ids": ["IF-OPS-003", "IF-INT-WKR-003", "IF-QUE-005"],
+      "data_ids": ["DATA-OPS-001", "DATA-R2-005"],
+      "flow_state_ids": ["FLOW-OPS-JOB-CONTROL", "STATE-EXPORT-JOB"],
+      "test_ids": ["TEST-OPS-001", "TEST-OPS-002"],
+      "evid_ids": ["EVID-OPS-001", "EVID-OPS-002"]
+    },
+    "REQ-OPS-001": {
+      "runtime_owners": ["gateway-worker", "jobs-worker", "ops-worker"],
+      "if_ids": ["IF-OPS-001", "IF-OPS-006"],
+      "data_ids": ["DATA-OPS-004"],
+      "flow_state_ids": ["FLOW-OPS-JOB-CONTROL"],
+      "test_ids": ["TEST-OPS-001", "TEST-COST-001"],
+      "evid_ids": ["EVID-OPS-001", "EVID-COST-001"]
+    },
+    "REQ-OPS-002": {
+      "runtime_owners": ["gateway-worker", "jobs-worker", "ops-worker", "RemoteServerDO"],
+      "if_ids": ["IF-FED-002", "IF-OPS-003", "IF-OPS-004"],
+      "data_ids": ["DATA-OPS-001", "DATA-FED-003", "DATA-R2-005"],
+      "flow_state_ids": ["FLOW-FED-INBOUND-TXN", "FLOW-OPS-JOB-CONTROL"],
+      "test_ids": ["TEST-OPS-001"],
+      "evid_ids": ["EVID-OPS-001"]
+    },
+    "REQ-OPS-003": {
+      "runtime_owners": ["gateway-worker", "jobs-worker", "ops-worker"],
+      "if_ids": ["IF-OPS-001", "IF-OPS-006"],
+      "data_ids": ["DATA-OPS-004", "DATA-D1-006"],
+      "flow_state_ids": ["FLOW-OPS-JOB-CONTROL"],
+      "test_ids": ["TEST-COST-001"],
+      "evid_ids": ["EVID-COST-001"]
+    },
+    "REQ-OPS-004": {
+      "runtime_owners": ["UserDO", "RoomDO", "RemoteServerDO"],
+      "if_ids": ["IF-INT-USER-001", "IF-INT-ROOM-001", "IF-INT-FED-001"],
+      "data_ids": ["DATA-USER-017", "DATA-ROOM-001", "DATA-FED-001"],
+      "flow_state_ids": ["FLOW-CS-LOGIN", "FLOW-ROOM-EVENT-ADMISSION", "FLOW-FED-OUTBOUND-TXN"],
+      "test_ids": ["TEST-OPS-001", "TEST-PERF-001"],
+      "evid_ids": ["EVID-OPS-001", "EVID-PERF-001"]
+    },
+    "REQ-OPS-005": {
+      "runtime_owners": ["jobs-worker", "gateway-worker"],
+      "if_ids": ["IF-INT-WKR-001", "IF-QUE-001", "IF-QUE-002"],
+      "data_ids": ["DATA-D1-001", "DATA-D1-004", "DATA-D1-005"],
+      "flow_state_ids": ["FLOW-SEARCH-INDEX", "FLOW-CS-MEDIA-UPLOAD", "FLOW-AS-TXN-DELIVERY"],
+      "test_ids": ["TEST-OPS-001", "TEST-COST-001"],
+      "evid_ids": ["EVID-OPS-001", "EVID-COST-001"]
+    },
+    "REQ-OPS-010": {
+      "runtime_owners": ["ops-worker", "jobs-worker"],
+      "if_ids": ["IF-OPS-001", "IF-INT-WKR-002", "IF-INT-WKR-003"],
+      "data_ids": ["DATA-OPS-001", "DATA-OPS-004"],
+      "flow_state_ids": ["FLOW-OPS-JOB-CONTROL"],
+      "test_ids": ["TEST-OPS-001"],
+      "evid_ids": ["EVID-OPS-001"]
+    },
+    "REQ-OPS-011": {
+      "runtime_owners": ["gateway-worker", "jobs-worker", "ops-worker", "UserDO", "RoomDO", "RemoteServerDO"],
+      "if_ids": ["IF-INT-USER-001", "IF-INT-ROOM-001", "IF-INT-WKR-002"],
+      "data_ids": ["DATA-OPS-001", "DATA-USER-017", "DATA-ROOM-001"],
+      "flow_state_ids": ["FLOW-OPS-JOB-CONTROL"],
+      "test_ids": ["TEST-OPS-001"],
+      "evid_ids": ["EVID-OPS-001"]
+    },
+    "REQ-OPS-012": {
+      "runtime_owners": ["ops-worker", "jobs-worker"],
+      "if_ids": ["IF-OPS-004", "IF-OPS-005", "IF-INT-WKR-002"],
+      "data_ids": ["DATA-OPS-001", "DATA-OPS-002", "DATA-OPS-003"],
+      "flow_state_ids": ["FLOW-REPLAY-REBUILD", "FLOW-OPS-JOB-CONTROL"],
+      "test_ids": ["TEST-OPS-001", "TEST-OPS-002"],
+      "evid_ids": ["EVID-OPS-001", "EVID-OPS-002"]
+    },
+    "REQ-OPS-013": {
+      "runtime_owners": ["ops-worker", "jobs-worker"],
+      "if_ids": ["IF-OPS-003", "IF-OPS-004", "IF-OPS-005"],
+      "data_ids": ["DATA-OPS-001", "DATA-OPS-002", "DATA-R2-005"],
+      "flow_state_ids": ["FLOW-OPS-JOB-CONTROL", "FLOW-REPLAY-REBUILD"],
+      "test_ids": ["TEST-OPS-002"],
+      "evid_ids": ["EVID-OPS-002"]
+    },
+    "REQ-SEC-001": {
+      "runtime_owners": ["UserDO", "gateway-worker"],
+      "if_ids": ["IF-INT-USER-001", "IF-CS-012", "IF-CS-013"],
+      "data_ids": ["DATA-ID-003", "DATA-ID-004", "DATA-USER-001", "DATA-USER-017"],
+      "flow_state_ids": ["FLOW-CS-LOGIN", "FLOW-CS-REFRESH", "STATE-USER-SESSION"],
+      "test_ids": ["TEST-CS-001", "TEST-SEC-001"],
+      "evid_ids": ["EVID-CS-001", "EVID-SEC-001"]
+    },
+    "REQ-SEC-002": {
+      "runtime_owners": ["gateway-worker", "ops-worker", "RemoteServerDO"],
+      "if_ids": ["IF-INT-USER-001", "IF-FED-001", "IF-OPS-008"],
+      "data_ids": ["DATA-ID-003", "DATA-ID-004", "DATA-D1-006"],
+      "flow_state_ids": ["FLOW-CS-LOGIN", "FLOW-FED-METADATA-SERVE", "FLOW-OPS-JOB-CONTROL"],
+      "test_ids": ["TEST-GOV-001", "TEST-SEC-001"],
+      "evid_ids": ["EVID-GOV-001", "EVID-SEC-001"]
+    },
+    "REQ-SEC-003": {
+      "runtime_owners": ["gateway-worker", "ops-worker", "RemoteServerDO"],
+      "if_ids": ["IF-INT-USER-001", "IF-FED-001", "IF-OPS-008"],
+      "data_ids": ["DATA-ID-003", "DATA-ID-004", "DATA-D1-006"],
+      "flow_state_ids": ["FLOW-CS-LOGIN", "FLOW-FED-METADATA-SERVE", "FLOW-OPS-JOB-CONTROL"],
+      "test_ids": ["TEST-GOV-001", "TEST-SEC-001"],
+      "evid_ids": ["EVID-GOV-001", "EVID-SEC-001"]
+    },
+    "REQ-SEC-004": {
+      "runtime_owners": ["RoomDO", "gateway-worker"],
+      "if_ids": ["IF-INT-ROOM-001", "IF-CS-031", "IF-CS-032"],
+      "data_ids": ["DATA-ROOM-001", "DATA-ROOM-007", "DATA-ROOM-008"],
+      "flow_state_ids": ["FLOW-ROOM-EVENT-ADMISSION"],
+      "test_ids": ["TEST-ROOM-001", "TEST-SEC-001"],
+      "evid_ids": ["EVID-ROOM-001", "EVID-SEC-001"]
+    },
+    "REQ-SEC-005": {
+      "runtime_owners": ["gateway-worker", "RemoteServerDO", "RoomDO"],
+      "if_ids": ["IF-FED-001", "IF-FED-002", "IF-FED-006"],
+      "data_ids": ["DATA-FED-003", "DATA-FED-005", "DATA-ROOM-001"],
+      "flow_state_ids": ["FLOW-FED-INBOUND-TXN", "FLOW-FED-OUTBOUND-TXN", "FLOW-FED-QUERY"],
+      "test_ids": ["TEST-FED-001", "TEST-SEC-001"],
+      "evid_ids": ["EVID-FED-001", "EVID-SEC-001"]
+    },
+    "REQ-SEC-006": {
+      "runtime_owners": ["gateway-worker", "RoomDO", "UserDO", "RemoteServerDO"],
+      "if_ids": ["IF-CS-009", "IF-CS-011", "IF-CS-050", "IF-CS-052", "IF-FED-002"],
+      "data_ids": ["DATA-USER-017", "DATA-USER-015", "DATA-ROOM-001", "DATA-FED-003"],
+      "flow_state_ids": ["FLOW-CS-REGISTER", "FLOW-CS-LOGIN", "FLOW-CS-MEDIA-UPLOAD", "FLOW-CS-SEARCH-QUERY", "FLOW-FED-INBOUND-TXN"],
+      "test_ids": ["TEST-SEC-001", "TEST-SEC-002"],
+      "evid_ids": ["EVID-SEC-001"]
+    },
+    "REQ-SEC-007": {
+      "runtime_owners": ["ops-worker", "jobs-worker"],
+      "if_ids": ["IF-OPS-003", "IF-OPS-004", "IF-OPS-005", "IF-OPS-008"],
+      "data_ids": ["DATA-OPS-004", "DATA-D1-006"],
+      "flow_state_ids": ["FLOW-OPS-JOB-CONTROL"],
+      "test_ids": ["TEST-SEC-001", "TEST-OPS-002"],
+      "evid_ids": ["EVID-SEC-001", "EVID-OPS-002"]
+    },
+    "REQ-SEC-008": {
+      "runtime_owners": ["gateway-worker", "ops-worker", "RemoteServerDO"],
+      "if_ids": ["IF-PUB-001", "IF-PUB-002", "IF-OPS-008"],
+      "data_ids": ["DATA-KV-001", "DATA-FED-005", "DATA-D1-005"],
+      "flow_state_ids": ["FLOW-CS-DISCOVERY", "FLOW-FED-METADATA-SERVE", "FLOW-OPS-JOB-CONTROL"],
+      "test_ids": ["TEST-GOV-001", "TEST-SEC-001"],
+      "evid_ids": ["EVID-GOV-001", "EVID-SEC-001"]
+    }
+  }
+}

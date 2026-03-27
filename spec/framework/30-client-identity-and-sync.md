@@ -115,6 +115,7 @@
 
 * `GET /_matrix/client/*/register/available` 必须存在，并只根据当前 registration policy、MXID grammar 与本地账户真值裁决可用性；不得读取可陈旧目录索引替代 `DATA-USER-017`。
 * `GET /_matrix/client/*/register/available` 不得被 shared edge cache、browser cache 或其它跨请求缓存当作可陈旧结果复用；响应必须使用 `no-store` 语义，最多只允许同一请求链路内的局部 memoization。
+* `GET /_matrix/client/v1/register/m.login.registration_token/validity` 必须存在；当 homeserver 当前不允许 registration 时，必须返回 `403 M_FORBIDDEN`；否则必须返回 `200 { valid: boolean }`，并对未知或当前无效 token 返回 `valid = false`。
 * 所有注册流程都必须收敛到 `UserDO` 创建用户主记录、初始 device 和初始 session。
 * 成功注册必须原子写入 `DATA-USER-017`、初始 `DATA-USER-002` device 与初始 `DATA-USER-001` session。
 * 若注册需要 UIA、registration token 或其他前置校验，`gateway-worker` 只负责协议编排，最终提交仍由 `UserDO` 原子完成。
