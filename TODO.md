@@ -357,16 +357,16 @@
 
 ### 04.01 实现公开 discovery 面
 
-- [ ] 实现 `IF-PUB-001`,`IF-PUB-002`,`IF-CS-001`,`IF-CS-002`,`IF-CS-005`,`IF-CS-009`。
+- [x] 实现 `IF-PUB-001`,`IF-PUB-002`,`IF-CS-001`,`IF-CS-002`,`IF-CS-005`,`IF-CS-009`,`IF-CS-066`。
   Spec refs: `23` 3.1, `30` 4-5, `32` 3, `25` `FLOW-CS-DISCOVERY`,`FLOW-FED-METADATA-SERVE`
   产出:
-  `/.well-known`、`/versions`、`/capabilities`、`/login`、`/register/available` handlers。
+  `/.well-known`、`/versions`、`/capabilities`、`/login`、`/register/available`、registration token validity handlers。
   完成标准:
   discoverability truth 与当前启用能力完全一致。
 
 ### 04.02 实现 Access/Refresh token 真相与 session 解析
 
-- [ ] 实现 `DATA-ID-003`,`DATA-ID-004`,`IF-INT-USER-001`,`STATE-USER-SESSION`。
+- [x] 实现 `DATA-ID-003`,`DATA-ID-004`,`IF-INT-USER-001`,`STATE-USER-SESSION`。
   Spec refs: `24` 2, `30` 3, `40` 2-3
   产出:
   session parser、token hash 校验、session lifecycle。
@@ -375,7 +375,7 @@
 
 ### 04.03 实现注册 / 登录 / 刷新 / 注销 / whoami
 
-- [ ] 完成 `IF-CS-010`~`IF-CS-014`。
+- [x] 完成 `IF-CS-010`~`IF-CS-014`。
   Spec refs: `30` 4.2, 4.3, 4.6, 4.7; `25` `FLOW-CS-REGISTER`,`FLOW-CS-LOGIN`,`FLOW-CS-REFRESH`
   产出:
   对应 handlers、`UserDO` command path、幂等与错误模型。
@@ -384,7 +384,7 @@
 
 ### 04.04 实现共享 UIA 模型、密码变更、账户停用
 
-- [ ] 完成 `DATA-ID-006`,`IF-CS-006`,`IF-CS-008`,`STATE-UIA-SESSION`。
+- [x] 完成 `DATA-ID-006`,`IF-CS-006`,`IF-CS-008`,`STATE-UIA-SESSION`。
   Spec refs: `30` 4.1, 4.4, 4.5; `26` 6.2; `40` 3.1
   产出:
   route-bound UIA token、password change、deactivate command path。
@@ -393,7 +393,7 @@
 
 ### 04.05 实现 deterministic stub / unsupported route guards
 
-- [ ] 实现 `IF-CS-007`,`IF-CS-053`~`IF-CS-065` 与对应 discoverability 收口。
+- [x] 实现 `IF-CS-007`,`IF-CS-053`~`IF-CS-065` 与对应 discoverability 收口。
   Spec refs: `12` stub-only 条目, `23` 3.6, `25` `FLOW-CS-DISABLED-ROUTE`
   产出:
   固定 `404 M_UNRECOGNIZED` / `401 M_UNKNOWN_TOKEN` guards、短路中间件。
