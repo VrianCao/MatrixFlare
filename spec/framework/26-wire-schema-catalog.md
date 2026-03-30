@@ -342,6 +342,7 @@
 | Field | Type | Rule |
 | --- | --- | --- |
 | `appservice` | `AppserviceDescriptor` | `POST` / `PUT` 时必填；`GET` / `DELETE` 时为空 |
+| `ticket_id` | string or null | 当命中的 operator policy 要求 ticket 时必填 |
 
 ### 5.14 `AppserviceConfigResponse`
 

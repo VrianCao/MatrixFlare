@@ -1,9 +1,6 @@
-import { createSkeletonFetchHandler } from '../../../packages/runtime-core/src/index.mjs';
+import { createOpsWorkerFetchHandler } from '../../../packages/control-plane/src/index.mjs';
 
-const fetch = createSkeletonFetchHandler('ops-worker', {
-  routeFamily: 'ops-control-plane',
-  message: 'ops-worker runtime skeleton placeholder',
-});
+const fetch = createOpsWorkerFetchHandler();
 
 export default {
   fetch,

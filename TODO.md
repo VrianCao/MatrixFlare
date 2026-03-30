@@ -171,7 +171,7 @@
 
 ### 02.01 实现 `ops-worker` 认证与授权
 
-- [ ] 实现 `Cf-Access-Jwt-Assertion` 验证、JWK 刷新、`principal_id` 映射、scope 判定。
+- [x] 实现 `Cf-Access-Jwt-Assertion` 验证、JWK 刷新、`principal_id` 映射、scope 判定。
   Spec refs: `40` 3.3, 3.3.1, 3.3.2; `24` `DATA-D1-006`; `26` 5; `13` `CF-NET-004`~`CF-NET-006`
   产出:
   Access JWT 验证器、operator authz middleware、`DATA-D1-006` 访问层。
@@ -180,7 +180,7 @@
 
 ### 02.02 实现 `DATA-OPS-004` 审计与控制面幂等
 
-- [ ] 建立 `audit_event` + `request_dedupe_projection`。
+- [x] 建立 `audit_event` + `request_dedupe_projection`。
   Spec refs: `24` 8, 8.1; `40` 8.2, 8.3; `26` 5
   产出:
   D1 schema、写入事务、重复请求折叠逻辑。
@@ -189,7 +189,7 @@
 
 ### 02.03 实现 `IF-OPS-001`~`IF-OPS-008`
 
-- [ ] 完成 healthz/readyz、jobs create/query/cancel、appservice config 控制面接口。
+- [x] 完成 healthz/readyz、jobs create/query/cancel、appservice config 控制面接口。
   Spec refs: `23` 3.8, `26` 5, `42` 12
   产出:
   `ops-worker` HTTP handlers、payload 验证、错误模型。
@@ -198,7 +198,7 @@
 
 ### 02.04 实现 `DATA-OPS-010` / `DATA-OPS-011` shard registry
 
-- [ ] 建立 shard registry、registry snapshot、post-commit success barrier 语义。
+- [x] 建立 shard registry、registry snapshot、post-commit success barrier 语义。
   Spec refs: `24` 8, 8.2; `42` 11.2.0
   产出:
   D1 schema、upsert 规则、snapshot 生成逻辑。
@@ -207,7 +207,7 @@
 
 ### 02.05 实现 control-plane job state 与 payload
 
-- [ ] 落地 `JobHandle`、`JobSummary`、`ExportJobSpec`、`RestoreJobSpec`、`RebuildJobSpec`、`RepairJobSpec` 等 payload。
+- [x] 落地 `JobHandle`、`JobSummary`、`ExportJobSpec`、`RestoreJobSpec`、`RebuildJobSpec`、`RepairJobSpec` 等 payload。
   Spec refs: `26` 5.1-6.4, `42` 10-12
   产出:
   控制面 payload 类型、作业状态存储、状态机实现。
@@ -216,7 +216,7 @@
 
 ### 02.06 建立 `jobs-worker` 作业框架与 Queue consumer
 
-- [ ] 建立统一 job dispatcher、queue consumer、checkpoint 机制。
+- [x] 建立统一 job dispatcher、queue consumer、checkpoint 机制。
   Spec refs: `21` 6, `23` 4.2, `26` 6.5, `42` 10
   产出:
   `jobs-worker` 作业总线、queue handlers、job checkpoint 存储。
@@ -225,12 +225,31 @@
 
 ### 02.07 实现导出/恢复 manifest 编码
 
-- [ ] 落地 checkpoint manifest、bundle manifest、registry snapshot、R2 object key 规则。
+- [x] 落地 checkpoint manifest、bundle manifest、registry snapshot、R2 object key 规则。
   Spec refs: `24` `DATA-R2-005`, `24` 8.3, `42` 11.2.1~11.2.4, `26` 6.4-6.5
   产出:
   manifest types、hash/signature、R2 object key builder、completeness state。
   完成标准:
-  后续 DR、restore、repair 都建立在统一 manifest 上，而不是临时 JSON。
+  统一 manifest artifact、签名/哈希、registry snapshot 与 object key 规则已经落地；restore checkpoint 绑定与 checkpoint object completeness 在 02.08 继续收口。
+
+### 02.08 收敛 Phase 02 审查残项
+
+- [ ] 完成 restore checkpoint 解析与 `RestoreShardJob.checkpoint_id` 的真实来源绑定。
+  Spec refs: `23` `IF-QUE-006`; `42` 11.2.1.4, 11.2.2
+  产出:
+  bundle manifest / checkpoint 选择逻辑、restore preflight checkpoint resolver。
+  完成标准:
+  restore queue payload 不再把 bundle hash 混作 checkpoint id，且能按 shard checkpoint 语义恢复。
+
+- [ ] 用真实 checkpoint object set 替换 placeholder checkpoint manifest，并补齐完整性 truth。
+  Spec refs: `24` `DATA-OPS-002`, `DATA-R2-005`; `42` 11.2.1.1~11.2.1.3
+  产出:
+  checkpoint manifest object 列表、watermark、hash/signature/key-version、required object coverage。
+  完成标准:
+  checkpoint manifest 不再以 placeholder/incomplete 占位充数，restore / export completeness 能基于真实 manifest 裁决。
+
+验证:
+`tests/local/control-plane/control-plane.test.mjs`，`npm test`
 
 ## Phase 03: Core Data Plane Storage And Schemas
 

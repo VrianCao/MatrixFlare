@@ -37,6 +37,24 @@
     ]
   },
   "queues": {
+    "producers": [
+      {
+        "binding": "REBUILD_SHARD_QUEUE",
+        "queue": "matrix-rebuild-shard-job"
+      },
+      {
+        "binding": "EXPORT_SHARD_QUEUE",
+        "queue": "matrix-export-shard-job"
+      },
+      {
+        "binding": "RESTORE_SHARD_QUEUE",
+        "queue": "matrix-restore-shard-job"
+      },
+      {
+        "binding": "REPAIR_SHARD_QUEUE",
+        "queue": "matrix-repair-shard-job"
+      }
+    ],
     "consumers": [
       {
         "queue": "matrix-search-index-job"
