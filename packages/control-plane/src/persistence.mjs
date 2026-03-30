@@ -790,6 +790,154 @@ export function createD1ControlPlanePersistence(db) {
       );
       return mapSnapshotRow(row);
     },
+    async exportControlPlaneSnapshot() {
+      const operatorRows = await statementAll(
+        db.prepare('SELECT * FROM operator_authz_policies ORDER BY principal_id ASC'),
+      );
+      const auditRows = await statementAll(
+        db.prepare('SELECT rowid AS audit_event_rowid, * FROM audit_events ORDER BY rowid ASC'),
+      );
+      const dedupeRows = await statementAll(
+        db.prepare(`
+          SELECT * FROM request_dedupe_projection
+          ORDER BY created_at ASC, operator_principal_id ASC, idempotency_key ASC, scope_token ASC
+        `),
+      );
+      const jobRows = await statementAll(
+        db.prepare('SELECT * FROM jobs ORDER BY created_at ASC, job_id ASC'),
+      );
+      const checkpointRows = await statementAll(
+        db.prepare('SELECT * FROM job_checkpoints ORDER BY job_id ASC, shard_type ASC, shard_key ASC'),
+      );
+      const replayManifestRows = await statementAll(
+        db.prepare('SELECT * FROM replay_manifests ORDER BY created_at ASC, job_id ASC'),
+      );
+      const repairDecisionRows = await statementAll(
+        db.prepare('SELECT * FROM repair_decisions ORDER BY created_at ASC, decision_id ASC'),
+      );
+      const shardRegistryRows = await statementAll(
+        db.prepare('SELECT * FROM shard_registry ORDER BY shard_type ASC, shard_key ASC'),
+      );
+      const registrySnapshotRows = await statementAll(
+        db.prepare('SELECT * FROM registry_snapshots ORDER BY created_at ASC, registry_snapshot_id ASC'),
+      );
+      const appserviceRows = await statementAll(
+        db.prepare('SELECT * FROM appservice_configs ORDER BY updated_at ASC, appservice_id ASC'),
+      );
+      const watermarkRow = await statementFirst(
+        db.prepare(`
+          SELECT
+            COALESCE(MIN(rowid), 0) AS min_rowid,
+            COALESCE(MAX(rowid), 0) AS max_rowid,
+            COUNT(*) AS audit_event_count
+          FROM audit_events
+        `),
+      );
+
+      const operatorPolicies = operatorRows.map((row) => ({
+        ...row,
+        access_subject_binding: parseJsonCell(row.access_subject_binding, {}),
+        allowed_scopes: parseJsonCell(row.allowed_scopes, []),
+        target_scope_constraints: parseJsonCell(row.target_scope_constraints, {}),
+        require_reason: Boolean(row.require_reason),
+        require_ticket: Boolean(row.require_ticket),
+      }));
+      const auditEvents = auditRows.map((row) => ({
+        audit_event_rowid: row.audit_event_rowid,
+        event_id: row.event_id,
+        event_type: row.event_type,
+        occurred_at: row.occurred_at,
+        operator_principal_id: row.operator_principal_id,
+        auth_mechanism: row.auth_mechanism,
+        scope_kind: row.scope_kind,
+        scope_id: row.scope_id,
+        scope_token: row.scope_token,
+        request_id: row.request_id,
+        idempotency_key: row.idempotency_key,
+        request_fingerprint: row.request_fingerprint,
+        job_id: row.job_id,
+        causation_id: row.causation_id,
+        result_code: row.result_code,
+        affected_objects: parseJsonCell(row.affected_objects, []),
+        details: parseJsonCell(row.details_json, null),
+      }));
+      const dedupeProjection = dedupeRows.map((row) => ({
+        ...row,
+        response_payload: parseJsonCell(row.response_payload_json, null),
+      }));
+      const jobs = jobRows.map(mapJobRow);
+      const jobCheckpoints = checkpointRows.map((row) => ({
+        job_id: row.job_id,
+        shard_type: row.shard_type,
+        shard_key: row.shard_key,
+        checkpoint: parseJsonCell(row.checkpoint_json, {}),
+        updated_at: row.updated_at,
+      }));
+      const replayManifests = replayManifestRows.map((row) => ({
+        job_id: row.job_id,
+        manifest_kind: row.manifest_kind,
+        manifest: parseJsonCell(row.manifest_json, {}),
+        manifest_hash: row.manifest_hash,
+        created_at: row.created_at,
+        export_epoch: row.export_epoch,
+        registry_snapshot_id: row.registry_snapshot_id,
+        r2_object_key: row.r2_object_key,
+      }));
+      const repairDecisions = repairDecisionRows.map((row) => ({
+        decision_id: row.decision_id,
+        repair_kind: row.repair_kind,
+        scope_kind: row.scope_kind,
+        scope_id: row.scope_id,
+        scope_token: row.scope_token,
+        dry_run: Boolean(row.dry_run),
+        reason: row.reason,
+        ticket_id: row.ticket_id,
+        created_at: row.created_at,
+        details: parseJsonCell(row.details_json, null),
+      }));
+      const shardRegistry = shardRegistryRows.map((row) => ({
+        shard_type: row.shard_type,
+        shard_key: row.shard_key,
+        created_at: row.created_at,
+        last_seen_at: row.last_seen_at,
+        schema_version: row.schema_version,
+        disabled_at: row.disabled_at,
+      }));
+      const registrySnapshots = registrySnapshotRows.map(mapSnapshotRow);
+      const appserviceConfigs = appserviceRows.map(mapAppserviceRow);
+
+      return {
+        range_start: Number(watermarkRow?.min_rowid ?? 0),
+        range_end: Number(watermarkRow?.max_rowid ?? 0),
+        watermark: {
+          audit_event_rowid: Number(watermarkRow?.max_rowid ?? 0),
+          audit_event_count: Number(watermarkRow?.audit_event_count ?? 0),
+        },
+        record_count:
+          operatorPolicies.length
+          + auditEvents.length
+          + dedupeProjection.length
+          + jobs.length
+          + jobCheckpoints.length
+          + replayManifests.length
+          + repairDecisions.length
+          + shardRegistry.length
+          + registrySnapshots.length
+          + appserviceConfigs.length,
+        tables: {
+          operator_authz_policies: operatorPolicies,
+          audit_events: auditEvents,
+          request_dedupe_projection: dedupeProjection,
+          jobs,
+          job_checkpoints: jobCheckpoints,
+          replay_manifests: replayManifests,
+          repair_decisions: repairDecisions,
+          shard_registry: shardRegistry,
+          registry_snapshots: registrySnapshots,
+          appservice_configs: appserviceConfigs,
+        },
+      };
+    },
     async upsertAppserviceConfig(record) {
       const descriptor = record.descriptor;
       const disabledAt = descriptor?.disabled_at ?? record.disabled_at ?? null;

@@ -12,7 +12,10 @@ import {
   computeStableSubject,
   createAccessJwkCache,
   createSignedManifest,
+  decryptBytes,
+  encryptBytes,
   parseExportKeyRing,
+  verifySignedManifestWithKeyRing,
   verifyAccessJwt,
 } from './crypto.mjs';
 import { createD1ControlPlanePersistence } from './persistence.mjs';
@@ -33,8 +36,52 @@ import {
   normalizeTargetScope,
   scopeToToken,
 } from './schemas.mjs';
+import { gunzipSync, gzipSync } from 'node:zlib';
 
 const ACCESS_JWK_CACHE = createAccessJwkCache();
+const RESTORE_PHASE_ORDER = Object.freeze([
+  'truth-core',
+  'truth-aux',
+  'ephemeral-current',
+  'dedupe-and-outbox',
+  'control-plane',
+]);
+const REQUIRED_RESTORE_OBJECT_KINDS = Object.freeze({
+  RoomDO: Object.freeze([
+    'room-events-metadata-segment',
+    'room-hot-event-json-segment',
+    'room-prev-edges-segment',
+    'room-auth-edges-segment',
+    'room-state-snapshot-segment',
+    'room-membership-current',
+    'room-forward-extremities-current',
+    'room-fanout-outbox-segment',
+    'room-client-txn-dedupe-segment',
+    'room-archive-reference-set',
+  ]),
+  UserDO: Object.freeze([
+    'user-identity-and-session-segment',
+    'user-profile-and-account-segment',
+    'user-stream-and-todevice-segment',
+  ]),
+  RemoteServerDO: Object.freeze([
+    'remote-outbound-queue-segment',
+    'remote-inbound-txn-segment',
+  ]),
+  'control-plane': Object.freeze([
+    'ops-core-segment',
+  ]),
+});
+const CONTROL_PLANE_CHECKPOINT_DATA_IDS = Object.freeze([
+  'DATA-D1-005',
+  'DATA-D1-006',
+  'DATA-OPS-001',
+  'DATA-OPS-002',
+  'DATA-OPS-003',
+  'DATA-OPS-004',
+  'DATA-OPS-010',
+  'DATA-OPS-011',
+]);
 
 function normalizeString(value, label, { allowNull = false } = {}) {
   if (value == null) {
@@ -47,6 +94,19 @@ function normalizeString(value, label, { allowNull = false } = {}) {
     throw new TypeError(`${label} must be a non-empty string`);
   }
   return value.trim();
+}
+
+function isRecord(value) {
+  return value != null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function assertNonNegativeInteger(value, label) {
+  if (!Number.isInteger(value) || value < 0) {
+    throw Object.assign(new Error(`${label} must be a non-negative integer`), {
+      code: 'job_conflict',
+      retryable: false,
+    });
+  }
 }
 
 export function jsonResponse(body, status = 200, extraHeaders = {}) {
@@ -580,6 +640,25 @@ export function buildArchiveObjectKey({
   return `exports/${normalizeString(exportEpochOrImportBatch, 'exportEpochOrImportBatch')}/${normalizeString(artifactKind, 'artifactKind')}/${normalizedScope.scope_kind}/${scopeIdOrGlobal}/${normalizeString(objectId, 'objectId')}`;
 }
 
+export function parseArchiveObjectKeyFromUri(uri) {
+  const normalized = normalizeString(uri, 'source_bundle_uri');
+  if (!normalized.startsWith('r2://')) {
+    throw Object.assign(new Error('source_bundle_uri must use the r2:// scheme'), {
+      code: 'job_conflict',
+      retryable: false,
+    });
+  }
+  const withoutScheme = normalized.slice('r2://'.length);
+  const firstSlashIndex = withoutScheme.indexOf('/');
+  if (firstSlashIndex < 0 || firstSlashIndex === withoutScheme.length - 1) {
+    throw Object.assign(new Error('source_bundle_uri must include a bucket segment and object key'), {
+      code: 'job_conflict',
+      retryable: false,
+    });
+  }
+  return withoutScheme.slice(firstSlashIndex + 1);
+}
+
 async function readArchiveObjectText(archiveBucket, objectKey) {
   if (!archiveBucket) {
     return null;
@@ -604,6 +683,21 @@ async function readArchiveObjectText(archiveBucket, objectKey) {
     return existing?.body ?? null;
   }
   return null;
+}
+
+export async function readArchiveJsonObject(archiveBucket, objectKey) {
+  const rawText = await readArchiveObjectText(archiveBucket, objectKey);
+  if (rawText == null) {
+    return null;
+  }
+  try {
+    return JSON.parse(rawText);
+  } catch (error) {
+    throw Object.assign(new Error(`Archive object ${objectKey} does not contain valid JSON: ${error.message}`), {
+      code: 'job_conflict',
+      retryable: false,
+    });
+  }
 }
 
 export async function putArchiveJsonObject(archiveBucket, objectKey, value) {
@@ -631,6 +725,184 @@ export async function putArchiveJsonObject(archiveBucket, objectKey, value) {
       contentType: 'application/json; charset=utf-8',
     },
   });
+}
+
+function jsonUtf8Size(value) {
+  return Buffer.byteLength(canonicalizeJsonValue(value), 'utf8');
+}
+
+function buildJsonlGzipBytes(records) {
+  const jsonl = records.map((record) => canonicalizeJsonValue(record)).join('\n');
+  const payload = jsonl.length > 0 ? `${jsonl}\n` : '';
+  return gzipSync(Buffer.from(payload, 'utf8'));
+}
+
+function computeRestorePhaseFromObjects(objects) {
+  const usedPhases = new Set(
+    (objects ?? [])
+      .filter((entry) => entry?.required_for_restore)
+      .map((entry) => entry.apply_phase),
+  );
+  for (const phase of RESTORE_PHASE_ORDER) {
+    if (usedPhases.has(phase)) {
+      return phase;
+    }
+  }
+  return 'control-plane';
+}
+
+function scopeToShardIdentity(scope) {
+  if (scope.scope_kind === 'room_id') {
+    return { shard_type: 'RoomDO', shard_key: scope.scope_id };
+  }
+  if (scope.scope_kind === 'user_id') {
+    return { shard_type: 'UserDO', shard_key: scope.scope_id };
+  }
+  if (scope.scope_kind === 'server_name') {
+    return { shard_type: 'RemoteServerDO', shard_key: scope.scope_id };
+  }
+  if (scope.scope_kind === 'global') {
+    return { shard_type: 'control-plane', shard_key: 'ops-core' };
+  }
+  throw Object.assign(new Error(`Unsupported restore scope_kind ${scope.scope_kind}`), {
+    code: 'job_conflict',
+    retryable: false,
+  });
+}
+
+function assertValidSourceWatermark(sourceWatermark, shardType, checkpointId) {
+  const labelPrefix = `Checkpoint ${checkpointId} source_watermark`;
+  if (shardType === 'RoomDO') {
+    if (!isRecord(sourceWatermark)) {
+      throw Object.assign(new Error(`${labelPrefix} must be an object for RoomDO checkpoints`), {
+        code: 'job_conflict',
+        retryable: false,
+      });
+    }
+    assertNonNegativeInteger(sourceWatermark.max_committed_room_pos, `${labelPrefix}.max_committed_room_pos`);
+    normalizeString(sourceWatermark.current_snapshot_id, `${labelPrefix}.current_snapshot_id`);
+    normalizeString(sourceWatermark.forward_extremities_hash, `${labelPrefix}.forward_extremities_hash`);
+    return;
+  }
+  if (shardType === 'UserDO') {
+    if (!isRecord(sourceWatermark)) {
+      throw Object.assign(new Error(`${labelPrefix} must be an object for UserDO checkpoints`), {
+        code: 'job_conflict',
+        retryable: false,
+      });
+    }
+    assertNonNegativeInteger(sourceWatermark.max_user_stream_pos, `${labelPrefix}.max_user_stream_pos`);
+    assertNonNegativeInteger(sourceWatermark.device_state_version, `${labelPrefix}.device_state_version`);
+    assertNonNegativeInteger(sourceWatermark.to_device_queue_highwater, `${labelPrefix}.to_device_queue_highwater`);
+    return;
+  }
+  if (shardType === 'RemoteServerDO') {
+    if (!isRecord(sourceWatermark)) {
+      throw Object.assign(new Error(`${labelPrefix} must be an object for RemoteServerDO checkpoints`), {
+        code: 'job_conflict',
+        retryable: false,
+      });
+    }
+    assertNonNegativeInteger(sourceWatermark.max_outbound_txn_seq, `${labelPrefix}.max_outbound_txn_seq`);
+    assertNonNegativeInteger(sourceWatermark.retry_schedule_version, `${labelPrefix}.retry_schedule_version`);
+    assertNonNegativeInteger(sourceWatermark.inbound_txn_cache_version, `${labelPrefix}.inbound_txn_cache_version`);
+    return;
+  }
+  if (shardType === 'control-plane') {
+    if (Number.isInteger(sourceWatermark) && sourceWatermark >= 0) {
+      return;
+    }
+    if (!isRecord(sourceWatermark)) {
+      throw Object.assign(new Error(`${labelPrefix} must be a non-negative integer or object for control-plane checkpoints`), {
+        code: 'job_conflict',
+        retryable: false,
+      });
+    }
+    if (sourceWatermark.max_audit_event_seq != null) {
+      assertNonNegativeInteger(sourceWatermark.max_audit_event_seq, `${labelPrefix}.max_audit_event_seq`);
+      return;
+    }
+    if (sourceWatermark.audit_event_rowid != null) {
+      assertNonNegativeInteger(sourceWatermark.audit_event_rowid, `${labelPrefix}.audit_event_rowid`);
+      return;
+    }
+    throw Object.assign(new Error(`${labelPrefix} must carry max_audit_event_seq or audit_event_rowid for control-plane checkpoints`), {
+      code: 'job_conflict',
+      retryable: false,
+    });
+  }
+  throw Object.assign(new Error(`Unsupported checkpoint shard_type ${shardType}`), {
+    code: 'job_conflict',
+    retryable: false,
+  });
+}
+
+function assertAllowedKeyVersion(allowedVersions, actualVersion, label) {
+  if (!Array.isArray(allowedVersions) || allowedVersions.length === 0) {
+    return;
+  }
+  if (!allowedVersions.includes(actualVersion)) {
+    throw Object.assign(new Error(`${label} ${actualVersion} is not in the allowed key version set`), {
+      code: 'job_conflict',
+      retryable: false,
+    });
+  }
+}
+
+function buildRestorePreflightConflict(message, error = null) {
+  return Object.assign(
+    new Error(error ? `${message}: ${error.message}` : message),
+    {
+      code: 'job_conflict',
+      retryable: false,
+    },
+  );
+}
+
+function assertRestoreObjectMetadata(objectEntry, checkpointManifest) {
+  if (objectEntry.shard_type !== checkpointManifest.shard_type || objectEntry.shard_key !== checkpointManifest.shard_key) {
+    throw buildRestorePreflightConflict(
+      `Checkpoint object ${objectEntry.object_id} resolved to unexpected shard identity ${objectEntry.shard_type}/${objectEntry.shard_key}`,
+    );
+  }
+  if (!RESTORE_PHASE_ORDER.includes(objectEntry.apply_phase)) {
+    throw buildRestorePreflightConflict(
+      `Checkpoint object ${objectEntry.object_id} apply_phase ${objectEntry.apply_phase ?? 'missing'} is not supported`,
+    );
+  }
+  if (objectEntry.codec !== 'jcs-json' && objectEntry.codec !== 'jsonl-gzip') {
+    throw buildRestorePreflightConflict(
+      `Checkpoint object ${objectEntry.object_id} codec ${objectEntry.codec ?? 'missing'} is not supported`,
+    );
+  }
+  if (objectEntry.codec === 'jcs-json' && objectEntry.record_count !== 1) {
+    throw buildRestorePreflightConflict(
+      `Checkpoint object ${objectEntry.object_id} record_count must be 1 for codec jcs-json`,
+    );
+  }
+  if (
+    objectEntry.codec === 'jsonl-gzip'
+    && (!Number.isInteger(objectEntry.record_count) || objectEntry.record_count <= 0)
+  ) {
+    throw buildRestorePreflightConflict(
+      `Checkpoint object ${objectEntry.object_id} record_count must be a positive integer for codec jsonl-gzip`,
+    );
+  }
+}
+
+function assertSignedManifestIntegrity(manifest, keyRing, label) {
+  if (manifest?.signature_algorithm !== 'Ed25519') {
+    throw Object.assign(new Error(`${label} must use Ed25519 signatures`), {
+      code: 'job_conflict',
+      retryable: false,
+    });
+  }
+  if (!verifySignedManifestWithKeyRing(manifest, keyRing)) {
+    throw Object.assign(new Error(`${label} signature verification failed`), {
+      code: 'job_conflict',
+      retryable: false,
+    });
+  }
 }
 
 export async function ensureControlPlaneShardRegistered({ persistence, now = new Date().toISOString() }) {
@@ -699,6 +971,655 @@ export async function freezeShardRegistrySnapshot({
     rows,
     r2_object_key: objectKey,
   };
+}
+
+function flattenControlPlaneSnapshotRecords(snapshot) {
+  const orderedTables = [
+    'operator_authz_policies',
+    'audit_events',
+    'request_dedupe_projection',
+    'jobs',
+    'job_checkpoints',
+    'replay_manifests',
+    'repair_decisions',
+    'shard_registry',
+    'registry_snapshots',
+    'appservice_configs',
+  ];
+  const records = [];
+  for (const table of orderedTables) {
+    const rows = snapshot.tables?.[table] ?? [];
+    for (const row of rows) {
+      records.push({
+        table,
+        row,
+      });
+    }
+  }
+  return records;
+}
+
+export async function buildControlPlaneCheckpointArtifact({
+  persistence,
+  archiveBucket,
+  keyRing,
+  job,
+  checkpointId,
+  now,
+}) {
+  if (!archiveBucket) {
+    throw Object.assign(new Error('Missing MATRIX_ARCHIVE_BUCKET binding'), {
+      code: 'job_conflict',
+      retryable: false,
+    });
+  }
+  const registrySnapshot = job.registry_snapshot_id == null
+    ? null
+    : await persistence.getRegistrySnapshot(job.registry_snapshot_id);
+  const snapshot = await persistence.exportControlPlaneSnapshot();
+  const records = flattenControlPlaneSnapshotRecords(snapshot);
+  const compressedBytes = buildJsonlGzipBytes(records);
+  const objectId = `${normalizeString(checkpointId, 'checkpointId')}--ops-core-segment`;
+  const encryptedEnvelope = Object.freeze({
+    envelope_version: 1,
+    checkpoint_id: checkpointId,
+    object_id: objectId,
+    shard_type: 'control-plane',
+    shard_key: 'ops-core',
+    codec: 'jsonl-gzip',
+    ...encryptBytes(compressedBytes, keyRing, {
+      aad: `${checkpointId}:${objectId}`,
+    }),
+  });
+  const checkpointObjectKey = buildArchiveObjectKey({
+    exportEpochOrImportBatch: job.export_epoch ?? checkpointId,
+    artifactKind: 'checkpoint-object',
+    scope: job.scope,
+    objectId,
+  });
+  await putArchiveJsonObject(archiveBucket, checkpointObjectKey, encryptedEnvelope);
+
+  const objectEntry = Object.freeze({
+    object_id: objectId,
+    object_kind: 'ops-core-segment',
+    shard_type: 'control-plane',
+    shard_key: 'ops-core',
+    data_ids: [...CONTROL_PLANE_CHECKPOINT_DATA_IDS],
+    required_for_restore: true,
+    apply_phase: 'control-plane',
+    range_start: snapshot.range_start,
+    range_end: snapshot.range_end,
+    content_hash: canonicalHash(encryptedEnvelope),
+    codec: 'jsonl-gzip',
+    encryption_key_version: keyRing.encryption.active,
+    byte_size: jsonUtf8Size(encryptedEnvelope),
+    record_count: records.length,
+    r2_object_key: checkpointObjectKey,
+  });
+
+  const unsignedManifest = {
+    manifest_version: CONTROL_PLANE_SCHEMA_VERSION,
+    checkpoint_id: checkpointId,
+    job_id: job.job_id,
+    export_epoch: job.export_epoch ?? null,
+    registry_snapshot_id: job.registry_snapshot_id ?? null,
+    registry_snapshot_hash: registrySnapshot?.snapshot_hash ?? null,
+    scope: job.scope,
+    shard_type: 'control-plane',
+    shard_key: 'ops-core',
+    started_at: now.toISOString(),
+    completed_at: now.toISOString(),
+    source_watermark: snapshot.watermark,
+    hash_algorithm: 'sha256',
+    signature_algorithm: 'Ed25519',
+    encryption_algorithm: 'AES-256-GCM',
+    signing_key_version: keyRing.signing.active,
+    encryption_key_version: keyRing.encryption.active,
+    objects: [objectEntry],
+    completeness_state: 'complete',
+  };
+  const signedManifest = createSignedManifest({
+    unsignedManifest,
+    keyRing,
+  });
+  const checkpointManifestKey = buildArchiveObjectKey({
+    exportEpochOrImportBatch: job.export_epoch ?? checkpointId,
+    artifactKind: 'checkpoint-manifest',
+    scope: job.scope,
+    objectId: checkpointId,
+  });
+  await putArchiveJsonObject(archiveBucket, checkpointManifestKey, signedManifest);
+
+  return Object.freeze({
+    checkpoint_id: checkpointId,
+    shard_type: 'control-plane',
+    shard_key: 'ops-core',
+    manifest: signedManifest,
+    manifest_hash: signedManifest.manifest_hash,
+    manifest_r2_object_key: checkpointManifestKey,
+    object_entries: [objectEntry],
+    source_watermark: snapshot.watermark,
+  });
+}
+
+function deriveBundleCompleteness({
+  registryRows,
+  completedCheckpoints,
+}) {
+  if (registryRows.length === 0) {
+    return 'incomplete';
+  }
+  let matched = 0;
+  for (const row of registryRows) {
+    const key = `${row.shard_type}:${row.shard_key}`;
+    const checkpoint = completedCheckpoints.get(key) ?? null;
+    if (!checkpoint) {
+      continue;
+    }
+    if (checkpoint.manifest_completeness_state !== 'complete') {
+      return matched > 0 ? 'partial' : 'incomplete';
+    }
+    matched += 1;
+  }
+  if (matched === registryRows.length) {
+    return 'complete';
+  }
+  return matched > 0 ? 'partial' : 'incomplete';
+}
+
+export async function finalizeExportBundleManifest({
+  persistence,
+  archiveBucket,
+  keyRing,
+  job,
+  now,
+}) {
+  if (!archiveBucket) {
+    throw Object.assign(new Error('Missing MATRIX_ARCHIVE_BUCKET binding'), {
+      code: 'job_conflict',
+      retryable: false,
+    });
+  }
+  const registrySnapshot = await persistence.getRegistrySnapshot(job.registry_snapshot_id);
+  if (!registrySnapshot) {
+    throw Object.assign(new Error(`Registry snapshot ${job.registry_snapshot_id} is required before bundle finalization`), {
+      code: 'job_conflict',
+      retryable: false,
+    });
+  }
+  const registryRows = registrySnapshot.snapshot?.rows ?? [];
+  const checkpoints = await persistence.listJobCheckpoints(job.job_id);
+  const completedCheckpoints = new Map(
+    checkpoints
+      .filter((entry) => entry.checkpoint?.status === 'complete')
+      .map((entry) => [`${entry.shard_type}:${entry.shard_key}`, entry.checkpoint]),
+  );
+  const registrySnapshotObject = {
+    object_id: registrySnapshot.registry_snapshot_id,
+    object_kind: 'registry-snapshot',
+    shard_type: 'control-plane',
+    shard_key: 'ops-core',
+    data_ids: ['DATA-OPS-011'],
+    required_for_restore: true,
+    apply_phase: 'control-plane',
+    range_start: registrySnapshot.created_at,
+    range_end: registrySnapshot.created_at,
+    content_hash: registrySnapshot.snapshot_hash,
+    codec: 'jcs-json',
+    encryption_key_version: keyRing.encryption.active,
+    byte_size: jsonUtf8Size(registrySnapshot.snapshot),
+    record_count: 1,
+    r2_object_key: registrySnapshot.r2_object_key,
+    completeness_state: registrySnapshot.snapshot?.completeness_state ?? 'complete',
+  };
+  const checkpointRefs = [...completedCheckpoints.values()]
+    .map((checkpoint) => ({
+      checkpoint_id: checkpoint.checkpoint_id,
+      shard_type: checkpoint.shard_type,
+      shard_key: checkpoint.shard_key,
+      manifest_hash: checkpoint.manifest_hash,
+      manifest_r2_object_key: checkpoint.manifest_r2_object_key,
+      source_watermark: checkpoint.source_watermark,
+      completeness_state: checkpoint.manifest_completeness_state,
+      apply_phase: checkpoint.apply_phase ?? 'control-plane',
+      object_count: checkpoint.object_entries?.length ?? 0,
+    }))
+    .sort((left, right) => `${left.shard_type}:${left.shard_key}`.localeCompare(`${right.shard_type}:${right.shard_key}`));
+  const completenessState = deriveBundleCompleteness({
+    registryRows,
+    completedCheckpoints,
+  });
+  const checkpointManifestObjects = [];
+  for (const ref of checkpointRefs) {
+    const checkpointManifest = await readArchiveJsonObject(archiveBucket, ref.manifest_r2_object_key);
+    if (!checkpointManifest) {
+      throw Object.assign(new Error(`Checkpoint manifest ${ref.manifest_r2_object_key} is required before bundle finalization`), {
+        code: 'job_conflict',
+        retryable: false,
+      });
+    }
+    if (checkpointManifest.manifest_hash !== ref.manifest_hash) {
+      throw Object.assign(new Error(`Checkpoint manifest hash mismatch for ${ref.checkpoint_id} during bundle finalization`), {
+        code: 'job_conflict',
+        retryable: false,
+      });
+    }
+    checkpointManifestObjects.push({
+      object_id: ref.checkpoint_id,
+      object_kind: 'checkpoint-manifest',
+      shard_type: ref.shard_type,
+      shard_key: ref.shard_key,
+      data_ids: ['DATA-R2-005'],
+      required_for_restore: true,
+      apply_phase: ref.apply_phase,
+      range_start: ref.source_watermark,
+      range_end: ref.source_watermark,
+      content_hash: ref.manifest_hash,
+      codec: 'jcs-json',
+      encryption_key_version: keyRing.encryption.active,
+      byte_size: jsonUtf8Size(checkpointManifest),
+      record_count: 1,
+      r2_object_key: ref.manifest_r2_object_key,
+      completeness_state: checkpointManifest.completeness_state,
+    });
+  }
+  const manifestObjects = [
+    registrySnapshotObject,
+    ...checkpointManifestObjects,
+  ];
+  const unsignedManifest = {
+    manifest_version: CONTROL_PLANE_SCHEMA_VERSION,
+    job_id: job.job_id,
+    job_type: job.job_type,
+    bundle_id: job.job_id,
+    scope: job.scope,
+    created_at: now.toISOString(),
+    export_epoch: job.export_epoch ?? null,
+    registry_snapshot_id: registrySnapshot.registry_snapshot_id,
+    registry_snapshot_hash: registrySnapshot.snapshot_hash,
+    registry_snapshot_r2_object_key: registrySnapshot.r2_object_key,
+    spec: job.spec,
+    hash_algorithm: 'sha256',
+    signature_algorithm: 'Ed25519',
+    encryption_algorithm: 'AES-256-GCM',
+    signing_key_version: keyRing.signing.active,
+    encryption_key_version: keyRing.encryption.active,
+    objects: manifestObjects,
+    checkpoint_refs: checkpointRefs,
+    completeness_state: completenessState,
+  };
+  const bundleManifest = createSignedManifest({
+    unsignedManifest,
+    keyRing,
+  });
+  const objectKey = buildArchiveObjectKey({
+    exportEpochOrImportBatch: job.export_epoch ?? job.job_id,
+    artifactKind: 'bundle-manifest',
+    scope: job.scope,
+    objectId: job.job_id,
+  });
+  await putArchiveJsonObject(archiveBucket, objectKey, bundleManifest);
+  await persistence.upsertReplayManifest({
+    job_id: job.job_id,
+    manifest_kind: 'bundle-manifest',
+    manifest: bundleManifest,
+    manifest_hash: bundleManifest.manifest_hash,
+    created_at: now.toISOString(),
+    export_epoch: job.export_epoch ?? null,
+    registry_snapshot_id: job.registry_snapshot_id ?? null,
+    r2_object_key: objectKey,
+  });
+  return Object.freeze({
+    manifest: bundleManifest,
+    object_key: objectKey,
+  });
+}
+
+function findBundleRegistrySnapshotObject(bundleManifest) {
+  const objects = Array.isArray(bundleManifest.objects) ? bundleManifest.objects : [];
+  return objects.find((entry) => entry?.object_kind === 'registry-snapshot') ?? null;
+}
+
+async function resolveBundleRegistrySnapshot({
+  persistence,
+  archiveBucket,
+  keyRing,
+  requestBody,
+  bundleManifest,
+}) {
+  if (bundleManifest.registry_snapshot_id == null) {
+    return Object.freeze({
+      registry_snapshot_id: null,
+      rows: [],
+    });
+  }
+
+  const registrySnapshotObject = findBundleRegistrySnapshotObject(bundleManifest);
+  const snapshotObjectKey = bundleManifest.registry_snapshot_r2_object_key
+    ?? registrySnapshotObject?.r2_object_key
+    ?? null;
+  if (snapshotObjectKey) {
+    const registrySnapshot = await readArchiveJsonObject(archiveBucket, snapshotObjectKey);
+    if (!registrySnapshot) {
+      throw Object.assign(new Error(`Registry snapshot ${snapshotObjectKey} referenced by bundle manifest was not found`), {
+        code: 'job_conflict',
+        retryable: false,
+      });
+    }
+    if (registrySnapshot.registry_snapshot_id !== bundleManifest.registry_snapshot_id) {
+      throw Object.assign(new Error(`Registry snapshot ${snapshotObjectKey} resolved to unexpected registry_snapshot_id ${registrySnapshot.registry_snapshot_id}`), {
+        code: 'job_conflict',
+        retryable: false,
+      });
+    }
+    if (registrySnapshot.manifest_hash !== bundleManifest.registry_snapshot_hash) {
+      throw Object.assign(new Error(`Registry snapshot hash mismatch for ${bundleManifest.registry_snapshot_id}`), {
+        code: 'job_conflict',
+        retryable: false,
+      });
+    }
+    if (registrySnapshotObject && registrySnapshotObject.content_hash !== registrySnapshot.manifest_hash) {
+      throw Object.assign(new Error(`Bundle manifest registry snapshot object hash mismatch for ${bundleManifest.registry_snapshot_id}`), {
+        code: 'job_conflict',
+        retryable: false,
+      });
+    }
+    assertAllowedKeyVersion(
+      requestBody.allowed_signing_key_versions,
+      registrySnapshot.signing_key_version,
+      'registry snapshot signing_key_version',
+    );
+    assertAllowedKeyVersion(
+      requestBody.allowed_encryption_key_versions,
+      registrySnapshot.encryption_key_version,
+      'registry snapshot encryption_key_version',
+    );
+    assertSignedManifestIntegrity(registrySnapshot, keyRing, `Registry snapshot ${bundleManifest.registry_snapshot_id}`);
+    if (registrySnapshot.completeness_state !== 'complete') {
+      throw Object.assign(new Error(`Registry snapshot ${bundleManifest.registry_snapshot_id} is ${registrySnapshot.completeness_state} and cannot be used for restore`), {
+        code: 'job_conflict',
+        retryable: false,
+      });
+    }
+    return Object.freeze({
+      registry_snapshot_id: registrySnapshot.registry_snapshot_id,
+      rows: Array.isArray(registrySnapshot.rows) ? registrySnapshot.rows : [],
+    });
+  }
+
+  const registrySnapshot = await persistence.getRegistrySnapshot(bundleManifest.registry_snapshot_id);
+  if (!registrySnapshot) {
+    throw Object.assign(new Error(`Registry snapshot ${bundleManifest.registry_snapshot_id} referenced by bundle manifest was not found`), {
+      code: 'job_conflict',
+      retryable: false,
+    });
+  }
+  if (registrySnapshot.snapshot_hash !== bundleManifest.registry_snapshot_hash) {
+    throw Object.assign(new Error(`Registry snapshot hash mismatch for ${bundleManifest.registry_snapshot_id}`), {
+      code: 'job_conflict',
+      retryable: false,
+    });
+  }
+  assertAllowedKeyVersion(
+    requestBody.allowed_signing_key_versions,
+    registrySnapshot.snapshot?.signing_key_version,
+    'registry snapshot signing_key_version',
+  );
+  assertAllowedKeyVersion(
+    requestBody.allowed_encryption_key_versions,
+    registrySnapshot.snapshot?.encryption_key_version,
+    'registry snapshot encryption_key_version',
+  );
+  assertSignedManifestIntegrity(registrySnapshot.snapshot, keyRing, `Registry snapshot ${bundleManifest.registry_snapshot_id}`);
+  if (registrySnapshot.snapshot?.completeness_state !== 'complete') {
+    throw Object.assign(new Error(`Registry snapshot ${bundleManifest.registry_snapshot_id} is ${registrySnapshot.snapshot?.completeness_state} and cannot be used for restore`), {
+      code: 'job_conflict',
+      retryable: false,
+    });
+  }
+  return Object.freeze({
+    registry_snapshot_id: registrySnapshot.registry_snapshot_id,
+    rows: registrySnapshot.snapshot?.rows ?? [],
+  });
+}
+
+function selectRestoreCheckpointRefs({
+  bundleManifest,
+  registryRows,
+  requestBody,
+}) {
+  const checkpointRefs = Array.isArray(bundleManifest.checkpoint_refs)
+    ? bundleManifest.checkpoint_refs
+    : [];
+  if (requestBody.restore_mode === 'full_namespace') {
+    return registryRows.map((row) => {
+      const matches = checkpointRefs.filter((entry) => (
+        entry.shard_type === row.shard_type
+        && entry.shard_key === row.shard_key
+      ));
+      if (matches.length !== 1) {
+        throw Object.assign(new Error(`Bundle manifest must contain exactly one checkpoint for ${row.shard_type}/${row.shard_key}`), {
+          code: 'job_conflict',
+          retryable: false,
+        });
+      }
+      return matches[0];
+    });
+  }
+
+  const targetShard = scopeToShardIdentity(requestBody.scope);
+  const scopedMatches = checkpointRefs.filter((entry) => (
+    entry.shard_type === targetShard.shard_type
+    && entry.shard_key === targetShard.shard_key
+  ));
+  if (scopedMatches.length !== 1) {
+    throw Object.assign(new Error(`Bundle manifest must contain exactly one checkpoint for ${targetShard.shard_type}/${targetShard.shard_key}`), {
+      code: 'job_conflict',
+      retryable: false,
+    });
+  }
+  return scopedMatches;
+}
+
+async function validateRestoreCheckpointRef({
+  archiveBucket,
+  keyRing,
+  requestBody,
+  checkpointRef,
+}) {
+  const checkpointManifest = await readArchiveJsonObject(archiveBucket, checkpointRef.manifest_r2_object_key);
+  if (!checkpointManifest) {
+    throw Object.assign(new Error(`Checkpoint manifest ${checkpointRef.manifest_r2_object_key} was not found`), {
+      code: 'job_conflict',
+      retryable: false,
+    });
+  }
+  if (checkpointManifest.manifest_hash !== checkpointRef.manifest_hash) {
+    throw Object.assign(new Error(`Checkpoint manifest hash mismatch for ${checkpointRef.checkpoint_id}`), {
+      code: 'job_conflict',
+      retryable: false,
+    });
+  }
+  if (checkpointManifest.checkpoint_id !== checkpointRef.checkpoint_id) {
+    throw Object.assign(new Error(`Checkpoint manifest ${checkpointRef.manifest_r2_object_key} resolved to unexpected checkpoint_id ${checkpointManifest.checkpoint_id}`), {
+      code: 'job_conflict',
+      retryable: false,
+    });
+  }
+  if (checkpointManifest.shard_type !== checkpointRef.shard_type || checkpointManifest.shard_key !== checkpointRef.shard_key) {
+    throw Object.assign(new Error(`Checkpoint manifest ${checkpointRef.manifest_r2_object_key} resolved to unexpected shard identity ${checkpointManifest.shard_type}/${checkpointManifest.shard_key}`), {
+      code: 'job_conflict',
+      retryable: false,
+    });
+  }
+  assertAllowedKeyVersion(
+    requestBody.allowed_signing_key_versions,
+    checkpointManifest.signing_key_version,
+    'checkpoint manifest signing_key_version',
+  );
+  assertAllowedKeyVersion(
+    requestBody.allowed_encryption_key_versions,
+    checkpointManifest.encryption_key_version,
+    'checkpoint manifest encryption_key_version',
+  );
+  assertSignedManifestIntegrity(checkpointManifest, keyRing, `Checkpoint manifest ${checkpointRef.checkpoint_id}`);
+  if (!requestBody.allow_incomplete && checkpointManifest.completeness_state !== 'complete') {
+    throw Object.assign(new Error(`Checkpoint ${checkpointRef.checkpoint_id} is ${checkpointManifest.completeness_state} and cannot be used for restore`), {
+      code: 'job_conflict',
+      retryable: false,
+    });
+  }
+  assertValidSourceWatermark(
+    checkpointManifest.source_watermark,
+    checkpointManifest.shard_type,
+    checkpointManifest.checkpoint_id,
+  );
+
+  const requiredKinds = REQUIRED_RESTORE_OBJECT_KINDS[checkpointRef.shard_type] ?? [];
+  const objects = Array.isArray(checkpointManifest.objects) ? checkpointManifest.objects : [];
+  for (const objectKind of requiredKinds) {
+    if (!objects.some((entry) => entry.object_kind === objectKind && entry.required_for_restore)) {
+      throw Object.assign(new Error(`Checkpoint ${checkpointRef.checkpoint_id} is missing required object_kind ${objectKind}`), {
+        code: 'job_conflict',
+        retryable: false,
+      });
+    }
+  }
+
+  for (const objectEntry of objects) {
+    assertRestoreObjectMetadata(objectEntry, checkpointManifest);
+    const objectEnvelope = await readArchiveJsonObject(archiveBucket, objectEntry.r2_object_key);
+    if (!objectEnvelope) {
+      throw Object.assign(new Error(`Checkpoint object ${objectEntry.r2_object_key} was not found`), {
+        code: 'job_conflict',
+        retryable: false,
+      });
+    }
+    if (canonicalHash(objectEnvelope) !== objectEntry.content_hash) {
+      throw Object.assign(new Error(`Checkpoint object hash mismatch for ${objectEntry.object_id}`), {
+        code: 'job_conflict',
+        retryable: false,
+      });
+    }
+    assertAllowedKeyVersion(
+      requestBody.allowed_encryption_key_versions,
+      objectEntry.encryption_key_version,
+      `checkpoint object ${objectEntry.object_id} encryption_key_version`,
+    );
+    let plaintext;
+    try {
+      plaintext = decryptBytes(objectEnvelope, keyRing, {
+        aad: `${checkpointManifest.checkpoint_id}:${objectEntry.object_id}`,
+      });
+    } catch (error) {
+      throw buildRestorePreflightConflict(`Checkpoint object ${objectEntry.object_id} failed decryptability validation`, error);
+    }
+    if (objectEntry.codec === 'jcs-json') {
+      try {
+        JSON.parse(plaintext.toString('utf8'));
+      } catch (error) {
+        throw buildRestorePreflightConflict(`Checkpoint object ${objectEntry.object_id} does not contain valid jcs-json`, error);
+      }
+      continue;
+    }
+    if (objectEntry.codec === 'jsonl-gzip') {
+      let decompressed;
+      try {
+        decompressed = gunzipSync(plaintext).toString('utf8');
+      } catch (error) {
+        throw buildRestorePreflightConflict(`Checkpoint object ${objectEntry.object_id} is not valid jsonl-gzip`, error);
+      }
+      const trimmed = decompressed.trimEnd();
+      const lines = trimmed.length === 0 ? [] : trimmed.split('\n');
+      if (lines.length !== objectEntry.record_count) {
+        throw Object.assign(new Error(`Checkpoint object ${objectEntry.object_id} record_count mismatch`), {
+          code: 'job_conflict',
+          retryable: false,
+        });
+      }
+      for (const line of lines) {
+        try {
+          JSON.parse(line);
+        } catch (error) {
+          throw buildRestorePreflightConflict(`Checkpoint object ${objectEntry.object_id} contains invalid jsonl-gzip records`, error);
+        }
+      }
+    }
+  }
+
+  return Object.freeze({
+    checkpoint_id: checkpointManifest.checkpoint_id,
+    shard_type: checkpointManifest.shard_type,
+    shard_key: checkpointManifest.shard_key,
+    apply_phase: computeRestorePhaseFromObjects(objects),
+    manifest_hash: checkpointManifest.manifest_hash,
+    manifest_r2_object_key: checkpointRef.manifest_r2_object_key,
+    checkpoint_manifest: checkpointManifest,
+  });
+}
+
+export async function resolveRestoreCheckpointRefs({
+  persistence,
+  archiveBucket,
+  keyRing,
+  requestBody,
+}) {
+  const bundleObjectKey = parseArchiveObjectKeyFromUri(requestBody.source_bundle_uri);
+  const bundleManifest = await readArchiveJsonObject(archiveBucket, bundleObjectKey);
+  if (!bundleManifest) {
+    throw Object.assign(new Error(`Bundle manifest ${bundleObjectKey} was not found`), {
+      code: 'job_conflict',
+      retryable: false,
+    });
+  }
+  if (bundleManifest.manifest_hash !== requestBody.source_bundle_hash) {
+    throw Object.assign(new Error('source_bundle_hash does not match the referenced bundle manifest'), {
+      code: 'job_conflict',
+      retryable: false,
+    });
+  }
+  assertAllowedKeyVersion(
+    requestBody.allowed_signing_key_versions,
+    bundleManifest.signing_key_version,
+    'bundle manifest signing_key_version',
+  );
+  assertAllowedKeyVersion(
+    requestBody.allowed_encryption_key_versions,
+    bundleManifest.encryption_key_version,
+    'bundle manifest encryption_key_version',
+  );
+  assertSignedManifestIntegrity(bundleManifest, keyRing, `Bundle manifest ${bundleObjectKey}`);
+
+  if (requestBody.restore_mode === 'full_namespace' && bundleManifest.completeness_state !== 'complete') {
+    throw Object.assign(new Error(`Bundle manifest completeness_state must be complete for full_namespace restore (got ${bundleManifest.completeness_state})`), {
+      code: 'job_conflict',
+      retryable: false,
+    });
+  }
+
+  const resolvedRegistrySnapshot = await resolveBundleRegistrySnapshot({
+    persistence,
+    archiveBucket,
+    keyRing,
+    requestBody,
+    bundleManifest,
+  });
+  const registryRows = resolvedRegistrySnapshot.rows;
+  const selectedRefs = selectRestoreCheckpointRefs({
+    bundleManifest,
+    registryRows,
+    requestBody,
+  });
+  const resolved = [];
+  for (const checkpointRef of selectedRefs) {
+    resolved.push(await validateRestoreCheckpointRef({
+      archiveBucket,
+      keyRing,
+      requestBody,
+      checkpointRef,
+    }));
+  }
+  return Object.freeze(resolved);
 }
 
 export async function createReplayManifest({
@@ -1230,11 +2151,67 @@ export async function startControlPlaneJob({
     requestContext,
     jobRecord,
   });
-  if (reservation.outcome === 'conflict' || reservation.outcome === 'replay') {
+  if (reservation.outcome === 'conflict') {
     return responseFromEnvelope(reservation.envelope);
+  }
+  if (reservation.outcome === 'replay') {
+    const replayJob = reservation.job_id == null
+      ? null
+      : await persistence.getJob(reservation.job_id);
+    const replayBody = reservation.envelope?.body ?? null;
+    const replayableQueueStart = replayJob
+      && replayBody?.retryable === true
+      && replayJob.checkpoint_state?.queue_delivery_state === 'staged'
+      && replayJob.job_type === jobType;
+    if (!replayableQueueStart) {
+      return responseFromEnvelope(reservation.envelope);
+    }
+    try {
+      const internalRoute = jobType === 'export'
+        ? ROUTE_TEMPLATES.internalStartExport
+        : jobType === 'restore'
+          ? ROUTE_TEMPLATES.internalStartRestore
+          : jobType === 'rebuild'
+            ? ROUTE_TEMPLATES.internalStartRebuild
+            : ROUTE_TEMPLATES.internalStartRepair;
+      await dispatchJobStart({
+        env,
+        routeTemplate: internalRoute,
+        spec: replayJob.spec,
+      });
+      const storedReplayJob = await persistence.getJob(replayJob.job_id);
+      const successEnvelope = serializeEnvelope('success', 202, buildJobHandleFromRecord(storedReplayJob ?? replayJob));
+      await finalizeReservedWrite({
+        persistence,
+        operator,
+        scope: requestBody.scope,
+        idempotencyKey,
+        envelope: successEnvelope,
+        resultCode: 'queued',
+        requestContext,
+        requestFingerprint,
+        jobId: replayJob.job_id,
+        eventType: `${jobType}.queued`,
+        details: {
+          route_template: routeTemplate,
+          recovered_from_retryable_start_failure: true,
+        },
+      });
+      return responseFromEnvelope(successEnvelope);
+    } catch {
+      return responseFromEnvelope(reservation.envelope);
+    }
   }
 
   try {
+    if (jobType === 'restore') {
+      await resolveRestoreCheckpointRefs({
+        persistence,
+        archiveBucket: env.MATRIX_ARCHIVE_BUCKET,
+        keyRing: parseExportKeyRingFromEnv(config, env),
+        requestBody,
+      });
+    }
     if (jobType === 'export') {
       await ensureControlPlaneShardRegistered({
         persistence,
@@ -1272,15 +2249,17 @@ export async function startControlPlaneJob({
       jobRecord.registry_snapshot_id = registrySnapshotId;
       jobRecord.export_epoch = exportEpoch;
     }
-    await createReplayManifest({
-      persistence,
-      archiveBucket: env.MATRIX_ARCHIVE_BUCKET,
-      keyRing,
-      jobRecord,
-      manifestKind: jobType === 'export' ? 'bundle-manifest' : 'shard-manifest',
-      scope: requestBody.scope,
-      now: new Date(),
-    });
+    if (jobType !== 'export') {
+      await createReplayManifest({
+        persistence,
+        archiveBucket: env.MATRIX_ARCHIVE_BUCKET,
+        keyRing,
+        jobRecord,
+        manifestKind: 'shard-manifest',
+        scope: requestBody.scope,
+        now: new Date(),
+      });
+    }
     const internalRoute = jobType === 'export'
       ? ROUTE_TEMPLATES.internalStartExport
       : jobType === 'restore'
@@ -1312,32 +2291,43 @@ export async function startControlPlaneJob({
     });
     return responseFromEnvelope(successEnvelope);
   } catch (error) {
+    const failureCode = error.code === 'job_conflict'
+      ? 'precondition_failed'
+      : error instanceof TypeError || error instanceof RangeError
+        ? 'validation_failed'
+        : 'internal';
+    const retryable = failureCode === 'internal'
+      ? (error.retryable == null ? true : Boolean(error.retryable))
+      : Boolean(error.retryable);
+    const failureStatus = failureCode === 'precondition_failed'
+      ? 409
+      : failureCode === 'validation_failed'
+        ? 422
+        : retryable
+          ? 503
+          : 500;
     const storedJob = await persistence.getJob(jobId);
     const failureBase = storedJob ?? jobRecord;
+    const failureBody = buildOpsErrorJson({
+      code: failureCode,
+      message: error.message,
+      requestId: requestContext.requestId,
+      retryable,
+      details: {
+        job_id: jobId,
+      },
+    });
     const failedJob = {
       ...failureBase,
       internal_state: 'failed',
       completed_at: new Date().toISOString(),
-      last_error: buildOpsErrorJson({
-        code: 'internal',
-        message: error.message,
-        requestId: requestContext.requestId,
-        retryable: true,
-      }),
+      last_error: failureBody,
       result_summary: {
         failure: error.message,
       },
     };
     await persistence.updateJob(failedJob);
-    const errorEnvelope = serializeEnvelope('error', 503, buildOpsErrorJson({
-      code: 'internal',
-      message: error.message,
-      requestId: requestContext.requestId,
-      retryable: true,
-      details: {
-        job_id: jobId,
-      },
-    }));
+    const errorEnvelope = serializeEnvelope('error', failureStatus, failureBody);
     await finalizeReservedWrite({
       persistence,
       operator,

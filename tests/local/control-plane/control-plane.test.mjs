@@ -1,10 +1,14 @@
 import assert from 'node:assert/strict';
+import { generateKeyPairSync, randomBytes } from 'node:crypto';
 import test from 'node:test';
 
 import {
+  buildArchiveObjectKey,
   buildExportShardJob,
   buildInternalJobSpec,
+  canonicalHash,
   createSignedManifest,
+  encryptBytes,
   parseExportKeyRing,
   verifySignedManifest,
 } from '../../../packages/control-plane/src/index.mjs';
@@ -47,6 +51,500 @@ function createStoredJobRecord({
     registry_snapshot_id: registrySnapshotId,
     export_epoch: exportEpoch,
     result_summary: null,
+  };
+}
+
+async function seedFullExportBundle(rig, {
+  idempotencyKey = `idem-export-seed-${Date.now()}`,
+  ticketId = 'OPS-SEED',
+} = {}) {
+  const exportResponse = await rig.opsWorker(
+    rig.makeOpsRequest('/_ops/v1/exports', {
+      method: 'POST',
+      body: {
+        export_mode: 'full_bundle',
+        scope: {
+          scope_kind: 'global',
+          scope_id: null,
+        },
+        reason: 'seed bundle',
+        ticket_id: ticketId,
+        reuse_checkpoint_policy: 'force_fresh',
+        max_checkpoint_age_seconds: 60,
+        include_optional_objects: false,
+        output_encryption_key_version: 'enc-v1',
+      },
+      headers: {
+        'Idempotency-Key': idempotencyKey,
+      },
+    }),
+    rig.opsEnv,
+  );
+  assert.equal(exportResponse.status, 202);
+  await exportResponse.json();
+  await rig.jobsWorker.queue(rig.queues.export.drainBatch(), rig.jobsEnv);
+
+  const keys = [...rig.archiveBucket.objects.keys()];
+  const bundleManifestKey = keys.find((key) => key.includes('/bundle-manifest/'));
+  assert.ok(bundleManifestKey);
+  const bundleManifest = rig.archiveBucket.getJson(bundleManifestKey);
+
+  const checkpointRef = bundleManifest.checkpoint_refs?.[0] ?? null;
+  assert.ok(checkpointRef?.manifest_r2_object_key);
+  const checkpointManifest = rig.archiveBucket.getJson(checkpointRef.manifest_r2_object_key);
+  const checkpointObjectKey = checkpointManifest?.objects?.[0]?.r2_object_key ?? null;
+  assert.ok(checkpointObjectKey);
+
+  return {
+    bundleManifestKey,
+    bundleManifest,
+    checkpointRef,
+    checkpointManifest,
+    checkpointObjectKey,
+  };
+}
+
+function createRotatedExportKeyRingSecret(baseSecret) {
+  const rotated = JSON.parse(baseSecret);
+  const signingKeyPair = generateKeyPairSync('ed25519');
+  rotated.signing.keys['sig-v2'] = {
+    private_key_pem: signingKeyPair.privateKey.export({ format: 'pem', type: 'pkcs8' }),
+    public_key_pem: signingKeyPair.publicKey.export({ format: 'pem', type: 'spki' }),
+  };
+  rotated.signing.active = 'sig-v2';
+  rotated.encryption.keys['enc-v2'] = {
+    key_base64: randomBytes(32).toString('base64'),
+  };
+  rotated.encryption.active = 'enc-v2';
+  return JSON.stringify(rotated);
+}
+
+const ROOM_REQUIRED_OBJECT_SPECS_WITHOUT_ARCHIVE_REFERENCE = Object.freeze([
+  { kind: 'room-events-metadata-segment', apply_phase: 'truth-core', data_ids: ['DATA-ROOM-001'] },
+  { kind: 'room-hot-event-json-segment', apply_phase: 'truth-core', data_ids: ['DATA-ROOM-002'] },
+  { kind: 'room-prev-edges-segment', apply_phase: 'truth-core', data_ids: ['DATA-ROOM-003'] },
+  { kind: 'room-auth-edges-segment', apply_phase: 'truth-core', data_ids: ['DATA-ROOM-004'] },
+  { kind: 'room-state-snapshot-segment', apply_phase: 'truth-aux', data_ids: ['DATA-ROOM-005'] },
+  { kind: 'room-membership-current', apply_phase: 'truth-aux', data_ids: ['DATA-ROOM-006'] },
+  { kind: 'room-forward-extremities-current', apply_phase: 'truth-aux', data_ids: ['DATA-ROOM-007'] },
+  { kind: 'room-fanout-outbox-segment', apply_phase: 'dedupe-and-outbox', data_ids: ['DATA-ROOM-011'] },
+  { kind: 'room-client-txn-dedupe-segment', apply_phase: 'dedupe-and-outbox', data_ids: ['DATA-ROOM-012'] },
+]);
+const USER_REQUIRED_OBJECT_SPECS = Object.freeze([
+  { kind: 'user-identity-and-session-segment', apply_phase: 'truth-core', data_ids: ['DATA-USER-001'] },
+  { kind: 'user-profile-and-account-segment', apply_phase: 'truth-aux', data_ids: ['DATA-USER-006'] },
+  { kind: 'user-stream-and-todevice-segment', apply_phase: 'dedupe-and-outbox', data_ids: ['DATA-USER-008'] },
+]);
+const CONTROL_PLANE_REQUIRED_OBJECT_SPECS = Object.freeze([
+  { kind: 'ops-core-segment', apply_phase: 'control-plane', data_ids: ['DATA-OPS-001'] },
+]);
+
+async function putJsonArchiveObject(bucket, key, value) {
+  await bucket.put(key, JSON.stringify(value), {
+    httpMetadata: {
+      contentType: 'application/json; charset=utf-8',
+    },
+  });
+}
+
+async function seedSyntheticRoomRestoreBundleMissingArchiveReference(rig, {
+  sourceWatermark = {
+    max_committed_room_pos: 7,
+    current_snapshot_id: 'snapshot_room_1',
+    forward_extremities_hash: 'forward_extremities_hash_1',
+  },
+} = {}) {
+  const keyRing = parseExportKeyRing(rig.opsEnv.EXPORT_BUNDLE_KEY_RING);
+  const exportEpoch = `export_epoch_room_missing_archive_${Date.now()}`;
+  const scope = {
+    scope_kind: 'global',
+    scope_id: null,
+  };
+  const shardType = 'RoomDO';
+  const shardKey = '!room:test';
+  const checkpointId = `checkpoint_room_missing_archive_${Date.now()}`;
+  const bundleId = `bundle_room_missing_archive_${Date.now()}`;
+  const registrySnapshotId = `registry_snapshot_room_missing_archive_${Date.now()}`;
+  const createdAt = new Date().toISOString();
+  const registryRows = [{
+    shard_type: shardType,
+    shard_key: shardKey,
+    created_at: createdAt,
+    last_seen_at: createdAt,
+    schema_version: 1,
+    disabled_at: null,
+  }];
+
+  const unsignedRegistrySnapshot = {
+    manifest_version: 1,
+    registry_snapshot_id: registrySnapshotId,
+    export_epoch: exportEpoch,
+    scope,
+    created_at: createdAt,
+    row_count: registryRows.length,
+    hash_algorithm: 'sha256',
+    signature_algorithm: 'Ed25519',
+    encryption_algorithm: 'AES-256-GCM',
+    signing_key_version: keyRing.signing.active,
+    encryption_key_version: keyRing.encryption.active,
+    completeness_state: 'complete',
+    rows: registryRows,
+  };
+  const registrySnapshot = createSignedManifest({
+    unsignedManifest: unsignedRegistrySnapshot,
+    keyRing,
+  });
+  const registrySnapshotKey = buildArchiveObjectKey({
+    exportEpochOrImportBatch: exportEpoch,
+    artifactKind: 'registry-snapshot',
+    scope,
+    objectId: registrySnapshotId,
+  });
+  await putJsonArchiveObject(rig.archiveBucket, registrySnapshotKey, registrySnapshot);
+
+  const objectEntries = [];
+  for (const [index, objectSpec] of ROOM_REQUIRED_OBJECT_SPECS_WITHOUT_ARCHIVE_REFERENCE.entries()) {
+    const objectId = `${checkpointId}--${index}`;
+    const objectKey = buildArchiveObjectKey({
+      exportEpochOrImportBatch: exportEpoch,
+      artifactKind: 'checkpoint-object',
+      scope,
+      objectId,
+    });
+    const objectEnvelope = {
+      envelope_version: 1,
+      checkpoint_id: checkpointId,
+      object_id: objectId,
+      shard_type: shardType,
+      shard_key: shardKey,
+      codec: 'jcs-json',
+      ...encryptBytes(Buffer.from('{}', 'utf8'), keyRing, {
+        aad: `${checkpointId}:${objectId}`,
+      }),
+    };
+    await putJsonArchiveObject(rig.archiveBucket, objectKey, objectEnvelope);
+    objectEntries.push({
+      object_id: objectId,
+      object_kind: objectSpec.kind,
+      shard_type: shardType,
+      shard_key: shardKey,
+      data_ids: objectSpec.data_ids,
+      required_for_restore: true,
+      apply_phase: objectSpec.apply_phase,
+      range_start: index,
+      range_end: index,
+      content_hash: canonicalHash(objectEnvelope),
+      codec: 'jcs-json',
+      encryption_key_version: keyRing.encryption.active,
+      byte_size: Buffer.byteLength(JSON.stringify(objectEnvelope), 'utf8'),
+      record_count: 1,
+      r2_object_key: objectKey,
+    });
+  }
+
+  const checkpointManifest = createSignedManifest({
+    unsignedManifest: {
+      manifest_version: 1,
+      checkpoint_id: checkpointId,
+      job_id: `export_job_${Date.now()}`,
+      export_epoch: exportEpoch,
+      registry_snapshot_id: registrySnapshotId,
+      registry_snapshot_hash: registrySnapshot.manifest_hash,
+      scope,
+      shard_type: shardType,
+      shard_key: shardKey,
+      started_at: createdAt,
+      completed_at: createdAt,
+      source_watermark: sourceWatermark,
+      hash_algorithm: 'sha256',
+      signature_algorithm: 'Ed25519',
+      encryption_algorithm: 'AES-256-GCM',
+      signing_key_version: keyRing.signing.active,
+      encryption_key_version: keyRing.encryption.active,
+      objects: objectEntries,
+      completeness_state: 'complete',
+    },
+    keyRing,
+  });
+  const checkpointManifestKey = buildArchiveObjectKey({
+    exportEpochOrImportBatch: exportEpoch,
+    artifactKind: 'checkpoint-manifest',
+    scope,
+    objectId: checkpointId,
+  });
+  await putJsonArchiveObject(rig.archiveBucket, checkpointManifestKey, checkpointManifest);
+
+  const bundleManifest = createSignedManifest({
+    unsignedManifest: {
+      manifest_version: 1,
+      job_id: bundleId,
+      job_type: 'export',
+      bundle_id: bundleId,
+      scope,
+      created_at: createdAt,
+      export_epoch: exportEpoch,
+      registry_snapshot_id: registrySnapshotId,
+      registry_snapshot_hash: registrySnapshot.manifest_hash,
+      registry_snapshot_r2_object_key: registrySnapshotKey,
+      spec: {
+        export_mode: 'full_bundle',
+      },
+      hash_algorithm: 'sha256',
+      signature_algorithm: 'Ed25519',
+      encryption_algorithm: 'AES-256-GCM',
+      signing_key_version: keyRing.signing.active,
+      encryption_key_version: keyRing.encryption.active,
+      objects: [
+        {
+          object_id: registrySnapshotId,
+          object_kind: 'registry-snapshot',
+          shard_type: 'control-plane',
+          shard_key: 'ops-core',
+          data_ids: ['DATA-OPS-011'],
+          required_for_restore: true,
+          apply_phase: 'control-plane',
+          range_start: createdAt,
+          range_end: createdAt,
+          content_hash: registrySnapshot.manifest_hash,
+          codec: 'jcs-json',
+          encryption_key_version: keyRing.encryption.active,
+          byte_size: Buffer.byteLength(JSON.stringify(registrySnapshot), 'utf8'),
+          record_count: 1,
+          r2_object_key: registrySnapshotKey,
+          completeness_state: 'complete',
+        },
+      ],
+      checkpoint_refs: [{
+        checkpoint_id: checkpointId,
+        shard_type: shardType,
+        shard_key: shardKey,
+        manifest_hash: checkpointManifest.manifest_hash,
+        manifest_r2_object_key: checkpointManifestKey,
+        source_watermark: sourceWatermark,
+        completeness_state: 'complete',
+        apply_phase: 'truth-core',
+        object_count: objectEntries.length,
+      }],
+      completeness_state: 'complete',
+    },
+    keyRing,
+  });
+  const bundleManifestKey = buildArchiveObjectKey({
+    exportEpochOrImportBatch: exportEpoch,
+    artifactKind: 'bundle-manifest',
+    scope,
+    objectId: bundleId,
+  });
+  await putJsonArchiveObject(rig.archiveBucket, bundleManifestKey, bundleManifest);
+
+  return {
+    bundleManifest,
+    bundleManifestKey,
+  };
+}
+
+async function seedSyntheticRestoreBundle(rig, {
+  shardType,
+  shardKey,
+  sourceWatermark,
+  objectSpecs,
+  scope = {
+    scope_kind: 'global',
+    scope_id: null,
+  },
+}) {
+  const keyRing = parseExportKeyRing(rig.opsEnv.EXPORT_BUNDLE_KEY_RING);
+  const exportEpoch = `export_epoch_synthetic_${Date.now()}`;
+  const bundleId = `bundle_synthetic_${Date.now()}`;
+  const checkpointId = `checkpoint_synthetic_${Date.now()}`;
+  const registrySnapshotId = `registry_snapshot_synthetic_${Date.now()}`;
+  const createdAt = new Date().toISOString();
+  const registryRows = [{
+    shard_type: shardType,
+    shard_key: shardKey,
+    created_at: createdAt,
+    last_seen_at: createdAt,
+    schema_version: 1,
+    disabled_at: null,
+  }];
+
+  const registrySnapshot = createSignedManifest({
+    unsignedManifest: {
+      manifest_version: 1,
+      registry_snapshot_id: registrySnapshotId,
+      export_epoch: exportEpoch,
+      scope,
+      created_at: createdAt,
+      row_count: registryRows.length,
+      hash_algorithm: 'sha256',
+      signature_algorithm: 'Ed25519',
+      encryption_algorithm: 'AES-256-GCM',
+      signing_key_version: keyRing.signing.active,
+      encryption_key_version: keyRing.encryption.active,
+      completeness_state: 'complete',
+      rows: registryRows,
+    },
+    keyRing,
+  });
+  const registrySnapshotKey = buildArchiveObjectKey({
+    exportEpochOrImportBatch: exportEpoch,
+    artifactKind: 'registry-snapshot',
+    scope,
+    objectId: registrySnapshotId,
+  });
+  await putJsonArchiveObject(rig.archiveBucket, registrySnapshotKey, registrySnapshot);
+
+  const objectEntries = [];
+  for (const [index, objectSpec] of objectSpecs.entries()) {
+    const objectId = `${checkpointId}--${index}`;
+    const objectKey = buildArchiveObjectKey({
+      exportEpochOrImportBatch: exportEpoch,
+      artifactKind: 'checkpoint-object',
+      scope,
+      objectId,
+    });
+    const defaultEnvelope = {
+      envelope_version: 1,
+      checkpoint_id: checkpointId,
+      object_id: objectId,
+      shard_type: shardType,
+      shard_key: shardKey,
+      codec: objectSpec.codec ?? 'jcs-json',
+      ...encryptBytes(
+        Buffer.isBuffer(objectSpec.payload)
+          ? objectSpec.payload
+          : Buffer.from(objectSpec.payload ?? '{}', 'utf8'),
+        keyRing,
+        {
+          aad: `${checkpointId}:${objectId}`,
+        },
+      ),
+    };
+    const objectEnvelope = {
+      ...defaultEnvelope,
+      ...(objectSpec.envelopeOverrides ?? {}),
+    };
+    await putJsonArchiveObject(rig.archiveBucket, objectKey, objectEnvelope);
+    objectEntries.push({
+      object_id: objectId,
+      object_kind: objectSpec.kind,
+      shard_type: shardType,
+      shard_key: shardKey,
+      data_ids: objectSpec.data_ids,
+      required_for_restore: objectSpec.required_for_restore ?? true,
+      apply_phase: objectSpec.apply_phase,
+      range_start: objectSpec.range_start ?? index,
+      range_end: objectSpec.range_end ?? index,
+      content_hash: canonicalHash(objectEnvelope),
+      codec: objectSpec.codec ?? 'jcs-json',
+      encryption_key_version: objectEnvelope.encryption_key_version,
+      byte_size: Buffer.byteLength(JSON.stringify(objectEnvelope), 'utf8'),
+      record_count: objectSpec.record_count ?? (objectSpec.codec === 'jsonl-gzip' ? 1 : 1),
+      r2_object_key: objectKey,
+      ...(objectSpec.entryOverrides ?? {}),
+    });
+  }
+
+  const checkpointManifest = createSignedManifest({
+    unsignedManifest: {
+      manifest_version: 1,
+      checkpoint_id: checkpointId,
+      job_id: `export_job_${Date.now()}`,
+      export_epoch: exportEpoch,
+      registry_snapshot_id: registrySnapshotId,
+      registry_snapshot_hash: registrySnapshot.manifest_hash,
+      scope,
+      shard_type: shardType,
+      shard_key: shardKey,
+      started_at: createdAt,
+      completed_at: createdAt,
+      source_watermark: sourceWatermark,
+      hash_algorithm: 'sha256',
+      signature_algorithm: 'Ed25519',
+      encryption_algorithm: 'AES-256-GCM',
+      signing_key_version: keyRing.signing.active,
+      encryption_key_version: keyRing.encryption.active,
+      objects: objectEntries,
+      completeness_state: 'complete',
+    },
+    keyRing,
+  });
+  const checkpointManifestKey = buildArchiveObjectKey({
+    exportEpochOrImportBatch: exportEpoch,
+    artifactKind: 'checkpoint-manifest',
+    scope,
+    objectId: checkpointId,
+  });
+  await putJsonArchiveObject(rig.archiveBucket, checkpointManifestKey, checkpointManifest);
+
+  const bundleManifest = createSignedManifest({
+    unsignedManifest: {
+      manifest_version: 1,
+      job_id: bundleId,
+      job_type: 'export',
+      bundle_id: bundleId,
+      scope,
+      created_at: createdAt,
+      export_epoch: exportEpoch,
+      registry_snapshot_id: registrySnapshotId,
+      registry_snapshot_hash: registrySnapshot.manifest_hash,
+      registry_snapshot_r2_object_key: registrySnapshotKey,
+      spec: {
+        export_mode: 'full_bundle',
+      },
+      hash_algorithm: 'sha256',
+      signature_algorithm: 'Ed25519',
+      encryption_algorithm: 'AES-256-GCM',
+      signing_key_version: keyRing.signing.active,
+      encryption_key_version: keyRing.encryption.active,
+      objects: [
+        {
+          object_id: registrySnapshotId,
+          object_kind: 'registry-snapshot',
+          shard_type: 'control-plane',
+          shard_key: 'ops-core',
+          data_ids: ['DATA-OPS-011'],
+          required_for_restore: true,
+          apply_phase: 'control-plane',
+          range_start: createdAt,
+          range_end: createdAt,
+          content_hash: registrySnapshot.manifest_hash,
+          codec: 'jcs-json',
+          encryption_key_version: keyRing.encryption.active,
+          byte_size: Buffer.byteLength(JSON.stringify(registrySnapshot), 'utf8'),
+          record_count: 1,
+          r2_object_key: registrySnapshotKey,
+          completeness_state: 'complete',
+        },
+      ],
+      checkpoint_refs: [{
+        checkpoint_id: checkpointId,
+        shard_type: shardType,
+        shard_key: shardKey,
+        manifest_hash: checkpointManifest.manifest_hash,
+        manifest_r2_object_key: checkpointManifestKey,
+        source_watermark: sourceWatermark,
+        completeness_state: 'complete',
+        apply_phase: objectEntries[0]?.apply_phase ?? 'truth-core',
+        object_count: objectEntries.length,
+      }],
+      completeness_state: 'complete',
+    },
+    keyRing,
+  });
+  const bundleManifestKey = buildArchiveObjectKey({
+    exportEpochOrImportBatch: exportEpoch,
+    artifactKind: 'bundle-manifest',
+    scope,
+    objectId: bundleId,
+  });
+  await putJsonArchiveObject(rig.archiveBucket, bundleManifestKey, bundleManifest);
+
+  return {
+    bundleManifest,
+    bundleManifestKey,
+    checkpointManifest,
+    checkpointManifestKey,
   };
 }
 
@@ -334,9 +832,11 @@ test('ops-worker accepts export jobs, deduplicates identical requests, rejects c
     const registrySnapshotKey = [...rig.archiveBucket.objects.keys()].find((key) => key.includes('/registry-snapshot/'));
     const bundleManifestKey = [...rig.archiveBucket.objects.keys()].find((key) => key.includes('/bundle-manifest/'));
     const checkpointManifestKey = [...rig.archiveBucket.objects.keys()].find((key) => key.includes('/checkpoint-manifest/'));
+    const checkpointObjectKey = [...rig.archiveBucket.objects.keys()].find((key) => key.includes('/checkpoint-object/'));
     assert.ok(registrySnapshotKey);
     assert.ok(bundleManifestKey);
     assert.ok(checkpointManifestKey);
+    assert.ok(checkpointObjectKey);
 
     const bundleManifest = rig.archiveBucket.getJson(bundleManifestKey);
     const checkpointManifest = rig.archiveBucket.getJson(checkpointManifestKey);
@@ -344,11 +844,24 @@ test('ops-worker accepts export jobs, deduplicates identical requests, rejects c
     const exportKeyRing = JSON.parse(rig.opsEnv.EXPORT_BUNDLE_KEY_RING);
     assert.equal(bundleManifest.signature_algorithm, 'Ed25519');
     assert.equal(typeof bundleManifest.registry_snapshot_hash, 'string');
+    assert.equal(bundleManifest.registry_snapshot_r2_object_key, registrySnapshotKey);
+    assert.equal(bundleManifest.completeness_state, 'complete');
     assert.equal(replayManifest?.manifest_kind, 'bundle-manifest');
     assert.equal(replayManifest?.manifest_hash, bundleManifest.manifest_hash);
-    assert.equal(checkpointManifest.completeness_state, 'incomplete');
+    assert.equal(checkpointManifest.signature_algorithm, 'Ed25519');
+    assert.equal(checkpointManifest.completeness_state, 'complete');
+    assert.ok(bundleManifest.objects.some((entry) => (
+      entry.object_kind === 'registry-snapshot'
+      && entry.r2_object_key === registrySnapshotKey
+      && entry.content_hash === bundleManifest.registry_snapshot_hash
+    )));
+    assert.equal(bundleManifest.checkpoint_refs[0].checkpoint_id, checkpointManifest.checkpoint_id);
     assert.equal(
       verifySignedManifest(bundleManifest, exportKeyRing.signing.keys['sig-v1'].public_key_pem),
+      true,
+    );
+    assert.equal(
+      verifySignedManifest(checkpointManifest, exportKeyRing.signing.keys['sig-v1'].public_key_pem),
       true,
     );
 
@@ -426,6 +939,87 @@ test('jobs-worker poisons queue messages with unsupported schema_version and mar
   }
 });
 
+test('ops-worker recovers staged queue fan-out on idempotent retry after transient queue publish failure', async () => {
+  const teamDomain = `ops-export-retry-${Date.now()}.cloudflareaccess.com`;
+  const rig = await createControlPlaneRig({
+    teamDomain,
+    policies: [
+      defaultPolicy({
+        principalId: 'human-1',
+        subjectValue: '@operator:example.test',
+        teamDomain,
+        audience: 'aud-ops',
+      }),
+    ],
+  });
+
+  try {
+    const originalSend = rig.queues.export.send.bind(rig.queues.export);
+    let sendAttempts = 0;
+    rig.queues.export.send = async (body) => {
+      sendAttempts += 1;
+      if (sendAttempts === 1) {
+        throw new Error('synthetic queue publish failure');
+      }
+      return originalSend(body);
+    };
+
+    const exportBody = {
+      export_mode: 'full_bundle',
+      scope: {
+        scope_kind: 'global',
+        scope_id: null,
+      },
+      reason: 'recover transient queue publish failure',
+      ticket_id: 'OPS-301',
+      reuse_checkpoint_policy: 'force_fresh',
+      max_checkpoint_age_seconds: 60,
+      include_optional_objects: false,
+      output_encryption_key_version: 'enc-v1',
+    };
+    const requestOptions = {
+      method: 'POST',
+      body: exportBody,
+      headers: {
+        'Idempotency-Key': 'idem-export-retryable-start',
+      },
+    };
+
+    const firstResponse = await rig.opsWorker(
+      rig.makeOpsRequest('/_ops/v1/exports', requestOptions),
+      rig.opsEnv,
+    );
+    assert.equal(firstResponse.status, 503);
+    const firstPayload = await firstResponse.json();
+    assert.equal(firstPayload.code, 'internal');
+    assert.equal(firstPayload.retryable, true);
+    assert.equal(rig.queues.export.messages.length, 0);
+
+    const stagedJob = (await rig.persistence.listJobs({ limit: 10 }))[0];
+    assert.equal(stagedJob.internal_state, 'failed');
+    assert.equal(stagedJob.checkpoint_state?.queue_delivery_state, 'staged');
+
+    const secondResponse = await rig.opsWorker(
+      rig.makeOpsRequest('/_ops/v1/exports', requestOptions),
+      rig.opsEnv,
+    );
+    assert.equal(secondResponse.status, 202);
+    const secondPayload = await secondResponse.json();
+    assert.equal(secondPayload.job_id, stagedJob.job_id);
+    assert.equal(rig.queues.export.messages.length, 1);
+
+    const recoveredJob = await rig.persistence.getJob(stagedJob.job_id);
+    assert.equal(recoveredJob.internal_state, 'checkpointed');
+    assert.equal(recoveredJob.checkpoint_state?.queue_delivery_state, 'published');
+
+    await rig.jobsWorker.queue(rig.queues.export.drainBatch(), rig.jobsEnv);
+    const completedJob = await rig.persistence.getJob(stagedJob.job_id);
+    assert.equal(completedJob.internal_state, 'finalized');
+  } finally {
+    rig.close();
+  }
+});
+
 test('ops-worker supports rebuild, restore, repair, and cancel control-plane routes', async () => {
   const teamDomain = `ops-jobs-${Date.now()}.cloudflareaccess.com`;
   const rig = await createControlPlaneRig({
@@ -441,6 +1035,35 @@ test('ops-worker supports rebuild, restore, repair, and cancel control-plane rou
   });
 
   try {
+    const exportResponse = await rig.opsWorker(
+      rig.makeOpsRequest('/_ops/v1/exports', {
+        method: 'POST',
+        body: {
+          export_mode: 'full_bundle',
+          scope: {
+            scope_kind: 'global',
+            scope_id: null,
+          },
+          reason: 'seed restore bundle',
+          ticket_id: 'OPS-199',
+          reuse_checkpoint_policy: 'force_fresh',
+          max_checkpoint_age_seconds: 60,
+          include_optional_objects: false,
+          output_encryption_key_version: 'enc-v1',
+        },
+        headers: {
+          'Idempotency-Key': 'idem-export-restore-seed',
+        },
+      }),
+      rig.opsEnv,
+    );
+    assert.equal(exportResponse.status, 202);
+    await exportResponse.json();
+    await rig.jobsWorker.queue(rig.queues.export.drainBatch(), rig.jobsEnv);
+    const bundleManifestKey = [...rig.archiveBucket.objects.keys()].find((key) => key.includes('/bundle-manifest/'));
+    assert.ok(bundleManifestKey);
+    const bundleManifest = rig.archiveBucket.getJson(bundleManifestKey);
+
     const rebuildResponse = await rig.opsWorker(
       rig.makeOpsRequest('/_ops/v1/rebuilds', {
         method: 'POST',
@@ -476,8 +1099,8 @@ test('ops-worker supports rebuild, restore, repair, and cancel control-plane rou
           },
           reason: 'restore namespace',
           ticket_id: 'OPS-201',
-          source_bundle_uri: 'r2://bundle/export-1',
-          source_bundle_hash: 'hash-1',
+          source_bundle_uri: `r2://matrix-archive/${bundleManifestKey}`,
+          source_bundle_hash: bundleManifest.manifest_hash,
           target_environment_id: 'target-env-1',
           allow_incomplete: false,
           allowed_signing_key_versions: ['sig-v1'],
@@ -491,6 +1114,7 @@ test('ops-worker supports rebuild, restore, repair, and cancel control-plane rou
     );
     assert.equal(restoreResponse.status, 202);
     assert.equal(rig.queues.restore.messages.length, 1);
+    assert.equal(rig.queues.restore.messages[0].checkpoint_id, bundleManifest.checkpoint_refs[0].checkpoint_id);
 
     const repairResponse = await rig.opsWorker(
       rig.makeOpsRequest('/_ops/v1/repairs', {
@@ -552,6 +1176,955 @@ test('ops-worker supports rebuild, restore, repair, and cancel control-plane rou
     );
     const afterLateQueuePayload = await afterLateQueueResponse.json();
     assert.equal(afterLateQueuePayload.job.state, 'canceled');
+  } finally {
+    rig.close();
+  }
+});
+
+test('ops-worker restore preflight rejects bundle hash mismatches before queue fanout', async () => {
+  const teamDomain = `ops-restore-preflight-${Date.now()}.cloudflareaccess.com`;
+  const rig = await createControlPlaneRig({
+    teamDomain,
+    policies: [
+      defaultPolicy({
+        principalId: 'human-1',
+        subjectValue: '@operator:example.test',
+        teamDomain,
+        audience: 'aud-ops',
+      }),
+    ],
+  });
+
+  try {
+    const { bundleManifestKey } = await seedFullExportBundle(rig, {
+      idempotencyKey: 'idem-export-preflight-seed',
+      ticketId: 'OPS-204',
+    });
+
+    const restoreResponse = await rig.opsWorker(
+      rig.makeOpsRequest('/_ops/v1/restores', {
+        method: 'POST',
+        body: {
+          restore_mode: 'full_namespace',
+          scope: {
+            scope_kind: 'global',
+            scope_id: null,
+          },
+          reason: 'restore namespace with bad hash',
+          ticket_id: 'OPS-205',
+          source_bundle_uri: `r2://matrix-archive/${bundleManifestKey}`,
+          source_bundle_hash: 'bundle-hash-mismatch',
+          target_environment_id: 'target-env-1',
+          allow_incomplete: false,
+          allowed_signing_key_versions: ['sig-v1'],
+          allowed_encryption_key_versions: ['enc-v1'],
+        },
+        headers: {
+          'Idempotency-Key': 'idem-restore-bad-hash',
+        },
+      }),
+      rig.opsEnv,
+    );
+    assert.equal(restoreResponse.status, 409);
+    const restorePayload = await restoreResponse.json();
+    assert.equal(restorePayload.code, 'precondition_failed');
+    assert.equal(rig.queues.restore.messages.length, 0);
+  } finally {
+    rig.close();
+  }
+});
+
+test('ops-worker restore preflight enforces signing key version allowlists before queue fanout', async () => {
+  const teamDomain = `ops-restore-allowlist-${Date.now()}.cloudflareaccess.com`;
+  const rig = await createControlPlaneRig({
+    teamDomain,
+    policies: [
+      defaultPolicy({
+        principalId: 'human-1',
+        subjectValue: '@operator:example.test',
+        teamDomain,
+        audience: 'aud-ops',
+      }),
+    ],
+  });
+
+  try {
+    const { bundleManifestKey, bundleManifest } = await seedFullExportBundle(rig, {
+      idempotencyKey: 'idem-export-allowlist-seed',
+      ticketId: 'OPS-208',
+    });
+
+    const restoreResponse = await rig.opsWorker(
+      rig.makeOpsRequest('/_ops/v1/restores', {
+        method: 'POST',
+        body: {
+          restore_mode: 'full_namespace',
+          scope: {
+            scope_kind: 'global',
+            scope_id: null,
+          },
+          reason: 'restore namespace with signing key allowlist mismatch',
+          ticket_id: 'OPS-209',
+          source_bundle_uri: `r2://matrix-archive/${bundleManifestKey}`,
+          source_bundle_hash: bundleManifest.manifest_hash,
+          target_environment_id: 'target-env-allowlist',
+          allow_incomplete: false,
+          allowed_signing_key_versions: ['sig-v0'],
+          allowed_encryption_key_versions: ['enc-v1'],
+        },
+        headers: {
+          'Idempotency-Key': 'idem-restore-allowlist-mismatch',
+        },
+      }),
+      rig.opsEnv,
+    );
+    assert.equal(restoreResponse.status, 409);
+    const restorePayload = await restoreResponse.json();
+    assert.equal(restorePayload.code, 'precondition_failed');
+    assert.equal(rig.queues.restore.messages.length, 0);
+  } finally {
+    rig.close();
+  }
+});
+
+test('ops-worker restore preflight enforces encryption key version allowlists before queue fanout', async () => {
+  const teamDomain = `ops-restore-encryption-allowlist-${Date.now()}.cloudflareaccess.com`;
+  const rig = await createControlPlaneRig({
+    teamDomain,
+    policies: [
+      defaultPolicy({
+        principalId: 'human-1',
+        subjectValue: '@operator:example.test',
+        teamDomain,
+        audience: 'aud-ops',
+      }),
+    ],
+  });
+
+  try {
+    const { bundleManifestKey, bundleManifest } = await seedFullExportBundle(rig, {
+      idempotencyKey: 'idem-export-encryption-allowlist-seed',
+      ticketId: 'OPS-210',
+    });
+
+    const restoreResponse = await rig.opsWorker(
+      rig.makeOpsRequest('/_ops/v1/restores', {
+        method: 'POST',
+        body: {
+          restore_mode: 'full_namespace',
+          scope: {
+            scope_kind: 'global',
+            scope_id: null,
+          },
+          reason: 'restore namespace with encryption key allowlist mismatch',
+          ticket_id: 'OPS-211',
+          source_bundle_uri: `r2://matrix-archive/${bundleManifestKey}`,
+          source_bundle_hash: bundleManifest.manifest_hash,
+          target_environment_id: 'target-env-encryption-allowlist',
+          allow_incomplete: false,
+          allowed_signing_key_versions: ['sig-v1'],
+          allowed_encryption_key_versions: ['enc-v0'],
+        },
+        headers: {
+          'Idempotency-Key': 'idem-restore-encryption-allowlist-mismatch',
+        },
+      }),
+      rig.opsEnv,
+    );
+    assert.equal(restoreResponse.status, 409);
+    const restorePayload = await restoreResponse.json();
+    assert.equal(restorePayload.code, 'precondition_failed');
+    assert.equal(rig.queues.restore.messages.length, 0);
+  } finally {
+    rig.close();
+  }
+});
+
+test('ops-worker restore preflight rejects tampered registry snapshots before queue fanout', async () => {
+  const teamDomain = `ops-restore-registry-tamper-${Date.now()}.cloudflareaccess.com`;
+  const rig = await createControlPlaneRig({
+    teamDomain,
+    policies: [
+      defaultPolicy({
+        principalId: 'human-1',
+        subjectValue: '@operator:example.test',
+        teamDomain,
+        audience: 'aud-ops',
+      }),
+    ],
+  });
+
+  try {
+    const { bundleManifestKey, bundleManifest } = await seedFullExportBundle(rig, {
+      idempotencyKey: 'idem-export-registry-tamper-seed',
+      ticketId: 'OPS-210',
+    });
+    const snapshotKey = bundleManifest.registry_snapshot_r2_object_key;
+    assert.ok(snapshotKey);
+
+    const snapshot = rig.archiveBucket.getJson(snapshotKey);
+    assert.ok(snapshot);
+    await rig.archiveBucket.put(snapshotKey, JSON.stringify({
+      ...snapshot,
+      row_count: Number(snapshot.row_count ?? 0) + 1,
+    }));
+
+    const restoreResponse = await rig.opsWorker(
+      rig.makeOpsRequest('/_ops/v1/restores', {
+        method: 'POST',
+        body: {
+          restore_mode: 'full_namespace',
+          scope: {
+            scope_kind: 'global',
+            scope_id: null,
+          },
+          reason: 'restore namespace with tampered registry snapshot',
+          ticket_id: 'OPS-211',
+          source_bundle_uri: `r2://matrix-archive/${bundleManifestKey}`,
+          source_bundle_hash: bundleManifest.manifest_hash,
+          target_environment_id: 'target-env-registry-tamper',
+          allow_incomplete: false,
+          allowed_signing_key_versions: ['sig-v1'],
+          allowed_encryption_key_versions: ['enc-v1'],
+        },
+        headers: {
+          'Idempotency-Key': 'idem-restore-registry-tamper',
+        },
+      }),
+      rig.opsEnv,
+    );
+
+    assert.equal(restoreResponse.status, 409);
+    const restorePayload = await restoreResponse.json();
+    assert.equal(restorePayload.code, 'precondition_failed');
+    assert.equal(rig.queues.restore.messages.length, 0);
+  } finally {
+    rig.close();
+  }
+});
+
+test('ops-worker restore preflight rejects tampered checkpoint manifests before queue fanout', async () => {
+  const teamDomain = `ops-restore-checkpoint-manifest-tamper-${Date.now()}.cloudflareaccess.com`;
+  const rig = await createControlPlaneRig({
+    teamDomain,
+    policies: [
+      defaultPolicy({
+        principalId: 'human-1',
+        subjectValue: '@operator:example.test',
+        teamDomain,
+        audience: 'aud-ops',
+      }),
+    ],
+  });
+
+  try {
+    const { bundleManifestKey, bundleManifest, checkpointRef } = await seedFullExportBundle(rig, {
+      idempotencyKey: 'idem-export-checkpoint-manifest-tamper-seed',
+      ticketId: 'OPS-212',
+    });
+    const checkpointManifestKey = checkpointRef.manifest_r2_object_key;
+    const checkpointManifest = rig.archiveBucket.getJson(checkpointManifestKey);
+    assert.ok(checkpointManifest);
+    await rig.archiveBucket.put(checkpointManifestKey, JSON.stringify({
+      ...checkpointManifest,
+      completeness_state: 'incomplete',
+    }));
+
+    const restoreResponse = await rig.opsWorker(
+      rig.makeOpsRequest('/_ops/v1/restores', {
+        method: 'POST',
+        body: {
+          restore_mode: 'full_namespace',
+          scope: {
+            scope_kind: 'global',
+            scope_id: null,
+          },
+          reason: 'restore namespace with tampered checkpoint manifest',
+          ticket_id: 'OPS-213',
+          source_bundle_uri: `r2://matrix-archive/${bundleManifestKey}`,
+          source_bundle_hash: bundleManifest.manifest_hash,
+          target_environment_id: 'target-env-checkpoint-manifest-tamper',
+          allow_incomplete: false,
+          allowed_signing_key_versions: ['sig-v1'],
+          allowed_encryption_key_versions: ['enc-v1'],
+        },
+        headers: {
+          'Idempotency-Key': 'idem-restore-checkpoint-manifest-tamper',
+        },
+      }),
+      rig.opsEnv,
+    );
+
+    assert.equal(restoreResponse.status, 409);
+    const restorePayload = await restoreResponse.json();
+    assert.equal(restorePayload.code, 'precondition_failed');
+    assert.equal(rig.queues.restore.messages.length, 0);
+  } finally {
+    rig.close();
+  }
+});
+
+test('ops-worker restore preflight rejects checkpoint object hash mismatches before queue fanout', async () => {
+  const teamDomain = `ops-restore-checkpoint-object-tamper-${Date.now()}.cloudflareaccess.com`;
+  const rig = await createControlPlaneRig({
+    teamDomain,
+    policies: [
+      defaultPolicy({
+        principalId: 'human-1',
+        subjectValue: '@operator:example.test',
+        teamDomain,
+        audience: 'aud-ops',
+      }),
+    ],
+  });
+
+  try {
+    const {
+      bundleManifestKey,
+      bundleManifest,
+      checkpointObjectKey,
+    } = await seedFullExportBundle(rig, {
+      idempotencyKey: 'idem-export-checkpoint-object-tamper-seed',
+      ticketId: 'OPS-214',
+    });
+
+    const objectEnvelope = rig.archiveBucket.getJson(checkpointObjectKey);
+    assert.ok(objectEnvelope);
+    await rig.archiveBucket.put(checkpointObjectKey, JSON.stringify({
+      ...objectEnvelope,
+      ciphertext_base64url: `${objectEnvelope.ciphertext_base64url}tampered`,
+    }));
+
+    const restoreResponse = await rig.opsWorker(
+      rig.makeOpsRequest('/_ops/v1/restores', {
+        method: 'POST',
+        body: {
+          restore_mode: 'full_namespace',
+          scope: {
+            scope_kind: 'global',
+            scope_id: null,
+          },
+          reason: 'restore namespace with tampered checkpoint object',
+          ticket_id: 'OPS-215',
+          source_bundle_uri: `r2://matrix-archive/${bundleManifestKey}`,
+          source_bundle_hash: bundleManifest.manifest_hash,
+          target_environment_id: 'target-env-checkpoint-object-tamper',
+          allow_incomplete: false,
+          allowed_signing_key_versions: ['sig-v1'],
+          allowed_encryption_key_versions: ['enc-v1'],
+        },
+        headers: {
+          'Idempotency-Key': 'idem-restore-checkpoint-object-tamper',
+        },
+      }),
+      rig.opsEnv,
+    );
+
+    assert.equal(restoreResponse.status, 409);
+    const restorePayload = await restoreResponse.json();
+    assert.equal(restorePayload.code, 'precondition_failed');
+    assert.equal(rig.queues.restore.messages.length, 0);
+  } finally {
+    rig.close();
+  }
+});
+
+test('ops-worker restore preflight resolves registry snapshots from the bundle archive instead of local D1 state', async () => {
+  const sourceTeamDomain = `ops-restore-source-${Date.now()}.cloudflareaccess.com`;
+  const targetTeamDomain = `ops-restore-target-${Date.now()}.cloudflareaccess.com`;
+  const sourceRig = await createControlPlaneRig({
+    teamDomain: sourceTeamDomain,
+    policies: [
+      defaultPolicy({
+        principalId: 'human-1',
+        subjectValue: '@operator:example.test',
+        teamDomain: sourceTeamDomain,
+        audience: 'aud-ops',
+      }),
+    ],
+  });
+
+  try {
+    const exportResponse = await sourceRig.opsWorker(
+      sourceRig.makeOpsRequest('/_ops/v1/exports', {
+        method: 'POST',
+        body: {
+          export_mode: 'full_bundle',
+          scope: {
+            scope_kind: 'global',
+            scope_id: null,
+          },
+          reason: 'seed cross environment restore',
+          ticket_id: 'OPS-206',
+          reuse_checkpoint_policy: 'force_fresh',
+          max_checkpoint_age_seconds: 60,
+          include_optional_objects: false,
+          output_encryption_key_version: 'enc-v1',
+        },
+        headers: {
+          'Idempotency-Key': 'idem-export-cross-env-seed',
+        },
+      }),
+      sourceRig.opsEnv,
+    );
+    assert.equal(exportResponse.status, 202);
+    await sourceRig.jobsWorker.queue(sourceRig.queues.export.drainBatch(), sourceRig.jobsEnv);
+
+    const bundleManifestKey = [...sourceRig.archiveBucket.objects.keys()].find((key) => key.includes('/bundle-manifest/'));
+    assert.ok(bundleManifestKey);
+    const bundleManifest = sourceRig.archiveBucket.getJson(bundleManifestKey);
+    assert.ok(bundleManifest.registry_snapshot_r2_object_key);
+
+    const targetRig = await createControlPlaneRig({
+      teamDomain: targetTeamDomain,
+      policies: [
+        defaultPolicy({
+          principalId: 'human-1',
+          subjectValue: '@operator:example.test',
+          teamDomain: targetTeamDomain,
+          audience: 'aud-ops',
+        }),
+      ],
+    });
+
+    try {
+      targetRig.opsEnv.MATRIX_ARCHIVE_BUCKET = sourceRig.archiveBucket;
+      targetRig.jobsEnv.MATRIX_ARCHIVE_BUCKET = sourceRig.archiveBucket;
+      targetRig.opsEnv.EXPORT_BUNDLE_KEY_RING = sourceRig.opsEnv.EXPORT_BUNDLE_KEY_RING;
+      targetRig.jobsEnv.EXPORT_BUNDLE_KEY_RING = sourceRig.jobsEnv.EXPORT_BUNDLE_KEY_RING;
+
+      assert.equal(
+        await targetRig.persistence.getRegistrySnapshot(bundleManifest.registry_snapshot_id),
+        null,
+      );
+
+      const restoreResponse = await targetRig.opsWorker(
+        targetRig.makeOpsRequest('/_ops/v1/restores', {
+          method: 'POST',
+          body: {
+            restore_mode: 'full_namespace',
+            scope: {
+              scope_kind: 'global',
+              scope_id: null,
+            },
+            reason: 'cross environment restore',
+            ticket_id: 'OPS-207',
+            source_bundle_uri: `r2://matrix-archive/${bundleManifestKey}`,
+            source_bundle_hash: bundleManifest.manifest_hash,
+            target_environment_id: 'target-env-2',
+            allow_incomplete: false,
+            allowed_signing_key_versions: ['sig-v1'],
+            allowed_encryption_key_versions: ['enc-v1'],
+          },
+          headers: {
+            'Idempotency-Key': 'idem-restore-cross-env',
+          },
+        }),
+        targetRig.opsEnv,
+      );
+
+      assert.equal(restoreResponse.status, 202);
+      assert.equal(targetRig.queues.restore.messages.length, 1);
+      assert.equal(
+        targetRig.queues.restore.messages[0].checkpoint_id,
+        bundleManifest.checkpoint_refs[0].checkpoint_id,
+      );
+    } finally {
+      targetRig.close();
+    }
+  } finally {
+    sourceRig.close();
+  }
+});
+
+test('ops-worker restore preflight accepts allowed non-active signing and encryption key versions after rotation', async () => {
+  const sourceTeamDomain = `ops-restore-rotated-source-${Date.now()}.cloudflareaccess.com`;
+  const targetTeamDomain = `ops-restore-rotated-target-${Date.now()}.cloudflareaccess.com`;
+  const sourceRig = await createControlPlaneRig({
+    teamDomain: sourceTeamDomain,
+    policies: [
+      defaultPolicy({
+        principalId: 'human-1',
+        subjectValue: '@operator:example.test',
+        teamDomain: sourceTeamDomain,
+        audience: 'aud-ops',
+      }),
+    ],
+  });
+
+  try {
+    const { bundleManifestKey, bundleManifest } = await seedFullExportBundle(sourceRig, {
+      idempotencyKey: 'idem-export-rotated-key-seed',
+      ticketId: 'OPS-216',
+    });
+
+    const targetRig = await createControlPlaneRig({
+      teamDomain: targetTeamDomain,
+      policies: [
+        defaultPolicy({
+          principalId: 'human-1',
+          subjectValue: '@operator:example.test',
+          teamDomain: targetTeamDomain,
+          audience: 'aud-ops',
+        }),
+      ],
+    });
+
+    try {
+      const rotatedSecret = createRotatedExportKeyRingSecret(sourceRig.opsEnv.EXPORT_BUNDLE_KEY_RING);
+      targetRig.opsEnv.MATRIX_ARCHIVE_BUCKET = sourceRig.archiveBucket;
+      targetRig.jobsEnv.MATRIX_ARCHIVE_BUCKET = sourceRig.archiveBucket;
+      targetRig.opsEnv.EXPORT_BUNDLE_KEY_RING = rotatedSecret;
+      targetRig.jobsEnv.EXPORT_BUNDLE_KEY_RING = rotatedSecret;
+
+      const restoreResponse = await targetRig.opsWorker(
+        targetRig.makeOpsRequest('/_ops/v1/restores', {
+          method: 'POST',
+          body: {
+            restore_mode: 'full_namespace',
+            scope: {
+              scope_kind: 'global',
+              scope_id: null,
+            },
+            reason: 'cross environment restore with rotated key ring',
+            ticket_id: 'OPS-217',
+            source_bundle_uri: `r2://matrix-archive/${bundleManifestKey}`,
+            source_bundle_hash: bundleManifest.manifest_hash,
+            target_environment_id: 'target-env-rotated-keys',
+            allow_incomplete: false,
+            allowed_signing_key_versions: ['sig-v1'],
+            allowed_encryption_key_versions: ['enc-v1'],
+          },
+          headers: {
+            'Idempotency-Key': 'idem-restore-rotated-keys',
+          },
+        }),
+        targetRig.opsEnv,
+      );
+
+      assert.equal(restoreResponse.status, 202);
+      const restorePayload = await restoreResponse.json();
+      assert.equal(restorePayload.job_type, 'restore');
+      assert.equal(targetRig.queues.restore.messages.length, 1);
+      assert.equal(
+        targetRig.queues.restore.messages[0].checkpoint_id,
+        bundleManifest.checkpoint_refs[0].checkpoint_id,
+      );
+    } finally {
+      targetRig.close();
+    }
+  } finally {
+    sourceRig.close();
+  }
+});
+
+test('ops-worker restore preflight accepts spec-minimal UserDO checkpoints', async () => {
+  const teamDomain = `ops-restore-user-minimal-${Date.now()}.cloudflareaccess.com`;
+  const rig = await createControlPlaneRig({
+    teamDomain,
+    policies: [
+      defaultPolicy({
+        principalId: 'human-1',
+        subjectValue: '@operator:example.test',
+        teamDomain,
+        audience: 'aud-ops',
+      }),
+    ],
+  });
+
+  try {
+    const { bundleManifest, bundleManifestKey } = await seedSyntheticRestoreBundle(rig, {
+      shardType: 'UserDO',
+      shardKey: '@alice:example.test',
+      sourceWatermark: {
+        max_user_stream_pos: 7,
+        device_state_version: 3,
+        to_device_queue_highwater: 9,
+      },
+      objectSpecs: USER_REQUIRED_OBJECT_SPECS,
+    });
+
+    const restoreResponse = await rig.opsWorker(
+      rig.makeOpsRequest('/_ops/v1/restores', {
+        method: 'POST',
+        body: {
+          restore_mode: 'full_namespace',
+          scope: {
+            scope_kind: 'global',
+            scope_id: null,
+          },
+          reason: 'accept spec-minimal user checkpoint',
+          ticket_id: 'OPS-218',
+          source_bundle_uri: `r2://matrix-archive/${bundleManifestKey}`,
+          source_bundle_hash: bundleManifest.manifest_hash,
+          target_environment_id: 'target-env-user-minimal',
+          allow_incomplete: false,
+          allowed_signing_key_versions: ['sig-v1'],
+          allowed_encryption_key_versions: ['enc-v1'],
+        },
+        headers: {
+          'Idempotency-Key': 'idem-restore-user-minimal',
+        },
+      }),
+      rig.opsEnv,
+    );
+
+    assert.equal(restoreResponse.status, 202);
+    const restorePayload = await restoreResponse.json();
+    assert.equal(restorePayload.job_type, 'restore');
+    assert.equal(rig.queues.restore.messages.length, 1);
+  } finally {
+    rig.close();
+  }
+});
+
+test('ops-worker restore preflight rejects undecodable checkpoint objects as precondition_failed', async () => {
+  const teamDomain = `ops-restore-undecodable-${Date.now()}.cloudflareaccess.com`;
+  const rig = await createControlPlaneRig({
+    teamDomain,
+    policies: [
+      defaultPolicy({
+        principalId: 'human-1',
+        subjectValue: '@operator:example.test',
+        teamDomain,
+        audience: 'aud-ops',
+      }),
+    ],
+  });
+
+  try {
+    const { bundleManifest, bundleManifestKey } = await seedSyntheticRestoreBundle(rig, {
+      shardType: 'control-plane',
+      shardKey: 'ops-core',
+      sourceWatermark: {
+        max_audit_event_seq: 11,
+      },
+      objectSpecs: [{
+        ...CONTROL_PLANE_REQUIRED_OBJECT_SPECS[0],
+        envelopeOverrides: {
+          tag_base64url: 'AA',
+        },
+      }],
+    });
+
+    const restoreResponse = await rig.opsWorker(
+      rig.makeOpsRequest('/_ops/v1/restores', {
+        method: 'POST',
+        body: {
+          restore_mode: 'full_namespace',
+          scope: {
+            scope_kind: 'global',
+            scope_id: null,
+          },
+          reason: 'reject undecodable checkpoint object',
+          ticket_id: 'OPS-219',
+          source_bundle_uri: `r2://matrix-archive/${bundleManifestKey}`,
+          source_bundle_hash: bundleManifest.manifest_hash,
+          target_environment_id: 'target-env-undecodable',
+          allow_incomplete: false,
+          allowed_signing_key_versions: ['sig-v1'],
+          allowed_encryption_key_versions: ['enc-v1'],
+        },
+        headers: {
+          'Idempotency-Key': 'idem-restore-undecodable-object',
+        },
+      }),
+      rig.opsEnv,
+    );
+
+    assert.equal(restoreResponse.status, 409);
+    const restorePayload = await restoreResponse.json();
+    assert.equal(restorePayload.code, 'precondition_failed');
+    assert.equal(rig.queues.restore.messages.length, 0);
+  } finally {
+    rig.close();
+  }
+});
+
+test('ops-worker restore preflight rejects checkpoint objects with unsupported apply_phase', async () => {
+  const teamDomain = `ops-restore-apply-phase-${Date.now()}.cloudflareaccess.com`;
+  const rig = await createControlPlaneRig({
+    teamDomain,
+    policies: [
+      defaultPolicy({
+        principalId: 'human-1',
+        subjectValue: '@operator:example.test',
+        teamDomain,
+        audience: 'aud-ops',
+      }),
+    ],
+  });
+
+  try {
+    const { bundleManifest, bundleManifestKey } = await seedSyntheticRestoreBundle(rig, {
+      shardType: 'control-plane',
+      shardKey: 'ops-core',
+      sourceWatermark: {
+        max_audit_event_seq: 12,
+      },
+      objectSpecs: [{
+        ...CONTROL_PLANE_REQUIRED_OBJECT_SPECS[0],
+        apply_phase: 'mystery-phase',
+      }],
+    });
+
+    const restoreResponse = await rig.opsWorker(
+      rig.makeOpsRequest('/_ops/v1/restores', {
+        method: 'POST',
+        body: {
+          restore_mode: 'full_namespace',
+          scope: {
+            scope_kind: 'global',
+            scope_id: null,
+          },
+          reason: 'reject invalid apply phase',
+          ticket_id: 'OPS-220',
+          source_bundle_uri: `r2://matrix-archive/${bundleManifestKey}`,
+          source_bundle_hash: bundleManifest.manifest_hash,
+          target_environment_id: 'target-env-apply-phase',
+          allow_incomplete: false,
+          allowed_signing_key_versions: ['sig-v1'],
+          allowed_encryption_key_versions: ['enc-v1'],
+        },
+        headers: {
+          'Idempotency-Key': 'idem-restore-invalid-apply-phase',
+        },
+      }),
+      rig.opsEnv,
+    );
+
+    assert.equal(restoreResponse.status, 409);
+    const restorePayload = await restoreResponse.json();
+    assert.equal(restorePayload.code, 'precondition_failed');
+    assert.equal(rig.queues.restore.messages.length, 0);
+  } finally {
+    rig.close();
+  }
+});
+
+test('ops-worker restore preflight rejects checkpoint objects with unsupported codec', async () => {
+  const teamDomain = `ops-restore-codec-${Date.now()}.cloudflareaccess.com`;
+  const rig = await createControlPlaneRig({
+    teamDomain,
+    policies: [
+      defaultPolicy({
+        principalId: 'human-1',
+        subjectValue: '@operator:example.test',
+        teamDomain,
+        audience: 'aud-ops',
+      }),
+    ],
+  });
+
+  try {
+    const { bundleManifest, bundleManifestKey } = await seedSyntheticRestoreBundle(rig, {
+      shardType: 'control-plane',
+      shardKey: 'ops-core',
+      sourceWatermark: {
+        max_audit_event_seq: 13,
+      },
+      objectSpecs: [{
+        ...CONTROL_PLANE_REQUIRED_OBJECT_SPECS[0],
+        codec: 'tarball',
+      }],
+    });
+
+    const restoreResponse = await rig.opsWorker(
+      rig.makeOpsRequest('/_ops/v1/restores', {
+        method: 'POST',
+        body: {
+          restore_mode: 'full_namespace',
+          scope: {
+            scope_kind: 'global',
+            scope_id: null,
+          },
+          reason: 'reject invalid codec',
+          ticket_id: 'OPS-221',
+          source_bundle_uri: `r2://matrix-archive/${bundleManifestKey}`,
+          source_bundle_hash: bundleManifest.manifest_hash,
+          target_environment_id: 'target-env-codec',
+          allow_incomplete: false,
+          allowed_signing_key_versions: ['sig-v1'],
+          allowed_encryption_key_versions: ['enc-v1'],
+        },
+        headers: {
+          'Idempotency-Key': 'idem-restore-invalid-codec',
+        },
+      }),
+      rig.opsEnv,
+    );
+
+    assert.equal(restoreResponse.status, 409);
+    const restorePayload = await restoreResponse.json();
+    assert.equal(restorePayload.code, 'precondition_failed');
+    assert.equal(rig.queues.restore.messages.length, 0);
+  } finally {
+    rig.close();
+  }
+});
+
+test('ops-worker restore preflight rejects jcs-json checkpoint objects with invalid record_count', async () => {
+  const teamDomain = `ops-restore-record-count-${Date.now()}.cloudflareaccess.com`;
+  const rig = await createControlPlaneRig({
+    teamDomain,
+    policies: [
+      defaultPolicy({
+        principalId: 'human-1',
+        subjectValue: '@operator:example.test',
+        teamDomain,
+        audience: 'aud-ops',
+      }),
+    ],
+  });
+
+  try {
+    const { bundleManifest, bundleManifestKey } = await seedSyntheticRestoreBundle(rig, {
+      shardType: 'control-plane',
+      shardKey: 'ops-core',
+      sourceWatermark: {
+        max_audit_event_seq: 14,
+      },
+      objectSpecs: [{
+        ...CONTROL_PLANE_REQUIRED_OBJECT_SPECS[0],
+        entryOverrides: {
+          record_count: 2,
+        },
+      }],
+    });
+
+    const restoreResponse = await rig.opsWorker(
+      rig.makeOpsRequest('/_ops/v1/restores', {
+        method: 'POST',
+        body: {
+          restore_mode: 'full_namespace',
+          scope: {
+            scope_kind: 'global',
+            scope_id: null,
+          },
+          reason: 'reject invalid record count',
+          ticket_id: 'OPS-222',
+          source_bundle_uri: `r2://matrix-archive/${bundleManifestKey}`,
+          source_bundle_hash: bundleManifest.manifest_hash,
+          target_environment_id: 'target-env-record-count',
+          allow_incomplete: false,
+          allowed_signing_key_versions: ['sig-v1'],
+          allowed_encryption_key_versions: ['enc-v1'],
+        },
+        headers: {
+          'Idempotency-Key': 'idem-restore-invalid-record-count',
+        },
+      }),
+      rig.opsEnv,
+    );
+
+    assert.equal(restoreResponse.status, 409);
+    const restorePayload = await restoreResponse.json();
+    assert.equal(restorePayload.code, 'precondition_failed');
+    assert.equal(rig.queues.restore.messages.length, 0);
+  } finally {
+    rig.close();
+  }
+});
+
+test('ops-worker restore preflight rejects RoomDO checkpoints missing room-archive-reference-set', async () => {
+  const teamDomain = `ops-restore-room-archive-ref-${Date.now()}.cloudflareaccess.com`;
+  const rig = await createControlPlaneRig({
+    teamDomain,
+    policies: [
+      defaultPolicy({
+        principalId: 'human-1',
+        subjectValue: '@operator:example.test',
+        teamDomain,
+        audience: 'aud-ops',
+      }),
+    ],
+  });
+
+  try {
+    const { bundleManifest, bundleManifestKey } = await seedSyntheticRoomRestoreBundleMissingArchiveReference(rig);
+    const restoreResponse = await rig.opsWorker(
+      rig.makeOpsRequest('/_ops/v1/restores', {
+        method: 'POST',
+        body: {
+          restore_mode: 'full_namespace',
+          scope: {
+            scope_kind: 'global',
+            scope_id: null,
+          },
+          reason: 'reject incomplete room checkpoint',
+          ticket_id: 'OPS-208',
+          source_bundle_uri: `r2://matrix-archive/${bundleManifestKey}`,
+          source_bundle_hash: bundleManifest.manifest_hash,
+          target_environment_id: 'target-env-room-1',
+          allow_incomplete: false,
+          allowed_signing_key_versions: ['sig-v1'],
+          allowed_encryption_key_versions: ['enc-v1'],
+        },
+        headers: {
+          'Idempotency-Key': 'idem-restore-room-missing-archive-ref',
+        },
+      }),
+      rig.opsEnv,
+    );
+
+    assert.equal(restoreResponse.status, 409);
+    const restorePayload = await restoreResponse.json();
+    assert.equal(restorePayload.code, 'precondition_failed');
+    assert.match(restorePayload.message, /room-archive-reference-set/);
+    assert.equal(rig.queues.restore.messages.length, 0);
+  } finally {
+    rig.close();
+  }
+});
+
+test('ops-worker restore preflight rejects RoomDO checkpoints with invalid source_watermark shape', async () => {
+  const teamDomain = `ops-restore-room-watermark-${Date.now()}.cloudflareaccess.com`;
+  const rig = await createControlPlaneRig({
+    teamDomain,
+    policies: [
+      defaultPolicy({
+        principalId: 'human-1',
+        subjectValue: '@operator:example.test',
+        teamDomain,
+        audience: 'aud-ops',
+      }),
+    ],
+  });
+
+  try {
+    const { bundleManifest, bundleManifestKey } = await seedSyntheticRoomRestoreBundleMissingArchiveReference(rig, {
+      sourceWatermark: 7,
+    });
+    const restoreResponse = await rig.opsWorker(
+      rig.makeOpsRequest('/_ops/v1/restores', {
+        method: 'POST',
+        body: {
+          restore_mode: 'full_namespace',
+          scope: {
+            scope_kind: 'global',
+            scope_id: null,
+          },
+          reason: 'reject invalid room watermark',
+          ticket_id: 'OPS-209',
+          source_bundle_uri: `r2://matrix-archive/${bundleManifestKey}`,
+          source_bundle_hash: bundleManifest.manifest_hash,
+          target_environment_id: 'target-env-room-2',
+          allow_incomplete: false,
+          allowed_signing_key_versions: ['sig-v1'],
+          allowed_encryption_key_versions: ['enc-v1'],
+        },
+        headers: {
+          'Idempotency-Key': 'idem-restore-room-invalid-watermark',
+        },
+      }),
+      rig.opsEnv,
+    );
+
+    assert.equal(restoreResponse.status, 409);
+    const restorePayload = await restoreResponse.json();
+    assert.equal(restorePayload.code, 'precondition_failed');
+    assert.match(restorePayload.message, /source_watermark/);
+    assert.equal(rig.queues.restore.messages.length, 0);
   } finally {
     rig.close();
   }

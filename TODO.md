@@ -234,14 +234,14 @@
 
 ### 02.08 收敛 Phase 02 审查残项
 
-- [ ] 完成 restore checkpoint 解析与 `RestoreShardJob.checkpoint_id` 的真实来源绑定。
+- [x] 完成 restore checkpoint 解析与 `RestoreShardJob.checkpoint_id` 的真实来源绑定。
   Spec refs: `23` `IF-QUE-006`; `42` 11.2.1.4, 11.2.2
   产出:
   bundle manifest / checkpoint 选择逻辑、restore preflight checkpoint resolver。
   完成标准:
   restore queue payload 不再把 bundle hash 混作 checkpoint id，且能按 shard checkpoint 语义恢复。
 
-- [ ] 用真实 checkpoint object set 替换 placeholder checkpoint manifest，并补齐完整性 truth。
+- [x] 用真实 checkpoint object set 替换 placeholder checkpoint manifest，并补齐完整性 truth。
   Spec refs: `24` `DATA-OPS-002`, `DATA-R2-005`; `42` 11.2.1.1~11.2.1.3
   产出:
   checkpoint manifest object 列表、watermark、hash/signature/key-version、required object coverage。

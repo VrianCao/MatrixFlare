@@ -4,21 +4,23 @@ import {
   CONTROL_PLANE_SCHEMA_VERSION,
   QUEUE_NAMES,
   ROUTE_TEMPLATES,
-	  buildExportShardJob,
-	  buildJobHandleFromRecord,
-	  buildOpsErrorJson,
-	  buildRebuildShardJob,
-	  buildRepairShardJob,
-	  buildRestoreShardJob,
-	  mapInternalJobStateToPublicState,
-	  normalizeQueuePayload,
+  buildExportShardJob,
+  buildJobHandleFromRecord,
+  buildOpsErrorJson,
+  buildRebuildShardJob,
+  buildRepairShardJob,
+  buildRestoreShardJob,
+  mapInternalJobStateToPublicState,
+  normalizeQueuePayload,
 } from './schemas.mjs';
 import {
-  buildArchiveObjectKey,
+  buildControlPlaneCheckpointArtifact,
+  finalizeExportBundleManifest,
   ensureControlPlaneShardRegistered,
   getControlPlanePersistence,
   jsonResponse,
-  putArchiveJsonObject,
+  parseExportKeyRingFromEnv,
+  resolveRestoreCheckpointRefs,
   sendQueueMessage,
   updateJobState,
 } from './services.mjs';
@@ -171,6 +173,7 @@ async function stageQueuedPayloads({
       checkpointState: {
         queue_ready: payloads.length,
         queue_name: queueName,
+        queue_delivery_state: payloads.length > 0 ? 'staged' : 'not_required',
       },
       progress: {
         completed_units: 0,
@@ -185,8 +188,34 @@ async function stageQueuedPayloads({
   });
 }
 
+async function markQueuedPayloadsPublished({
+  persistence,
+  jobId,
+  payloadCount,
+  queueName,
+}) {
+  const job = await persistence.getJob(jobId);
+  if (!job) {
+    return null;
+  }
+  const updatedJob = {
+    ...job,
+    checkpoint_state: {
+      ...(job.checkpoint_state ?? {}),
+      queue_ready: payloadCount,
+      queue_name: queueName,
+      queue_delivery_state: 'published',
+      queue_published: payloadCount,
+    },
+  };
+  await persistence.updateJob(updatedJob);
+  return updatedJob;
+}
+
 async function fanOutJobTasks({ env, persistence, job, kind }) {
+  const config = loadWorkerRuntimeConfig('jobs-worker', env);
   const now = new Date();
+  const queueName = queueNameForKind(kind);
   const queueBindings = {
     export: env.EXPORT_SHARD_QUEUE,
     rebuild: env.REBUILD_SHARD_QUEUE,
@@ -232,14 +261,23 @@ async function fanOutJobTasks({ env, persistence, job, kind }) {
       attempt: 0,
     }));
   } else if (kind === 'start-restore') {
-    payloads = [buildRestoreShardJob({
+    const restoreCheckpoints = await resolveRestoreCheckpointRefs({
+      persistence,
+      archiveBucket: env.MATRIX_ARCHIVE_BUCKET,
+      keyRing: parseExportKeyRingFromEnv(config, env),
+      requestBody: {
+        ...job.spec,
+        scope: job.scope,
+      },
+    });
+    payloads = restoreCheckpoints.map((checkpoint) => buildRestoreShardJob({
       jobId: job.job_id,
-      checkpointId: job.spec.source_bundle_hash,
-      shardType: 'control-plane',
-      shardKey: 'ops-core',
-      applyPhase: 'control-plane',
+      checkpointId: checkpoint.checkpoint_id,
+      shardType: checkpoint.shard_type,
+      shardKey: checkpoint.shard_key,
+      applyPhase: checkpoint.apply_phase,
       attempt: 0,
-    })];
+    }));
   } else {
     payloads = [buildRepairShardJob({
       jobId: job.job_id,
@@ -265,6 +303,14 @@ async function fanOutJobTasks({ env, persistence, job, kind }) {
   for (const payload of payloads) {
     await sendQueueMessage(queueBinding, payload);
   }
+  if (payloads.length > 0) {
+    await markQueuedPayloadsPublished({
+      persistence,
+      jobId: job.job_id,
+      payloadCount: payloads.length,
+      queueName,
+    });
+  }
   return payloads.length;
 }
 
@@ -274,6 +320,7 @@ async function processQueueMessage({
   persistence,
   archiveBucket,
   asyncContext,
+  env,
 }) {
   const job = await persistence.getJob(messageBody.job_id);
   if (!job) {
@@ -333,6 +380,16 @@ async function processQueueMessage({
     const totalUnits = Math.max(job.progress_total_units ?? 1, 1);
     const isTerminal = completedUnits >= totalUnits;
     if (isTerminal && !['completed', 'finalized', 'failed', 'canceled'].includes(job.internal_state)) {
+      if (queueName === QUEUE_NAMES.export) {
+        const keyRing = parseExportKeyRingFromEnv(loadWorkerRuntimeConfig('jobs-worker', env), env);
+        await finalizeExportBundleManifest({
+          persistence,
+          archiveBucket,
+          keyRing,
+          job,
+          now,
+        });
+      }
       await updateJobState({
         persistence,
         job,
@@ -389,55 +446,94 @@ async function processQueueMessage({
       requestContext: asyncContext,
     });
   }
-  const checkpointId = makeId('checkpoint');
-  const placeholderManifest = {
-    manifest_version: CONTROL_PLANE_SCHEMA_VERSION,
+  let checkpointId = makeId('checkpoint');
+  let completedCheckpoint = {
+    status: 'complete',
     checkpoint_id: checkpointId,
-    job_id: job.job_id,
+    queue_name: queueName,
+    completed_at: now.toISOString(),
     shard_type: checkpointShardType,
     shard_key: checkpointShardKey,
-    queue_name: queueName,
-    started_at: now.toISOString(),
-    completed_at: now.toISOString(),
-    hash_algorithm: 'sha256',
-    signature_algorithm: 'none',
-    signing_key_version: null,
-    encryption_key_version: null,
-    source_watermark: {
-      placeholder: true,
-      queue_name: queueName,
-    },
-    objects: [],
-    completeness_state: 'incomplete',
+    manifest_completeness_state: queueName === QUEUE_NAMES.restore ? 'complete' : null,
+    manifest_hash: null,
+    manifest_r2_object_key: null,
+    source_watermark: null,
+    object_entries: [],
+    apply_phase: messageBody.apply_phase ?? null,
   };
-  let objectKey = null;
-  if (archiveBucket) {
-    objectKey = buildArchiveObjectKey({
-      exportEpochOrImportBatch: job.export_epoch ?? job.job_id,
-      artifactKind: 'checkpoint-manifest',
-      scope: job.scope,
-      objectId: checkpointId,
+
+  if (queueName === QUEUE_NAMES.export) {
+    const keyRing = parseExportKeyRingFromEnv(loadWorkerRuntimeConfig('jobs-worker', env), env);
+    const artifact = await buildControlPlaneCheckpointArtifact({
+      persistence,
+      archiveBucket,
+      keyRing,
+      job,
+      checkpointId,
+      now,
     });
-    await putArchiveJsonObject(archiveBucket, objectKey, placeholderManifest);
+    completedCheckpoint = {
+      ...completedCheckpoint,
+      checkpoint_id: artifact.checkpoint_id,
+      manifest_completeness_state: artifact.manifest.completeness_state,
+      manifest_hash: artifact.manifest_hash,
+      manifest_r2_object_key: artifact.manifest_r2_object_key,
+      source_watermark: artifact.source_watermark,
+      object_entries: artifact.object_entries,
+      apply_phase: 'control-plane',
+    };
+  } else if (queueName === QUEUE_NAMES.restore) {
+    checkpointId = messageBody.checkpoint_id;
+    const keyRing = parseExportKeyRingFromEnv(loadWorkerRuntimeConfig('jobs-worker', env), env);
+    const restoreCheckpoints = await resolveRestoreCheckpointRefs({
+      persistence,
+      archiveBucket,
+      keyRing,
+      requestBody: {
+        ...job.spec,
+        scope: job.scope,
+      },
+    });
+    const matchedCheckpoint = restoreCheckpoints.find((entry) => (
+      entry.checkpoint_id === checkpointId
+      && entry.shard_type === checkpointShardType
+      && entry.shard_key === checkpointShardKey
+    ));
+    if (!matchedCheckpoint) {
+      throw new Error(`Restore checkpoint ${checkpointId} for ${checkpointShardType}/${checkpointShardKey} is no longer resolvable from the source bundle`);
+    }
+    completedCheckpoint = {
+      ...completedCheckpoint,
+      checkpoint_id: checkpointId,
+      manifest_completeness_state: matchedCheckpoint.checkpoint_manifest.completeness_state,
+      manifest_hash: matchedCheckpoint.manifest_hash,
+      manifest_r2_object_key: matchedCheckpoint.manifest_r2_object_key,
+      source_watermark: matchedCheckpoint.checkpoint_manifest.source_watermark ?? null,
+      object_entries: matchedCheckpoint.checkpoint_manifest.objects ?? [],
+      apply_phase: matchedCheckpoint.apply_phase,
+    };
   }
   await persistence.upsertJobCheckpoint({
     job_id: job.job_id,
     shard_type: checkpointShardType,
     shard_key: checkpointShardKey,
-    checkpoint: {
-      status: 'complete',
-      checkpoint_id: checkpointId,
-      queue_name: queueName,
-      completed_at: now.toISOString(),
-      manifest_completeness_state: placeholderManifest.completeness_state,
-      r2_object_key: objectKey,
-    },
+    checkpoint: completedCheckpoint,
     updated_at: now.toISOString(),
   });
   const checkpoints = await persistence.listJobCheckpoints(job.job_id);
   const completedUnits = checkpoints.filter((entry) => entry.checkpoint?.status === 'complete').length;
   const totalUnits = Math.max(job.progress_total_units ?? 1, 1);
   const isTerminal = completedUnits >= totalUnits;
+  if (queueName === QUEUE_NAMES.export && isTerminal) {
+    const keyRing = parseExportKeyRingFromEnv(loadWorkerRuntimeConfig('jobs-worker', env), env);
+    await finalizeExportBundleManifest({
+      persistence,
+      archiveBucket,
+      keyRing,
+      job: await persistence.getJob(job.job_id) ?? job,
+      now,
+    });
+  }
   await updateJobState({
     persistence,
     job,
@@ -525,7 +621,16 @@ export function createJobsWorkerFetchHandler() {
         message: `Job ${job.job_id} type ${job.job_type} does not match ${info.kind}`,
       });
     }
-    if (job.internal_state !== 'pending') {
+    const stagedQueueDelivery = job.checkpoint_state?.queue_delivery_state === 'staged';
+    if (job.internal_state === 'failed' && stagedQueueDelivery) {
+      await persistence.updateJob({
+        ...job,
+        internal_state: 'pending',
+        completed_at: null,
+        last_error: null,
+        result_summary: null,
+      });
+    } else if (job.internal_state !== 'pending') {
       return jsonResponse(buildJobHandleFromRecord(job));
     }
     try {
@@ -566,6 +671,7 @@ export function createJobsWorkerQueueHandler() {
           persistence,
           archiveBucket: env.MATRIX_ARCHIVE_BUCKET,
           asyncContext,
+          env,
         });
         if (typeof message.ack === 'function' && result.acknowledged) {
           message.ack();

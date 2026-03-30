@@ -105,7 +105,9 @@ const WORKER_RUNTIME_MANIFEST = Object.freeze({
       ...SHARED_TEXT_BINDINGS,
       MANAGEMENT_API_BASE_URL: { type: 'string', required: true },
     }),
-    secrets: Object.freeze({}),
+    secrets: Object.freeze({
+      export_bundle_key_ring: 'EXPORT_BUNDLE_KEY_RING',
+    }),
     featureGates: Object.freeze([
       'federation',
       'media_remote_fetch',

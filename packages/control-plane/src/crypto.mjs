@@ -301,8 +301,32 @@ export function parseExportKeyRing(secretValue) {
   }
   const signingActive = normalizeString(signing.active, 'signing.active');
   const encryptionActive = normalizeString(encryption.active, 'encryption.active');
-  const signingKey = signing.keys?.[signingActive];
-  const encryptionKey = encryption.keys?.[encryptionActive];
+  const signingKeys = Object.freeze(Object.fromEntries(
+    Object.entries(signing.keys ?? {}).map(([version, keyRecord]) => {
+      const normalizedVersion = normalizeString(version, 'signing.keys version');
+      return [normalizedVersion, Object.freeze({
+        private_key_pem: normalizeString(keyRecord?.private_key_pem, `signing.keys.${normalizedVersion}.private_key_pem`),
+        public_key_pem: normalizeString(keyRecord?.public_key_pem, `signing.keys.${normalizedVersion}.public_key_pem`),
+      })];
+    }),
+  ));
+  const encryptionKeys = Object.freeze(Object.fromEntries(
+    Object.entries(encryption.keys ?? {}).map(([version, keyRecord]) => {
+      const normalizedVersion = normalizeString(version, 'encryption.keys version');
+      const keyBytes = Buffer.from(
+        normalizeString(keyRecord?.key_base64, `encryption.keys.${normalizedVersion}.key_base64`),
+        'base64',
+      );
+      if (keyBytes.length !== 32) {
+        throw new TypeError(`AES-256-GCM encryption key ${normalizedVersion} must be 32 bytes`);
+      }
+      return [normalizedVersion, Object.freeze({
+        key_bytes: keyBytes,
+      })];
+    }),
+  ));
+  const signingKey = signingKeys[signingActive];
+  const encryptionKey = encryptionKeys[encryptionActive];
   if (!signingKey || !encryptionKey) {
     throw new TypeError('Active signing/encryption key versions must exist in the key ring');
   }
@@ -311,17 +335,41 @@ export function parseExportKeyRing(secretValue) {
       active: signingActive,
       private_key_pem: normalizeString(signingKey.private_key_pem, 'signing.private_key_pem'),
       public_key_pem: normalizeString(signingKey.public_key_pem, 'signing.public_key_pem'),
+      keys: signingKeys,
     }),
     encryption: Object.freeze({
       active: encryptionActive,
-      key_bytes: Buffer.from(normalizeString(encryptionKey.key_base64, 'encryption.key_base64'), 'base64'),
+      key_bytes: Buffer.from(encryptionKey.key_bytes),
+      keys: encryptionKeys,
     }),
   });
 }
 
+function resolveSigningKeyRecord(keyRing, version = keyRing?.signing?.active) {
+  const resolvedVersion = normalizeString(version, 'signing_key_version');
+  const keyRecord = keyRing?.signing?.keys?.[resolvedVersion];
+  if (!keyRecord) {
+    throw new TypeError(`Signing key version ${resolvedVersion} is not present in the export key ring`);
+  }
+  return keyRecord;
+}
+
+function resolveEncryptionKeyRecord(keyRing, version = keyRing?.encryption?.active) {
+  const resolvedVersion = normalizeString(version, 'encryption_key_version');
+  const keyRecord = keyRing?.encryption?.keys?.[resolvedVersion];
+  if (!keyRecord) {
+    throw new TypeError(`Encryption key version ${resolvedVersion} is not present in the export key ring`);
+  }
+  return keyRecord;
+}
+
+export function resolveSigningPublicKeyPem(keyRing, version = keyRing?.signing?.active) {
+  return resolveSigningKeyRecord(keyRing, version).public_key_pem;
+}
+
 export function signCanonicalPayload(unsignedPayload, keyRing) {
   const canonicalBytes = canonicalJsonBytes(unsignedPayload);
-  const privateKey = createPrivateKey(keyRing.signing.private_key_pem);
+  const privateKey = createPrivateKey(resolveSigningKeyRecord(keyRing, keyRing.signing.active).private_key_pem);
   const signature = nodeSign(null, canonicalBytes, privateKey);
   return {
     payload: unsignedPayload,
@@ -346,11 +394,12 @@ export function verifyCanonicalPayloadSignature(signedPayload, publicKeyPem) {
 
 export function encryptBytes(bytes, keyRing, { aad = null } = {}) {
   const buffer = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
-  if (keyRing.encryption.key_bytes.length !== 32) {
+  const encryptionKey = resolveEncryptionKeyRecord(keyRing, keyRing.encryption.active);
+  if (encryptionKey.key_bytes.length !== 32) {
     throw new TypeError('AES-256-GCM encryption key must be 32 bytes');
   }
   const iv = randomBytes(12);
-  const cipher = createCipheriv('aes-256-gcm', keyRing.encryption.key_bytes, iv);
+  const cipher = createCipheriv('aes-256-gcm', encryptionKey.key_bytes, iv);
   if (aad != null) {
     cipher.setAAD(Buffer.from(aad));
   }
@@ -369,7 +418,11 @@ export function decryptBytes(envelope, keyRing, { aad = null } = {}) {
   const ciphertext = base64UrlToBytes(envelope.ciphertext_base64url);
   const iv = base64UrlToBytes(envelope.iv_base64url);
   const tag = base64UrlToBytes(envelope.tag_base64url);
-  const decipher = createDecipheriv('aes-256-gcm', keyRing.encryption.key_bytes, iv);
+  const encryptionKey = resolveEncryptionKeyRecord(
+    keyRing,
+    envelope?.encryption_key_version ?? keyRing?.encryption?.active,
+  );
+  const decipher = createDecipheriv('aes-256-gcm', encryptionKey.key_bytes, iv);
   if (aad != null) {
     decipher.setAAD(Buffer.from(aad));
   }
@@ -413,6 +466,16 @@ export function verifySignedManifest(signedManifest, publicKeyPem) {
     payload: unsignedManifest,
     signature: signedManifest.signature,
   }, publicKeyPem);
+}
+
+export function verifySignedManifestWithKeyRing(signedManifest, keyRing) {
+  return verifySignedManifest(
+    signedManifest,
+    resolveSigningPublicKeyPem(
+      keyRing,
+      signedManifest?.signing_key_version ?? keyRing?.signing?.active,
+    ),
+  );
 }
 
 export function createJwtForTest({
