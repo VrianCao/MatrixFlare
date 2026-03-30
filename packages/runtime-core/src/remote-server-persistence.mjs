@@ -1,4 +1,7 @@
 import {
+  canonicalizeJsonValue,
+} from './canonical-json.mjs';
+import {
   createSqliteTableAccess,
   ensureSingletonState,
   mapSqliteRow,
@@ -12,6 +15,7 @@ import {
 } from './persistence-common.mjs';
 
 export const REMOTE_SERVER_DO_SCHEMA_VERSION = 1;
+const REMOTE_INBOUND_TXN_MARKER_STATES = Object.freeze(['in_progress', 'finalized', 'conflict']);
 
 const REMOTE_SERVER_RUNTIME_STATE_TABLE = 'remote_server_runtime_state';
 const REMOTE_SERVER_REQUIRED_TABLES = Object.freeze([
@@ -61,7 +65,7 @@ CREATE TABLE IF NOT EXISTS remote_inbound_txn_markers (
   origin TEXT NOT NULL,
   txn_id TEXT NOT NULL,
   dedupe_request_hash TEXT NOT NULL,
-  state TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('in_progress', 'finalized', 'conflict')),
   first_seen_at TEXT NOT NULL,
   finalized_at TEXT,
   conflict_reason TEXT,
@@ -212,7 +216,20 @@ function allocateOutboundTxnSequenceWithinTransaction(sql, { updatedAt, serverNa
 }
 
 function buildCacheKey(cacheKind, keyId = null) {
-  return `${normalizeString(cacheKind, 'cacheKind')}:${keyId == null ? 'singleton' : normalizeString(keyId, 'keyId')}`;
+  const normalizedCacheKind = normalizeString(cacheKind, 'cacheKind');
+  const normalizedKeyId = keyId == null ? null : normalizeString(keyId, 'keyId');
+  if (normalizedCacheKind === 'server-key' && normalizedKeyId == null) {
+    throw new TypeError('keyId must be present when cacheKind is server-key');
+  }
+  return `${normalizedCacheKind}:${normalizedKeyId ?? 'singleton'}`;
+}
+
+function normalizeInboundTxnMarkerState(value, label = 'state') {
+  const normalizedState = normalizeString(value, label);
+  if (!REMOTE_INBOUND_TXN_MARKER_STATES.includes(normalizedState)) {
+    throw new RangeError(`${label} must be one of ${REMOTE_INBOUND_TXN_MARKER_STATES.join(', ')}`);
+  }
+  return normalizedState;
 }
 
 export function createRemoteServerDurableObjectPersistence(sqlStorage) {
@@ -270,21 +287,33 @@ export function createRemoteServerDurableObjectPersistence(sqlStorage) {
     enqueueOutboundTransaction(record) {
       return withSqliteTransaction(sql, () => {
         const createdAt = normalizeString(record.created_at ?? new Date().toISOString(), 'record.created_at');
+        const normalizedTxnId = normalizeString(record.txn_id, 'record.txn_id');
+        const normalizedPayload = record.payload ?? {};
+        const normalizedPayloadHash = record.payload_hash ?? null;
+        const existing = outboundTransactions.get(normalizedTxnId);
+        if (existing) {
+          const samePayload = canonicalizeJsonValue(existing.payload ?? {}) === canonicalizeJsonValue(normalizedPayload);
+          const samePayloadHash = (existing.payload_hash ?? null) === normalizedPayloadHash;
+          if (!samePayload || !samePayloadHash) {
+            throw new Error(`Outbound txn ${normalizedTxnId} payload is immutable once queued`);
+          }
+          return existing;
+        }
         const txnSequence = record.txn_sequence ?? allocateOutboundTxnSequenceWithinTransaction(sql, {
           updatedAt: createdAt,
           serverName: record.server_name ?? null,
         });
         outboundTransactions.put({
-          txn_id: normalizeString(record.txn_id, 'record.txn_id'),
+          txn_id: normalizedTxnId,
           txn_sequence: txnSequence,
-          payload_hash: record.payload_hash ?? null,
+          payload_hash: normalizedPayloadHash,
           created_at: createdAt,
           dispatched_at: record.dispatched_at ?? null,
           acknowledged_at: record.acknowledged_at ?? null,
-          payload_json: record.payload ?? {},
+          payload_json: normalizedPayload,
           record_json: record.record ?? {},
         });
-        return outboundTransactions.get(record.txn_id);
+        return outboundTransactions.get(normalizedTxnId);
       });
     },
     putInboundTxnMarker(record) {
@@ -292,7 +321,7 @@ export function createRemoteServerDurableObjectPersistence(sqlStorage) {
         origin: normalizeString(record.origin, 'record.origin'),
         txn_id: normalizeString(record.txn_id, 'record.txn_id'),
         dedupe_request_hash: normalizeString(record.dedupe_request_hash, 'record.dedupe_request_hash'),
-        state: record.state ?? 'in_progress',
+        state: normalizeInboundTxnMarkerState(record.state ?? 'in_progress'),
         first_seen_at: normalizeString(record.first_seen_at ?? new Date().toISOString(), 'record.first_seen_at'),
         finalized_at: record.finalized_at ?? null,
         conflict_reason: record.conflict_reason ?? null,
@@ -304,6 +333,9 @@ export function createRemoteServerDurableObjectPersistence(sqlStorage) {
         const existingMarker = inboundMarkers.get({ origin, txn_id });
         if (!existingMarker) {
           throw new Error(`Inbound txn marker ${origin}/${txn_id} must exist before conflict is recorded`);
+        }
+        if (existingMarker.state === 'finalized') {
+          throw new Error(`Inbound txn ${origin}/${txn_id} is already finalized and cannot be rewritten as conflict`);
         }
         const conflictingHash = normalizeString(dedupe_request_hash, 'dedupe_request_hash');
         if (existingMarker.dedupe_request_hash === conflictingHash) {
@@ -338,6 +370,16 @@ export function createRemoteServerDurableObjectPersistence(sqlStorage) {
         }
         if (existingMarker.dedupe_request_hash !== dedupe_request_hash) {
           throw new Error(`Inbound txn ${origin}/${txn_id} dedupe_request_hash mismatch`);
+        }
+        if (existingMarker.state === 'finalized') {
+          const existingResult = inboundResults.get({ origin, txn_id });
+          if (!existingResult) {
+            throw new Error(`Inbound txn ${origin}/${txn_id} is marked finalized without a cached result`);
+          }
+          return {
+            marker: existingMarker,
+            result: existingResult,
+          };
         }
         inboundResults.put({
           origin,

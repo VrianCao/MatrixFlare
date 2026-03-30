@@ -79,6 +79,35 @@ function measureBodyBytes(body) {
   return Buffer.byteLength(String(body), 'utf8');
 }
 
+function toBodyBuffer(body) {
+  if (typeof body === 'string') {
+    return Buffer.from(body, 'utf8');
+  }
+  if (body instanceof Uint8Array || Buffer.isBuffer(body)) {
+    return Buffer.from(body);
+  }
+  return Buffer.from(String(body), 'utf8');
+}
+
+async function readR2ObjectBytes(object) {
+  if (!object) {
+    return null;
+  }
+  if (typeof object.arrayBuffer === 'function') {
+    return Buffer.from(await object.arrayBuffer());
+  }
+  if (typeof object.text === 'function') {
+    return Buffer.from(await object.text(), 'utf8');
+  }
+  if (typeof object.body === 'string') {
+    return Buffer.from(object.body, 'utf8');
+  }
+  if (object.body instanceof Uint8Array || Buffer.isBuffer(object.body)) {
+    return Buffer.from(object.body);
+  }
+  return null;
+}
+
 export function buildLocalMediaObjectKey(mediaId) {
   return `media/local/${normalizeString(mediaId, 'mediaId')}`;
 }
@@ -159,7 +188,11 @@ export function buildRemoteCacheKey({
   if (!REMOTE_CACHE_KINDS.includes(normalizedCacheKind)) {
     throw new RangeError(`cacheKind must be one of ${REMOTE_CACHE_KINDS.join(', ')}`);
   }
-  const suffix = keyId == null ? '' : `:${normalizeString(keyId, 'keyId')}`;
+  const normalizedKeyId = keyId == null ? null : normalizeString(keyId, 'keyId');
+  if (normalizedCacheKind === 'server-key' && normalizedKeyId == null) {
+    throw new TypeError('keyId must be present when cacheKind is server-key');
+  }
+  const suffix = normalizedKeyId == null ? '' : `:${normalizedKeyId}`;
   return `remote:${normalizedCacheKind}:${normalizeString(serverName, 'serverName')}${suffix}`;
 }
 
@@ -260,6 +293,18 @@ export async function putR2Object(bucket, key, body, {
   const normalizedBody = typeof body === 'string' || body instanceof Uint8Array || Buffer.isBuffer(body)
     ? body
     : String(body);
+  const existingObject = await r2.get(normalizedKey);
+  if (existingObject) {
+    const existingBytes = await readR2ObjectBytes(existingObject);
+    const nextBytes = toBodyBuffer(normalizedBody);
+    if (!existingBytes || !existingBytes.equals(nextBytes)) {
+      throw new Error(`R2 object key conflict for ${normalizedKey}`);
+    }
+    return {
+      key: normalizedKey,
+      byte_size: nextBytes.byteLength,
+    };
+  }
   await r2.put(normalizedKey, normalizedBody, {
     customMetadata: stringifyCustomMetadata(metadata),
     httpMetadata: httpMetadata ?? undefined,
@@ -349,12 +394,22 @@ export async function deleteKvKeysByPrefix(namespace, prefix) {
     throw new TypeError('namespace must expose list() and delete() to delete by prefix');
   }
   const normalizedPrefix = normalizeString(prefix, 'prefix');
-  const listed = await kv.list({ prefix: normalizedPrefix });
-  const keys = listed?.keys ?? [];
-  for (const key of keys) {
-    await kv.delete(key.name);
+  let deletedCount = 0;
+  let cursor = null;
+  while (true) {
+    const listed = await kv.list(cursor == null
+      ? { prefix: normalizedPrefix }
+      : { prefix: normalizedPrefix, cursor });
+    const keys = listed?.keys ?? [];
+    for (const key of keys) {
+      await kv.delete(key.name);
+      deletedCount += 1;
+    }
+    if (listed?.list_complete !== false || listed?.cursor == null) {
+      return deletedCount;
+    }
+    cursor = listed.cursor;
   }
-  return keys.length;
 }
 
 export async function putWellKnownCacheEntry(namespace, entry, {

@@ -101,8 +101,9 @@ export class FakeR2Bucket {
 }
 
 export class FakeKvNamespace {
-  constructor() {
+  constructor({ pageSize = 1000 } = {}) {
     this.entries = new Map();
+    this.pageSize = pageSize;
   }
 
   async put(key, value, options = {}) {
@@ -132,14 +133,25 @@ export class FakeKvNamespace {
     this.entries.delete(key);
   }
 
-  async list({ prefix = '' } = {}) {
-    const keys = [...this.entries.entries()]
+  async list({ prefix = '', cursor = null, limit = null } = {}) {
+    const pageLimit = limit ?? this.pageSize;
+    const allKeys = [...this.entries.entries()]
       .filter(([key]) => key.startsWith(prefix))
       .map(([name, entry]) => ({
         name,
         metadata: entry.metadata ?? null,
       }))
       .sort((left, right) => left.name.localeCompare(right.name));
-    return { keys };
+    const startIndex = cursor == null
+      ? 0
+      : allKeys.findIndex((entry) => entry.name > cursor);
+    const normalizedStartIndex = startIndex === -1 ? allKeys.length : startIndex;
+    const keys = allKeys.slice(normalizedStartIndex, normalizedStartIndex + pageLimit);
+    const listComplete = normalizedStartIndex + pageLimit >= allKeys.length;
+    return {
+      keys,
+      list_complete: listComplete,
+      cursor: listComplete || keys.length === 0 ? null : keys.at(-1).name,
+    };
   }
 }

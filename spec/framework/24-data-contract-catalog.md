@@ -123,7 +123,7 @@
 | `DATA-D1-002` | table | user directory | derived | `jobs-worker` | D1 | `user_id` | eventual | rebuild from `UserDO` exports | 来源于 `DATA-USER-012` 与本地目录策略；受隐私与可发现性规则约束。 |
 | `DATA-D1-003` | table | public room directory | derived | `jobs-worker` | D1 | `room_id` | eventual | rebuild from `RoomDO` | 可见性随 join rules/public flag 更新；每行必须带来源 `room_serial` / visibility watermark，用于判断“可见性是否不确定”。 |
 | `DATA-D1-004` | table | media catalog | derived | `jobs-worker` | D1 | `mxc_uri` | eventual | R2 listing + finalize logs | 不能成为下载前置单点；若镜像 legacy unauth freeze 相关派生字段，只能作查询/审计辅助，不得替代 R2 object metadata 真值。 |
-| `DATA-D1-005` | table | appservice config / txn cursors | authoritative-control-plane | `ops-worker` / `jobs-worker` | D1 + secrets | `{appservice_id}` | strong at primary / session consistent | config backup | 控制面数据，不是房间或用户真相。 |
+| `DATA-D1-005` | table | appservice config / delivery cursor state | authoritative-control-plane | `ops-worker` / `jobs-worker` | D1 + secrets | `{appservice_id}` | strong at primary / session consistent | config backup | 控制面数据，不是房间或用户真相；Phase 03 物理形态可把 delivery progress / cursor state 与结构化 appservice config 共存于同一 `appservice_id` row（当前最小可观察字段见 `delivery_state`），而不是要求单独的 per-txn 队列表。 |
 | `DATA-D1-006` | table | operator authz policy | authoritative-control-plane | `ops-worker` | D1 + Cloudflare Access config | `principal_id` | strong at primary / session consistent | config backup | 记录人类/自动化 operator principal、Access binding、允许 scope、target scope 约束、失效时间与审计要求；不存 Access secret 本体。 |
 
 ### 6.1 `DATA-D1-006` Operator Authz Policy 最小形态

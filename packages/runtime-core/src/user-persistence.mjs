@@ -255,7 +255,7 @@ CREATE TABLE IF NOT EXISTS user_to_device_txn_dedupe (
   result_json TEXT,
   record_json TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_user_to_device_txn_dedupe_public_key
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_user_to_device_txn_dedupe_public_key
   ON user_to_device_txn_dedupe (sender_user_id, event_type, txn_id);
 
 CREATE TABLE IF NOT EXISTS user_principal (
@@ -489,6 +489,16 @@ const USER_TABLES = Object.freeze({
     ],
     jsonColumns: ['result_json', 'record_json'],
     jsonFallbacks: { result_json: null, record_json: {} },
+    requiredColumns: [
+      'txn_dedupe_key',
+      'sender_user_id',
+      'event_type',
+      'txn_id',
+      'request_fingerprint',
+      'terminal_state',
+      'created_at',
+      'updated_at',
+    ],
     orderBy: 'created_at ASC, txn_dedupe_key ASC',
   }),
 });
@@ -542,7 +552,20 @@ function allocateUserStreamPosWithinTransaction(sql, { updatedAt, userId = null 
 function createUserPrincipalAccess(sql) {
   return Object.freeze({
     put(record) {
-      const now = normalizeString(record.created_at ?? record.updated_at ?? new Date().toISOString(), 'record.created_at');
+      const existing = mapSqliteRow(
+        sqlFirst(sql, 'SELECT * FROM user_principal WHERE singleton = 1'),
+        {
+          jsonColumns: ['record_json'],
+          jsonFallbacks: { record_json: {} },
+          booleanColumns: ['password_login_enabled', 'erase_requested_flag'],
+        },
+      );
+      const authVersion = normalizeInteger(record.auth_version ?? 1, 'record.auth_version', { min: 1 });
+      if (existing && authVersion < existing.auth_version) {
+        throw new RangeError('record.auth_version must not decrease');
+      }
+      const createdAt = existing?.created_at
+        ?? normalizeString(record.created_at ?? record.updated_at ?? new Date().toISOString(), 'record.created_at');
       sqlRun(
         sql,
         `
@@ -556,7 +579,7 @@ function createUserPrincipalAccess(sql) {
             user_type = excluded.user_type,
             password_hash_or_null = excluded.password_hash_or_null,
             password_login_enabled = excluded.password_login_enabled,
-            created_at = excluded.created_at,
+            created_at = user_principal.created_at,
             deactivated_at_or_null = excluded.deactivated_at_or_null,
             erase_requested_flag = excluded.erase_requested_flag,
             auth_version = excluded.auth_version,
@@ -569,10 +592,10 @@ function createUserPrincipalAccess(sql) {
         record.user_type ?? null,
         record.password_hash_or_null ?? null,
         record.password_login_enabled == null ? 1 : (record.password_login_enabled ? 1 : 0),
-        now,
+        createdAt,
         record.deactivated_at_or_null ?? null,
         record.erase_requested_flag ? 1 : 0,
-        normalizeInteger(record.auth_version ?? 1, 'record.auth_version', { min: 1 }),
+        authVersion,
         record.registration_source ?? null,
         JSON.stringify(record.record ?? {}),
       );
@@ -591,6 +614,34 @@ function createUserPrincipalAccess(sql) {
   });
 }
 
+function createProfileDocumentAccess(sql) {
+  const base = createSqliteTableAccess(sql, USER_TABLES.profileDocument);
+  return Object.freeze({
+    put(record) {
+      const normalizedKeyName = normalizeString(record.key_name, 'record.key_name');
+      const normalizedProfileVersion = normalizeInteger(record.profile_version, 'record.profile_version', { min: 1 });
+      const existing = base.get({ key_name: normalizedKeyName });
+      if (existing && normalizedProfileVersion < existing.profile_version) {
+        throw new RangeError('record.profile_version must not decrease');
+      }
+      return base.put({
+        ...record,
+        key_name: normalizedKeyName,
+        profile_version: normalizedProfileVersion,
+      });
+    },
+    get(key) {
+      return base.get(key);
+    },
+    list() {
+      return base.list();
+    },
+    delete(key) {
+      return base.delete(key);
+    },
+  });
+}
+
 export function createUserDurableObjectPersistence(sqlStorage) {
   const sql = requireSqlStorage(sqlStorage);
   const sessions = createSqliteTableAccess(sql, USER_TABLES.sessions);
@@ -604,7 +655,7 @@ export function createUserDurableObjectPersistence(sqlStorage) {
   const presence = createSqliteTableAccess(sql, USER_TABLES.presence);
   const userStream = createSqliteTableAccess(sql, USER_TABLES.userStream);
   const roomKeyBackupManifests = createSqliteTableAccess(sql, USER_TABLES.roomKeyBackupManifests);
-  const profileDocument = createSqliteTableAccess(sql, USER_TABLES.profileDocument);
+  const profileDocument = createProfileDocumentAccess(sql);
   const pushRules = createSqliteTableAccess(sql, USER_TABLES.pushRules);
   const storedFilters = createSqliteTableAccess(sql, USER_TABLES.storedFilters);
   const pendingUploadGrants = createSqliteTableAccess(sql, USER_TABLES.pendingUploadGrants);
@@ -680,10 +731,15 @@ export function createUserDurableObjectPersistence(sqlStorage) {
     appendUserStream(record) {
       return withSqliteTransaction(sql, () => {
         const createdAt = normalizeString(record.created_at ?? new Date().toISOString(), 'record.created_at');
-        const streamPos = record.stream_pos ?? allocateUserStreamPosWithinTransaction(sql, {
-          updatedAt: createdAt,
-          userId: record.user_id ?? null,
-        });
+        const streamPos = record.stream_pos == null
+          ? allocateUserStreamPosWithinTransaction(sql, {
+            updatedAt: createdAt,
+            userId: record.user_id ?? null,
+          })
+          : normalizeInteger(record.stream_pos, 'record.stream_pos', { min: 1 });
+        if (record.stream_pos != null && userStream.get(streamPos)) {
+          throw new Error(`User stream position ${streamPos} already exists`);
+        }
         userStream.put({
           stream_pos: streamPos,
           stream_kind: normalizeString(record.stream_kind, 'record.stream_kind'),

@@ -26,6 +26,7 @@ import {
   getRemoteCacheEntry,
   getR2JsonObject,
   getWellKnownCacheEntry,
+  normalizeEncryptedBackupSegmentMetadata,
   normalizeExportBundleObjectMetadata,
   normalizeLocalMediaObjectMetadata,
   normalizeRemoteMediaObjectMetadata,
@@ -81,6 +82,19 @@ test('UserDO persistence lands DATA-USER-001 through DATA-USER-017 and exposes s
     auth_version: 1,
     registration_source: 'password',
     record: { mxid: '@alice:test' },
+  });
+  persistence.userPrincipal.put({
+    user_id: '@alice:test',
+    localpart: 'alice',
+    user_type: 'human',
+    password_hash_or_null: 'pw-hash-2',
+    password_login_enabled: true,
+    created_at: '2026-03-30T00:00:30.000Z',
+    deactivated_at_or_null: null,
+    erase_requested_flag: false,
+    auth_version: 2,
+    registration_source: 'password-reset',
+    record: { mxid: '@alice:test', rotated: true },
   });
   persistence.sessions.put({
     session_id: 'sess-1',
@@ -194,6 +208,16 @@ test('UserDO persistence lands DATA-USER-001 through DATA-USER-017 and exposes s
     value_json: 'Alice',
     record_json: { visible: true },
   });
+  assert.throws(
+    () => persistence.profileDocument.put({
+      key_name: 'displayname',
+      profile_version: 1,
+      updated_at: '2026-03-30T00:00:08.500Z',
+      value_json: 'Alice (stale)',
+      record_json: { visible: true },
+    }),
+    /profile_version must not decrease/,
+  );
   persistence.pushRules.put({
     scope: 'global',
     kind: 'override',
@@ -237,6 +261,36 @@ test('UserDO persistence lands DATA-USER-001 through DATA-USER-017 and exposes s
     result_json: { delivered: 1 },
     record_json: { request_hash: 'fingerprint-1' },
   });
+  assert.throws(
+    () => persistence.toDeviceTxnDedupe.put({
+      txn_dedupe_key: 'dedupe-2',
+      sender_user_id: '@alice:test',
+      event_type: 'm.room_key',
+      txn_id: 'txn-1',
+      request_fingerprint: 'fingerprint-2',
+      terminal_state: 'succeeded',
+      created_at: '2026-03-30T00:00:12.500Z',
+      updated_at: '2026-03-30T00:00:12.500Z',
+      result_json: { delivered: 2 },
+      record_json: { request_hash: 'fingerprint-2' },
+    }),
+    /UNIQUE constraint failed/,
+  );
+  assert.throws(
+    () => persistence.userPrincipal.put({
+      user_id: '@alice:test',
+      localpart: 'alice',
+      user_type: 'human',
+      password_hash_or_null: 'pw-hash-3',
+      password_login_enabled: true,
+      deactivated_at_or_null: null,
+      erase_requested_flag: false,
+      auth_version: 1,
+      registration_source: 'stale-replay',
+      record: { mxid: '@alice:test', regressed: true },
+    }),
+    /auth_version must not decrease/,
+  );
 
   const claimedKey = persistence.claimOneTimeKey({
     device_id: 'DEVICE1',
@@ -263,9 +317,22 @@ test('UserDO persistence lands DATA-USER-001 through DATA-USER-017 and exposes s
   assert.equal(persistence.pendingUploadGrants.list().length, 1);
   assert.equal(persistence.toDeviceTxnDedupe.list().length, 1);
   assert.equal(persistence.userPrincipal.get().user_id, '@alice:test');
+  assert.equal(persistence.userPrincipal.get().created_at, '2026-03-30T00:00:02.000Z');
+  assert.equal(persistence.userPrincipal.get().auth_version, 2);
   assert.equal(userStreamEntry.stream_pos, 1);
   assert.equal(queuedToDevice.stream_pos, 2);
   assert.equal(claimedKey.claim_context.by, '@bob:test');
+  assert.throws(
+    () => persistence.appendUserStream({
+      stream_pos: 1,
+      stream_kind: 'presence',
+      created_at: '2026-03-30T00:00:13.500Z',
+      payload: { presence: 'offline' },
+      record: { source: 'duplicate' },
+      user_id: '@alice:test',
+    }),
+    /already exists/,
+  );
 
   const userDo = new UserDO({ storage }, TEST_ENV);
   const schemaState = await userDo.ensureSchema();
@@ -396,6 +463,7 @@ test('RoomDO persistence lands DATA-ROOM-001 through DATA-ROOM-012 with query in
     txn_dedupe_key: 'txn-room-1',
     user_id: '@alice:test',
     device_id: 'DEVICE1',
+    room_id: '!room:test',
     route_template: '/_matrix/client/v3/rooms/{roomId}/send/{eventType}/{txnId}',
     txn_id_or_request_hash: 'txn-1',
     request_fingerprint: 'fingerprint-room-1',
@@ -406,6 +474,24 @@ test('RoomDO persistence lands DATA-ROOM-001 through DATA-ROOM-012 with query in
     updated_at: '2026-03-30T01:00:07.000Z',
     record_json: { route_kind: 'timeline' },
   });
+  assert.throws(
+    () => persistence.clientTxnDedupe.put({
+      txn_dedupe_key: 'txn-room-2',
+      user_id: '@alice:test',
+      device_id: 'DEVICE1',
+      room_id: '!room:test',
+      route_template: '/_matrix/client/v3/rooms/{roomId}/send/{eventType}/{txnId}',
+      txn_id_or_request_hash: 'txn-1',
+      request_fingerprint: 'fingerprint-room-2',
+      terminal_state: 'conflict',
+      result_event_id: null,
+      error_json: { errcode: 'M_DUPLICATE_ANNOTATION' },
+      created_at: '2026-03-30T01:00:07.500Z',
+      updated_at: '2026-03-30T01:00:07.500Z',
+      record_json: { route_kind: 'timeline' },
+    }),
+    /UNIQUE constraint failed/,
+  );
 
   const indexedEvent = persistence.getEventMetadataByRoomPos(1);
   const pendingOutbox = persistence.listPendingFanoutOutbox();
@@ -433,6 +519,7 @@ test('RoomDO persistence lands DATA-ROOM-001 through DATA-ROOM-012 with query in
   assert.equal(ackedOutbox.status, 'acked');
   assert.equal(persistence.clientTxnDedupe.list().length, 1);
   assert.ok(metadataIndexes.some((index) => index.name === 'idx_room_events_metadata_timestamp_room_pos'));
+  assert.ok(metadataIndexes.some((index) => index.name === 'idx_room_events_metadata_room_pos'));
   assert.ok(metadataIndexes.some((index) => index.name === 'idx_room_events_metadata_relations'));
   assert.ok(metadataIndexes.some((index) => index.name === 'idx_room_events_metadata_threads'));
   assert.ok(metadataIndexes.some((index) => index.name === 'idx_room_events_metadata_membership_target'));
@@ -461,6 +548,17 @@ test('RemoteServerDO persistence lands DATA-FED-001 through DATA-FED-006 and enf
     record: { source: 'RoomDO' },
     server_name: 'remote.example',
   });
+  assert.throws(
+    () => persistence.enqueueOutboundTransaction({
+      txn_id: 'txn-out-1',
+      payload_hash: 'payload-hash-2',
+      created_at: '2026-03-30T02:00:02.100Z',
+      payload: { pdus: ['$event2'], edus: [] },
+      record: { source: 'retry' },
+      server_name: 'remote.example',
+    }),
+    /payload is immutable once queued/,
+  );
   persistence.retrySchedule.put({
     txn_id: 'txn-out-1',
     attempt_count: 1,
@@ -526,6 +624,16 @@ test('RemoteServerDO persistence lands DATA-FED-001 through DATA-FED-006 and enf
     finalized_at: '2026-03-30T02:00:05.750Z',
     record: { phase: 'conflict' },
   });
+  assert.throws(
+    () => persistence.putInboundTxnMarker({
+      origin: 'remote.example',
+      txn_id: 'txn-invalid-state',
+      dedupe_request_hash: 'request-hash-invalid',
+      state: 'poison',
+      first_seen_at: '2026-03-30T02:00:05.500Z',
+    }),
+    /state must be one of/,
+  );
   const finalized = persistence.finalizeInboundTxn({
     origin: 'remote.example',
     txn_id: 'txn-in-1',
@@ -536,6 +644,36 @@ test('RemoteServerDO persistence lands DATA-FED-001 through DATA-FED-006 and enf
     created_at: '2026-03-30T02:00:06.000Z',
     record: { finalized_by: 'gateway-worker' },
   });
+  assert.throws(
+    () => persistence.finalizeInboundTxn({
+      origin: 'remote.example',
+      txn_id: 'txn-in-1',
+      dedupe_request_hash: 'request-hash-mismatch',
+      canonical_response_text: '{"pdus":{"$event1":{}}}',
+      canonical_response_bytes_base64: Buffer.from('{"pdus":{"$event1":{}}}', 'utf8').toString('base64'),
+      pdu_results: { '$event1': {} },
+      created_at: '2026-03-30T02:00:06.100Z',
+    }),
+    /dedupe_request_hash mismatch/,
+  );
+  assert.throws(
+    () => persistence.markInboundTxnConflict({
+      origin: 'remote.example',
+      txn_id: 'txn-in-1',
+      dedupe_request_hash: 'request-hash-different',
+      conflict_reason: 'hash_mismatch',
+      finalized_at: '2026-03-30T02:00:06.200Z',
+    }),
+    /already finalized/,
+  );
+  assert.throws(
+    () => persistence.putCacheEntry({
+      cache_kind: 'server-key',
+      fetched_at: '2026-03-30T02:00:05.100Z',
+      record: { key: 'missing-id' },
+    }),
+    /keyId must be present/,
+  );
 
   assert.equal(persistence.getRuntimeState().schema_version, REMOTE_SERVER_DO_SCHEMA_VERSION);
   assert.equal(outbound.txn_sequence, 1);
@@ -560,6 +698,29 @@ test('derived D1 persistence lands DATA-D1-001 through DATA-D1-004 and composes 
   const d1 = createFakeD1Database();
   const derived = createD1DerivedDataPersistence(d1);
   const controlPlane = createD1ControlPlanePersistence(d1);
+  const appserviceDescriptor = {
+    appservice_id: 'as-1',
+    url: 'https://appservice.example.test',
+    sender_localpart: 'bridgebot',
+    hs_token_secret_ref: 'secret://hs-token',
+    as_token_secret_ref: 'secret://as-token',
+    namespaces: {
+      users: [],
+      aliases: [],
+      rooms: [],
+    },
+    protocols: ['irc'],
+    rate_limited: true,
+    receive_ephemeral: false,
+    healthcheck_enabled: true,
+    disabled_at: null,
+    delivery_state: {
+      last_success_at: null,
+      backlog_depth: 0,
+      retry_state: 'idle',
+      last_error: null,
+    },
+  };
 
   await controlPlane.ensureSchema();
   await derived.ensureSchema('2026-03-30T03:00:00.000Z');
@@ -599,7 +760,7 @@ test('derived D1 persistence lands DATA-D1-001 through DATA-D1-004 and composes 
     world_readable: true,
     guest_can_join: false,
     joined_members: 5,
-    source_room_serial: 12,
+    room_serial: 12,
     visibility_watermark: 12,
     is_public: true,
     updated_at: '2026-03-30T03:00:03.000Z',
@@ -635,12 +796,40 @@ test('derived D1 persistence lands DATA-D1-001 through DATA-D1-004 and composes 
     created_at: '2026-03-30T03:00:05.000Z',
     updated_at: '2026-03-30T03:00:05.000Z',
   });
+  await controlPlane.upsertAppserviceConfig({
+    appservice_id: 'as-1',
+    descriptor: appserviceDescriptor,
+    created_at: '2026-03-30T03:00:06.000Z',
+    updated_at: '2026-03-30T03:00:06.000Z',
+  });
+  await assert.rejects(
+    () => derived.publicRoomDirectory.put({
+      room_id: '!room-missing:test',
+      canonical_alias: null,
+      name: 'Incomplete',
+      topic: null,
+      avatar_url: null,
+      join_rules: 'public',
+      history_visibility: 'shared',
+      world_readable: false,
+      guest_can_join: false,
+      joined_members: 0,
+      room_serial: null,
+      visibility_watermark: 99,
+      is_public: false,
+      updated_at: '2026-03-30T03:00:07.000Z',
+      record_json: {},
+    }),
+    /record\.room_serial must be present/,
+  );
 
   assert.equal((await derived.getSchemaState()).schema_version, DERIVED_DATA_SCHEMA_VERSION);
   assert.equal((await derived.searchIndex.list()).length, 1);
   assert.equal((await derived.userDirectory.list()).length, 1);
   assert.equal((await derived.publicRoomDirectory.list()).length, 1);
   assert.equal((await derived.mediaCatalog.list()).length, 1);
+  assert.equal((await controlPlane.getAppserviceConfig('as-1')).descriptor.delivery_state.retry_state, 'idle');
+  assert.equal((await controlPlane.listAppserviceConfigs()).length, 1);
   assert.equal((await controlPlane.listActiveOperatorPolicies({
     issuer: 'https://matrix.cloudflareaccess.com',
     audience: 'aud',
@@ -651,7 +840,7 @@ test('derived D1 persistence lands DATA-D1-001 through DATA-D1-004 and composes 
 
 test('R2 and KV keyspace builders plus wrappers cover DATA-R2-001 through DATA-R2-006 and DATA-KV-001 through DATA-KV-002', async () => {
   const bucket = new FakeR2Bucket();
-  const kv = new FakeKvNamespace();
+  const kv = new FakeKvNamespace({ pageSize: 1 });
 
   const localMediaKey = buildLocalMediaObjectKey('media-1');
   const remoteMediaKey = buildRemoteMediaObjectKey('remote.example', 'media-2');
@@ -734,6 +923,12 @@ test('R2 and KV keyspace builders plus wrappers cover DATA-R2-001 through DATA-R
     encryption_key_version: 'enc-v1',
     completeness_state: 'complete',
   });
+  const backupMetadata = normalizeEncryptedBackupSegmentMetadata({
+    user_id: '@alice:test',
+    backup_version: '1',
+    segment_id: 'segment-1',
+    content_hash: 'sha256-backup',
+  });
 
   await putR2JsonObject(bucket, localMediaKey, { hello: 'local' }, { metadata: localMetadata });
   await putR2JsonObject(bucket, remoteMediaKey, { hello: 'remote' }, { metadata: remoteMetadata });
@@ -741,10 +936,15 @@ test('R2 and KV keyspace builders plus wrappers cover DATA-R2-001 through DATA-R
   await putR2JsonObject(bucket, roomArchiveKey, { hello: 'archive' }, { metadata: archiveMetadata });
   await putR2JsonObject(bucket, exportBundleKey, { hello: 'export' }, { metadata: exportMetadata });
   await putR2JsonObject(bucket, backupKey, { hello: 'backup' }, {
-    metadata: { ...exportMetadata, content_hash: 'sha256-backup' },
+    metadata: backupMetadata,
   });
+  await assert.rejects(
+    () => putR2JsonObject(bucket, exportBundleKey, { hello: 'tampered' }, { metadata: exportMetadata }),
+    /R2 object key conflict/,
+  );
 
   await putKvJson(kv, 'wellknown:raw:test', { value: 1 }, { metadata: { raw: true } });
+  await putKvJson(kv, 'wellknown:raw:extra', { value: 2 }, { metadata: { raw: 'extra' } });
   await putWellKnownCacheEntry(kv, {
     kind: 'client',
     host: 'matrix.example.test',
@@ -774,12 +974,20 @@ test('R2 and KV keyspace builders plus wrappers cover DATA-R2-001 through DATA-R
   assert.equal(backupKey, 'backup/@alice:test/1/segment-1');
   assert.equal(wellKnownKey, 'wellknown:client:matrix.example.test');
   assert.equal(remoteCacheKey, 'remote:capabilities:remote.example');
+  assert.throws(
+    () => buildRemoteCacheKey({
+      cacheKind: 'server-key',
+      serverName: 'remote.example',
+    }),
+    /keyId must be present/,
+  );
   assert.deepEqual(await getR2JsonObject(bucket, localMediaKey), { hello: 'local' });
   assert.deepEqual(await getR2JsonObject(bucket, exportBundleKey), { hello: 'export' });
   assert.equal((await bucket.get(localMediaKey)).customMetadata.first_ingested_at, '2026-03-30T04:00:00.000Z');
   assert.equal((await bucket.get(remoteMediaKey)).customMetadata.legacy_unauth_access_flag, 'true');
+  assert.equal((await bucket.get(backupKey)).customMetadata.segment_id, 'segment-1');
   assert.equal((await getWellKnownCacheEntry(kv, { kind: 'client', host: 'matrix.example.test' })).response_json['m.homeserver'].base_url, 'https://matrix.example.test');
   assert.equal((await getRemoteCacheEntry(kv, { cacheKind: 'capabilities', serverName: 'remote.example' })).payload.version, 'v1.17');
-  assert.equal(await deleteKvKeysByPrefix(kv, 'wellknown:'), 2);
+  assert.equal(await deleteKvKeysByPrefix(kv, 'wellknown:'), 3);
   assert.equal((await kv.list({ prefix: 'wellknown:' })).keys.length, 0);
 });

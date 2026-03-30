@@ -195,6 +195,7 @@ CREATE TABLE IF NOT EXISTS room_client_txn_dedupe (
   txn_dedupe_key TEXT PRIMARY KEY,
   user_id TEXT NOT NULL,
   device_id TEXT NOT NULL,
+  room_id TEXT NOT NULL,
   route_template TEXT NOT NULL,
   txn_id_or_request_hash TEXT NOT NULL,
   request_fingerprint TEXT NOT NULL,
@@ -205,8 +206,8 @@ CREATE TABLE IF NOT EXISTS room_client_txn_dedupe (
   updated_at TEXT NOT NULL,
   record_json TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_room_client_txn_dedupe_public_key
-  ON room_client_txn_dedupe (user_id, device_id, route_template, txn_id_or_request_hash);
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_room_client_txn_dedupe_public_key
+  ON room_client_txn_dedupe (user_id, device_id, room_id, route_template, txn_id_or_request_hash);
 `;
 
 const ROOM_TABLES = Object.freeze({
@@ -336,6 +337,7 @@ const ROOM_TABLES = Object.freeze({
       'txn_dedupe_key',
       'user_id',
       'device_id',
+      'room_id',
       'route_template',
       'txn_id_or_request_hash',
       'request_fingerprint',
@@ -348,6 +350,18 @@ const ROOM_TABLES = Object.freeze({
     ],
     jsonColumns: ['error_json', 'record_json'],
     jsonFallbacks: { error_json: null, record_json: {} },
+    requiredColumns: [
+      'txn_dedupe_key',
+      'user_id',
+      'device_id',
+      'room_id',
+      'route_template',
+      'txn_id_or_request_hash',
+      'request_fingerprint',
+      'terminal_state',
+      'created_at',
+      'updated_at',
+    ],
     orderBy: 'created_at ASC, txn_dedupe_key ASC',
   }),
 });

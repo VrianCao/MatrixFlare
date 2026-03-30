@@ -60,8 +60,8 @@ CREATE TABLE IF NOT EXISTS public_room_directory_entries (
   world_readable INTEGER NOT NULL DEFAULT 0,
   guest_can_join INTEGER NOT NULL DEFAULT 0,
   joined_members INTEGER NOT NULL DEFAULT 0,
-  source_room_serial INTEGER,
-  visibility_watermark INTEGER,
+  room_serial INTEGER NOT NULL,
+  visibility_watermark INTEGER NOT NULL,
   is_public INTEGER NOT NULL DEFAULT 0,
   updated_at TEXT NOT NULL,
   record_json TEXT
@@ -116,6 +116,7 @@ function createD1TableAccess(db, {
   jsonColumns = [],
   jsonFallbacks = {},
   booleanColumns = [],
+  requiredColumns = keyColumns,
   orderBy = null,
 } = {}) {
   const updateColumns = columns.filter((column) => !keyColumns.includes(column));
@@ -140,6 +141,11 @@ function createD1TableAccess(db, {
 
   return Object.freeze({
     async put(record) {
+      for (const requiredColumn of requiredColumns) {
+        if (record[requiredColumn] == null) {
+          throw new TypeError(`record.${requiredColumn} must be present`);
+        }
+      }
       const bindings = columns.map((column) => {
         const value = record[column];
         if (jsonColumns.includes(column)) {
@@ -236,7 +242,7 @@ export function createD1DerivedDataPersistence(database) {
       'world_readable',
       'guest_can_join',
       'joined_members',
-      'source_room_serial',
+      'room_serial',
       'visibility_watermark',
       'is_public',
       'updated_at',
@@ -245,6 +251,7 @@ export function createD1DerivedDataPersistence(database) {
     jsonColumns: ['record_json'],
     jsonFallbacks: { record_json: {} },
     booleanColumns: ['world_readable', 'guest_can_join', 'is_public'],
+    requiredColumns: ['room_id', 'room_serial', 'visibility_watermark', 'updated_at'],
     orderBy: 'joined_members DESC, room_id ASC',
   });
   const mediaCatalog = createD1TableAccess(db, {

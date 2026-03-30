@@ -115,6 +115,7 @@
   * backlog 深度
   * 最近错误
   * 当前重试状态
+* 在 Phase 03 的基础 schema 中，上述 delivery progress / cursor state 允许与结构化 appservice config 共存于同一 `DATA-D1-005` row（例如 `descriptor.delivery_state`）；真正的按 `txn_id` 有序发射与 ack 推进逻辑仍由后续 Phase 10 落地。
 
 ## 9. Derived Data Ownership Rules
 

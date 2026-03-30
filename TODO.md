@@ -335,7 +335,7 @@
 - [x] 建立 `DATA-D1-001`~`DATA-D1-006`。
   Spec refs: `24` 6, `34`, `40`, `42`
   产出:
-  search index、user directory、public rooms、media catalog、appservice config、operator authz policy 表。
+  search index、user directory、public rooms、media catalog、appservice config / delivery_state、operator authz policy 表。
   完成标准:
   D1 上只有派生面和控制面权威元数据，没有数据面权威真相。
 
