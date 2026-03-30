@@ -479,44 +479,63 @@ A development task is not done when code compiles. It is done when:
 * any newly discovered ambiguity is captured as `DEC-*` or `OQ-*`
 * any claimed profile impact is honest
 
-## CodeGraphContext For Large-Repo Navigation
+## Code Intelligence And Large-Repo Navigation
 
-This repository is expected to grow large enough that file-by-file search alone will become inefficient. Use CodeGraphContext (`cgc`) as the preferred code-graph navigation tool when it is available.
+As of `2026-03-30`, this repository's JavaScript ESM (`.mjs`) code is navigated more reliably by a TypeScript LSP workflow than by CodeGraphContext. For this repo, use `typescript-language-server` / `tsserver` as the primary semantic navigation tool, `rg` as the primary text search tool, and `cgc` as an optional secondary exploration aid.
 
 Purpose:
 
-* accelerate symbol lookup, caller/callee tracing, inheritance inspection, and impact analysis
-* reduce missed cross-file dependencies before edits or reviews
-* supplement `rg`, direct file reads, and Spec review, not replace them
+* use LSP for `definition`, `references`, `workspace/symbol`, `rename`, `implementation`, and diagnostics
+* use `rg` for exact text recall, path discovery, and fastest broad search
+* use `cgc` only to supplement LSP and direct file reading, not to replace them
 
 Authority rule:
 
 * `spec/framework/`, source files, tests, and control documents remain authoritative
-* `cgc` is a discovery and navigation aid only
-* never implement behavior from graph output alone; confirm against the actual files and required Spec stack
-* if `cgc` output conflicts with source or Spec, trust the source and Spec, then re-index
+* LSP, `rg`, and `cgc` are navigation aids only
+* never implement behavior from tool output alone; confirm against the actual files and required Spec stack
+* if tool output conflicts with source or Spec, trust the source and Spec
+* if `cgc` conflicts with source or LSP on this repo, trust source first, LSP second, `cgc` last
 
-Initialization and freshness:
+Primary workflow for this repo:
 
-1. verify the tool is available with `command -v cgc`
-2. check whether the repository is already indexed with `cgc list`
-3. if `/root/Matrix` is missing from the graph, or the graph is stale, run `cgc index /root/Matrix`
-4. for long-lived sessions or large refactors, prefer `cgc watch /root/Matrix` so graph state updates incrementally as files change
-5. do not assume `watch` survives process restart; restart it explicitly when needed
+1. for JS/ESM semantic navigation, start `typescript-language-server --stdio`
+2. if the workspace does not provide a local `typescript` install, launch the server with `npx -y -p typescript -p typescript-language-server typescript-language-server --stdio`
+3. use standard LSP requests such as `textDocument/definition`, `textDocument/references`, `workspace/symbol`, and `textDocument/rename`
+4. if semantic results are weak, inspect and improve `tsconfig.json` / `jsconfig.json` before reaching for a separate graph database
+5. use `rg` and direct file reads to verify every important result before editing
+
+`cgc` status for this repo:
+
+* do not treat `cgc` as the preferred or required semantic engine for this repository
+* current `cgc` behavior on this `.mjs` codebase is useful for some symbol discovery but may miss or misreport caller/callee relationships
+* `cgc` remains acceptable for coarse impact exploration when false negatives are tolerable
+* do not treat `cgc watch` as a requirement for normal development on this repo
+
+`cgc` operational rules:
+
+* verify the tool is available with `command -v cgc`
+* check indexed repositories with `cgc list`
+* if `/root/Matrix` is missing or stale, run `cgc index /root/Matrix`
+* if `cgc` is being used through an MCP server, do not assume the CLI can safely share the same Kuzu database path
+* Kuzu is single-process for this workflow; concurrent CLI and MCP access to the same DB path will fail with lock errors
+* if concurrent use is necessary, give the CLI a separate `KUZUDB_PATH`
+* do not assume `cgc watch` survives process restart; restart it explicitly when needed
 
 When agents should use `cgc`:
 
-* before changing shared functions, handlers, or storage code, trace callers and callees
-* before refactors, estimate blast radius across modules and symbols
-* when entering an unfamiliar code area, find the concrete owning files and related symbols quickly
-* during review/debug work, find indirect dependencies that plain text search may miss
-* when the repo becomes large enough that repeated recursive grep is noisy or incomplete
+* when LSP is unavailable or not yet configured
+* for coarse symbol discovery or broad blast-radius exploration
+* when entering an unfamiliar area and a graph-style overview is helpful
+* during review or debugging when an additional non-authoritative signal is still useful
 
 Baseline commands:
 
+* `rg -n "symbol_or_text" /root/Matrix`
+* `rg --files /root/Matrix`
+* `npx -y -p typescript -p typescript-language-server typescript-language-server --stdio`
 * `cgc list`
-* `cgc index /root/Matrix`
-* `cgc watch /root/Matrix`
+* `KUZUDB_PATH=/tmp/matrix-cgc-cli cgc index /root/Matrix` when an MCP server already owns the default DB
 * `cgc find pattern "RoomDO"`
 * `cgc analyze callers some_function`
 * `cgc analyze calls some_function`
@@ -524,10 +543,10 @@ Baseline commands:
 
 Query discipline:
 
-* after using `cgc`, open the actual files before editing
+* after using LSP or `cgc`, open the actual files before editing
 * still follow the required Spec read order before implementation
-* for code review, bug fixing, and large edits, use `cgc` early, then validate findings with `rg` and direct reads
-* do not treat custom graph queries as merge-ready evidence without file-level verification
+* for code review, bug fixing, and large edits, prefer LSP plus `rg`, then use `cgc` only as a secondary signal when it helps
+* do not treat custom graph queries or raw LSP responses as merge-ready evidence without file-level verification
 
 ## Practical Rules For A Spec-Heavy Repository
 
