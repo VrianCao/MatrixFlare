@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": false,
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "target": "ES2022",
+    "noEmit": true
+  },
+  "include": [
+    "apps/**/*.mjs",
+    "packages/**/*.mjs",
+    "tests/**/*.mjs"
+  ],
+  "exclude": [
+    "node_modules",
+    "evidence/**",
+    "notes/**",
+    "research/**",
+    "spec/**"
+  ]
+}
