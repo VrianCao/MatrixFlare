@@ -122,12 +122,12 @@
 
 ### 01.02 固定环境配置与 secrets 装载模型
 
-- [x] 建立显式环境变量、secret、feature gate、compatibility date 管理层。
-  Spec refs: `10` `REQ-GOV-004`, `13` `CF-WKR-013`~`CF-WKR-022`, `40` 5
+- [x] 建立显式环境变量、secret、feature gate、compatibility date/flags 管理层。
+  Spec refs: `10` `REQ-GOV-004`, `13` `CF-WKR-013`~`CF-WKR-022`, `CF-WKR-026`, `40` 5
   产出:
   配置加载模块、环境 schema、secret 访问封装。
   完成标准:
-  无业务代码直接读取散乱环境变量或 secret 名称。
+  无业务代码直接读取散乱环境变量或 secret 名称；wrangler 配置显式钉住所需 `compatibility_flags` 并与 runtime manifest 快照保持一致。
 
 ### 01.03 建立共享错误模型与 wire schema 类型
 
@@ -247,6 +247,54 @@
   checkpoint manifest object 列表、watermark、hash/signature/key-version、required object coverage。
   完成标准:
   checkpoint manifest 不再以 placeholder/incomplete 占位充数，restore / export completeness 能基于真实 manifest 裁决。
+
+验证:
+`tests/local/control-plane/control-plane.test.mjs`，`npm test`
+
+### 02.09 收敛 Phase 00-02 深审残项
+
+- [x] 修复 control-plane job payload 持久化与 queue batch 相关性链路的审查残项。
+  Spec refs: `24` 8, 8.1-8.3; `25` `STATE-EXPORT-JOB`; `41` 2-5
+  产出:
+  `jobs.spec_json` 更新持久化、按消息粒度创建 `jobs-worker` queue async context、对应回归测试。
+  完成标准:
+  export job 在冻结 `registry_snapshot_id` / `export_epoch` 后，持久化 `spec_json` 与内存态一致；单个 queue batch 包含多个 `job_id` 时，日志与审计的 `job_id` / `causation_id` 不串号。
+
+验证:
+`tests/local/control-plane/control-plane.test.mjs`，`npm test`
+
+### 02.10 收敛 Phase 00-02 深审残项（二）
+
+- [x] 修复 `ops-worker` 内部启动 RPC 错误映射与治理证据快照残项。
+  Spec refs: `23` 2, 2.1, `IF-OPS-002`~`IF-OPS-008`, `IF-INT-WKR-003`~`IF-INT-WKR-006`; `26` 4-6.5; `44` 2, 6
+  产出:
+  `jobs-worker` typed internal error 透传映射、`EVID-GOV-001` 的 code/data version 上下文、wildcard version-segment grammar 校验、route snapshot 缺失时的失败证据落盘、对应回归测试。
+  完成标准:
+  `ops-worker` 遇到 `jobs-worker` 的 `job_conflict` / `unsupported_schema_version` 等 typed internal error 时不会错误降格为 `internal`；治理工具会拒绝非法 wildcard family，且在 pinned Matrix route snapshot 缺失时仍能产出带失败状态的 `EVID-GOV-001` 证据与上下文。
+
+验证:
+`tests/local/control-plane/control-plane.test.mjs`，`tests/local/spec-tools/governance.test.mjs`，`npm test`
+
+### 02.11 收敛 Phase 00-02 深审残项（三）
+
+- [x] 修复 restore/export 状态机 fail-closed 与导出对象哈希语义残项。
+  Spec refs: `23` `IF-QUE-005`,`IF-QUE-006`; `24` 8.2-8.3; `25` `STATE-EXPORT-JOB`,`STATE-RESTORE-JOB`; `26` 5.7-6.5; `42` 11.2.1-11.2.3
+  产出:
+  restore 缺 `DATA-OPS-011` frozen registry snapshot 时的 fail-closed、queue fatal error 统一推进 `job.failed`、`started_at` 持久化修复、archive bucket 缺失时的 snapshot freeze fail-closed、bundle manifest 对 registry/checkpoint manifest object 的 `content_hash(raw_bytes)` 修复、对应回归测试与 `25/26` 状态集合对齐。
+  完成标准:
+  full namespace restore 不会把缺 snapshot 的 bundle 误判为可完成；任何非重试型 queue 错误都不会把 job 卡在非终态；队列驱动后的终态 job 保留首个 `started_at`；manifest object `content_hash` 与实际 R2 JSON bytes 一致，而不是误用 manifest hash。
+
+验证:
+`tests/local/control-plane/control-plane.test.mjs`，`npm test`
+
+### 02.12 收敛 Phase 00-02 深审残项（四）
+
+- [x] 修复 Phase 02 export materialization 对未实现 shard 的假成功风险。
+  Spec refs: `23` `IF-INT-USER-006`,`IF-INT-ROOM-004`,`IF-INT-FED-003`,`IF-QUE-005`; `24` `DATA-OPS-010`,`DATA-OPS-011`,`DATA-R2-005`; `42` 11.2.0, 11.2.1.3, 11.2.2
+  产出:
+  `start-export` 的 frozen registry snapshot fail-closed 校验、queue consumer 对非 `control-plane/ops-core` export shard 的二次拒绝、对应回归测试。
+  完成标准:
+  当前 Phase 02 runtime 不会把 `RoomDO` / `UserDO` / `RemoteServerDO` 或其他非 `control-plane/ops-core` shard 误物化成 control-plane checkpoint；若 frozen registry snapshot 或 queue 消息越过了当前实现边界，job 必须 deterministically fail-closed。
 
 验证:
 `tests/local/control-plane/control-plane.test.mjs`，`npm test`

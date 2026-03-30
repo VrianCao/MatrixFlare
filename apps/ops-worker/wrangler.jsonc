@@ -2,6 +2,10 @@
   "name": "matrix-ops-worker",
   "main": "src/index.mjs",
   "compatibility_date": "2026-03-26",
+  "compatibility_flags": [
+    "nodejs_compat",
+    "nodejs_compat_do_not_populate_process_env"
+  ],
   "vars": {
     "ENVIRONMENT_NAME": "environment_name-placeholder",
     "MATRIX_SERVER_NAME": "matrix_server_name-placeholder",

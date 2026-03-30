@@ -1,4 +1,7 @@
 import {
+  parseInternalErrorEnvelope,
+} from '../../contracts/src/index.mjs';
+import {
   buildNormalizedRequestObject,
   canonicalizeJsonText,
   canonicalizeJsonValue,
@@ -702,7 +705,10 @@ export async function readArchiveJsonObject(archiveBucket, objectKey) {
 
 export async function putArchiveJsonObject(archiveBucket, objectKey, value) {
   if (!archiveBucket || typeof archiveBucket.put !== 'function') {
-    return;
+    throw Object.assign(new Error('Missing MATRIX_ARCHIVE_BUCKET binding'), {
+      code: 'job_conflict',
+      retryable: false,
+    });
   }
   const serialized = canonicalizeJsonValue(value);
   const existing = await readArchiveObjectText(archiveBucket, objectKey);
@@ -1164,7 +1170,7 @@ export async function finalizeExportBundleManifest({
     apply_phase: 'control-plane',
     range_start: registrySnapshot.created_at,
     range_end: registrySnapshot.created_at,
-    content_hash: registrySnapshot.snapshot_hash,
+    content_hash: canonicalHash(registrySnapshot.snapshot),
     codec: 'jcs-json',
     encryption_key_version: keyRing.encryption.active,
     byte_size: jsonUtf8Size(registrySnapshot.snapshot),
@@ -1214,7 +1220,7 @@ export async function finalizeExportBundleManifest({
       apply_phase: ref.apply_phase,
       range_start: ref.source_watermark,
       range_end: ref.source_watermark,
-      content_hash: ref.manifest_hash,
+      content_hash: canonicalHash(checkpointManifest),
       codec: 'jcs-json',
       encryption_key_version: keyRing.encryption.active,
       byte_size: jsonUtf8Size(checkpointManifest),
@@ -1287,10 +1293,10 @@ async function resolveBundleRegistrySnapshot({
   requestBody,
   bundleManifest,
 }) {
-  if (bundleManifest.registry_snapshot_id == null) {
-    return Object.freeze({
-      registry_snapshot_id: null,
-      rows: [],
+  if (bundleManifest.registry_snapshot_id == null || bundleManifest.registry_snapshot_hash == null) {
+    throw Object.assign(new Error('Bundle manifest must include registry snapshot id and hash for restore preflight'), {
+      code: 'job_conflict',
+      retryable: false,
     });
   }
 
@@ -1318,7 +1324,7 @@ async function resolveBundleRegistrySnapshot({
         retryable: false,
       });
     }
-    if (registrySnapshotObject && registrySnapshotObject.content_hash !== registrySnapshot.manifest_hash) {
+    if (registrySnapshotObject && registrySnapshotObject.content_hash !== canonicalHash(registrySnapshot)) {
       throw Object.assign(new Error(`Bundle manifest registry snapshot object hash mismatch for ${bundleManifest.registry_snapshot_id}`), {
         code: 'job_conflict',
         retryable: false,
@@ -1392,6 +1398,12 @@ function selectRestoreCheckpointRefs({
     ? bundleManifest.checkpoint_refs
     : [];
   if (requestBody.restore_mode === 'full_namespace') {
+    if (registryRows.length === 0) {
+      throw Object.assign(new Error('Full namespace restore requires a non-empty frozen registry snapshot'), {
+        code: 'job_conflict',
+        retryable: false,
+      });
+    }
     return registryRows.map((row) => {
       const matches = checkpointRefs.filter((entry) => (
         entry.shard_type === row.shard_type
@@ -1737,7 +1749,23 @@ export async function dispatchJobStart({
   }));
   const responseBody = await response.json();
   if (!response.ok) {
-    throw new Error(`jobs-worker start failed with ${response.status}: ${JSON.stringify(responseBody)}`);
+    try {
+      const internalError = parseInternalErrorEnvelope(responseBody);
+      throw Object.assign(new Error(internalError.message), {
+        code: internalError.code,
+        retryable: internalError.retryable,
+        details: internalError.details,
+        status: response.status,
+      });
+    } catch (parseError) {
+      if (parseError?.message === responseBody?.message && parseError?.code === responseBody?.code) {
+        throw parseError;
+      }
+      throw Object.assign(new Error(`jobs-worker start failed with ${response.status}: ${JSON.stringify(responseBody)}`), {
+        retryable: response.status >= 500,
+        status: response.status,
+      });
+    }
   }
   return responseBody;
 }
@@ -2293,6 +2321,8 @@ export async function startControlPlaneJob({
   } catch (error) {
     const failureCode = error.code === 'job_conflict'
       ? 'precondition_failed'
+      : error.code === 'unsupported_schema_version'
+        ? 'validation_failed'
       : error instanceof TypeError || error instanceof RangeError
         ? 'validation_failed'
         : 'internal';

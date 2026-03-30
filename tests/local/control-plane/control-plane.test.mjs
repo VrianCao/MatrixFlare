@@ -305,7 +305,7 @@ async function seedSyntheticRoomRestoreBundleMissingArchiveReference(rig, {
           apply_phase: 'control-plane',
           range_start: createdAt,
           range_end: createdAt,
-          content_hash: registrySnapshot.manifest_hash,
+          content_hash: canonicalHash(registrySnapshot),
           codec: 'jcs-json',
           encryption_key_version: keyRing.encryption.active,
           byte_size: Buffer.byteLength(JSON.stringify(registrySnapshot), 'utf8'),
@@ -508,7 +508,7 @@ async function seedSyntheticRestoreBundle(rig, {
           apply_phase: 'control-plane',
           range_start: createdAt,
           range_end: createdAt,
-          content_hash: registrySnapshot.manifest_hash,
+          content_hash: canonicalHash(registrySnapshot),
           codec: 'jcs-json',
           encryption_key_version: keyRing.encryption.active,
           byte_size: Buffer.byteLength(JSON.stringify(registrySnapshot), 'utf8'),
@@ -840,6 +840,7 @@ test('ops-worker accepts export jobs, deduplicates identical requests, rejects c
 
     const bundleManifest = rig.archiveBucket.getJson(bundleManifestKey);
     const checkpointManifest = rig.archiveBucket.getJson(checkpointManifestKey);
+    const registrySnapshot = rig.archiveBucket.getJson(registrySnapshotKey);
     const replayManifest = await rig.persistence.getReplayManifest(firstPayload.job_id);
     const exportKeyRing = JSON.parse(rig.opsEnv.EXPORT_BUNDLE_KEY_RING);
     assert.equal(bundleManifest.signature_algorithm, 'Ed25519');
@@ -853,7 +854,12 @@ test('ops-worker accepts export jobs, deduplicates identical requests, rejects c
     assert.ok(bundleManifest.objects.some((entry) => (
       entry.object_kind === 'registry-snapshot'
       && entry.r2_object_key === registrySnapshotKey
-      && entry.content_hash === bundleManifest.registry_snapshot_hash
+      && entry.content_hash === canonicalHash(registrySnapshot)
+    )));
+    assert.ok(bundleManifest.objects.some((entry) => (
+      entry.object_kind === 'checkpoint-manifest'
+      && entry.r2_object_key === checkpointManifestKey
+      && entry.content_hash === canonicalHash(checkpointManifest)
     )));
     assert.equal(bundleManifest.checkpoint_refs[0].checkpoint_id, checkpointManifest.checkpoint_id);
     assert.equal(
@@ -939,6 +945,63 @@ test('jobs-worker poisons queue messages with unsupported schema_version and mar
   }
 });
 
+test('jobs-worker marks non-retryable queue failures as failed instead of leaving the job in-flight', async () => {
+  const teamDomain = `queue-fatal-${Date.now()}.cloudflareaccess.com`;
+  const rig = await createControlPlaneRig({
+    teamDomain,
+    policies: [
+      defaultPolicy({
+        principalId: 'human-1',
+        subjectValue: '@operator:example.test',
+        teamDomain,
+        audience: 'aud-ops',
+      }),
+    ],
+  });
+
+  try {
+    const response = await rig.opsWorker(
+      rig.makeOpsRequest('/_ops/v1/exports', {
+        method: 'POST',
+        body: {
+          export_mode: 'full_bundle',
+          scope: {
+            scope_kind: 'global',
+            scope_id: null,
+          },
+          reason: 'fatal queue error should fail the job',
+          ticket_id: 'OPS-300A',
+          reuse_checkpoint_policy: 'force_fresh',
+          max_checkpoint_age_seconds: 60,
+          include_optional_objects: false,
+          output_encryption_key_version: 'enc-v1',
+        },
+        headers: {
+          'Idempotency-Key': 'idem-export-fatal-queue-failure',
+        },
+      }),
+      rig.opsEnv,
+    );
+    assert.equal(response.status, 202);
+    const payload = await response.json();
+    const batch = rig.queues.export.drainBatch();
+    rig.jobsEnv.MATRIX_ARCHIVE_BUCKET = null;
+
+    await rig.jobsWorker.queue(batch, rig.jobsEnv);
+
+    assert.equal(batch.messages[0].acked, true);
+    assert.equal(batch.messages[0].retried, false);
+
+    const failedJob = await rig.persistence.getJob(payload.job_id);
+    assert.equal(failedJob.internal_state, 'failed');
+    assert.equal(failedJob.last_error.code, 'precondition_failed');
+    assert.match(failedJob.last_error.message, /Missing MATRIX_ARCHIVE_BUCKET binding/);
+    assert.equal(failedJob.result_summary.failure, failedJob.last_error.message);
+  } finally {
+    rig.close();
+  }
+});
+
 test('ops-worker recovers staged queue fan-out on idempotent retry after transient queue publish failure', async () => {
   const teamDomain = `ops-export-retry-${Date.now()}.cloudflareaccess.com`;
   const rig = await createControlPlaneRig({
@@ -1015,6 +1078,181 @@ test('ops-worker recovers staged queue fan-out on idempotent retry after transie
     await rig.jobsWorker.queue(rig.queues.export.drainBatch(), rig.jobsEnv);
     const completedJob = await rig.persistence.getJob(stagedJob.job_id);
     assert.equal(completedJob.internal_state, 'finalized');
+  } finally {
+    rig.close();
+  }
+});
+
+test('ops-worker persists the enriched export job spec after freezing the registry snapshot', async () => {
+  const teamDomain = `ops-export-spec-${Date.now()}.cloudflareaccess.com`;
+  const rig = await createControlPlaneRig({
+    teamDomain,
+    policies: [
+      defaultPolicy({
+        principalId: 'human-1',
+        subjectValue: '@operator:example.test',
+        teamDomain,
+        audience: 'aud-ops',
+      }),
+    ],
+  });
+
+  try {
+    const exportResponse = await rig.opsWorker(
+      rig.makeOpsRequest('/_ops/v1/exports', {
+        method: 'POST',
+        body: {
+          export_mode: 'full_bundle',
+          scope: {
+            scope_kind: 'global',
+            scope_id: null,
+          },
+          reason: 'persist export spec',
+          ticket_id: 'OPS-301A',
+          reuse_checkpoint_policy: 'force_fresh',
+          max_checkpoint_age_seconds: 60,
+          include_optional_objects: false,
+          output_encryption_key_version: 'enc-v1',
+        },
+        headers: {
+          'Idempotency-Key': 'idem-export-persisted-spec',
+        },
+      }),
+      rig.opsEnv,
+    );
+    assert.equal(exportResponse.status, 202);
+    const payload = await exportResponse.json();
+
+    const storedJob = await rig.persistence.getJob(payload.job_id);
+    assert.equal(typeof storedJob.registry_snapshot_id, 'string');
+    assert.equal(typeof storedJob.export_epoch, 'string');
+    assert.equal(storedJob.spec.registry_snapshot_id, storedJob.registry_snapshot_id);
+    assert.equal(storedJob.spec.export_epoch, storedJob.export_epoch);
+    assert.equal(storedJob.spec.reuse_checkpoint_policy, 'force_fresh');
+  } finally {
+    rig.close();
+  }
+});
+
+test('jobs-worker assigns per-message async context when a queue batch spans multiple jobs', async () => {
+  const teamDomain = `jobs-queue-context-${Date.now()}.cloudflareaccess.com`;
+  const rig = await createControlPlaneRig({
+    teamDomain,
+    policies: [
+      defaultPolicy({
+        principalId: 'human-1',
+        subjectValue: '@operator:example.test',
+        teamDomain,
+        audience: 'aud-ops',
+      }),
+    ],
+  });
+
+  try {
+    const makeExportRequest = (idempotencyKey, ticketId, reason) => rig.opsWorker(
+      rig.makeOpsRequest('/_ops/v1/exports', {
+        method: 'POST',
+        body: {
+          export_mode: 'full_bundle',
+          scope: {
+            scope_kind: 'global',
+            scope_id: null,
+          },
+          reason,
+          ticket_id: ticketId,
+          reuse_checkpoint_policy: 'force_fresh',
+          max_checkpoint_age_seconds: 60,
+          include_optional_objects: false,
+          output_encryption_key_version: 'enc-v1',
+        },
+        headers: {
+          'Idempotency-Key': idempotencyKey,
+        },
+      }),
+      rig.opsEnv,
+    );
+
+    const firstResponse = await makeExportRequest('idem-export-batch-context-1', 'OPS-301B', 'batch context one');
+    const secondResponse = await makeExportRequest('idem-export-batch-context-2', 'OPS-301C', 'batch context two');
+    assert.equal(firstResponse.status, 202);
+    assert.equal(secondResponse.status, 202);
+
+    const firstPayload = await firstResponse.json();
+    const secondPayload = await secondResponse.json();
+    assert.equal(rig.queues.export.messages.length, 2);
+
+    await rig.jobsWorker.queue(rig.queues.export.drainBatch(), rig.jobsEnv);
+
+    const firstAuditEvents = await rig.persistence.listAuditEvents({ job_id: firstPayload.job_id });
+    const secondAuditEvents = await rig.persistence.listAuditEvents({ job_id: secondPayload.job_id });
+
+    assert.ok(firstAuditEvents.some((event) => (
+      event.event_type === 'export.materializing'
+      && event.causation_id === firstPayload.job_id
+    )));
+    assert.ok(firstAuditEvents.some((event) => (
+      event.event_type === 'export.finalized'
+      && event.causation_id === firstPayload.job_id
+    )));
+    assert.ok(secondAuditEvents.some((event) => (
+      event.event_type === 'export.materializing'
+      && event.causation_id === secondPayload.job_id
+    )));
+    assert.ok(secondAuditEvents.some((event) => (
+      event.event_type === 'export.finalized'
+      && event.causation_id === secondPayload.job_id
+    )));
+  } finally {
+    rig.close();
+  }
+});
+
+test('jobs-worker preserves started_at when queue processing reaches a terminal export state', async () => {
+  const teamDomain = `jobs-started-at-${Date.now()}.cloudflareaccess.com`;
+  const rig = await createControlPlaneRig({
+    teamDomain,
+    policies: [
+      defaultPolicy({
+        principalId: 'human-1',
+        subjectValue: '@operator:example.test',
+        teamDomain,
+        audience: 'aud-ops',
+      }),
+    ],
+  });
+
+  try {
+    const exportResponse = await rig.opsWorker(
+      rig.makeOpsRequest('/_ops/v1/exports', {
+        method: 'POST',
+        body: {
+          export_mode: 'full_bundle',
+          scope: {
+            scope_kind: 'global',
+            scope_id: null,
+          },
+          reason: 'started_at should survive queue completion',
+          ticket_id: 'OPS-301D',
+          reuse_checkpoint_policy: 'force_fresh',
+          max_checkpoint_age_seconds: 60,
+          include_optional_objects: false,
+          output_encryption_key_version: 'enc-v1',
+        },
+        headers: {
+          'Idempotency-Key': 'idem-export-started-at',
+        },
+      }),
+      rig.opsEnv,
+    );
+    assert.equal(exportResponse.status, 202);
+    const payload = await exportResponse.json();
+
+    await rig.jobsWorker.queue(rig.queues.export.drainBatch(), rig.jobsEnv);
+
+    const storedJob = await rig.persistence.getJob(payload.job_id);
+    assert.equal(typeof storedJob.started_at, 'string');
+    assert.equal(typeof storedJob.completed_at, 'string');
+    assert.equal(storedJob.started_at <= storedJob.completed_at, true);
   } finally {
     rig.close();
   }
@@ -1403,6 +1641,75 @@ test('ops-worker restore preflight rejects tampered registry snapshots before qu
   }
 });
 
+test('ops-worker restore preflight rejects bundle manifests that omit the frozen registry snapshot', async () => {
+  const teamDomain = `ops-restore-missing-registry-${Date.now()}.cloudflareaccess.com`;
+  const rig = await createControlPlaneRig({
+    teamDomain,
+    policies: [
+      defaultPolicy({
+        principalId: 'human-1',
+        subjectValue: '@operator:example.test',
+        teamDomain,
+        audience: 'aud-ops',
+      }),
+    ],
+  });
+
+  try {
+    const { bundleManifestKey, bundleManifest } = await seedFullExportBundle(rig, {
+      idempotencyKey: 'idem-export-missing-registry-seed',
+      ticketId: 'OPS-211A',
+    });
+    const unsignedBundleManifest = {
+      ...bundleManifest,
+      registry_snapshot_id: null,
+      registry_snapshot_hash: null,
+      registry_snapshot_r2_object_key: null,
+    };
+    delete unsignedBundleManifest.manifest_hash;
+    delete unsignedBundleManifest.signature;
+    const keyRing = parseExportKeyRing(rig.opsEnv.EXPORT_BUNDLE_KEY_RING);
+    const tamperedBundleManifest = createSignedManifest({
+      unsignedManifest: unsignedBundleManifest,
+      keyRing,
+    });
+    await rig.archiveBucket.put(bundleManifestKey, JSON.stringify(tamperedBundleManifest));
+
+    const restoreResponse = await rig.opsWorker(
+      rig.makeOpsRequest('/_ops/v1/restores', {
+        method: 'POST',
+        body: {
+          restore_mode: 'full_namespace',
+          scope: {
+            scope_kind: 'global',
+            scope_id: null,
+          },
+          reason: 'restore namespace without frozen registry snapshot',
+          ticket_id: 'OPS-211B',
+          source_bundle_uri: `r2://matrix-archive/${bundleManifestKey}`,
+          source_bundle_hash: tamperedBundleManifest.manifest_hash,
+          target_environment_id: 'target-env-missing-registry',
+          allow_incomplete: false,
+          allowed_signing_key_versions: ['sig-v1'],
+          allowed_encryption_key_versions: ['enc-v1'],
+        },
+        headers: {
+          'Idempotency-Key': 'idem-restore-missing-registry',
+        },
+      }),
+      rig.opsEnv,
+    );
+
+    assert.equal(restoreResponse.status, 409);
+    const restorePayload = await restoreResponse.json();
+    assert.equal(restorePayload.code, 'precondition_failed');
+    assert.match(restorePayload.message, /registry snapshot id and hash/);
+    assert.equal(rig.queues.restore.messages.length, 0);
+  } finally {
+    rig.close();
+  }
+});
+
 test('ops-worker restore preflight rejects tampered checkpoint manifests before queue fanout', async () => {
   const teamDomain = `ops-restore-checkpoint-manifest-tamper-${Date.now()}.cloudflareaccess.com`;
   const rig = await createControlPlaneRig({
@@ -1459,6 +1766,55 @@ test('ops-worker restore preflight rejects tampered checkpoint manifests before 
     const restorePayload = await restoreResponse.json();
     assert.equal(restorePayload.code, 'precondition_failed');
     assert.equal(rig.queues.restore.messages.length, 0);
+  } finally {
+    rig.close();
+  }
+});
+
+test('ops-worker export creation fails closed when the archive bucket binding is missing during snapshot freeze', async () => {
+  const teamDomain = `ops-export-missing-bucket-${Date.now()}.cloudflareaccess.com`;
+  const rig = await createControlPlaneRig({
+    teamDomain,
+    policies: [
+      defaultPolicy({
+        principalId: 'human-1',
+        subjectValue: '@operator:example.test',
+        teamDomain,
+        audience: 'aud-ops',
+      }),
+    ],
+  });
+
+  try {
+    rig.opsEnv.MATRIX_ARCHIVE_BUCKET = null;
+    const exportResponse = await rig.opsWorker(
+      rig.makeOpsRequest('/_ops/v1/exports', {
+        method: 'POST',
+        body: {
+          export_mode: 'full_bundle',
+          scope: {
+            scope_kind: 'global',
+            scope_id: null,
+          },
+          reason: 'snapshot freeze should fail without archive bucket',
+          ticket_id: 'OPS-215A',
+          reuse_checkpoint_policy: 'force_fresh',
+          max_checkpoint_age_seconds: 60,
+          include_optional_objects: false,
+          output_encryption_key_version: 'enc-v1',
+        },
+        headers: {
+          'Idempotency-Key': 'idem-export-missing-archive-bucket',
+        },
+      }),
+      rig.opsEnv,
+    );
+
+    assert.equal(exportResponse.status, 409);
+    const exportPayload = await exportResponse.json();
+    assert.equal(exportPayload.code, 'precondition_failed');
+    assert.match(exportPayload.message, /Missing MATRIX_ARCHIVE_BUCKET binding/);
+    assert.equal(rig.queues.export.messages.length, 0);
   } finally {
     rig.close();
   }
@@ -2177,6 +2533,86 @@ test('jobs-worker internal export start returns a typed conflict when the regist
   }
 });
 
+test('jobs-worker internal export start rejects registry snapshots with shard rows that Phase 02 cannot materialize', async () => {
+  const rig = await createControlPlaneRig();
+
+  try {
+    const exportEpoch = `export_epoch_unsupported_shard_${Date.now()}`;
+    const registrySnapshotId = `registry_snapshot_unsupported_shard_${Date.now()}`;
+    const createdAt = new Date().toISOString();
+    const snapshotRows = [
+      {
+        shard_type: 'RoomDO',
+        shard_key: '!room:test',
+        created_at: createdAt,
+        last_seen_at: createdAt,
+        schema_version: 1,
+        disabled_at: null,
+      },
+    ];
+    await rig.persistence.insertRegistrySnapshot({
+      registry_snapshot_id: registrySnapshotId,
+      export_epoch: exportEpoch,
+      scope: {
+        scope_kind: 'global',
+        scope_id: null,
+      },
+      created_at: createdAt,
+      row_count: snapshotRows.length,
+      snapshot: {
+        rows: snapshotRows,
+      },
+      snapshot_hash: 'hash-unsupported-shard',
+      signature: 'sig-unsupported-shard',
+      signing_key_version: 'sig-v1',
+      r2_object_key: null,
+    });
+
+    const spec = buildInternalJobSpec({
+      jobId: `export-unsupported-shard-${Date.now()}`,
+      jobType: 'export',
+      operatorPrincipalId: 'human-1',
+      authMechanism: 'Cf-Access-Jwt-Assertion',
+      scope: {
+        scope_kind: 'global',
+        scope_id: null,
+      },
+      reason: 'test unsupported shard export start',
+      ticketId: 'OPS-UNSUPPORTED-SHARD',
+      idempotencyKey: 'idem-unsupported-shard',
+      requestFingerprint: 'fingerprint-unsupported-shard',
+      extra: {
+        registry_snapshot_id: registrySnapshotId,
+        export_epoch: exportEpoch,
+        reuse_checkpoint_policy: 'force_fresh',
+      },
+    });
+    await rig.persistence.createJob(createStoredJobRecord({
+      spec,
+      registrySnapshotId,
+      exportEpoch,
+    }));
+
+    const response = await rig.jobsWorker.fetch(new Request('https://jobs.internal/_internal/jobs/start/export', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json; charset=utf-8',
+      },
+      body: JSON.stringify(spec),
+    }), rig.jobsEnv);
+
+    assert.equal(response.status, 409);
+    const payload = await response.json();
+    assert.equal(payload.code, 'job_conflict');
+    assert.equal(payload.retryable, false);
+    assert.match(payload.message, /only control-plane\/ops-core is implemented/);
+    assert.equal(rig.queues.export.messages.length, 0);
+    assert.deepEqual(await rig.persistence.listJobCheckpoints(spec.job_id), []);
+  } finally {
+    rig.close();
+  }
+});
+
 test('jobs-worker queue retries when a shard checkpoint was not staged before delivery', async () => {
   const rig = await createControlPlaneRig();
 
@@ -2244,6 +2680,96 @@ test('jobs-worker queue retries when a shard checkpoint was not staged before de
       shard_key: 'ops-core',
     });
     assert.equal(checkpoint, null);
+  } finally {
+    rig.close();
+  }
+});
+
+test('jobs-worker fails staged unsupported export shard queue messages before writing control-plane artifacts', async () => {
+  const rig = await createControlPlaneRig();
+
+  try {
+    const exportEpoch = `export_epoch_unsupported_queue_${Date.now()}`;
+    const spec = buildInternalJobSpec({
+      jobId: `export-unsupported-queue-${Date.now()}`,
+      jobType: 'export',
+      operatorPrincipalId: 'human-1',
+      authMechanism: 'Cf-Access-Jwt-Assertion',
+      scope: {
+        scope_kind: 'global',
+        scope_id: null,
+      },
+      reason: 'test unsupported shard queue delivery',
+      ticketId: 'OPS-UNSUPPORTED-QUEUE',
+      idempotencyKey: 'idem-unsupported-queue',
+      requestFingerprint: 'fingerprint-unsupported-queue',
+      extra: {
+        registry_snapshot_id: 'registry_snapshot_unsupported_queue',
+        export_epoch: exportEpoch,
+        reuse_checkpoint_policy: 'force_fresh',
+      },
+    });
+    await rig.persistence.createJob(createStoredJobRecord({
+      spec,
+      internalState: 'checkpointed',
+      checkpointState: {
+        queue_ready: 1,
+        queue_name: 'matrix-export-shard-job',
+      },
+      progressTotalUnits: 1,
+      registrySnapshotId: 'registry_snapshot_unsupported_queue',
+      exportEpoch,
+    }));
+    await rig.persistence.upsertJobCheckpoint({
+      job_id: spec.job_id,
+      shard_type: 'RoomDO',
+      shard_key: '!room:test',
+      checkpoint: {
+        status: 'queued',
+        queue_name: 'matrix-export-shard-job',
+        attempt: 0,
+      },
+      updated_at: new Date().toISOString(),
+    });
+
+    const message = {
+      body: buildExportShardJob({
+        jobId: spec.job_id,
+        exportEpoch,
+        shardType: 'RoomDO',
+        shardKey: '!room:test',
+        checkpointStrategy: 'force_fresh',
+        attempt: 0,
+      }),
+      acked: false,
+      retried: false,
+      ack() {
+        this.acked = true;
+      },
+      retry() {
+        this.retried = true;
+      },
+    };
+    await rig.jobsWorker.queue({
+      queue: 'matrix-export-shard-job',
+      messages: [message],
+    }, rig.jobsEnv);
+
+    assert.equal(message.acked, true);
+    assert.equal(message.retried, false);
+
+    const failedJob = await rig.persistence.getJob(spec.job_id);
+    assert.equal(failedJob.internal_state, 'failed');
+    assert.equal(failedJob.last_error.code, 'precondition_failed');
+    assert.match(failedJob.last_error.message, /only control-plane\/ops-core is implemented/);
+
+    const checkpoint = await rig.persistence.getJobCheckpoint({
+      job_id: spec.job_id,
+      shard_type: 'RoomDO',
+      shard_key: '!room:test',
+    });
+    assert.equal(checkpoint.checkpoint.status, 'queued');
+    assert.equal(rig.archiveBucket.objects.size, 0);
   } finally {
     rig.close();
   }
@@ -2348,6 +2874,69 @@ test('ops-worker cancel idempotency is linearized by job_id instead of shared sc
     assert.equal(secondCancelResponse.status, 202);
     const secondCancelPayload = await secondCancelResponse.json();
     assert.equal(secondCancelPayload.job_id, secondJob.job_id);
+  } finally {
+    rig.close();
+  }
+});
+
+test('ops-worker preserves typed jobs-worker start conflicts as precondition_failed instead of internal', async () => {
+  const teamDomain = `ops-start-map-${Date.now()}.cloudflareaccess.com`;
+  const rig = await createControlPlaneRig({
+    teamDomain,
+    policies: [
+      defaultPolicy({
+        principalId: 'human-1',
+        subjectValue: '@operator:example.test',
+        teamDomain,
+        audience: 'aud-ops',
+      }),
+    ],
+  });
+
+  try {
+    rig.opsEnv.JOBS_WORKER = {
+      async fetch() {
+        return new Response(JSON.stringify({
+          code: 'job_conflict',
+          message: 'synthetic conflict',
+          retryable: false,
+          details: {
+            source: 'test',
+          },
+        }), {
+          status: 409,
+          headers: {
+            'content-type': 'application/json; charset=utf-8',
+          },
+        });
+      },
+    };
+
+    const response = await rig.opsWorker(
+      rig.makeOpsRequest('/_ops/v1/rebuilds', {
+        method: 'POST',
+        body: {
+          rebuild_target: 'search_index',
+          scope: {
+            scope_kind: 'global',
+            scope_id: null,
+          },
+          reason: 'typed internal error mapping',
+          ticket_id: 'OPS-304',
+          force_full_scan: false,
+        },
+        headers: {
+          'Idempotency-Key': 'idem-start-dispatch-mapping',
+        },
+      }),
+      rig.opsEnv,
+    );
+
+    assert.equal(response.status, 409);
+    const payload = await response.json();
+    assert.equal(payload.code, 'precondition_failed');
+    assert.equal(payload.message, 'synthetic conflict');
+    assert.equal(payload.retryable, false);
   } finally {
     rig.close();
   }

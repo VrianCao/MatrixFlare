@@ -1,6 +1,11 @@
+import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
+
+const execFileAsync = promisify(execFile);
 
 const CANONICAL_PREFIXES = [
   'REQ',
@@ -140,6 +145,10 @@ function slugifyTimestamp(date = new Date()) {
 
 function stableJson(value) {
   return JSON.stringify(value, null, 2) + '\n';
+}
+
+function sha256Hex(value) {
+  return createHash('sha256').update(value).digest('hex');
 }
 
 function csvEscape(value) {
@@ -975,6 +984,17 @@ function routePatternToRegex(routePath) {
   );
 }
 
+function isValidMatrixWildcardRoutePattern(routePath) {
+  const segments = routePath.split('/');
+  const wildcardSegments = segments.filter((segment) => segment.includes('*'));
+  return (
+    routePath.startsWith('/_matrix/')
+    && wildcardSegments.length === 1
+    && segments[3] === '*'
+    && wildcardSegments[0] === '*'
+  );
+}
+
 function parseRouteCell(rawValue) {
   return rawValue
     .replaceAll('`', '')
@@ -1005,6 +1025,16 @@ function buildWildcardRouteExpansion(definitions, matrixRouteCatalog, issues) {
     const routeEntries = parseRouteCell(routeCell);
     for (const routeEntry of routeEntries) {
       if (!routeEntry.path.includes('*') || !routeEntry.path.startsWith('/_matrix/')) {
+        continue;
+      }
+      if (!isValidMatrixWildcardRoutePattern(routeEntry.path)) {
+        issues.push({
+          severity: 'error',
+          code: 'wildcard_route_invalid_pattern',
+          file: definition.file,
+          line: definition.line,
+          message: `${definition.id} route pattern ${routeEntry.path} uses "*" outside the Matrix API version segment`,
+        });
         continue;
       }
       const matcher = routePatternToRegex(routeEntry.path);
@@ -1359,7 +1389,18 @@ export async function analyzeRepository(repoRoot = getRepoRoot()) {
   );
   validateReverseEdges(traceabilityMatrix, issues);
 
-  const matrixRouteCatalog = await extractMatrixRouteCatalog(repoRoot);
+  let matrixRouteCatalog = [];
+  try {
+    matrixRouteCatalog = await extractMatrixRouteCatalog(repoRoot);
+  } catch (error) {
+    issues.push({
+      severity: 'error',
+      code: 'matrix_route_catalog_unavailable',
+      file: 'research/sources',
+      line: 1,
+      message: `Pinned Matrix v1.17 route catalog could not be loaded: ${error.message}`,
+    });
+  }
   const wildcardRouteExpansion = buildWildcardRouteExpansion(definitions, matrixRouteCatalog, issues);
   const expandedSourceIds = collectExpandedSourceIds(fieldInventory, 'EVID-GOV-001');
 
@@ -1435,11 +1476,54 @@ export function formatCheckReport(analysis) {
   return lines.join('\n');
 }
 
+async function collectCodeVersionContext(repoRoot) {
+  try {
+    const [{ stdout: commitStdout }, { stdout: statusStdout }] = await Promise.all([
+      execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: repoRoot }),
+      execFileAsync('git', ['status', '--short'], { cwd: repoRoot }),
+    ]);
+    return {
+      git_commit: commitStdout.trim() || null,
+      worktree_dirty: statusStdout.trim().length > 0,
+    };
+  } catch {
+    return {
+      git_commit: null,
+      worktree_dirty: null,
+    };
+  }
+}
+
+function collectDataVersionContext(analysis) {
+  const requirementRegisterJson = stableJson(analysis.requirementRegister);
+  const traceabilityMatrixJson = stableJson(analysis.traceabilityMatrix);
+  const expandedSourceIdsJson = stableJson(analysis.expandedSourceIds);
+  const wildcardRouteExpansionJson = stableJson(analysis.wildcardRouteExpansion);
+  const analysisSnapshotJson = stableJson({
+    summary: analysis.summary,
+    issues: analysis.issues,
+    requirement_register: analysis.requirementRegister,
+    traceability_matrix: analysis.traceabilityMatrix,
+    expanded_source_ids: analysis.expandedSourceIds,
+    wildcard_route_expansion: analysis.wildcardRouteExpansion,
+  });
+  return {
+    analysis_sha256: sha256Hex(analysisSnapshotJson),
+    requirement_register_sha256: sha256Hex(requirementRegisterJson),
+    traceability_matrix_sha256: sha256Hex(traceabilityMatrixJson),
+    expanded_source_ids_sha256: sha256Hex(expandedSourceIdsJson),
+    wildcard_route_expansion_sha256: sha256Hex(wildcardRouteExpansionJson),
+  };
+}
+
 export async function writeGovernanceEvidence(repoRoot = getRepoRoot(), options = {}) {
   const analysis = await analyzeRepository(repoRoot);
   const runTimestamp = options.timestamp ?? slugifyTimestamp();
   const evidenceRoot = path.join(repoRoot, 'evidence/common/EVID-GOV-001', runTimestamp);
   const artifactsDir = path.join(evidenceRoot, 'artifacts');
+  const generatedAt = new Date().toISOString();
+  const codeVersion = await collectCodeVersionContext(repoRoot);
+  const dataVersion = collectDataVersionContext(analysis);
 
   await fs.mkdir(artifactsDir, { recursive: true });
 
@@ -1465,7 +1549,7 @@ export async function writeGovernanceEvidence(repoRoot = getRepoRoot(), options 
     fs.writeFile(
       path.join(artifactsDir, 'requirement-register.json'),
       stableJson({
-        generated_at: new Date().toISOString(),
+        generated_at: generatedAt,
         row_count: analysis.requirementRegister.length,
         rows: analysis.requirementRegister,
       }),
@@ -1485,7 +1569,7 @@ export async function writeGovernanceEvidence(repoRoot = getRepoRoot(), options 
     fs.writeFile(
       path.join(artifactsDir, 'traceability-matrix.json'),
       stableJson({
-        generated_at: new Date().toISOString(),
+        generated_at: generatedAt,
         row_count: analysis.traceabilityMatrix.length,
         rows: analysis.traceabilityMatrix,
       }),
@@ -1507,7 +1591,7 @@ export async function writeGovernanceEvidence(repoRoot = getRepoRoot(), options 
     fs.writeFile(
       path.join(artifactsDir, 'expanded-source-ids.json'),
       stableJson({
-        generated_at: new Date().toISOString(),
+        generated_at: generatedAt,
         declared_source_ids: analysis.expandedSourceIds.declaredSourceIds,
         expanded_source_ids: analysis.expandedSourceIds.expandedSourceIds,
         expansions: analysis.expandedSourceIds.expansions,
@@ -1516,7 +1600,7 @@ export async function writeGovernanceEvidence(repoRoot = getRepoRoot(), options 
     fs.writeFile(
       path.join(artifactsDir, 'wildcard-route-expansion.json'),
       stableJson({
-        generated_at: new Date().toISOString(),
+        generated_at: generatedAt,
         row_count: analysis.wildcardRouteExpansion.length,
         rows: analysis.wildcardRouteExpansion,
       }),
@@ -1536,8 +1620,10 @@ export async function writeGovernanceEvidence(repoRoot = getRepoRoot(), options 
     fs.writeFile(
       path.join(artifactsDir, 'governance-summary.json'),
       stableJson({
-        generated_at: new Date().toISOString(),
+        generated_at: generatedAt,
         valid: analysis.valid,
+        code_version: codeVersion,
+        data_version: dataVersion,
         summary: analysis.summary,
         expanded_source_ids: analysis.expandedSourceIds,
         issues: analysis.issues,
@@ -1549,9 +1635,19 @@ export async function writeGovernanceEvidence(repoRoot = getRepoRoot(), options 
     '# EVID-GOV-001 Summary',
     '',
     `- status: ${analysis.valid ? 'pass' : 'fail'}`,
-    `- generated_at: ${new Date().toISOString()}`,
+    `- generated_at: ${generatedAt}`,
     `- run_ts: ${runTimestamp}`,
     `- repo_root: ${normalizePath(repoRoot)}`,
+    '',
+    '## Context',
+    '',
+    `- code_version.git_commit: ${codeVersion.git_commit == null ? '`unknown`' : `\`${codeVersion.git_commit}\``}`,
+    `- code_version.worktree_dirty: ${codeVersion.worktree_dirty == null ? 'unknown' : String(codeVersion.worktree_dirty)}`,
+    `- data_version.analysis_sha256: \`${dataVersion.analysis_sha256}\``,
+    `- data_version.requirement_register_sha256: \`${dataVersion.requirement_register_sha256}\``,
+    `- data_version.traceability_matrix_sha256: \`${dataVersion.traceability_matrix_sha256}\``,
+    `- data_version.expanded_source_ids_sha256: \`${dataVersion.expanded_source_ids_sha256}\``,
+    `- data_version.wildcard_route_expansion_sha256: \`${dataVersion.wildcard_route_expansion_sha256}\``,
     '',
     '## Scope',
     '',

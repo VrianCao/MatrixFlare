@@ -27,6 +27,18 @@ import {
 
 const TERMINAL_JOB_STATES = new Set(['completed', 'finalized', 'failed', 'canceled']);
 
+function assertSupportedExportMaterializationTarget({ shardType, shardKey }) {
+  if (shardType === 'control-plane' && shardKey === 'ops-core') {
+    return;
+  }
+  throw Object.assign(new Error(
+    `Export shard ${shardType}/${shardKey} cannot be materialized by the current Phase 02 runtime; only control-plane/ops-core is implemented`,
+  ), {
+    code: 'job_conflict',
+    retryable: false,
+  });
+}
+
 function parseInternalRoute(pathname) {
   if (pathname === ROUTE_TEMPLATES.internalStartExport) {
     return { kind: 'start-export' };
@@ -112,7 +124,7 @@ function checkpointTargetForPayload({ kind, payload }) {
 
 function classifyFanOutError(error, { job, kind }) {
   const message = error instanceof Error ? error.message : String(error);
-  if (message.includes('Registry snapshot') || message.includes('contains no shard rows')) {
+  if (error?.code === 'job_conflict' || message.includes('Registry snapshot') || message.includes('contains no shard rows')) {
     return {
       status: 409,
       code: 'job_conflict',
@@ -134,6 +146,86 @@ function classifyFanOutError(error, { job, kind }) {
       start_kind: kind,
     },
   };
+}
+
+function classifyQueueTerminalFailure(error, { queueName, schemaVersion }) {
+  if (error.code === 'job_conflict') {
+    return {
+      opsCode: 'precondition_failed',
+      details: {
+        queue_name: queueName,
+      },
+      auditDetails: {
+        queue_name: queueName,
+        reason: 'job_conflict',
+      },
+    };
+  }
+  if (error.code === 'unsupported_schema_version' || error instanceof TypeError || error instanceof RangeError) {
+    return {
+      opsCode: 'validation_failed',
+      details: {
+        queue_name: queueName,
+        schema_version: schemaVersion,
+        expected_schema_version: CONTROL_PLANE_SCHEMA_VERSION,
+      },
+      auditDetails: {
+        queue_name: queueName,
+        reason: error.code ?? 'validation_failed',
+        schema_version: schemaVersion,
+      },
+    };
+  }
+  return {
+    opsCode: 'internal',
+    details: {
+      queue_name: queueName,
+    },
+    auditDetails: {
+      queue_name: queueName,
+      reason: error.code ?? 'queue_processing_failed',
+    },
+  };
+}
+
+async function failJobForQueueMessage({
+  persistence,
+  queueName,
+  message,
+  asyncContext,
+  error,
+}) {
+  const jobId = typeof message?.body?.job_id === 'string' ? message.body.job_id.trim() : '';
+  if (!jobId) {
+    return;
+  }
+  const job = await persistence.getJob(jobId);
+  if (!job || TERMINAL_JOB_STATES.has(job.internal_state)) {
+    return;
+  }
+  const classified = classifyQueueTerminalFailure(error, {
+    queueName,
+    schemaVersion: message?.body?.schema_version ?? null,
+  });
+  await updateJobState({
+    persistence,
+    job,
+    newState: 'failed',
+    now: new Date(),
+    lastError: buildOpsErrorJson({
+      code: classified.opsCode,
+      message: error.message,
+      requestId: asyncContext.causationId ?? jobId,
+      retryable: false,
+      details: classified.details,
+    }),
+    auditEventType: `${job.job_type}.failed`,
+    auditDetails: classified.auditDetails,
+    requestContext: asyncContext,
+    resultSummary: {
+      failure: error.message,
+    },
+  });
 }
 
 async function stageQueuedPayloads({
@@ -231,6 +323,12 @@ async function fanOutJobTasks({ env, persistence, job, kind }) {
     const rows = snapshot?.snapshot?.rows ?? [];
     if (rows.length === 0) {
       throw new Error(`Registry snapshot ${job.registry_snapshot_id} contains no shard rows`);
+    }
+    for (const row of rows) {
+      assertSupportedExportMaterializationTarget({
+        shardType: row.shard_type,
+        shardKey: row.shard_key,
+      });
     }
     payloads = rows.map((row) => buildExportShardJob({
       jobId: job.job_id,
@@ -374,6 +472,12 @@ async function processQueueMessage({
   if (!existingCheckpoint) {
     throw new Error(`Checkpoint ${job.job_id}/${checkpointShardType}/${checkpointShardKey} was not staged before queue delivery`);
   }
+  if (queueName === QUEUE_NAMES.export) {
+    assertSupportedExportMaterializationTarget({
+      shardType: checkpointShardType,
+      shardKey: checkpointShardKey,
+    });
+  }
   if (existingCheckpoint?.checkpoint?.status === 'complete') {
     const checkpoints = await persistence.listJobCheckpoints(job.job_id);
     const completedUnits = checkpoints.filter((entry) => entry.checkpoint?.status === 'complete').length;
@@ -434,7 +538,7 @@ async function processQueueMessage({
     throw new Error(`Job ${job.job_id} has not entered checkpointed state before queue delivery`);
   }
   if (job.internal_state !== runningState) {
-    await updateJobState({
+    const runningJob = await updateJobState({
       persistence,
       job,
       newState: runningState,
@@ -445,6 +549,8 @@ async function processQueueMessage({
       },
       requestContext: asyncContext,
     });
+    job.started_at = runningJob.started_at;
+    job.internal_state = runningJob.internal_state;
   }
   let checkpointId = makeId('checkpoint');
   let completedCheckpoint = {
@@ -656,13 +762,16 @@ export function createJobsWorkerQueueHandler() {
     const config = loadWorkerRuntimeConfig('jobs-worker', env);
     const persistence = getControlPlanePersistence(env);
     await persistence.ensureSchema();
-    const asyncContext = createAsyncTaskContext({
-      workerName: 'jobs-worker',
-      workerVersion: config.text.WORKER_VERSION_ID,
-      routeFamily: `queue:${batch.queue}`,
-      jobId: batch.messages[0]?.body?.job_id ?? null,
-    });
     for (const message of batch.messages) {
+      const rawJobId = typeof message?.body?.job_id === 'string' && message.body.job_id.trim().length > 0
+        ? message.body.job_id.trim()
+        : null;
+      const asyncContext = createAsyncTaskContext({
+        workerName: 'jobs-worker',
+        workerVersion: config.text.WORKER_VERSION_ID,
+        routeFamily: `queue:${batch.queue}`,
+        jobId: rawJobId,
+      });
       try {
         const normalizedBody = normalizeQueuePayload(batch.queue, message.body);
         const result = await processQueueMessage({
@@ -684,36 +793,14 @@ export function createJobsWorkerQueueHandler() {
           retryable: error.retryable ?? null,
         });
         const retryable = error.retryable ?? !(error instanceof TypeError || error instanceof RangeError);
-        if (error.code === 'unsupported_schema_version') {
-          const jobId = typeof message?.body?.job_id === 'string' ? message.body.job_id.trim() : '';
-          if (jobId) {
-            const job = await persistence.getJob(jobId);
-            if (job && !['completed', 'finalized', 'failed', 'canceled'].includes(job.internal_state)) {
-              await updateJobState({
-                persistence,
-                job,
-                newState: 'failed',
-                now: new Date(),
-                lastError: buildOpsErrorJson({
-                  code: 'internal',
-                  message: error.message,
-                  requestId: asyncContext.causationId ?? jobId,
-                  retryable: false,
-                  details: {
-                    queue_name: batch.queue,
-                    schema_version: message?.body?.schema_version ?? null,
-                    expected_schema_version: CONTROL_PLANE_SCHEMA_VERSION,
-                  },
-                }),
-                auditEventType: `${job.job_type}.failed`,
-                auditDetails: {
-                  queue_name: batch.queue,
-                  reason: 'unsupported_schema_version',
-                  schema_version: message?.body?.schema_version ?? null,
-                },
-              });
-            }
-          }
+        if (!retryable) {
+          await failJobForQueueMessage({
+            persistence,
+            queueName: batch.queue,
+            message,
+            asyncContext,
+            error,
+          });
         }
         if (typeof message.retry === 'function' && retryable) {
           message.retry();

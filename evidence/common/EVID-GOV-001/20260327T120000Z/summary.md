@@ -1,8 +1,10 @@
 # EVID-GOV-001 Summary
 
-- status: pass
+- status: superseded
 - generated_at: 2026-03-27T00:56:00.867Z
 - run_ts: 20260327T120000Z
+- superseded_by: 20260330T112812Z
+- supersede_reason: superseded by the final Phase 00-02 governance evidence run after additional review-loop fixes
 - repo_root: /root/Matrix
 
 ## Scope

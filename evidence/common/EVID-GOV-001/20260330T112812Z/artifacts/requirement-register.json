@@ -1,0 +1,384 @@
+{
+  "generated_at": "2026-03-30T11:28:27.238Z",
+  "row_count": 42,
+  "rows": [
+    {
+      "req_id": "REQ-ARCH-001",
+      "owning_spec": "20",
+      "title": "主权状态机优先",
+      "normative_statement": "房间、用户、远端服务器三类权威状态必须各自拥有唯一串行裁决者。",
+      "source_file": "spec/framework/20-system-context-and-principles.md",
+      "source_line": 73,
+      "status": "active"
+    },
+    {
+      "req_id": "REQ-ARCH-002",
+      "owning_spec": "20",
+      "title": "单一真相面",
+      "normative_statement": "任一业务事实只能有一个权威写入位置。",
+      "source_file": "spec/framework/20-system-context-and-principles.md",
+      "source_line": 74,
+      "status": "active"
+    },
+    {
+      "req_id": "REQ-ARCH-003",
+      "owning_spec": "20",
+      "title": "协议入口统一",
+      "normative_statement": "同一类 Matrix 语义无论来自本地客户端、联邦还是 AS，都必须进入同一语义裁决管道。",
+      "source_file": "spec/framework/20-system-context-and-principles.md",
+      "source_line": 75,
+      "status": "active"
+    },
+    {
+      "req_id": "REQ-ARCH-004",
+      "owning_spec": "20",
+      "title": "提交前不等待外部 I/O",
+      "normative_statement": "权威写路径在提交前不得依赖远端网络、D1、KV、Queues 或 R2 的成功。",
+      "source_file": "spec/framework/20-system-context-and-principles.md",
+      "source_line": 76,
+      "status": "active"
+    },
+    {
+      "req_id": "REQ-ARCH-005",
+      "owning_spec": "20",
+      "title": "可恢复优先",
+      "normative_statement": "任何衍生副作用失败都必须可通过重放、重建或补偿修复。",
+      "source_file": "spec/framework/20-system-context-and-principles.md",
+      "source_line": 77,
+      "status": "active"
+    },
+    {
+      "req_id": "REQ-ARCH-006",
+      "owning_spec": "20",
+      "title": "DO SQLite 承载真相",
+      "normative_statement": "需要强一致、串行裁决的数据必须优先放在 DO SQLite。",
+      "source_file": "spec/framework/20-system-context-and-principles.md",
+      "source_line": 90,
+      "status": "active"
+    },
+    {
+      "req_id": "REQ-ARCH-007",
+      "owning_spec": "20",
+      "title": "D1 不承载数据面业务真相",
+      "normative_statement": "D1 可以承载可重建衍生面与少量权威控制面元数据，但不得承载房间当前状态、设备会话真相、联邦幂等真相或任何需要由数据面主权对象串行裁决的业务事实。",
+      "source_file": "spec/framework/20-system-context-and-principles.md",
+      "source_line": 91,
+      "status": "active"
+    },
+    {
+      "req_id": "REQ-ARCH-008",
+      "owning_spec": "20",
+      "title": "KV 仅作缓存",
+      "normative_statement": "KV 不得被视为即时一致或权威来源。",
+      "source_file": "spec/framework/20-system-context-and-principles.md",
+      "source_line": 92,
+      "status": "active"
+    },
+    {
+      "req_id": "REQ-ARCH-009",
+      "owning_spec": "20",
+      "title": "R2 承载对象与冷历史",
+      "normative_statement": "大对象、冷数据、归档必须移出 DO 热路径。",
+      "source_file": "spec/framework/20-system-context-and-principles.md",
+      "source_line": 93,
+      "status": "active"
+    },
+    {
+      "req_id": "REQ-ARCH-010",
+      "owning_spec": "20",
+      "title": "每房间串行",
+      "normative_statement": "同一 `room_id` 的事件接纳与状态推进必须在同一 `RoomDO` 内串行完成。",
+      "source_file": "spec/framework/20-system-context-and-principles.md",
+      "source_line": 99,
+      "status": "active"
+    },
+    {
+      "req_id": "REQ-ARCH-011",
+      "owning_spec": "20",
+      "title": "每用户串行",
+      "normative_statement": "同一 `user_id` 的 session、device、to-device、sync stream 必须在同一 `UserDO` 内线性化。",
+      "source_file": "spec/framework/20-system-context-and-principles.md",
+      "source_line": 100,
+      "status": "active"
+    },
+    {
+      "req_id": "REQ-ARCH-012",
+      "owning_spec": "20",
+      "title": "每远端服务器串行出站",
+      "normative_statement": "同一 `server_name` 的出站事务排序、重试和去重必须由同一 `RemoteServerDO` 裁决。",
+      "source_file": "spec/framework/20-system-context-and-principles.md",
+      "source_line": 101,
+      "status": "active"
+    },
+    {
+      "req_id": "REQ-ARCH-013",
+      "owning_spec": "20",
+      "title": "派生最终一致",
+      "normative_statement": "搜索、目录、统计、媒体目录、导出索引可以滞后，但必须可重建。",
+      "source_file": "spec/framework/20-system-context-and-principles.md",
+      "source_line": 102,
+      "status": "active"
+    },
+    {
+      "req_id": "REQ-ARCH-014",
+      "owning_spec": "20",
+      "title": "成本与语义解耦",
+      "normative_statement": "不能通过把权威语义塞进更便宜但不一致的存储来降低成本。",
+      "source_file": "spec/framework/20-system-context-and-principles.md",
+      "source_line": 108,
+      "status": "active"
+    },
+    {
+      "req_id": "REQ-ARCH-015",
+      "owning_spec": "20",
+      "title": "长等待在 Worker，不在 DO",
+      "normative_statement": "长轮询和稀疏等待应尽量停留在 Worker 或 hibernating DO 连接上。",
+      "source_file": "spec/framework/20-system-context-and-principles.md",
+      "source_line": 109,
+      "status": "active"
+    },
+    {
+      "req_id": "REQ-ARCH-016",
+      "owning_spec": "20",
+      "title": "以分片替代纵向堆高",
+      "normative_statement": "扩容优先通过更多主权对象，而不是更重单体实例。",
+      "source_file": "spec/framework/20-system-context-and-principles.md",
+      "source_line": 110,
+      "status": "active"
+    },
+    {
+      "req_id": "REQ-ARCH-017",
+      "owning_spec": "20",
+      "title": "版本偏斜容忍",
+      "normative_statement": "Worker 与 DO 接口必须前后兼容，以适应 Cloudflare 渐进和最终一致发布。",
+      "source_file": "spec/framework/20-system-context-and-principles.md",
+      "source_line": 116,
+      "status": "active"
+    },
+    {
+      "req_id": "REQ-ARCH-018",
+      "owning_spec": "20",
+      "title": "房间版本隔离",
+      "normative_statement": "房间版本差异必须通过策略层隔离，不得散落在业务代码中。",
+      "source_file": "spec/framework/20-system-context-and-principles.md",
+      "source_line": 117,
+      "status": "active"
+    },
+    {
+      "req_id": "REQ-ARCH-019",
+      "owning_spec": "20",
+      "title": "协议与平台事实分离",
+      "normative_statement": "Matrix 语义与 Cloudflare 平台限制必须分开建模，然后在责任分册中组合。",
+      "source_file": "spec/framework/20-system-context-and-principles.md",
+      "source_line": 118,
+      "status": "active"
+    },
+    {
+      "req_id": "REQ-GOV-001",
+      "owning_spec": "10",
+      "title": "Single-homeserver deployment",
+      "normative_statement": "一个部署环境只服务一个 homeserver 域名。",
+      "source_file": "spec/framework/10-governance-and-references.md",
+      "source_line": 72,
+      "status": "active"
+    },
+    {
+      "req_id": "REQ-GOV-002",
+      "owning_spec": "10",
+      "title": "Single-tenant state plane",
+      "normative_statement": "首版不支持同一部署内多租户混用同一状态平面。",
+      "source_file": "spec/framework/10-governance-and-references.md",
+      "source_line": 73,
+      "status": "active"
+    },
+    {
+      "req_id": "REQ-GOV-003",
+      "owning_spec": "10",
+      "title": "Workers Paid baseline",
+      "normative_statement": "所有成本、容量和运行时判断都基于 Workers Paid。",
+      "source_file": "spec/framework/10-governance-and-references.md",
+      "source_line": 74,
+      "status": "active"
+    },
+    {
+      "req_id": "REQ-GOV-004",
+      "owning_spec": "10",
+      "title": "Explicit compatibility control",
+      "normative_statement": "所有 Worker 都必须设置显式 `compatibility_date` 并在验证后推进。",
+      "source_file": "spec/framework/10-governance-and-references.md",
+      "source_line": 75,
+      "status": "active"
+    },
+    {
+      "req_id": "REQ-GOV-005",
+      "owning_spec": "10",
+      "title": "Staging required",
+      "normative_statement": "生产前必须存在独立 staging 环境。",
+      "source_file": "spec/framework/10-governance-and-references.md",
+      "source_line": 76,
+      "status": "active"
+    },
+    {
+      "req_id": "REQ-GOV-006",
+      "owning_spec": "10",
+      "title": "R2 export required",
+      "normative_statement": "生产必须具备到 R2 的导出与恢复演练能力。",
+      "source_file": "spec/framework/10-governance-and-references.md",
+      "source_line": 77,
+      "status": "active"
+    },
+    {
+      "req_id": "REQ-OPS-001",
+      "owning_spec": "41",
+      "title": "Structured logs",
+      "normative_statement": "所有生产 Worker 必须输出结构化 JSON 日志。",
+      "source_file": "spec/framework/41-observability-performance-and-cost.md",
+      "source_line": 24,
+      "status": "active"
+    },
+    {
+      "req_id": "REQ-OPS-002",
+      "owning_spec": "41",
+      "title": "Correlation IDs",
+      "normative_statement": "每个请求、异步任务、联邦事务和运维作业都必须能关联到稳定 ID。",
+      "source_file": "spec/framework/41-observability-performance-and-cost.md",
+      "source_line": 25,
+      "status": "active"
+    },
+    {
+      "req_id": "REQ-OPS-003",
+      "owning_spec": "41",
+      "title": "Cost attribution",
+      "normative_statement": "每个主要成本面都必须有可观测指标与月度归因面板。",
+      "source_file": "spec/framework/41-observability-performance-and-cost.md",
+      "source_line": 26,
+      "status": "active"
+    },
+    {
+      "req_id": "REQ-OPS-004",
+      "owning_spec": "41",
+      "title": "Truth-path visibility",
+      "normative_statement": "`UserDO`、`RoomDO`、`RemoteServerDO` 的核心提交路径必须有独立指标。",
+      "source_file": "spec/framework/41-observability-performance-and-cost.md",
+      "source_line": 27,
+      "status": "active"
+    },
+    {
+      "req_id": "REQ-OPS-005",
+      "owning_spec": "41",
+      "title": "Derived-lag visibility",
+      "normative_statement": "D1/Queue/R2 派生滞后必须可测。",
+      "source_file": "spec/framework/41-observability-performance-and-cost.md",
+      "source_line": 28,
+      "status": "active"
+    },
+    {
+      "req_id": "REQ-OPS-010",
+      "owning_spec": "42",
+      "title": "Versioned deployments",
+      "normative_statement": "生产发布必须使用 Worker versions/deployments 模型。",
+      "source_file": "spec/framework/42-deployment-migration-and-recovery.md",
+      "source_line": 24,
+      "status": "active"
+    },
+    {
+      "req_id": "REQ-OPS-011",
+      "owning_spec": "42",
+      "title": "Compatibility before rollout",
+      "normative_statement": "任何破坏性行为切换前必须先发布兼容代码。",
+      "source_file": "spec/framework/42-deployment-migration-and-recovery.md",
+      "source_line": 25,
+      "status": "active"
+    },
+    {
+      "req_id": "REQ-OPS-012",
+      "owning_spec": "42",
+      "title": "Migrations isolated",
+      "normative_statement": "DO migration 必须与普通代码发布解耦。",
+      "source_file": "spec/framework/42-deployment-migration-and-recovery.md",
+      "source_line": 26,
+      "status": "active"
+    },
+    {
+      "req_id": "REQ-OPS-013",
+      "owning_spec": "42",
+      "title": "Recovery path before cleanup",
+      "normative_statement": "删除旧 schema、旧索引、旧对象前必须确认已有恢复入口。",
+      "source_file": "spec/framework/42-deployment-migration-and-recovery.md",
+      "source_line": 27,
+      "status": "active"
+    },
+    {
+      "req_id": "REQ-SEC-001",
+      "owning_spec": "40",
+      "title": "Token truth",
+      "normative_statement": "access token 与 refresh token 的有效性只以 `UserDO` 真相为准。",
+      "source_file": "spec/framework/40-security-and-abuse-resistance.md",
+      "source_line": 24,
+      "status": "active"
+    },
+    {
+      "req_id": "REQ-SEC-002",
+      "owning_spec": "40",
+      "title": "Secret storage",
+      "normative_statement": "所有敏感密钥、bearer token 本体与可离线重放的凭据都必须存放于 Workers secrets 或 Secrets Store；不适用于仅以 hash 形式存于 `UserDO` 真相中的 access/refresh token。",
+      "source_file": "spec/framework/40-security-and-abuse-resistance.md",
+      "source_line": 25,
+      "status": "active"
+    },
+    {
+      "req_id": "REQ-SEC-003",
+      "owning_spec": "40",
+      "title": "No plaintext secrets",
+      "normative_statement": "严禁把敏感信息存入 Wrangler `vars`、D1、KV、Git 或日志。",
+      "source_file": "spec/framework/40-security-and-abuse-resistance.md",
+      "source_line": 26,
+      "status": "active"
+    },
+    {
+      "req_id": "REQ-SEC-004",
+      "owning_spec": "40",
+      "title": "Room authorization",
+      "normative_statement": "房间级授权最终只由 `RoomDO` + room version auth rules 裁决。",
+      "source_file": "spec/framework/40-security-and-abuse-resistance.md",
+      "source_line": 27,
+      "status": "active"
+    },
+    {
+      "req_id": "REQ-SEC-005",
+      "owning_spec": "40",
+      "title": "Federation auth",
+      "normative_statement": "除显式登记为 deterministic disabled stub 的联邦路由外，联邦请求只以 `X-Matrix` 签名和 Matrix 规则验证，不以 IP allowlist 替代。",
+      "source_file": "spec/framework/40-security-and-abuse-resistance.md",
+      "source_line": 28,
+      "status": "active"
+    },
+    {
+      "req_id": "REQ-SEC-006",
+      "owning_spec": "40",
+      "title": "Abuse controls",
+      "normative_statement": "注册、登录、媒体、房间发送、联邦入口、搜索等都必须具备限流或配额控制。",
+      "source_file": "spec/framework/40-security-and-abuse-resistance.md",
+      "source_line": 29,
+      "status": "active"
+    },
+    {
+      "req_id": "REQ-SEC-007",
+      "owning_spec": "40",
+      "title": "Auditability",
+      "normative_statement": "所有高权限操作都必须有审计记录与因果链。",
+      "source_file": "spec/framework/40-security-and-abuse-resistance.md",
+      "source_line": 30,
+      "status": "active"
+    },
+    {
+      "req_id": "REQ-SEC-008",
+      "owning_spec": "40",
+      "title": "Single-tenant isolation",
+      "normative_statement": "首版隔离边界是“每个 homeserver 域名独立部署单元”。",
+      "source_file": "spec/framework/40-security-and-abuse-resistance.md",
+      "source_line": 31,
+      "status": "active"
+    }
+  ]
+}

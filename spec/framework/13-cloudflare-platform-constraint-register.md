@@ -64,6 +64,7 @@
 | `CF-WKR-023` | Workers RPC / Service Bindings RPC / Durable Object RPC | limits | workers-rpc, do-rpc-stubs | Paid | 普通 serialized RPC message 的 hard ceiling 为 `32 MiB`；更大传输必须改用 stream-based transfer，而不是单条序列化消息。Durable Object method-call RPC 需按 DO stubs 指南回链到 Workers RPC 文档理解该 transport 约束。 | 所有内部 Worker/DO RPC 契约都必须分页、分段或改为 stream / R2 locator 设计；不得把大房间投影、导出段或审计结果一次性塞进单个 RPC 返回值。 | `21`,`23`,`26`,`30`,`31`,`32`,`42` |
 | `CF-WKR-024` | Workers | limits | workers-limits | Paid | Request header size 上限 `128 KB (total)`；response header size 上限 `128 KB (total)`。 | Access/JWT、联邦签名与任何 cookie/header 注入不得把 header 膨胀为大 payload；可增长的材料必须限制长度或改走 body/locator。 | `21`,`32`,`40` |
 | `CF-WKR-025` | Workers | limits | workers-limits | Paid | Worker 必须在 `1s` 内完成 global scope（top-level code）解析与执行；超限时部署校验会失败，Wrangler 会报告 `startup_time_ms`，并可能返回 `Script startup exceeded CPU time limit (10021)`。 | 所有 Worker 必须避免重型 top-level 初始化；发布门禁必须记录 `startup_time_ms` 并在接近 `1s` ceiling 前 fail-closed，而不是等线上流量触发问题。 | `21`,`42` |
+| `CF-WKR-026` | Workers | runtime | workers-compatibility-flags | Paid | Node.js runtime APIs 只在显式启用 `nodejs_compat` compatibility flag 时可用；该 flag 不会在未来某个日期自动变为默认开启。启用 `nodejs_compat` 后，若不希望 bindings 被自动注入到 `process.env`，必须显式设置 `nodejs_compat_do_not_populate_process_env`。 | 若代码中存在 `node:*` import，则 wrangler 配置必须显式钉住 `compatibility_flags`；默认策略为启用 `nodejs_compat` 并禁用 `process.env` 自动注入，以维持 secret/feature gate 的集中装载模型。 | `13`,`21`,`40`,`42` |
 
 ## 4. Durable Objects 约束
 

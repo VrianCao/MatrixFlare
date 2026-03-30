@@ -1,16 +1,24 @@
 # EVID-GOV-001 Summary
 
-- status: superseded
-- generated_at: 2026-03-27T01:27:33.197Z
-- run_ts: 20260327T160000Z
-- superseded_by: 20260330T112812Z
-- supersede_reason: superseded by the final Phase 00-02 governance evidence run after additional review-loop fixes
+- status: pass
+- generated_at: 2026-03-30T11:28:27.238Z
+- run_ts: 20260330T112812Z
 - repo_root: /root/Matrix
+
+## Context
+
+- code_version.git_commit: `0a7d8a2adb4b048a88a9301c78dc018e67206005`
+- code_version.worktree_dirty: true
+- data_version.analysis_sha256: `6687b602c14f9595b53b7ca2690571c9b9c09f1c41b85c7ca3d7a0e959b6d205`
+- data_version.requirement_register_sha256: `0b888c155e4d191ab2ecccfc676e0ecd84262625ddbc6b664011ec2e8a233598`
+- data_version.traceability_matrix_sha256: `bfd709d440b56595922ffb17648c399318c4fe527d0ad5be7e7e8fd210dd426b`
+- data_version.expanded_source_ids_sha256: `10a77e29d9303c0685d908ee3d39e98792a2c549a35ec4b56ea887263e33365d`
+- data_version.wildcard_route_expansion_sha256: `36a11aa9bc55e0800be48548c8c6beb38ee55c54981bf5e9c2b1c7940a4492ac`
 
 ## Scope
 
 - declared_source_ids: `CF-*`,`DATA-*`,`DEC-*`,`EVID-*`,`FLOW-*`,`IF-*`,`MX-*`,`OQ-*`,`REQ-*`,`STATE-*`,`TEST-*`
-- expanded_source_ids_count: 417
+- expanded_source_ids_count: 418
 - expanded_source_ids_artifact: `artifacts/expanded-source-ids.json`
 
 ## Artifacts
@@ -26,10 +34,10 @@
 
 ## Summary
 
-- definition_counts: {"REQ":42,"MX":45,"CF":75,"IF":101,"DATA":61,"FLOW":36,"STATE":14,"TEST":22,"EVID":18,"DEC":1,"OQ":2}
+- definition_counts: {"REQ":42,"MX":45,"CF":76,"IF":101,"DATA":61,"FLOW":36,"STATE":14,"TEST":22,"EVID":18,"DEC":1,"OQ":2}
 - requirement_register_count: 42
-- traceability_edge_count: 5293
-- expanded_source_ids_count: 417
+- traceability_edge_count: 5303
+- expanded_source_ids_count: 418
 - wildcard_route_family_count: 161
 - issue_count: 0
 
@@ -110,6 +118,7 @@
 - `CF-WKR-023`
 - `CF-WKR-024`
 - `CF-WKR-025`
+- `CF-WKR-026`
 - `DATA-D1-001`
 - `DATA-D1-002`
 - `DATA-D1-003`

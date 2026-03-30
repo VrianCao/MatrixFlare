@@ -66,6 +66,26 @@ test('wildcard expansion preserves canonical trailing-slash routes and excludes 
   );
 });
 
+test('wildcard expansion rejects route families that place "*" outside the Matrix version segment', async () => {
+  const tempRoot = await makeTempRepo();
+  await replaceInFile(
+    tempRoot,
+    'spec/framework/23-interface-contract-catalog.md',
+    '`GET /_matrix/client/*/login`',
+    '`GET /_matrix/client/v3/*/login`',
+  );
+
+  const analysis = await analyzeRepository(tempRoot);
+  assert.equal(analysis.valid, false);
+  assert.ok(
+    analysis.issues.some(
+      (issue) =>
+        issue.code === 'wildcard_route_invalid_pattern' &&
+        issue.message.includes('/_matrix/client/v3/*/login'),
+    ),
+  );
+});
+
 test('missing REQ sidecar entry fails governance analysis', async () => {
   const tempRoot = await makeTempRepo();
   const sidecarPath = path.join(tempRoot, 'spec/framework/14-requirement-traceability-sidecar.json');
@@ -147,6 +167,31 @@ test('governance evidence writer emits required EVID-GOV-001 artifacts', async (
   }
 
   const summary = await fs.readFile(path.join(evidenceRoot, 'summary.md'), 'utf8');
+  assert.match(summary, /## Context/);
+  assert.match(summary, /code_version\.git_commit:/);
+  assert.match(summary, /data_version\.analysis_sha256:/);
   assert.match(summary, /## Expanded Source IDs/);
   assert.match(summary, /`REQ-ARCH-001`/);
+});
+
+test('governance evidence writer still emits fail evidence when pinned Matrix snapshots are unavailable', async () => {
+  const tempRoot = await makeTempRepo();
+  await fs.unlink(path.join(tempRoot, 'research/sources/matrix-v1.17-client-server-api.html'));
+
+  const result = await writeGovernanceEvidence(tempRoot, { timestamp: '20260327T010000Z' });
+  assert.equal(result.analysis.valid, false);
+  assert.ok(
+    result.analysis.issues.some((issue) => issue.code === 'matrix_route_catalog_unavailable'),
+  );
+
+  const evidenceRoot = path.join(tempRoot, 'evidence/common/EVID-GOV-001/20260327T010000Z');
+  await fs.access(path.join(evidenceRoot, 'summary.md'));
+  await fs.access(path.join(evidenceRoot, 'artifacts/requirement-register.json'));
+  await fs.access(path.join(evidenceRoot, 'artifacts/traceability-matrix.json'));
+  await fs.access(path.join(evidenceRoot, 'artifacts/expanded-source-ids.json'));
+  await fs.access(path.join(evidenceRoot, 'artifacts/wildcard-route-expansion.json'));
+
+  const summary = await fs.readFile(path.join(evidenceRoot, 'summary.md'), 'utf8');
+  assert.match(summary, /- status: fail/);
+  assert.match(summary, /matrix_route_catalog_unavailable/);
 });

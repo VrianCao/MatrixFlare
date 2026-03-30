@@ -84,7 +84,7 @@
 | `STATE-MEDIA-CACHE-OBJECT` | remote media cache object | `33` | cached media | miss, fetching, present, stale, purging, deleted | partial fetch cleanup |
 | `STATE-APPSERVICE-TXN` | appservice txn | `34` | appservice delivery | queued, sending, acked, retrying, poison | exactly-once illusion via idempotency |
 | `STATE-REBUILD-JOB` | rebuild job | `42`,`34` | replay/reindex job | pending, scanning, applying, checkpointed, cancel_requested, completed, failed, canceled | resumability |
-| `STATE-EXPORT-JOB` | export job | `42` | export bundle | pending, materializing, uploading, cancel_requested, finalized, failed, canceled | partial export cleanup |
+| `STATE-EXPORT-JOB` | export job | `42` | export bundle | pending, checkpointed, materializing, uploading, cancel_requested, finalized, failed, canceled | partial export cleanup |
 | `STATE-RESTORE-JOB` | restore job | `42` | restore/import job | pending, validating, importing, cutover-ready, cutover, cancel_requested, completed, failed, canceled | manifest validation and cutover safety |
 | `STATE-REPAIR-JOB` | repair job | `42` | scoped repair job | pending, scanning, applying, verifying, cancel_requested, completed, failed, canceled | bounded blast radius and re-verification |
 

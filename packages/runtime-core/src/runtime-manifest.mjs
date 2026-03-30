@@ -1,4 +1,8 @@
 const COMPATIBILITY_DATE = '2026-03-26';
+const COMPATIBILITY_FLAGS = Object.freeze([
+  'nodejs_compat',
+  'nodejs_compat_do_not_populate_process_env',
+]);
 
 const RELEASE_PROFILES = ['L1', 'L2', 'L3'];
 const LOG_LEVELS = ['debug', 'info', 'warn', 'error'];
@@ -334,6 +338,7 @@ export function createWranglerConfigSnapshot(workerName) {
     name: `matrix-${workerName}`,
     main: 'src/index.mjs',
     compatibility_date: manifest.compatibilityDate,
+    compatibility_flags: [...COMPATIBILITY_FLAGS],
     vars: {},
   };
 
