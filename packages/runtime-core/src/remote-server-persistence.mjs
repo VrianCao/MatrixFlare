@@ -299,16 +299,26 @@ export function createRemoteServerDurableObjectPersistence(sqlStorage) {
         record_json: record.record ?? {},
       });
     },
-    markInboundTxnConflict({ origin, txn_id, dedupe_request_hash, conflict_reason, finalized_at = new Date().toISOString(), record = {} }) {
-      return inboundMarkers.put({
-        origin,
-        txn_id,
-        dedupe_request_hash,
-        state: 'conflict',
-        first_seen_at: finalized_at,
-        finalized_at,
-        conflict_reason: normalizeString(conflict_reason, 'conflict_reason'),
-        record_json: record,
+    markInboundTxnConflict({ origin, txn_id, dedupe_request_hash, conflict_reason, finalized_at = new Date().toISOString(), record = null }) {
+      return withSqliteTransaction(sql, () => {
+        const existingMarker = inboundMarkers.get({ origin, txn_id });
+        if (!existingMarker) {
+          throw new Error(`Inbound txn marker ${origin}/${txn_id} must exist before conflict is recorded`);
+        }
+        const conflictingHash = normalizeString(dedupe_request_hash, 'dedupe_request_hash');
+        if (existingMarker.dedupe_request_hash === conflictingHash) {
+          throw new Error(`Inbound txn ${origin}/${txn_id} conflict hash must differ from the original dedupe_request_hash`);
+        }
+        return inboundMarkers.put({
+          origin,
+          txn_id,
+          dedupe_request_hash: existingMarker.dedupe_request_hash,
+          state: 'conflict',
+          first_seen_at: existingMarker.first_seen_at,
+          finalized_at: normalizeString(finalized_at, 'finalized_at'),
+          conflict_reason: normalizeString(conflict_reason, 'conflict_reason'),
+          record_json: record ?? existingMarker.record ?? {},
+        });
       });
     },
     finalizeInboundTxn({

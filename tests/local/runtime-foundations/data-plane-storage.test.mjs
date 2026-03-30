@@ -496,6 +496,36 @@ test('RemoteServerDO persistence lands DATA-FED-001 through DATA-FED-006 and enf
     etag: 'etag-discovery',
     record: { delegate: 'remote.example:443' },
   });
+  assert.throws(
+    () => persistence.finalizeInboundTxn({
+      origin: 'remote.example',
+      txn_id: 'txn-missing',
+      dedupe_request_hash: 'request-hash-missing',
+      canonical_response_text: '{"pdus":{}}',
+      canonical_response_bytes_base64: Buffer.from('{"pdus":{}}', 'utf8').toString('base64'),
+      pdu_results: {},
+      created_at: '2026-03-30T02:00:05.500Z',
+    }),
+    /must exist before finalization/,
+  );
+  persistence.putInboundTxnMarker({
+    origin: 'remote.example',
+    txn_id: 'txn-in-conflict',
+    dedupe_request_hash: 'request-hash-original',
+    state: 'in_progress',
+    first_seen_at: '2026-03-30T02:00:05.250Z',
+    finalized_at: null,
+    conflict_reason: null,
+    record: { phase: 'initial' },
+  });
+  const conflicted = persistence.markInboundTxnConflict({
+    origin: 'remote.example',
+    txn_id: 'txn-in-conflict',
+    dedupe_request_hash: 'request-hash-conflicting',
+    conflict_reason: 'hash_mismatch',
+    finalized_at: '2026-03-30T02:00:05.750Z',
+    record: { phase: 'conflict' },
+  });
   const finalized = persistence.finalizeInboundTxn({
     origin: 'remote.example',
     txn_id: 'txn-in-1',
@@ -512,6 +542,10 @@ test('RemoteServerDO persistence lands DATA-FED-001 through DATA-FED-006 and enf
   assert.equal(persistence.outboundTransactions.list().length, 1);
   assert.equal(persistence.retrySchedule.list().length, 1);
   assert.equal(finalized.marker.state, 'finalized');
+  assert.equal(conflicted.state, 'conflict');
+  assert.equal(conflicted.dedupe_request_hash, 'request-hash-original');
+  assert.equal(conflicted.first_seen_at, '2026-03-30T02:00:05.250Z');
+  assert.equal(conflicted.finalized_at, '2026-03-30T02:00:05.750Z');
   assert.equal(persistence.inboundResults.list().length, 1);
   assert.equal(persistence.gapRepairBacklog.list().length, 1);
   assert.equal(persistence.getCacheEntry({ cache_kind: 'discovery' }).etag, 'etag-discovery');
