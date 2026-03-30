@@ -1,4 +1,7 @@
 import {
+  createCipheriv,
+  createDecipheriv,
+  createHash,
   createHmac,
   randomBytes,
   scryptSync,
@@ -78,6 +81,74 @@ function decodeKeyMaterial(entry, version) {
 
 function signOpaqueTokenPayload(secretBytes, signingInput) {
   return createHmac('sha256', secretBytes).update(signingInput).digest('base64url');
+}
+
+function deriveUiaEncryptionKey(secretBytes) {
+  return createHash('sha256')
+    .update(secretBytes)
+    .update('matrix-uia-token-v1')
+    .digest();
+}
+
+function encryptOpaqueJsonPayload(secretBytes, payload) {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', deriveUiaEncryptionKey(secretBytes), iv);
+  const ciphertext = Buffer.concat([
+    cipher.update(JSON.stringify(payload), 'utf8'),
+    cipher.final(),
+  ]);
+  return {
+    iv: iv.toString('base64url'),
+    ciphertext: ciphertext.toString('base64url'),
+    tag: cipher.getAuthTag().toString('base64url'),
+  };
+}
+
+function decryptOpaqueJsonPayload(secretBytes, ivBase64Url, ciphertextBase64Url, tagBase64Url) {
+  const decipher = createDecipheriv(
+    'aes-256-gcm',
+    deriveUiaEncryptionKey(secretBytes),
+    decodeBase64UrlBytes(ivBase64Url, 'uia iv'),
+  );
+  decipher.setAuthTag(decodeBase64UrlBytes(tagBase64Url, 'uia auth tag'));
+  const plaintext = Buffer.concat([
+    decipher.update(decodeBase64UrlBytes(ciphertextBase64Url, 'uia ciphertext')),
+    decipher.final(),
+  ]);
+  return JSON.parse(plaintext.toString('utf8'));
+}
+
+function normalizeVerifiedUiaPayload(payload, rootKeyVersion, expectedRouteFamily, expectedMethod, now) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return Object.freeze({ valid: false, reason: 'invalid_payload' });
+  }
+  if (payload.route_family !== normalizeString(expectedRouteFamily, 'expectedRouteFamily')) {
+    return Object.freeze({ valid: false, reason: 'route_family_mismatch' });
+  }
+  if (payload.method !== normalizeString(expectedMethod, 'expectedMethod').toUpperCase()) {
+    return Object.freeze({ valid: false, reason: 'method_mismatch' });
+  }
+  if (payload.root_key_version !== normalizeString(rootKeyVersion, 'rootKeyVersion')) {
+    return Object.freeze({ valid: false, reason: 'root_key_version_mismatch' });
+  }
+  const nowMs = Date.parse(normalizeString(now, 'now'));
+  const expiresAtMs = Date.parse(normalizeString(payload.expires_at, 'payload.expires_at'));
+  if (!Number.isFinite(nowMs) || !Number.isFinite(expiresAtMs) || expiresAtMs <= nowMs) {
+    return Object.freeze({ valid: false, reason: 'expired' });
+  }
+  return Object.freeze({
+    valid: true,
+    payload: Object.freeze({
+      route_family: payload.route_family,
+      method: payload.method,
+      issued_at: payload.issued_at,
+      expires_at: payload.expires_at,
+      auth_subject_hint: payload.auth_subject_hint ?? null,
+      completed_stages: normalizeCompletedStages(payload.completed_stages),
+      nonce: normalizeString(payload.nonce, 'payload.nonce'),
+      root_key_version: normalizeString(payload.root_key_version, 'payload.root_key_version'),
+    }),
+  });
 }
 
 function normalizeTokenRevision(tokenRevision) {
@@ -279,11 +350,9 @@ export function issueUiaChallengeToken({
     nonce: normalizeString(nonce, 'nonce'),
     root_key_version: ring.active_version,
   });
-  const encodedPayload = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
-  const signingInput = `uia.${ring.active_version}.${encodedPayload}`;
-  const signature = signOpaqueTokenPayload(ring.keys[ring.active_version], signingInput);
+  const encrypted = encryptOpaqueJsonPayload(ring.keys[ring.active_version], payload);
   return Object.freeze({
-    token: `${signingInput}.${signature}`,
+    token: `uia.${ring.active_version}.${encrypted.iv}.${encrypted.ciphertext}.${encrypted.tag}`,
     payload,
   });
 }
@@ -297,17 +366,24 @@ export function verifyUiaChallengeToken({
 }) {
   try {
     const parts = normalizeString(token, 'token').split('.');
-    if (parts.length !== 4 || parts[0] !== 'uia') {
+    if (![4, 5].includes(parts.length) || parts[0] !== 'uia') {
       return Object.freeze({ valid: false, reason: 'invalid_format' });
     }
 
-    const [, rootKeyVersion, encodedPayload, signature] = parts;
+    const [, rootKeyVersion] = parts;
     const ring = parseSessionRootKeyRing(secretValue);
     const secretBytes = ring.keys[rootKeyVersion];
     if (!secretBytes) {
       return Object.freeze({ valid: false, reason: 'unknown_root_key_version' });
     }
 
+    if (parts.length === 5) {
+      const payload = decryptOpaqueJsonPayload(secretBytes, parts[2], parts[3], parts[4]);
+      return normalizeVerifiedUiaPayload(payload, rootKeyVersion, expectedRouteFamily, expectedMethod, now);
+    }
+
+    const encodedPayload = parts[2];
+    const signature = parts[3];
     const signingInput = `uia.${rootKeyVersion}.${encodedPayload}`;
     const expectedSignature = signOpaqueTokenPayload(secretBytes, signingInput);
     const providedSignatureBytes = Buffer.from(signature, 'utf8');
@@ -320,33 +396,7 @@ export function verifyUiaChallengeToken({
     }
 
     const payload = JSON.parse(Buffer.from(encodedPayload, 'base64url').toString('utf8'));
-    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
-      return Object.freeze({ valid: false, reason: 'invalid_payload' });
-    }
-    if (payload.route_family !== normalizeString(expectedRouteFamily, 'expectedRouteFamily')) {
-      return Object.freeze({ valid: false, reason: 'route_family_mismatch' });
-    }
-    if (payload.method !== normalizeString(expectedMethod, 'expectedMethod').toUpperCase()) {
-      return Object.freeze({ valid: false, reason: 'method_mismatch' });
-    }
-    const nowMs = Date.parse(normalizeString(now, 'now'));
-    const expiresAtMs = Date.parse(normalizeString(payload.expires_at, 'payload.expires_at'));
-    if (!Number.isFinite(nowMs) || !Number.isFinite(expiresAtMs) || expiresAtMs <= nowMs) {
-      return Object.freeze({ valid: false, reason: 'expired' });
-    }
-    return Object.freeze({
-      valid: true,
-      payload: Object.freeze({
-        route_family: payload.route_family,
-        method: payload.method,
-        issued_at: payload.issued_at,
-        expires_at: payload.expires_at,
-        auth_subject_hint: payload.auth_subject_hint ?? null,
-        completed_stages: normalizeCompletedStages(payload.completed_stages),
-        nonce: normalizeString(payload.nonce, 'payload.nonce'),
-        root_key_version: normalizeString(payload.root_key_version, 'payload.root_key_version'),
-      }),
-    });
+    return normalizeVerifiedUiaPayload(payload, rootKeyVersion, expectedRouteFamily, expectedMethod, now);
   } catch {
     return Object.freeze({ valid: false, reason: 'invalid_token' });
   }

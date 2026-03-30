@@ -17,7 +17,6 @@ import {
   extractLoginLocalpart,
   generateDeviceId,
   generateSessionId,
-  getAccessTokenUserIdHint,
   getRefreshTokenUserIdHint,
   hashOpaqueToken,
   hashPassword,
@@ -404,28 +403,19 @@ export class UserDO extends BaseDurableObject {
     await this.ensureCurrentness();
     await this.ensureSchema();
     const [request = {}] = arguments;
-    const accessToken = request?.access_token ?? null;
+    const accessTokenHash = typeof request?.access_token_hash === 'string' && request.access_token_hash.length > 0
+      ? request.access_token_hash
+      : null;
+    const legacyAccessToken = typeof request?.access_token === 'string' && request.access_token.length > 0
+      ? request.access_token
+      : null;
     const now = request?.now ?? new Date().toISOString();
-    if (typeof accessToken !== 'string' || accessToken.length === 0) {
+    if (!accessTokenHash && !legacyAccessToken) {
       return {
         ok: false,
         error: createInternalErrorEnvelope({
           code: 'invalid_token',
-          message: 'access_token must be present',
-          retryable: false,
-        }),
-      };
-    }
-
-    let hintedUserId;
-    try {
-      hintedUserId = getAccessTokenUserIdHint(accessToken);
-    } catch {
-      return {
-        ok: false,
-        error: createInternalErrorEnvelope({
-          code: 'invalid_token',
-          message: 'access token format is invalid',
+          message: 'access_token_hash must be present',
           retryable: false,
         }),
       };
@@ -437,19 +427,11 @@ export class UserDO extends BaseDurableObject {
       this.persistence.setRuntimeIdentity({ user_id: principal.user_id, updated_at: now });
     }
     const refreshedRuntimeState = this.persistence.getRuntimeState();
-    if (refreshedRuntimeState.user_id && refreshedRuntimeState.user_id !== hintedUserId) {
-      return {
-        ok: false,
-        error: createInternalErrorEnvelope({
-          code: 'invalid_token',
-          message: 'access token does not belong to this user shard',
-          retryable: false,
-        }),
-      };
-    }
-
-    const hashedToken = hashOpaqueToken(accessToken);
-    const session = findSessionByHashedToken(this.persistence, 'access_token_hash', hashedToken);
+    const session = findSessionByHashedToken(
+      this.persistence,
+      'access_token_hash',
+      accessTokenHash ?? hashOpaqueToken(legacyAccessToken),
+    );
     const device = session?.device_id ? this.persistence.devices.get(session.device_id) : null;
     const usability = isSessionUsable({
       session,
@@ -890,6 +872,80 @@ export class UserDO extends BaseDurableObject {
     });
   }
 
+  async resolvePhase04PasswordChangeReplay() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const [request = {}] = arguments;
+    const userId = request?.user_id ?? null;
+    const requestFingerprint = request?.request_fingerprint ?? null;
+    const uiaNonce = request?.uia_nonce ?? null;
+    if (typeof userId !== 'string' || userId.length === 0) {
+      return createMatrixError(400, 'M_BAD_JSON', 'user_id must be present');
+    }
+    if (typeof requestFingerprint !== 'string' || requestFingerprint.length === 0) {
+      return createMatrixError(400, 'M_BAD_JSON', 'request_fingerprint must be present');
+    }
+    if (typeof uiaNonce !== 'string' || uiaNonce.length === 0) {
+      return createMatrixError(400, 'M_BAD_JSON', 'uia_nonce must be present');
+    }
+
+    const principal = this.persistence.userPrincipal.get();
+    if (!principal || principal.user_id !== userId) {
+      return createSuccessResult({ handled: false });
+    }
+
+    const phase04 = readPhase04Meta(principal);
+    const previousPasswordChange = phase04.password_change ?? null;
+    if (previousPasswordChange?.uia_nonce !== uiaNonce) {
+      return createSuccessResult({ handled: false });
+    }
+    if (previousPasswordChange.request_fingerprint === requestFingerprint) {
+      return createSuccessResult({
+        handled: true,
+        response: {},
+      });
+    }
+    return createMatrixError(409, 'M_CONFLICT', 'This UIA session was already used for a different password change');
+  }
+
+  async resolvePhase04DeactivateReplay() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const [request = {}] = arguments;
+    const userId = request?.user_id ?? null;
+    const requestFingerprint = request?.request_fingerprint ?? null;
+    const uiaNonce = request?.uia_nonce ?? null;
+    if (typeof userId !== 'string' || userId.length === 0) {
+      return createMatrixError(400, 'M_BAD_JSON', 'user_id must be present');
+    }
+    if (typeof requestFingerprint !== 'string' || requestFingerprint.length === 0) {
+      return createMatrixError(400, 'M_BAD_JSON', 'request_fingerprint must be present');
+    }
+    if (typeof uiaNonce !== 'string' || uiaNonce.length === 0) {
+      return createMatrixError(400, 'M_BAD_JSON', 'uia_nonce must be present');
+    }
+
+    const principal = this.persistence.userPrincipal.get();
+    if (!principal || principal.user_id !== userId) {
+      return createSuccessResult({ handled: false });
+    }
+
+    const phase04 = readPhase04Meta(principal);
+    const previousDeactivate = phase04.deactivate ?? null;
+    if (previousDeactivate?.uia_nonce !== uiaNonce) {
+      return createSuccessResult({ handled: false });
+    }
+    if (previousDeactivate.request_fingerprint === requestFingerprint) {
+      return createSuccessResult({
+        handled: true,
+        response: {
+          id_server_unbind_result: 'success',
+        },
+      });
+    }
+    return createMatrixError(409, 'M_CONFLICT', 'This UIA session was already used for a different deactivation request');
+  }
+
   async changePassword() {
     await this.ensureCurrentness();
     await this.ensureSchema();
@@ -904,6 +960,12 @@ export class UserDO extends BaseDurableObject {
     }
     if (typeof newPassword !== 'string' || newPassword.trim().length === 0) {
       return createMatrixError(400, 'M_MISSING_PARAM', 'new_password must be present');
+    }
+    if (typeof requestFingerprint !== 'string' || requestFingerprint.length === 0) {
+      return createMatrixError(400, 'M_BAD_JSON', 'request_fingerprint must be present');
+    }
+    if (typeof uiaNonce !== 'string' || uiaNonce.length === 0) {
+      return createMatrixError(400, 'M_BAD_JSON', 'uia_nonce must be present');
     }
 
     const sql = this.requireSqlStorage();
@@ -969,6 +1031,12 @@ export class UserDO extends BaseDurableObject {
     const erase = request?.erase === true;
     if (typeof userId !== 'string' || userId.length === 0) {
       return createMatrixError(400, 'M_BAD_JSON', 'user_id must be present');
+    }
+    if (typeof requestFingerprint !== 'string' || requestFingerprint.length === 0) {
+      return createMatrixError(400, 'M_BAD_JSON', 'request_fingerprint must be present');
+    }
+    if (typeof uiaNonce !== 'string' || uiaNonce.length === 0) {
+      return createMatrixError(400, 'M_BAD_JSON', 'uia_nonce must be present');
     }
 
     const sql = this.requireSqlStorage();

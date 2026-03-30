@@ -20,6 +20,7 @@ function makeGatewayEnv(overrides = {}) {
     MATRIX_MEDIA_MAX_UPLOAD_BYTES: '1048576',
     HOMESERVER_SIGNING_KEY_RING: 'hs-key-ring-v1',
     SESSION_ROOT_KEY_RING: 'session-key-ring-v1',
+    UIA_ROOT_KEY_RING: 'uia-key-ring-v1',
     APPSERVICE_TOKEN_SET: 'appservice-token-set-v1',
     FF_FEDERATION: 'false',
     FF_MEDIA_REMOTE_FETCH: 'false',
@@ -46,9 +47,10 @@ test('gateway runtime config validates explicit vars, feature gates, and secrets
   assert.equal(config.featureGates.otel_persist, true);
   assert.equal(config.featureGates.federation, false);
   assert.equal(config.secrets.require('session_root_key_ring'), 'session-key-ring-v1');
+  assert.equal(config.secrets.require('uia_root_key_ring'), 'uia-key-ring-v1');
   assert.deepEqual(
     config.secrets.names().sort(),
-    ['appservice_token_set', 'homeserver_signing_key_ring', 'session_root_key_ring'],
+    ['appservice_token_set', 'homeserver_signing_key_ring', 'session_root_key_ring', 'uia_root_key_ring'],
   );
 });
 

@@ -55,6 +55,7 @@ const TEST_ENV = {
   ACCESS_AUDIENCE: 'aud',
   HOMESERVER_SIGNING_KEY_RING: 'hs',
   SESSION_ROOT_KEY_RING: 'session',
+  UIA_ROOT_KEY_RING: 'uia',
   APPSERVICE_TOKEN_SET: 'appservices',
 };
 

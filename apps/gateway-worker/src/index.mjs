@@ -15,6 +15,7 @@ import {
   extractLoginLocalpart,
   getAccessTokenUserIdHint,
   getRefreshTokenUserIdHint,
+  hashOpaqueToken,
   issueUiaChallengeToken,
   normalizeLocalUserIdentifier,
   verifyUiaChallengeToken,
@@ -151,6 +152,10 @@ function buildRequestFingerprint(routeTemplate, principalId, body) {
   });
 }
 
+function getUiaSecretValue(env) {
+  return env.UIA_ROOT_KEY_RING;
+}
+
 function isRegistrationEnabled(env) {
   return String(env.MATRIX_REGISTRATION_ENABLED ?? 'true').trim().toLowerCase() !== 'false';
 }
@@ -184,7 +189,8 @@ async function requireAccessSession(request, env) {
 
   const userDo = getUserDoStub(env, hintedUserId);
   const result = await userDo.resolveSession({
-    access_token: accessToken,
+    access_token_hash: hashOpaqueToken(accessToken),
+    presented_at: new Date().toISOString(),
   });
   if (!result?.ok) {
     return {
@@ -218,7 +224,7 @@ function buildCapabilitiesResponse() {
 
 function buildUiaChallengeResponse(env, routeFamily, method, authSubjectHint = null) {
   const { token } = issueUiaChallengeToken({
-    secretValue: env.SESSION_ROOT_KEY_RING,
+    secretValue: getUiaSecretValue(env),
     routeFamily,
     method,
     authSubjectHint,
@@ -239,14 +245,83 @@ function buildUiaChallengeResponse(env, routeFamily, method, authSubjectHint = n
 function verifyRouteBoundUia(env, sessionToken, routeFamily, method) {
   const verification = verifyUiaChallengeToken({
     token: sessionToken,
-    secretValue: env.SESSION_ROOT_KEY_RING,
+    secretValue: getUiaSecretValue(env),
     expectedRouteFamily: routeFamily,
     expectedMethod: method,
   });
-  if (!verification.valid) {
-    return null;
+  if (verification.valid) {
+    return verification.payload;
   }
-  return verification.payload;
+
+  // Accept legacy signed UIA tokens during the rollout window where older
+  // deployments still issued them from the session key ring.
+  if (typeof sessionToken === 'string' && sessionToken.split('.').length === 4) {
+    const legacySecretValue = env.SESSION_ROOT_KEY_RING;
+    if (typeof legacySecretValue === 'string' && legacySecretValue.length > 0) {
+      const legacyVerification = verifyUiaChallengeToken({
+        token: sessionToken,
+        secretValue: legacySecretValue,
+        expectedRouteFamily: routeFamily,
+        expectedMethod: method,
+      });
+      if (legacyVerification.valid) {
+        return legacyVerification.payload;
+      }
+    }
+  }
+
+  return null;
+}
+
+function resolvePasswordUiaContext({
+  env,
+  auth,
+  accessSession,
+  hintedLocalpart,
+}) {
+  if (!auth || auth.type !== 'm.login.password' || typeof auth.session !== 'string') {
+    return { ok: false, reason: 'challenge' };
+  }
+
+  const payload = verifyRouteBoundUia(env, auth.session, auth.route_family, 'POST');
+  if (!payload) {
+    return { ok: false, reason: 'challenge' };
+  }
+
+  let localpart;
+  try {
+    localpart = accessSession
+      ? normalizeLocalUserIdentifier(accessSession.user_id, env.MATRIX_SERVER_NAME)
+      : hintedLocalpart;
+  } catch {
+    return { ok: false, reason: 'challenge' };
+  }
+
+  if (!localpart) {
+    return { ok: false, reason: 'challenge' };
+  }
+
+  const expectedUserId = buildLocalUserId(localpart, env.MATRIX_SERVER_NAME);
+  if (payload.auth_subject_hint && payload.auth_subject_hint !== expectedUserId) {
+    return {
+      ok: false,
+      response: matrixErrorResponse(403, 'M_FORBIDDEN', 'UIA session subject binding mismatch'),
+    };
+  }
+  if (accessSession && accessSession.user_id !== expectedUserId) {
+    return {
+      ok: false,
+      response: matrixErrorResponse(403, 'M_FORBIDDEN', 'UIA subject does not match the access token subject'),
+    };
+  }
+
+  return {
+    ok: true,
+    localpart,
+    user_id: expectedUserId,
+    user_do: getUserDoStub(env, expectedUserId),
+    payload,
+  };
 }
 
 async function handleWellKnownClient(url, env) {
@@ -473,84 +548,31 @@ async function handleWhoAmI(request, env) {
   });
 }
 
-async function verifyPasswordStage({
-  env,
-  auth,
-  accessSession,
-}) {
-  if (!auth || auth.type !== 'm.login.password' || typeof auth.session !== 'string') {
-    return { ok: false, reason: 'challenge' };
-  }
-
-  const payload = verifyRouteBoundUia(env, auth.session, auth.route_family, 'POST');
-  if (!payload) {
-    return { ok: false, reason: 'challenge' };
-  }
-
-  let localpart;
-  if (accessSession) {
-    localpart = normalizeLocalUserIdentifier(accessSession.user_id, env.MATRIX_SERVER_NAME);
-  } else {
-    const hintedLocalpart = getOptionalUiaLocalpart(auth, env.MATRIX_SERVER_NAME);
-    if (!hintedLocalpart) {
-      return { ok: false, reason: 'challenge' };
-    }
-    localpart = hintedLocalpart;
-  }
-  const expectedUserId = buildLocalUserId(localpart, env.MATRIX_SERVER_NAME);
-  if (payload.auth_subject_hint && payload.auth_subject_hint !== expectedUserId) {
-    return {
-      ok: false,
-      response: matrixErrorResponse(403, 'M_FORBIDDEN', 'UIA session subject binding mismatch'),
-    };
-  }
-  if (accessSession && accessSession.user_id !== expectedUserId) {
-    return {
-      ok: false,
-      response: matrixErrorResponse(403, 'M_FORBIDDEN', 'UIA subject does not match the access token subject'),
-    };
-  }
-
-  const verification = await getUserDoStub(env, expectedUserId).verifyPasswordAuth({
-    localpart,
-    password: auth.password ?? '',
-  });
-  if (!verification.ok) {
-    return {
-      ok: false,
-      response: jsonResponse(verification.matrix_error.body, verification.matrix_error.status),
-    };
-  }
-
-  return {
-    ok: true,
-    localpart,
-    user_id: verification.user_id,
-    user_do: getUserDoStub(env, expectedUserId),
-    payload,
-  };
-}
-
 async function handlePasswordChange(request, env) {
   const accessToken = getBearerToken(request);
   let accessSession = null;
-  if (accessToken) {
-    const access = await requireAccessSession(request, env);
-    if (!access.ok) {
-      return access.response;
-    }
-    accessSession = access;
-  }
+  let accessFailureResponse = null;
 
   const body = await readJsonObject(request);
   if (body instanceof Response) {
     return body;
+  }
+  if (accessToken) {
+    const access = await requireAccessSession(request, env);
+    if (access.ok) {
+      accessSession = access;
+    } else {
+      accessFailureResponse = access.response;
+    }
   }
   const auth = body.auth && typeof body.auth === 'object' && !Array.isArray(body.auth)
     ? { ...body.auth, route_family: 'account/password' }
     : null;
   const hintedLocalpart = getOptionalUiaLocalpart(auth, env.MATRIX_SERVER_NAME);
   if (!accessSession && !hintedLocalpart) {
+    if (accessFailureResponse) {
+      return accessFailureResponse;
+    }
     return matrixErrorResponse(400, 'M_MISSING_PARAM', 'user or identifier.user is required when no access token is supplied');
   }
   const authSubjectHint = accessSession?.session.user_id ?? buildLocalUserId(hintedLocalpart, env.MATRIX_SERVER_NAME);
@@ -558,10 +580,11 @@ async function handlePasswordChange(request, env) {
     return buildUiaChallengeResponse(env, 'account/password', 'POST', authSubjectHint);
   }
 
-  const stage = await verifyPasswordStage({
+  const stage = resolvePasswordUiaContext({
     env,
     auth,
     accessSession: accessSession?.session ?? null,
+    hintedLocalpart,
   });
   if (!stage.ok) {
     return stage.response ?? buildUiaChallengeResponse(env, 'account/password', 'POST', authSubjectHint);
@@ -569,8 +592,29 @@ async function handlePasswordChange(request, env) {
 
   const requestFingerprint = buildRequestFingerprint('/_matrix/client/v3/account/password', stage.user_id, {
     new_password: body.new_password ?? null,
-    logout_devices: body.logout_devices ?? null,
+    logout_devices: body.logout_devices === false ? false : true,
   });
+
+  const replay = await stage.user_do.resolvePhase04PasswordChangeReplay({
+    user_id: stage.user_id,
+    request_fingerprint: requestFingerprint,
+    uia_nonce: stage.payload.nonce,
+  });
+  if (!replay.ok) {
+    return jsonResponse(replay.matrix_error.body, replay.matrix_error.status);
+  }
+  if (replay.handled) {
+    return jsonResponse(replay.response);
+  }
+
+  const verification = await stage.user_do.verifyPasswordAuth({
+    localpart: stage.localpart,
+    password: auth.password ?? '',
+  });
+  if (!verification.ok) {
+    return jsonResponse(verification.matrix_error.body, verification.matrix_error.status);
+  }
+
   const result = await stage.user_do.changePassword({
     user_id: stage.user_id,
     current_session_id: accessSession?.session.session_id ?? null,
@@ -588,23 +632,28 @@ async function handlePasswordChange(request, env) {
 async function handleDeactivateAccount(request, env) {
   const accessToken = getBearerToken(request);
   let accessSession = null;
-  if (accessToken) {
-    const access = await requireAccessSession(request, env);
-    if (!access.ok) {
-      return access.response;
-    }
-    accessSession = access;
-  }
+  let accessFailureResponse = null;
 
   const body = await readJsonObject(request);
   if (body instanceof Response) {
     return body;
+  }
+  if (accessToken) {
+    const access = await requireAccessSession(request, env);
+    if (access.ok) {
+      accessSession = access;
+    } else {
+      accessFailureResponse = access.response;
+    }
   }
   const auth = body.auth && typeof body.auth === 'object' && !Array.isArray(body.auth)
     ? { ...body.auth, route_family: 'account/deactivate' }
     : null;
   const hintedLocalpart = getOptionalUiaLocalpart(auth, env.MATRIX_SERVER_NAME);
   if (!accessSession && !hintedLocalpart) {
+    if (accessFailureResponse) {
+      return accessFailureResponse;
+    }
     return matrixErrorResponse(400, 'M_MISSING_PARAM', 'user or identifier.user is required when no access token is supplied');
   }
   const authSubjectHint = accessSession?.session.user_id ?? buildLocalUserId(hintedLocalpart, env.MATRIX_SERVER_NAME);
@@ -612,10 +661,11 @@ async function handleDeactivateAccount(request, env) {
     return buildUiaChallengeResponse(env, 'account/deactivate', 'POST', authSubjectHint);
   }
 
-  const stage = await verifyPasswordStage({
+  const stage = resolvePasswordUiaContext({
     env,
     auth,
     accessSession: accessSession?.session ?? null,
+    hintedLocalpart,
   });
   if (!stage.ok) {
     return stage.response ?? buildUiaChallengeResponse(env, 'account/deactivate', 'POST', authSubjectHint);
@@ -624,6 +674,27 @@ async function handleDeactivateAccount(request, env) {
   const requestFingerprint = buildRequestFingerprint('/_matrix/client/v3/account/deactivate', stage.user_id, {
     erase: body.erase === true,
   });
+
+  const replay = await stage.user_do.resolvePhase04DeactivateReplay({
+    user_id: stage.user_id,
+    request_fingerprint: requestFingerprint,
+    uia_nonce: stage.payload.nonce,
+  });
+  if (!replay.ok) {
+    return jsonResponse(replay.matrix_error.body, replay.matrix_error.status);
+  }
+  if (replay.handled) {
+    return jsonResponse(replay.response);
+  }
+
+  const verification = await stage.user_do.verifyPasswordAuth({
+    localpart: stage.localpart,
+    password: auth.password ?? '',
+  });
+  if (!verification.ok) {
+    return jsonResponse(verification.matrix_error.body, verification.matrix_error.status);
+  }
+
   const result = await stage.user_do.deactivateAccount({
     user_id: stage.user_id,
     erase: body.erase === true,

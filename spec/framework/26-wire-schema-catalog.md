@@ -411,6 +411,7 @@
 | `device_id` | string or null | 设备 ID |
 | `session_id` | string | 会话 ID |
 | `auth_version` | integer | 必须与 `DATA-USER-017.auth_version` 对齐 |
+| `session_epoch` | integer | 必须与 `user_runtime_state.session_epoch` 对齐 |
 | `is_guest` | boolean | 访客标记 |
 | `expires_at` | string or null | 过期时间 |
 

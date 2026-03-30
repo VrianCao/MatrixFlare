@@ -252,6 +252,7 @@ export async function createControlPlaneRig({
     EXPORT_BUNDLE_KEY_RING: createExportKeyRingSecret(),
     HOMESERVER_SIGNING_KEY_RING: 'hs-key-ring',
     SESSION_ROOT_KEY_RING: 'session-root-key-ring',
+    UIA_ROOT_KEY_RING: 'uia-root-key-ring',
     APPSERVICE_TOKEN_SET: 'appservice-token-set',
     __ACCESS_FETCH__: accessFetch,
   };

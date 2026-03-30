@@ -58,6 +58,12 @@ function createDefaultEnv(overrides = {}) {
         v1: { secret_text: 'phase04-session-root-v1' },
       },
     }),
+    UIA_ROOT_KEY_RING: JSON.stringify({
+      active: 'v1',
+      keys: {
+        v1: { secret_text: 'phase04-uia-root-v1' },
+      },
+    }),
     APPSERVICE_TOKEN_SET: 'appservice-token-set',
     FF_FEDERATION: 'false',
     FF_MEDIA_REMOTE_FETCH: 'false',

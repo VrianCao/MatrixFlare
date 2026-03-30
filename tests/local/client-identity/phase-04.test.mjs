@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
+import { createHmac } from 'node:crypto';
 import test from 'node:test';
 
+import { parseSessionRootKeyRing } from '../../../packages/runtime-core/src/user-identity.mjs';
 import { createGatewayPhase04Rig } from './support.mjs';
 
 async function expectMatrixError(response, status, errcode) {
@@ -8,6 +10,40 @@ async function expectMatrixError(response, status, errcode) {
   const body = await response.json();
   assert.equal(body.errcode, errcode);
   return body;
+}
+
+function assertOpaqueUiaSessionToken(sessionToken) {
+  assert.equal(typeof sessionToken, 'string');
+  const parts = sessionToken.split('.');
+  assert.equal(parts[0], 'uia');
+  assert.equal(parts.length, 5);
+  assert.throws(() => JSON.parse(Buffer.from(parts[3], 'base64url').toString('utf8')));
+}
+
+function createLegacySignedUiaSessionToken({
+  secretValue,
+  routeFamily,
+  method,
+  authSubjectHint = null,
+  nonce = 'uia_legacy_rollout_overlap',
+  now = new Date().toISOString(),
+  ttlMs = 5 * 60 * 1000,
+}) {
+  const ring = parseSessionRootKeyRing(secretValue);
+  const payload = {
+    route_family: routeFamily,
+    method,
+    issued_at: now,
+    expires_at: new Date(Date.parse(now) + ttlMs).toISOString(),
+    auth_subject_hint: authSubjectHint,
+    completed_stages: [],
+    nonce,
+    root_key_version: ring.active_version,
+  };
+  const encodedPayload = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+  const signingInput = `uia.${ring.active_version}.${encodedPayload}`;
+  const signature = createHmac('sha256', ring.keys[ring.active_version]).update(signingInput).digest('base64url');
+  return `${signingInput}.${signature}`;
 }
 
 async function createRegisterChallenge(rig, {
@@ -26,6 +62,7 @@ async function createRegisterChallenge(rig, {
   assert.equal(challengeResponse.status, 401);
   const challengeBody = await challengeResponse.json();
   assert.deepEqual(challengeBody.flows, [{ stages: ['m.login.dummy'] }]);
+  assertOpaqueUiaSessionToken(challengeBody.session);
   return challengeBody;
 }
 
@@ -171,6 +208,12 @@ test('Phase 04 session lifecycle covers register, login, refresh, logout, whoami
   const aliceUserDo = rig.getUserDo('alice');
   await aliceUserDo.ensureSchema();
   assert.equal(aliceUserDo.persistence.sessions.list().length, 1);
+  const capturedResolveSessionRequests = [];
+  const originalResolveSession = aliceUserDo.resolveSession.bind(aliceUserDo);
+  aliceUserDo.resolveSession = async (request) => {
+    capturedResolveSessionRequests.push(request);
+    return originalResolveSession(request);
+  };
 
   const availabilityAfterRegister = await rig.gatewayFetch('/_matrix/client/v3/register/available?username=alice');
   await expectMatrixError(availabilityAfterRegister, 400, 'M_USER_IN_USE');
@@ -202,6 +245,12 @@ test('Phase 04 session lifecycle covers register, login, refresh, logout, whoami
     device_id: 'ALICEPHONE',
     is_guest: false,
   });
+  assert.ok(capturedResolveSessionRequests.length >= 2);
+  for (const envelope of capturedResolveSessionRequests) {
+    assert.equal(typeof envelope.access_token_hash, 'string');
+    assert.match(envelope.presented_at, /^\d{4}-\d{2}-\d{2}T/);
+    assert.equal('access_token' in envelope, false);
+  }
 
   const unsupportedLoginType = await rig.gatewayFetch('/_matrix/client/v3/login', {
     method: 'POST',
@@ -320,6 +369,7 @@ test('Phase 04 UIA routes enforce route binding, tokenless password UIA, and dea
   assert.equal(passwordChallenge.status, 401);
   const passwordChallengeBody = await passwordChallenge.json();
   assert.deepEqual(passwordChallengeBody.flows, [{ stages: ['m.login.password'] }]);
+  assertOpaqueUiaSessionToken(passwordChallengeBody.session);
 
   const reusedOnDeactivate = await rig.gatewayFetch('/_matrix/client/v3/account/deactivate', {
     method: 'POST',
@@ -356,6 +406,39 @@ test('Phase 04 UIA routes enforce route binding, tokenless password UIA, and dea
   assert.equal(passwordChange.status, 200);
   assert.deepEqual(await passwordChange.json(), {});
 
+  const passwordChangeReplay = await rig.gatewayFetch('/_matrix/client/v3/account/password', {
+    method: 'POST',
+    headers: rig.authHeaders(registration.access_token),
+    json: {
+      new_password: 'secret-two',
+      logout_devices: false,
+      auth: {
+        type: 'm.login.password',
+        session: passwordChallengeBody.session,
+        user: 'bob',
+        password: 'secret-one',
+      },
+    },
+  });
+  assert.equal(passwordChangeReplay.status, 200);
+  assert.deepEqual(await passwordChangeReplay.json(), {});
+
+  const passwordChangeReplayConflict = await rig.gatewayFetch('/_matrix/client/v3/account/password', {
+    method: 'POST',
+    headers: rig.authHeaders(registration.access_token),
+    json: {
+      new_password: 'secret-two-conflict',
+      logout_devices: false,
+      auth: {
+        type: 'm.login.password',
+        session: passwordChallengeBody.session,
+        user: 'bob',
+        password: 'secret-one',
+      },
+    },
+  });
+  await expectMatrixError(passwordChangeReplayConflict, 409, 'M_CONFLICT');
+
   const oldPasswordLogin = await loginWithPassword(rig, {
     user: 'bob',
     password: 'secret-one',
@@ -390,6 +473,7 @@ test('Phase 04 UIA routes enforce route binding, tokenless password UIA, and dea
   });
   assert.equal(tokenlessPasswordChallenge.status, 401);
   const tokenlessPasswordChallengeBody = await tokenlessPasswordChallenge.json();
+  assertOpaqueUiaSessionToken(tokenlessPasswordChallengeBody.session);
 
   const tokenlessPasswordChange = await rig.gatewayFetch('/_matrix/client/v3/account/password', {
     method: 'POST',
@@ -473,6 +557,7 @@ test('Phase 04 UIA routes enforce route binding, tokenless password UIA, and dea
   });
   assert.equal(deactivateChallenge.status, 401);
   const deactivateChallengeBody = await deactivateChallenge.json();
+  assertOpaqueUiaSessionToken(deactivateChallengeBody.session);
 
   const deactivate = await rig.gatewayFetch('/_matrix/client/v3/account/deactivate', {
     method: 'POST',
@@ -491,6 +576,39 @@ test('Phase 04 UIA routes enforce route binding, tokenless password UIA, and dea
   assert.deepEqual(await deactivate.json(), {
     id_server_unbind_result: 'success',
   });
+
+  const deactivateReplay = await rig.gatewayFetch('/_matrix/client/v3/account/deactivate', {
+    method: 'POST',
+    headers: rig.authHeaders(secondPasswordLoginBody.access_token),
+    json: {
+      erase: true,
+      auth: {
+        type: 'm.login.password',
+        session: deactivateChallengeBody.session,
+        user: 'bob',
+        password: 'secret-three',
+      },
+    },
+  });
+  assert.equal(deactivateReplay.status, 200);
+  assert.deepEqual(await deactivateReplay.json(), {
+    id_server_unbind_result: 'success',
+  });
+
+  const deactivateReplayConflict = await rig.gatewayFetch('/_matrix/client/v3/account/deactivate', {
+    method: 'POST',
+    headers: rig.authHeaders(secondPasswordLoginBody.access_token),
+    json: {
+      erase: false,
+      auth: {
+        type: 'm.login.password',
+        session: deactivateChallengeBody.session,
+        user: 'bob',
+        password: 'secret-three',
+      },
+    },
+  });
+  await expectMatrixError(deactivateReplayConflict, 409, 'M_CONFLICT');
 
   const loginAfterDeactivate = await loginWithPassword(rig, {
     user: 'bob',
@@ -513,6 +631,125 @@ test('Phase 04 UIA routes enforce route binding, tokenless password UIA, and dea
   assert.equal(userDo.persistence.pushRules.list().length, 0);
 });
 
+test('Phase 04 password change fingerprint normalizes omitted logout_devices to true', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const registration = await registerViaUia(rig, {
+    username: 'dave',
+    password: 'secret-one',
+    deviceId: 'DAVEPHONE',
+  });
+
+  const passwordChallenge = await rig.gatewayFetch('/_matrix/client/v3/account/password', {
+    method: 'POST',
+    headers: rig.authHeaders(registration.access_token),
+    json: {
+      new_password: 'secret-two',
+    },
+  });
+  assert.equal(passwordChallenge.status, 401);
+  const passwordChallengeBody = await passwordChallenge.json();
+  assertOpaqueUiaSessionToken(passwordChallengeBody.session);
+
+  const passwordChange = await rig.gatewayFetch('/_matrix/client/v3/account/password', {
+    method: 'POST',
+    headers: rig.authHeaders(registration.access_token),
+    json: {
+      new_password: 'secret-two',
+      auth: {
+        type: 'm.login.password',
+        session: passwordChallengeBody.session,
+        user: 'dave',
+        password: 'secret-one',
+      },
+    },
+  });
+  assert.equal(passwordChange.status, 200);
+  assert.deepEqual(await passwordChange.json(), {});
+
+  const replayWithExplicitTrue = await rig.gatewayFetch('/_matrix/client/v3/account/password', {
+    method: 'POST',
+    headers: rig.authHeaders(registration.access_token),
+    json: {
+      new_password: 'secret-two',
+      logout_devices: true,
+      auth: {
+        type: 'm.login.password',
+        session: passwordChallengeBody.session,
+        user: 'dave',
+        password: 'secret-one',
+      },
+    },
+  });
+  assert.equal(replayWithExplicitTrue.status, 200);
+  assert.deepEqual(await replayWithExplicitTrue.json(), {});
+
+  const replayWithExplicitFalse = await rig.gatewayFetch('/_matrix/client/v3/account/password', {
+    method: 'POST',
+    headers: rig.authHeaders(registration.access_token),
+    json: {
+      new_password: 'secret-two',
+      logout_devices: false,
+      auth: {
+        type: 'm.login.password',
+        session: passwordChallengeBody.session,
+        user: 'dave',
+        password: 'secret-one',
+      },
+    },
+  });
+  await expectMatrixError(replayWithExplicitFalse, 409, 'M_CONFLICT');
+});
+
+test('Phase 04 legacy UIA tokens remain valid during session-secret to UIA-secret rollout overlap', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  assert.notEqual(rig.env.SESSION_ROOT_KEY_RING, rig.env.UIA_ROOT_KEY_RING);
+
+  const registration = await registerViaUia(rig, {
+    username: 'erin',
+    password: 'secret-one',
+    deviceId: 'ERINPHONE',
+  });
+
+  const legacySessionToken = createLegacySignedUiaSessionToken({
+    secretValue: rig.env.SESSION_ROOT_KEY_RING,
+    routeFamily: 'account/password',
+    method: 'POST',
+    authSubjectHint: '@erin:matrix.example.test',
+  });
+
+  const passwordChange = await rig.gatewayFetch('/_matrix/client/v3/account/password', {
+    method: 'POST',
+    headers: rig.authHeaders(registration.access_token),
+    json: {
+      new_password: 'secret-two',
+      auth: {
+        type: 'm.login.password',
+        session: legacySessionToken,
+        user: 'erin',
+        password: 'secret-one',
+      },
+    },
+  });
+  assert.equal(passwordChange.status, 200);
+  assert.deepEqual(await passwordChange.json(), {});
+
+  const oldPasswordLogin = await loginWithPassword(rig, {
+    user: 'erin',
+    password: 'secret-one',
+  });
+  await expectMatrixError(oldPasswordLogin, 403, 'M_FORBIDDEN');
+
+  const newPasswordLogin = await loginWithPassword(rig, {
+    user: 'erin',
+    password: 'secret-two',
+  });
+  assert.equal(newPasswordLogin.status, 200);
+});
+
 test('Phase 04 deterministic stubs short-circuit before auth and discoverability stays closed', async (t) => {
   const rig = createGatewayPhase04Rig();
   t.after(() => rig.close());
@@ -523,22 +760,98 @@ test('Phase 04 deterministic stubs short-circuit before auth and discoverability
     deviceId: 'CAROLPHONE',
   });
 
-  for (const [method, path] of [
-    ['GET', '/_matrix/client/v1/auth_metadata'],
-    ['POST', '/_matrix/client/v1/login/get_token'],
-    ['GET', '/_matrix/client/v3/account/3pid'],
-    ['GET', '/_matrix/client/v3/joined_rooms'],
-    ['GET', '/_matrix/client/v3/notifications'],
-    ['GET', '/_matrix/client/v3/voip/turnServer'],
-    ['GET', '/_matrix/client/v3/events'],
-  ]) {
+  const stubbedRoutes = [
+    // IF-CS-065
+    ['GET', '/_matrix/client/v1/auth_metadata', null],
+    // IF-CS-059
+    ['GET', '/_matrix/client/v3/login/sso/redirect', null],
+    ['GET', '/_matrix/client/v3/login/sso/redirect/example', null],
+    ['POST', '/_matrix/client/v1/login/get_token', { type: 'm.login.token' }],
+    // IF-CS-007
+    ['POST', '/_matrix/client/v3/register/email/requestToken', { client_secret: 'disabled' }],
+    ['POST', '/_matrix/client/v3/register/msisdn/requestToken', { client_secret: 'disabled' }],
+    ['POST', '/_matrix/client/v3/account/password/email/requestToken', { client_secret: 'disabled' }],
+    ['POST', '/_matrix/client/v3/account/password/msisdn/requestToken', { client_secret: 'disabled' }],
+    // IF-CS-053
+    ['GET', '/_matrix/client/v3/joined_rooms', null],
+    ['GET', '/_matrix/client/v3/directory/room/room-alias', null],
+    ['PUT', '/_matrix/client/v3/directory/room/room-alias', { visibility: 'public' }],
+    ['DELETE', '/_matrix/client/v3/directory/room/room-alias', null],
+    ['GET', '/_matrix/client/v3/rooms/room-id/aliases', null],
+    ['GET', '/_matrix/client/v3/directory/list/room/room-id', null],
+    ['PUT', '/_matrix/client/v3/directory/list/room/room-id', { visibility: 'public' }],
+    ['GET', '/_matrix/client/v1/room_summary/room-id', null],
+    // IF-CS-054
+    ['GET', '/_matrix/client/v3/notifications', null],
+    // IF-CS-055
+    ['GET', '/_matrix/client/v3/pushers', null],
+    ['POST', '/_matrix/client/v3/pushers/set', { pushkey: 'disabled' }],
+    // IF-CS-056
+    ['POST', '/_matrix/client/v3/rooms/room-id/upgrade', { new_version: '12' }],
+    // IF-CS-057
+    ['POST', '/_matrix/client/v3/rooms/room-id/report', { reason: 'disabled' }],
+    ['POST', '/_matrix/client/v3/rooms/room-id/report/event-id', { reason: 'disabled' }],
+    ['POST', '/_matrix/client/v3/users/@user:matrix.example.test/report', { reason: 'disabled' }],
+    // IF-CS-058
+    ['GET', '/_matrix/client/v1/media/preview_url', null],
+    ['GET', '/_matrix/media/v3/preview_url', null],
+    // IF-CS-060
+    ['GET', '/_matrix/client/v3/account/3pid', null],
+    ['POST', '/_matrix/client/v3/account/3pid', { threepids: [] }],
+    ['POST', '/_matrix/client/v3/account/3pid/add', { client_secret: 'disabled' }],
+    ['POST', '/_matrix/client/v3/account/3pid/bind', { client_secret: 'disabled' }],
+    ['POST', '/_matrix/client/v3/account/3pid/delete', { address: 'disabled@example.test' }],
+    ['POST', '/_matrix/client/v3/account/3pid/email/requestToken', { client_secret: 'disabled' }],
+    ['POST', '/_matrix/client/v3/account/3pid/msisdn/requestToken', { client_secret: 'disabled' }],
+    ['POST', '/_matrix/client/v3/account/3pid/unbind', { address: 'disabled@example.test' }],
+    // IF-CS-061
+    ['GET', '/_matrix/client/v3/thirdparty/protocols', null],
+    ['GET', '/_matrix/client/v3/thirdparty/protocol/irc', null],
+    ['GET', '/_matrix/client/v3/thirdparty/location', null],
+    ['GET', '/_matrix/client/v3/thirdparty/location/irc', null],
+    ['GET', '/_matrix/client/v3/thirdparty/user', null],
+    ['GET', '/_matrix/client/v3/thirdparty/user/irc', null],
+    ['GET', '/_matrix/client/v3/admin/whois/@user:matrix.example.test', null],
+    // IF-CS-062
+    ['POST', '/_matrix/client/v3/user/@user:matrix.example.test/openid/request_token', { duration_seconds: 3600 }],
+    // IF-CS-063
+    ['GET', '/_matrix/client/v3/voip/turnServer', null],
+    // IF-CS-064
+    ['GET', '/_matrix/client/v3/events', null],
+    ['GET', '/_matrix/client/v3/events/event-id', null],
+    ['GET', '/_matrix/client/v3/initialSync', null],
+    ['GET', '/_matrix/client/v3/rooms/room-id/initialSync', null],
+  ];
+
+  for (const [method, path, json] of stubbedRoutes) {
     const response = await rig.gatewayFetch(path, {
       method,
       headers: rig.authHeaders('atk.invalid.token'),
+      json,
     });
     const body = await expectMatrixError(response, 404, 'M_UNRECOGNIZED');
     assert.equal(body.error, 'Unrecognized or unsupported endpoint');
   }
+
+  const originalUserDo = rig.env.USER_DO;
+  rig.env.USER_DO = {
+    idFromName() {
+      throw new Error('stubbed routes must short-circuit before Durable Object resolution');
+    },
+    get() {
+      throw new Error('stubbed routes must short-circuit before Durable Object resolution');
+    },
+  };
+  for (const [method, path, json] of stubbedRoutes) {
+    const response = await rig.gatewayFetch(path, {
+      method,
+      headers: rig.authHeaders(registration.access_token),
+      json,
+    });
+    const body = await expectMatrixError(response, 404, 'M_UNRECOGNIZED');
+    assert.equal(body.error, 'Unrecognized or unsupported endpoint');
+  }
+  rig.env.USER_DO = originalUserDo;
 
   const loginFlows = await rig.gatewayFetch('/_matrix/client/v3/login');
   const loginBody = await loginFlows.json();

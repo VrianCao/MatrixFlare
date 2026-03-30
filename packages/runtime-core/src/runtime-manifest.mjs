@@ -45,6 +45,7 @@ const WORKER_RUNTIME_MANIFEST = Object.freeze({
     secrets: Object.freeze({
       homeserver_signing_key_ring: 'HOMESERVER_SIGNING_KEY_RING',
       session_root_key_ring: 'SESSION_ROOT_KEY_RING',
+      uia_root_key_ring: 'UIA_ROOT_KEY_RING',
       appservice_token_set: 'APPSERVICE_TOKEN_SET',
     }),
     featureGates: Object.freeze([
