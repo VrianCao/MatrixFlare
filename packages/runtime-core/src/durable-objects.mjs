@@ -1,6 +1,18 @@
 import { createInternalErrorEnvelope } from '../../contracts/src/index.mjs';
+import {
+  REMOTE_SERVER_DO_SCHEMA_VERSION,
+  createRemoteServerDurableObjectPersistence,
+} from './remote-server-persistence.mjs';
+import {
+  ROOM_DO_SCHEMA_VERSION,
+  createRoomDurableObjectPersistence,
+} from './room-persistence.mjs';
 import { createAsyncTaskContext, createRequestContext } from './structured-logging.mjs';
 import { loadWorkerRuntimeConfig } from './runtime-manifest.mjs';
+import {
+  USER_DO_SCHEMA_VERSION,
+  createUserDurableObjectPersistence,
+} from './user-persistence.mjs';
 
 function jsonResponse(payload, status = 200) {
   return new Response(JSON.stringify(payload), {
@@ -79,10 +91,19 @@ export class BaseDurableObject {
       503,
     );
   }
+
+  requireSqlStorage() {
+    const sql = this.ctx?.storage?.sql;
+    if (!sql || typeof sql.exec !== 'function') {
+      throw new TypeError(`${this.options.className} requires SQLite-backed Durable Object storage`);
+    }
+    return sql;
+  }
 }
 
 export class UserDO extends BaseDurableObject {
   static authorityKind = 'user';
+  static schemaVersion = USER_DO_SCHEMA_VERSION;
 
   constructor(ctx, env) {
     super(ctx, env, {
@@ -93,24 +114,46 @@ export class UserDO extends BaseDurableObject {
     });
   }
 
+  get persistence() {
+    if (!this._persistence) {
+      this._persistence = createUserDurableObjectPersistence(this.requireSqlStorage());
+    }
+    return this._persistence;
+  }
+
+  async ensureSchema() {
+    await this.persistence.ensureSchema();
+    return this.persistence.getRuntimeState();
+  }
+
   async resolveSession() {
     await this.ensureCurrentness();
-    return this.createNotImplementedEnvelope('resolveSession');
+    await this.ensureSchema();
+    return this.createNotImplementedEnvelope('resolveSession', {
+      schema_version: UserDO.schemaVersion,
+    });
   }
 
   async collectSince() {
     await this.ensureCurrentness();
-    return this.createNotImplementedEnvelope('collectSince');
+    await this.ensureSchema();
+    return this.createNotImplementedEnvelope('collectSince', {
+      schema_version: UserDO.schemaVersion,
+    });
   }
 
   async enqueueToDevice() {
     await this.ensureCurrentness();
-    return this.createNotImplementedEnvelope('enqueueToDevice');
+    await this.ensureSchema();
+    return this.createNotImplementedEnvelope('enqueueToDevice', {
+      schema_version: UserDO.schemaVersion,
+    });
   }
 }
 
 export class RoomDO extends BaseDurableObject {
   static authorityKind = 'room';
+  static schemaVersion = ROOM_DO_SCHEMA_VERSION;
 
   constructor(ctx, env) {
     super(ctx, env, {
@@ -121,24 +164,46 @@ export class RoomDO extends BaseDurableObject {
     });
   }
 
+  get persistence() {
+    if (!this._persistence) {
+      this._persistence = createRoomDurableObjectPersistence(this.requireSqlStorage());
+    }
+    return this._persistence;
+  }
+
+  async ensureSchema() {
+    await this.persistence.ensureSchema();
+    return this.persistence.getRuntimeState();
+  }
+
   async admitEvent() {
     await this.ensureCurrentness();
-    return this.createNotImplementedEnvelope('admitEvent');
+    await this.ensureSchema();
+    return this.createNotImplementedEnvelope('admitEvent', {
+      schema_version: RoomDO.schemaVersion,
+    });
   }
 
   async projectForSync() {
     await this.ensureCurrentness();
-    return this.createNotImplementedEnvelope('projectForSync');
+    await this.ensureSchema();
+    return this.createNotImplementedEnvelope('projectForSync', {
+      schema_version: RoomDO.schemaVersion,
+    });
   }
 
   async queryRoom() {
     await this.ensureCurrentness();
-    return this.createNotImplementedEnvelope('queryRoom');
+    await this.ensureSchema();
+    return this.createNotImplementedEnvelope('queryRoom', {
+      schema_version: RoomDO.schemaVersion,
+    });
   }
 }
 
 export class RemoteServerDO extends BaseDurableObject {
   static authorityKind = 'remote-server';
+  static schemaVersion = REMOTE_SERVER_DO_SCHEMA_VERSION;
 
   constructor(ctx, env) {
     super(ctx, env, {
@@ -149,13 +214,31 @@ export class RemoteServerDO extends BaseDurableObject {
     });
   }
 
+  get persistence() {
+    if (!this._persistence) {
+      this._persistence = createRemoteServerDurableObjectPersistence(this.requireSqlStorage());
+    }
+    return this._persistence;
+  }
+
+  async ensureSchema() {
+    await this.persistence.ensureSchema();
+    return this.persistence.getRuntimeState();
+  }
+
   async enqueueOutbound() {
     await this.ensureCurrentness();
-    return this.createNotImplementedEnvelope('enqueueOutbound');
+    await this.ensureSchema();
+    return this.createNotImplementedEnvelope('enqueueOutbound', {
+      schema_version: RemoteServerDO.schemaVersion,
+    });
   }
 
   async recordInboundTxn() {
     await this.ensureCurrentness();
-    return this.createNotImplementedEnvelope('recordInboundTxn');
+    await this.ensureSchema();
+    return this.createNotImplementedEnvelope('recordInboundTxn', {
+      schema_version: RemoteServerDO.schemaVersion,
+    });
   }
 }

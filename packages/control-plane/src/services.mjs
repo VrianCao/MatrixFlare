@@ -2,6 +2,7 @@ import {
   parseInternalErrorEnvelope,
 } from '../../contracts/src/index.mjs';
 import {
+  buildExportBundleObjectKey,
   buildNormalizedRequestObject,
   canonicalizeJsonText,
   canonicalizeJsonValue,
@@ -638,9 +639,12 @@ export function buildArchiveObjectKey({
   scope,
   objectId,
 }) {
-  const normalizedScope = normalizeTargetScope(scope);
-  const scopeIdOrGlobal = normalizedScope.scope_kind === 'global' ? 'global' : normalizedScope.scope_id;
-  return `exports/${normalizeString(exportEpochOrImportBatch, 'exportEpochOrImportBatch')}/${normalizeString(artifactKind, 'artifactKind')}/${normalizedScope.scope_kind}/${scopeIdOrGlobal}/${normalizeString(objectId, 'objectId')}`;
+  return buildExportBundleObjectKey({
+    exportEpochOrImportBatch,
+    artifactKind,
+    scope,
+    objectId,
+  });
 }
 
 export function parseArchiveObjectKeyFromUri(uri) {

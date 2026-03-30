@@ -305,7 +305,7 @@
 
 ### 03.01 落地 `UserDO` schema
 
-- [ ] 建立 `DATA-USER-001`~`DATA-USER-017`。
+- [x] 建立 `DATA-USER-001`~`DATA-USER-017`。
   Spec refs: `24` 3, `30`
   产出:
   `UserDO` SQLite schema、schema_version、访问层。
@@ -314,7 +314,7 @@
 
 ### 03.02 落地 `RoomDO` schema
 
-- [ ] 建立 `DATA-ROOM-001`~`DATA-ROOM-012`。
+- [x] 建立 `DATA-ROOM-001`~`DATA-ROOM-012`。
   Spec refs: `24` 4, `31`
   产出:
   `RoomDO` SQLite schema、查询索引、fanout outbox、客户端幂等表。
@@ -323,7 +323,7 @@
 
 ### 03.03 落地 `RemoteServerDO` schema
 
-- [ ] 建立 `DATA-FED-001`~`DATA-FED-006`。
+- [x] 建立 `DATA-FED-001`~`DATA-FED-006`。
   Spec refs: `24` 5, `32`
   产出:
   `RemoteServerDO` SQLite schema、两阶段入站 txn 去重与结果缓存。
@@ -332,7 +332,7 @@
 
 ### 03.04 落地 D1 派生面与控制面 schema
 
-- [ ] 建立 `DATA-D1-001`~`DATA-D1-006`。
+- [x] 建立 `DATA-D1-001`~`DATA-D1-006`。
   Spec refs: `24` 6, `34`, `40`, `42`
   产出:
   search index、user directory、public rooms、media catalog、appservice config、operator authz policy 表。
@@ -341,12 +341,15 @@
 
 ### 03.05 落地 R2 / KV keyspace
 
-- [ ] 建立 `DATA-R2-001`~`DATA-R2-006`、`DATA-KV-001`~`DATA-KV-002` 的对象键空间和 metadata 规则。
+- [x] 建立 `DATA-R2-001`~`DATA-R2-006`、`DATA-KV-001`~`DATA-KV-002` 的对象键空间和 metadata 规则。
   Spec refs: `24` 7, `33`, `42`
   产出:
   key builders、metadata schema、读写封装。
   完成标准:
   本地媒体、远端媒体缓存、缩略图、房间冷归档、导出对象、backup segment 都可按固定模式落盘。
+
+验证:
+`tests/local/runtime-foundations/data-plane-storage.test.mjs`，`npm test`
 
 ## Phase 04: Discovery, Session, Identity, UIA, And Stub Guards
 
