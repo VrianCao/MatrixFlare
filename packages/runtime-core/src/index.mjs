@@ -16,6 +16,37 @@ export {
   createD1DerivedDataPersistence,
 } from './derived-d1-persistence.mjs';
 export {
+  applyMediaCatalogProjection,
+  applyPublicRoomDirectoryProjection,
+  applySearchIndexProjection,
+  applyUserDirectoryProjection,
+  clearDerivedTarget,
+  ensureDerivedSchema,
+  extractPublicRoomsQuery,
+  getDerivedPersistence,
+  lookupRoomAlias,
+  queryPublicRooms,
+  querySearchIndex,
+  queryUserDirectory,
+} from './derived-services.mjs';
+export {
+  DEFAULT_MEDIA_FETCH_TIMEOUT_MS,
+  DEFAULT_MEDIA_ORPHAN_RETENTION_MS,
+  DEFAULT_MEDIA_PENDING_UPLOAD_TTL_MS,
+  DEFAULT_MEDIA_THUMBNAIL_VARIANTS,
+  MAX_MEDIA_FETCH_TIMEOUT_MS,
+  buildMediaConfig,
+  buildMxcUri,
+  buildThumbnailBody,
+  buildThumbnailDescriptor,
+  computeLegacyUnauthAccessFlag,
+  createDefaultThumbnailJob,
+  normalizeDownloadOptions,
+  parseLegacyUnauthFreezeAt,
+  readBodyWithDigest,
+  readReadableStreamWithDigest,
+} from './media-domain.mjs';
+export {
   buildNormalizedRequestObject,
   canonicalJsonHash,
   createCanonicalFilterHash,
@@ -89,3 +120,10 @@ export {
   createSkeletonFetchHandler,
   createSkeletonQueueHandler,
 } from './worker-skeleton.mjs';
+export {
+  INTERNAL_RUNTIME_DERIVED_WORK_PATH,
+  RUNTIME_DERIVED_WORK_TYPES,
+  RUNTIME_JOB_SCHEMA_VERSION,
+  enqueueDerivedWork,
+  normalizeDerivedWorkBatch,
+} from './runtime-jobs.mjs';

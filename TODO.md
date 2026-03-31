@@ -584,7 +584,7 @@
 
 ### 07.01 实现本地媒体上传
 
-- [ ] 实现 `IF-CS-050`,`IF-INT-MEDIA-001`,`IF-INT-MEDIA-002`,`DATA-USER-015`,`DATA-R2-001`。
+- [x] 实现 `IF-CS-050`,`IF-INT-MEDIA-001`,`IF-INT-MEDIA-002`,`DATA-USER-015`,`DATA-R2-001`。
   Spec refs: `33` 2-3, `24` `DATA-USER-015`,`DATA-R2-001`, `25` `FLOW-CS-MEDIA-UPLOAD`
   产出:
   配额校验、pending upload、流式写 R2、finalize。
@@ -593,7 +593,7 @@
 
 ### 07.02 实现本地媒体下载与 legacy freeze 语义
 
-- [ ] 实现 `IF-CS-051`,`FLOW-CS-MEDIA-DOWNLOAD`,`DATA-R2-001`,`DATA-R2-002`,`DATA-R2-003`。
+- [x] 实现 `IF-CS-051`,`FLOW-CS-MEDIA-DOWNLOAD`,`DATA-R2-001`,`DATA-R2-002`,`DATA-R2-003`。
   Spec refs: `33` 4, 6, `24` 7, `25` `FLOW-CS-MEDIA-DOWNLOAD`
   产出:
   authenticated current routes、deprecated unauthenticated compatibility routes、freeze 判断。
@@ -602,7 +602,7 @@
 
 ### 07.03 实现远端媒体缓存
 
-- [ ] 实现 `FLOW-CS-REMOTE-MEDIA-FETCH` 和远端抓取护栏。
+- [x] 实现 `FLOW-CS-REMOTE-MEDIA-FETCH` 和远端抓取护栏。
   Spec refs: `33` 5, `25` `FLOW-CS-REMOTE-MEDIA-FETCH`, `13` `CF-WKR-006`
   产出:
   remote fetch pipeline、cache miss guard、same-key backoff。
@@ -611,7 +611,7 @@
 
 ### 07.04 实现缩略图与生命周期管理
 
-- [ ] 建立 thumbnail job、animated 变体隔离、orphan/pending 清理。
+- [x] 建立 thumbnail job、animated 变体隔离、orphan/pending 清理。
   Spec refs: `33` 6-7, `23` `IF-QUE-002`
   产出:
   thumbnail consumer、生命周期任务、清理逻辑。
@@ -620,7 +620,7 @@
 
 ### 07.05 实现搜索与目录派生面
 
-- [ ] 实现 `IF-CS-052`,`IF-INT-WKR-001`,`IF-QUE-001`,`DATA-D1-001`,`DATA-D1-002`,`DATA-D1-003`。
+- [x] 实现 `IF-CS-052`,`IF-INT-WKR-001`,`IF-QUE-001`,`DATA-D1-001`,`DATA-D1-002`,`DATA-D1-003`。
   Spec refs: `34` 2-5, `25` `FLOW-CS-SEARCH-QUERY`,`FLOW-SEARCH-INDEX`
   产出:
   index pipeline、query service、visibility fail-closed 逻辑，以及 `join/knock {roomIdOrAlias}` 所需的 alias lookup。
@@ -629,7 +629,7 @@
 
 ### 07.06 实现 rebuild 能力
 
-- [ ] 支持从 truth + archive 重建 search/user_directory/public_rooms。
+- [x] 支持从 truth + archive 重建 search/user_directory/public_rooms。
   Spec refs: `34` 3.4, `42` 10, `25` `FLOW-REPLAY-REBUILD`
   产出:
   rebuild job、checkpoint、重放逻辑。

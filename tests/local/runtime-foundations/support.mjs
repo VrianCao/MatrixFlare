@@ -90,9 +90,7 @@ export class FakeR2Bucket {
   }
 
   async put(key, value, options = {}) {
-    const body = typeof value === 'string' || Buffer.isBuffer(value) || value instanceof Uint8Array
-      ? value
-      : String(value);
+    const body = await readInputToBuffer(value);
     this.objects.set(key, {
       body,
       options,
@@ -106,18 +104,122 @@ export class FakeR2Bucket {
     }
     return {
       body: entry.body,
+      size: entry.body.byteLength,
+      etag: `"${key}"`,
+      key,
       customMetadata: entry.options.customMetadata ?? null,
       httpMetadata: entry.options.httpMetadata ?? null,
+      arrayBuffer: async () => entry.body.buffer.slice(
+        entry.body.byteOffset,
+        entry.body.byteOffset + entry.body.byteLength,
+      ),
       text: async () => (
-        typeof entry.body === 'string'
-          ? entry.body
-          : Buffer.from(entry.body).toString('utf8')
+        Buffer.from(entry.body).toString('utf8')
       ),
       json: async () => JSON.parse(
-        typeof entry.body === 'string'
-          ? entry.body
-          : Buffer.from(entry.body).toString('utf8'),
+        Buffer.from(entry.body).toString('utf8'),
       ),
+    };
+  }
+
+  async delete(key) {
+    this.objects.delete(key);
+  }
+
+  async head(key) {
+    const object = await this.get(key);
+    if (!object) {
+      return null;
+    }
+    return {
+      key,
+      size: object.size,
+      etag: object.etag,
+      customMetadata: object.customMetadata,
+      httpMetadata: object.httpMetadata,
+    };
+  }
+
+  async list({ prefix = '' } = {}) {
+    const objects = [...this.objects.entries()]
+      .filter(([key]) => key.startsWith(prefix))
+      .sort(([leftKey], [rightKey]) => leftKey.localeCompare(rightKey))
+      .map(([key, entry]) => ({
+        key,
+        size: entry.body.byteLength,
+        etag: `"${key}"`,
+        customMetadata: entry.options.customMetadata ?? null,
+        httpMetadata: entry.options.httpMetadata ?? null,
+      }));
+    return {
+      objects,
+      truncated: false,
+      cursor: null,
+      delimitedPrefixes: [],
+    };
+  }
+}
+
+async function readInputToBuffer(value) {
+  if (value == null) {
+    return Buffer.alloc(0);
+  }
+  if (typeof value === 'string') {
+    return Buffer.from(value, 'utf8');
+  }
+  if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
+    return Buffer.from(value);
+  }
+  if (value instanceof ArrayBuffer) {
+    return Buffer.from(value);
+  }
+  if (typeof value.arrayBuffer === 'function') {
+    return Buffer.from(await value.arrayBuffer());
+  }
+  if (typeof value.getReader === 'function') {
+    const reader = value.getReader();
+    const chunks = [];
+    while (true) {
+      const { done, value: chunk } = await reader.read();
+      if (done) {
+        break;
+      }
+      chunks.push(Buffer.from(chunk));
+    }
+    return Buffer.concat(chunks);
+  }
+  return Buffer.from(String(value), 'utf8');
+}
+
+export class FakeQueueBinding {
+  constructor(queueName) {
+    this.queueName = queueName;
+    this.messages = [];
+  }
+
+  async send(body) {
+    this.messages.push(body);
+  }
+
+  async sendBatch(bodies) {
+    this.messages.push(...bodies);
+  }
+
+  drainBatch() {
+    const drained = this.messages.splice(0);
+    return {
+      queue: this.queueName,
+      messages: drained.map((body) => ({
+        body,
+        acked: false,
+        retried: false,
+        ack() {
+          this.acked = true;
+        },
+        retry() {
+          this.retried = true;
+        },
+      })),
     };
   }
 }

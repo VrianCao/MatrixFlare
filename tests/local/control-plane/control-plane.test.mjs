@@ -2953,7 +2953,7 @@ test('jobs-worker fails staged unsupported export shard queue messages before wr
   }
 });
 
-test('jobs-worker routes non-control-plane consumer queues to placeholder handling', async () => {
+test('jobs-worker runtime consumer queues acknowledge malformed search jobs instead of falling through to placeholder handling', async () => {
   const rig = await createControlPlaneRig();
 
   try {
@@ -2975,7 +2975,7 @@ test('jobs-worker routes non-control-plane consumer queues to placeholder handli
       messages: [message],
     }, rig.jobsEnv);
 
-    assert.equal(message.acked, false);
+    assert.equal(message.acked, true);
     assert.equal(message.retried, false);
   } finally {
     rig.close();

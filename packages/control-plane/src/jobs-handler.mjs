@@ -1,5 +1,13 @@
 import { createInternalErrorEnvelope } from '../../contracts/src/index.mjs';
-import { createAsyncTaskContext, loadWorkerRuntimeConfig, makeId } from '../../runtime-core/src/index.mjs';
+import {
+  applyPublicRoomDirectoryProjection,
+  applySearchIndexProjection,
+  applyUserDirectoryProjection,
+  clearDerivedTarget,
+  createAsyncTaskContext,
+  loadWorkerRuntimeConfig,
+  makeId,
+} from '../../runtime-core/src/index.mjs';
 import {
   CONTROL_PLANE_SCHEMA_VERSION,
   QUEUE_NAMES,
@@ -503,6 +511,78 @@ async function runScopedFanoutRepair({
   });
 }
 
+async function executeRebuildAction({
+  job,
+  messageBody,
+  env,
+}) {
+  const target = messageBody.rebuild_target;
+  if (messageBody.shard_type === 'RoomDO') {
+    const roomDo = getDurableObjectStub(env.ROOM_DO, messageBody.shard_key, 'ROOM_DO');
+    const snapshot = await roomDo.exportDerivedShard({
+      updated_at: new Date().toISOString(),
+    });
+    if (!snapshot?.ok) {
+      throw snapshot?.error ?? new Error(`RoomDO exportDerivedShard failed for ${messageBody.shard_key}`);
+    }
+    if (target === 'search_index' || target === 'all_derived') {
+      await clearDerivedTarget(env, {
+        target: 'search_index',
+        roomId: messageBody.shard_key,
+      });
+      for (const row of snapshot.search_index_rows ?? []) {
+        await applySearchIndexProjection(env, row);
+      }
+    }
+    if (target === 'public_room_directory' || target === 'all_derived') {
+      await clearDerivedTarget(env, {
+        target: 'public_room_directory',
+        roomId: messageBody.shard_key,
+      });
+      if (snapshot.public_room_directory_entry) {
+        await applyPublicRoomDirectoryProjection(env, snapshot.public_room_directory_entry);
+      }
+    }
+    return {
+      rebuilt_kind: 'room',
+      room_id: messageBody.shard_key,
+      search_rows: snapshot.search_index_rows?.length ?? 0,
+      public_room_directory: snapshot.public_room_directory_entry ? 1 : 0,
+    };
+  }
+
+  if (messageBody.shard_type === 'UserDO') {
+    const userDo = getDurableObjectStub(env.USER_DO, messageBody.shard_key, 'USER_DO');
+    const snapshot = await userDo.getUserDirectoryEntry({
+      user_id: messageBody.shard_key,
+      updated_at: new Date().toISOString(),
+    });
+    if (!snapshot?.ok) {
+      throw snapshot?.error ?? new Error(`UserDO getUserDirectoryEntry failed for ${messageBody.shard_key}`);
+    }
+    if (target === 'user_directory' || target === 'all_derived') {
+      await clearDerivedTarget(env, {
+        target: 'user_directory',
+        userId: messageBody.shard_key,
+      });
+      if (snapshot.entry) {
+        await applyUserDirectoryProjection(env, snapshot.entry);
+      }
+    }
+    return {
+      rebuilt_kind: 'user',
+      user_id: messageBody.shard_key,
+      user_directory: snapshot.entry ? 1 : 0,
+    };
+  }
+
+  return {
+    rebuilt_kind: 'noop',
+    shard_type: messageBody.shard_type,
+    shard_key: messageBody.shard_key,
+  };
+}
+
 async function processQueueMessage({
   queueName,
   messageBody,
@@ -710,6 +790,16 @@ async function processQueueMessage({
       object_entries: matchedCheckpoint.checkpoint_manifest.objects ?? [],
       apply_phase: matchedCheckpoint.apply_phase,
     };
+  } else if (queueName === QUEUE_NAMES.rebuild) {
+    const rebuildSummary = await executeRebuildAction({
+      job,
+      messageBody,
+      env,
+    });
+    resultSummary = {
+      rebuild_target: messageBody.rebuild_target,
+      ...rebuildSummary,
+    };
   } else if (queueName === QUEUE_NAMES.repair) {
     const repairSummary = await executeRepairAction({
       job,
@@ -769,7 +859,9 @@ async function processQueueMessage({
     resultSummary: isTerminal ? {
       terminal_state: mapInternalJobStateToPublicState(terminalState),
       last_checkpoint_id: checkpointId,
-      ...(resultSummary == null ? {} : { repair_summary: resultSummary }),
+      ...(resultSummary == null ? {} : {
+        [queueName === QUEUE_NAMES.repair ? 'repair_summary' : (queueName === QUEUE_NAMES.rebuild ? 'rebuild_summary' : 'queue_summary')]: resultSummary,
+      }),
     } : null,
   });
   asyncContext.logger.info('jobs.queue.processed', {

@@ -548,6 +548,9 @@
 | `content_type` | string | MIME |
 | `declared_size` | integer | 客户端声明字节数 |
 | `sha256` | string or null | 若客户端已知可带上 |
+| `media_id` | string or null | `upload-by-ID` 时必须是 `create` 预留出的本地 media ID |
+| `reservation_only` | boolean | `true` 时只创建 pending grant，不写 R2 |
+| `require_existing` | boolean | `true` 时必须复用已存在的 pending grant，不得隐式新建 |
 
 #### `PendingUploadGrant`
 
@@ -557,16 +560,20 @@
 | `max_bytes` | integer | 本次允许的最大字节数 |
 | `allowed_content_types` | array | 允许 MIME 集 |
 | `expires_at` | string | 授权过期时间 |
+| `media_id` | string | 与本次授权绑定的本地 media ID |
+| `mxc_uri` | string | 对应的本地 `mxc://server/media_id` |
 
 #### `MediaFinalizeRequest`
 
 | Field | Type | Rule |
 | --- | --- | --- |
 | `pending_upload_id` | string | 上传授权 ID |
-| `r2_object_key` | string | 已写入对象键 |
-| `byte_size` | integer | 实际大小 |
-| `content_type` | string | 实际 MIME |
-| `sha256` | string | 对象 hash |
+| `finalize_state` | string | `completed`,`reverted`,`orphaned` 之一 |
+| `r2_object_key` | string or null | `completed` / `orphaned` 时为对象键，`reverted` 时可省略 |
+| `byte_size` | integer or null | `completed` 时必须带实际大小 |
+| `content_type` | string or null | `completed` 时必须带实际 MIME |
+| `sha256` | string or null | `completed` 时必须带对象 hash |
+| `error_message` | string or null | `reverted` / `orphaned` 时应带失败原因 |
 | `upload_completed_at` | string | RFC 3339 UTC |
 
 #### `MediaFinalizeAck`

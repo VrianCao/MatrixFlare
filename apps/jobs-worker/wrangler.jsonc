@@ -15,6 +15,7 @@
     "LOG_LEVEL": "info",
     "CPU_LIMIT_CLASS": "default",
     "MANAGEMENT_API_BASE_URL": "management_api_base_url-placeholder",
+    "MATRIX_MEDIA_LEGACY_UNAUTH_FREEZE_AT": "",
     "FF_FEDERATION": "false",
     "FF_MEDIA_REMOTE_FETCH": "false",
     "FF_APPSERVICE_API": "false",

@@ -17,6 +17,7 @@
     "MATRIX_PUBLIC_BASE_URL": "matrix_public_base_url-placeholder",
     "MANAGEMENT_API_BASE_URL": "management_api_base_url-placeholder",
     "MATRIX_MEDIA_MAX_UPLOAD_BYTES": 104857600,
+    "MATRIX_MEDIA_LEGACY_UNAUTH_FREEZE_AT": "",
     "FF_FEDERATION": "false",
     "FF_MEDIA_REMOTE_FETCH": "false",
     "FF_APPSERVICE_API": "false",

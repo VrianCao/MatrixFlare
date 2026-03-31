@@ -41,6 +41,7 @@ const WORKER_RUNTIME_MANIFEST = Object.freeze({
       MATRIX_PUBLIC_BASE_URL: { type: 'string', required: true },
       MANAGEMENT_API_BASE_URL: { type: 'string', required: true },
       MATRIX_MEDIA_MAX_UPLOAD_BYTES: { type: 'integer', required: false, default: 104857600 },
+      MATRIX_MEDIA_LEGACY_UNAUTH_FREEZE_AT: { type: 'string', required: false, default: '' },
     }),
     secrets: Object.freeze({
       homeserver_signing_key_ring: 'HOMESERVER_SIGNING_KEY_RING',
@@ -109,6 +110,7 @@ const WORKER_RUNTIME_MANIFEST = Object.freeze({
     vars: Object.freeze({
       ...SHARED_TEXT_BINDINGS,
       MANAGEMENT_API_BASE_URL: { type: 'string', required: true },
+      MATRIX_MEDIA_LEGACY_UNAUTH_FREEZE_AT: { type: 'string', required: false, default: '' },
     }),
     secrets: Object.freeze({
       export_bundle_key_ring: 'EXPORT_BUNDLE_KEY_RING',

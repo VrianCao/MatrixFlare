@@ -67,7 +67,13 @@ import {
   USER_DO_SCHEMA_VERSION,
   createUserDurableObjectPersistence,
 } from './user-persistence.mjs';
-import { canonicalJsonHash } from './fingerprints.mjs';
+import { canonicalJsonHash, makeId } from './fingerprints.mjs';
+import {
+  DEFAULT_MEDIA_ORPHAN_RETENTION_MS,
+  DEFAULT_MEDIA_PENDING_UPLOAD_TTL_MS,
+  buildMxcUri,
+} from './media-domain.mjs';
+import { enqueueDerivedWork, RUNTIME_JOB_SCHEMA_VERSION } from './runtime-jobs.mjs';
 
 function jsonResponse(payload, status = 200) {
   return new Response(JSON.stringify(payload), {
@@ -928,6 +934,258 @@ function mapMembershipVisibilityClass(membership) {
     return 'left';
   }
   return null;
+}
+
+function normalizePendingUploadState(value) {
+  const normalized = normalizeString(value, 'pending_upload_state');
+  if (!['pending', 'completed', 'reverted', 'orphaned', 'expired', 'cleaned'].includes(normalized)) {
+    throw new RangeError('pending_upload_state is not supported');
+  }
+  return normalized;
+}
+
+function collectSearchableTextFragments(value, fragments = []) {
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (trimmed.length > 0) {
+      fragments.push(trimmed);
+    }
+    return fragments;
+  }
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      collectSearchableTextFragments(entry, fragments);
+    }
+    return fragments;
+  }
+  if (value && typeof value === 'object') {
+    for (const entry of Object.values(value)) {
+      collectSearchableTextFragments(entry, fragments);
+    }
+  }
+  return fragments;
+}
+
+function buildSearchVectorText(event) {
+  const fragments = [];
+  if (typeof event?.type === 'string') {
+    fragments.push(event.type);
+  }
+  if (typeof event?.sender === 'string') {
+    fragments.push(event.sender);
+  }
+  collectSearchableTextFragments(event?.content ?? {}, fragments);
+  return fragments.join('\n').trim();
+}
+
+function getSingleStateContent(roomDo, stateMap, eventType, stateKey = '') {
+  const stateEntry = getTypedStateEvent(stateMap, eventType, stateKey);
+  if (!stateEntry) {
+    return null;
+  }
+  const event = roomDo.loadRoomEventById(stateEntry.event_id).event;
+  return isObjectRecord(event?.content) ? cloneJson(event.content) : null;
+}
+
+function buildUserDirectoryProjection(userDo, updatedAt = new Date().toISOString()) {
+  const principal = userDo.persistence.userPrincipal.get();
+  if (!principal || principal.deactivated_at_or_null) {
+    return null;
+  }
+  const profile = serializeProfileDocumentFromPersistence(userDo.persistence);
+  const profileVersion = getNextProfileVersion(userDo.persistence) - 1;
+  return {
+    user_id: principal.user_id,
+    displayname: typeof profile.displayname === 'string' ? profile.displayname : null,
+    avatar_url: typeof profile.avatar_url === 'string' ? profile.avatar_url : null,
+    profile_version: profileVersion > 0 ? profileVersion : 1,
+    directory_visibility: principal.erase_requested_flag ? 'hidden' : 'visible',
+    discovery_flags_json: {
+      password_login_enabled: principal.password_login_enabled !== false,
+      user_type: principal.user_type ?? null,
+    },
+    updated_at: updatedAt,
+    record_json: {
+      registration_source: principal.registration_source ?? null,
+      deactivated_at_or_null: principal.deactivated_at_or_null ?? null,
+      erase_requested_flag: principal.erase_requested_flag === true,
+    },
+  };
+}
+
+function resolveRoomDirectoryVisibility(roomDo, stateMap) {
+  const createEvent = getCreateEventFromStateMap(roomDo, stateMap);
+  const explicitVisibility = typeof createEvent?.unsigned?.directory_visibility === 'string'
+    ? createEvent.unsigned.directory_visibility
+    : (typeof createEvent?.unsigned?.public?.directory_visibility === 'string'
+      ? createEvent.unsigned.public.directory_visibility
+      : null);
+  if (explicitVisibility === 'public') {
+    return 'public';
+  }
+  return 'private';
+}
+
+function buildRoomDirectoryProjection(roomDo, {
+  updatedAt = new Date().toISOString(),
+} = {}) {
+  const runtimeState = roomDo.persistence.getRuntimeState();
+  const roomId = runtimeState?.room_id ?? null;
+  if (!roomId) {
+    return null;
+  }
+  const stateMap = roomDo.getCurrentStateMap();
+  const createEvent = getCreateEventFromStateMap(roomDo, stateMap);
+  const name = getSingleStateContent(roomDo, stateMap, 'm.room.name', '')?.name ?? null;
+  const topic = getSingleStateContent(roomDo, stateMap, 'm.room.topic', '')?.topic ?? null;
+  const avatarUrl = getSingleStateContent(roomDo, stateMap, 'm.room.avatar', '')?.url ?? null;
+  const canonicalAlias = getSingleStateContent(roomDo, stateMap, 'm.room.canonical_alias', '')?.alias ?? null;
+  const joinRules = getJoinRule(roomDo, stateMap);
+  const historyVisibility = getSingleStateContent(roomDo, stateMap, 'm.room.history_visibility', '')?.history_visibility ?? 'shared';
+  const guestCanJoin = getSingleStateContent(roomDo, stateMap, 'm.room.guest_access', '')?.guest_access === 'can_join';
+  const worldReadable = historyVisibility === 'world_readable';
+  const joinedMembers = [...stateMap.values()]
+    .filter((entry) => entry.event_type === 'm.room.member')
+    .map((entry) => roomDo.loadRoomEventById(entry.event_id).event)
+    .filter((event) => event?.content?.membership === 'join')
+    .length;
+  const roomSerial = Math.max(0, (runtimeState?.next_room_pos ?? 1) - 1);
+  const directoryVisibility = resolveRoomDirectoryVisibility(roomDo, stateMap);
+  return {
+    room_id: roomId,
+    canonical_alias: typeof canonicalAlias === 'string' ? canonicalAlias : null,
+    name: typeof name === 'string' ? name : null,
+    topic: typeof topic === 'string' ? topic : null,
+    avatar_url: typeof avatarUrl === 'string' ? avatarUrl : null,
+    join_rules: joinRules,
+    history_visibility: historyVisibility,
+    world_readable: worldReadable,
+    guest_can_join: guestCanJoin,
+    joined_members: joinedMembers,
+    room_serial: roomSerial,
+    visibility_watermark: roomSerial,
+    is_public: directoryVisibility === 'public',
+    updated_at: updatedAt,
+    record_json: {
+      directory_visibility: directoryVisibility,
+      room_version: runtimeState?.room_version ?? null,
+      create_event_id: createEvent?.event_id ?? null,
+    },
+  };
+}
+
+function buildSearchIndexProjection(roomDo, eventId, updatedAt = new Date().toISOString()) {
+  const metadata = roomDo.persistence.eventMetadata.get({ event_id: eventId });
+  if (!metadata || metadata.soft_failed_flag === true || metadata.waiting_missing_flag === true) {
+    return null;
+  }
+  const event = roomDo.loadRoomEventById(eventId).event;
+  return {
+    event_id: metadata.event_id,
+    room_id: roomDo.persistence.getRuntimeState()?.room_id ?? event.room_id ?? null,
+    event_type: metadata.event_type,
+    origin_server_ts: metadata.origin_server_ts,
+    sender_user_id: metadata.sender_user_id,
+    search_vector_text: buildSearchVectorText(event),
+    visibility_scope: metadata.membership_visibility_class ?? metadata.history_visibility_class ?? 'shared',
+    updated_at: updatedAt,
+    record_json: {
+      room_pos: metadata.room_pos,
+      room_version: metadata.record?.room_version ?? null,
+      redacts_event_id_or_null: metadata.redacts_event_id_or_null ?? null,
+      relates_to_event_id_or_null: metadata.relates_to_event_id_or_null ?? null,
+    },
+  };
+}
+
+function buildPendingUploadId(mediaId) {
+  return `upload_${normalizeString(mediaId, 'mediaId')}`;
+}
+
+function buildPendingUploadGrantView(grantRecord, serverName) {
+  const record = grantRecord?.record ?? {};
+  const mediaId = grantRecord?.media_id ?? record.media_id ?? null;
+  const mxcUri = mediaId ? buildMxcUri(serverName, mediaId) : null;
+  return {
+    pending_upload_id: grantRecord.pending_upload_id,
+    max_bytes: grantRecord.max_bytes,
+    allowed_content_types: Array.isArray(record.allowed_content_types) && record.allowed_content_types.length > 0
+      ? record.allowed_content_types
+      : (grantRecord.content_type ? [grantRecord.content_type] : ['application/octet-stream']),
+    expires_at: grantRecord.expires_at,
+    media_id: mediaId,
+    mxc_uri: mxcUri,
+  };
+}
+
+function sweepPendingUploadGrants(userDo, nowIso, { applyChanges = false } = {}) {
+  const nowMs = Date.parse(normalizeString(nowIso, 'nowIso'));
+  const orphanCleanup = [];
+  let nextAlarmAtMs = Number.POSITIVE_INFINITY;
+  for (const grant of userDo.persistence.pendingUploadGrants.list()) {
+    const state = normalizePendingUploadState(grant.state);
+    const expiresAtMs = Date.parse(grant.expires_at);
+    if (state === 'pending') {
+      if (Number.isFinite(expiresAtMs) && expiresAtMs <= nowMs) {
+        if (applyChanges) {
+          userDo.persistence.pendingUploadGrants.put({
+            pending_upload_id: grant.pending_upload_id,
+            media_id: grant.media_id,
+            content_type: grant.content_type,
+            max_bytes: grant.max_bytes,
+            state: 'expired',
+            granted_at: grant.granted_at,
+            expires_at: grant.expires_at,
+            finalized_at: nowIso,
+            record_json: {
+              ...(grant.record ?? {}),
+              expired_at: nowIso,
+            },
+          });
+        }
+      } else if (Number.isFinite(expiresAtMs)) {
+        nextAlarmAtMs = Math.min(nextAlarmAtMs, expiresAtMs);
+      }
+      continue;
+    }
+    if (state !== 'orphaned') {
+      continue;
+    }
+    const orphanDeadlineMs = Date.parse(grant.finalized_at ?? grant.expires_at) + DEFAULT_MEDIA_ORPHAN_RETENTION_MS;
+    if (Number.isFinite(orphanDeadlineMs) && orphanDeadlineMs <= nowMs) {
+      const objectKey = typeof grant.record?.r2_object_key === 'string' ? grant.record.r2_object_key : null;
+      if (objectKey) {
+        orphanCleanup.push({
+          pending_upload_id: grant.pending_upload_id,
+          r2_object_key: objectKey,
+        });
+      }
+      if (applyChanges) {
+        userDo.persistence.pendingUploadGrants.put({
+          pending_upload_id: grant.pending_upload_id,
+          media_id: grant.media_id,
+          content_type: grant.content_type,
+          max_bytes: grant.max_bytes,
+          state: 'cleaned',
+          granted_at: grant.granted_at,
+          expires_at: grant.expires_at,
+          finalized_at: grant.finalized_at ?? nowIso,
+          record_json: {
+            ...(grant.record ?? {}),
+            cleanup_requested_at: nowIso,
+          },
+        });
+      }
+      continue;
+    }
+    if (Number.isFinite(orphanDeadlineMs)) {
+      nextAlarmAtMs = Math.min(nextAlarmAtMs, orphanDeadlineMs);
+    }
+  }
+  return {
+    orphan_cleanup: orphanCleanup,
+    next_alarm_at: Number.isFinite(nextAlarmAtMs) ? new Date(nextAlarmAtMs).toISOString() : null,
+  };
 }
 
 function isReadableRoomMembership(membership) {
@@ -3382,6 +3640,248 @@ export class UserDO extends BaseDurableObject {
     });
   }
 
+  async scheduleMediaLifecycleAlarm(nextAlarmAt) {
+    if (nextAlarmAt) {
+      await this.ctx.storage.setAlarm(Date.parse(nextAlarmAt));
+      return;
+    }
+    await this.ctx.storage.deleteAlarm?.();
+  }
+
+  async cleanupOrphanedMediaObjects(entries = []) {
+    if (!Array.isArray(entries) || entries.length === 0) {
+      return;
+    }
+    const bucket = this.env.MATRIX_MEDIA_BUCKET;
+    if (!bucket || typeof bucket.delete !== 'function') {
+      return;
+    }
+    for (const entry of entries) {
+      if (typeof entry?.r2_object_key !== 'string' || entry.r2_object_key.length === 0) {
+        continue;
+      }
+      try {
+        await bucket.delete(entry.r2_object_key);
+      } catch {
+        // Cleanup is best-effort; a later sweep can retry.
+      }
+    }
+  }
+
+  async beginMediaUpload() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const [request = {}] = arguments;
+    const principal = this.persistence.userPrincipal.get();
+    const userId = normalizeString(request?.user_id ?? principal?.user_id, 'request.user_id');
+    if (!principal || principal.user_id !== userId || principal.deactivated_at_or_null) {
+      return {
+        ok: false,
+        error: createInternalErrorEnvelope({
+          code: 'target_not_local',
+          message: 'Target user does not exist on this homeserver',
+          retryable: false,
+        }),
+      };
+    }
+    const declaredSize = normalizeInteger(request?.declared_size ?? 0, 'request.declared_size', { min: 0 });
+    const maxBytes = normalizeInteger(
+      request?.max_bytes ?? this.config.text.MATRIX_MEDIA_MAX_UPLOAD_BYTES,
+      'request.max_bytes',
+      { min: 1 },
+    );
+    if (declaredSize > maxBytes) {
+      return {
+        ok: false,
+        error: createInternalErrorEnvelope({
+          code: 'content_too_large',
+          message: `Media upload exceeds the ${maxBytes} byte limit`,
+          retryable: false,
+        }),
+      };
+    }
+    const contentType = normalizeString(request?.content_type ?? 'application/octet-stream', 'request.content_type');
+    const now = request?.now ?? new Date().toISOString();
+    let sweepResult = {
+      orphan_cleanup: [],
+      next_alarm_at: null,
+    };
+    let grant = null;
+    const sql = this.requireSqlStorage();
+    withSqliteTransaction(sql, () => {
+      sweepResult = sweepPendingUploadGrants(this, now, { applyChanges: true });
+      const mediaId = request?.media_id == null
+        ? makeId('media')
+        : normalizeString(request.media_id, 'request.media_id');
+      const pendingUploadId = buildPendingUploadId(mediaId);
+      const existingGrant = this.persistence.pendingUploadGrants.get({ pending_upload_id: pendingUploadId });
+      if (existingGrant && normalizePendingUploadState(existingGrant.state) === 'pending') {
+        grant = buildPendingUploadGrantView(existingGrant, this.env.MATRIX_SERVER_NAME);
+        return;
+      }
+      if (request?.require_existing === true) {
+        throw createInternalErrorEnvelope({
+          code: 'upload_not_found',
+          message: `Pending upload ${pendingUploadId} does not exist`,
+          retryable: false,
+        });
+      }
+      const activePendingCount = this.persistence.pendingUploadGrants.list()
+        .filter((row) => normalizePendingUploadState(row.state) === 'pending')
+        .length;
+      if (activePendingCount >= 8) {
+        throw createInternalErrorEnvelope({
+          code: 'quota_exceeded',
+          message: 'Too many concurrent pending uploads',
+          retryable: true,
+        });
+      }
+      const expiresAt = isoAfter(now, DEFAULT_MEDIA_PENDING_UPLOAD_TTL_MS);
+      const row = this.persistence.pendingUploadGrants.put({
+        pending_upload_id: pendingUploadId,
+        media_id: mediaId,
+        content_type: contentType,
+        max_bytes: maxBytes,
+        state: 'pending',
+        granted_at: now,
+        expires_at: expiresAt,
+        finalized_at: null,
+        record_json: {
+          allowed_content_types: [contentType],
+          device_id: request?.device_id ?? null,
+          filename: request?.filename ?? null,
+          request_fingerprint: request?.request_fingerprint ?? null,
+          reservation_only: request?.reservation_only === true,
+          sha256: request?.sha256 ?? null,
+        },
+      });
+      grant = buildPendingUploadGrantView(row, this.env.MATRIX_SERVER_NAME);
+      const alarmAt = sweepResult.next_alarm_at == null
+        ? expiresAt
+        : (Date.parse(sweepResult.next_alarm_at) < Date.parse(expiresAt) ? sweepResult.next_alarm_at : expiresAt);
+      sweepResult = {
+        ...sweepResult,
+        next_alarm_at: alarmAt,
+      };
+    });
+    await this.scheduleMediaLifecycleAlarm(sweepResult.next_alarm_at);
+    await this.cleanupOrphanedMediaObjects(sweepResult.orphan_cleanup);
+    return createSuccessResult({
+      grant,
+    });
+  }
+
+  async finalizeMediaUpload() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const [request = {}] = arguments;
+    const pendingUploadId = normalizeString(request?.pending_upload_id, 'request.pending_upload_id');
+    const finalizeState = normalizePendingUploadState(request?.finalize_state ?? 'completed');
+    const now = normalizeString(request?.upload_completed_at ?? request?.now ?? new Date().toISOString(), 'request.upload_completed_at');
+    let sweepResult = {
+      orphan_cleanup: [],
+      next_alarm_at: null,
+    };
+    let ack = null;
+    const sql = this.requireSqlStorage();
+    withSqliteTransaction(sql, () => {
+      sweepResult = sweepPendingUploadGrants(this, now, { applyChanges: true });
+      const grant = this.persistence.pendingUploadGrants.get({ pending_upload_id: pendingUploadId });
+      if (!grant) {
+        throw createInternalErrorEnvelope({
+          code: 'upload_not_found',
+          message: `Pending upload ${pendingUploadId} does not exist`,
+          retryable: false,
+        });
+      }
+      const currentState = normalizePendingUploadState(grant.state);
+      if (currentState === 'completed') {
+        ack = {
+          mxc_uri: grant.record?.mxc_uri ?? buildMxcUri(this.env.MATRIX_SERVER_NAME, grant.media_id),
+          media_id: grant.media_id,
+          catalog_visibility: 'pending',
+          thumbnail_job_enqueued: false,
+        };
+        return;
+      }
+      if (currentState !== 'pending') {
+        throw createInternalErrorEnvelope({
+          code: 'upload_not_found',
+          message: `Pending upload ${pendingUploadId} is already terminal`,
+          retryable: false,
+        });
+      }
+      const recordJson = {
+        ...(grant.record ?? {}),
+        finalized_at: now,
+      };
+      if (finalizeState === 'completed') {
+        recordJson.r2_object_key = normalizeString(request?.r2_object_key, 'request.r2_object_key');
+        recordJson.byte_size = normalizeInteger(request?.byte_size, 'request.byte_size', { min: 0 });
+        recordJson.content_type = normalizeString(request?.content_type ?? grant.content_type, 'request.content_type');
+        recordJson.sha256 = normalizeString(request?.sha256, 'request.sha256');
+        recordJson.mxc_uri = buildMxcUri(this.env.MATRIX_SERVER_NAME, grant.media_id);
+        ack = {
+          mxc_uri: recordJson.mxc_uri,
+          media_id: grant.media_id,
+          catalog_visibility: 'pending',
+          thumbnail_job_enqueued: false,
+        };
+      } else {
+        recordJson.finalize_error = normalizeString(
+          request?.error_message ?? (finalizeState === 'reverted' ? 'R2 upload failed' : 'Finalize failed after object write'),
+          'request.error_message',
+        );
+        if (finalizeState === 'orphaned') {
+          recordJson.r2_object_key = normalizeString(request?.r2_object_key, 'request.r2_object_key');
+        }
+      }
+      this.persistence.pendingUploadGrants.put({
+        pending_upload_id: grant.pending_upload_id,
+        media_id: grant.media_id,
+        content_type: recordJson.content_type ?? grant.content_type,
+        max_bytes: grant.max_bytes,
+        state: finalizeState,
+        granted_at: grant.granted_at,
+        expires_at: grant.expires_at,
+        finalized_at: now,
+        record_json: recordJson,
+      });
+      if (finalizeState === 'orphaned') {
+        const orphanAlarmAt = new Date(Date.parse(now) + DEFAULT_MEDIA_ORPHAN_RETENTION_MS).toISOString();
+        sweepResult = {
+          ...sweepResult,
+          next_alarm_at: sweepResult.next_alarm_at == null
+            ? orphanAlarmAt
+            : (Date.parse(sweepResult.next_alarm_at) < Date.parse(orphanAlarmAt) ? sweepResult.next_alarm_at : orphanAlarmAt),
+        };
+      }
+    });
+    await this.scheduleMediaLifecycleAlarm(sweepResult.next_alarm_at);
+    await this.cleanupOrphanedMediaObjects(sweepResult.orphan_cleanup);
+    return createSuccessResult({
+      ack,
+    });
+  }
+
+  async getUserDirectoryEntry() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const [request = {}] = arguments;
+    const userId = request?.user_id == null
+      ? this.persistence.userPrincipal.get()?.user_id ?? null
+      : normalizeString(request.user_id, 'request.user_id');
+    const principal = this.persistence.userPrincipal.get();
+    if (!principal || principal.user_id !== userId) {
+      return createSuccessResult({
+        entry: null,
+      });
+    }
+    return createSuccessResult({
+      entry: buildUserDirectoryProjection(this, request?.updated_at ?? new Date().toISOString()),
+    });
+  }
+
   async resolvePhase04PasswordChangeReplay() {
     await this.ensureCurrentness();
     await this.ensureSchema();
@@ -3627,6 +4127,26 @@ export class UserDO extends BaseDurableObject {
         },
       });
     });
+  }
+
+  async alarm(alarmInfo = {}) {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const now = new Date(
+      Number.isFinite(alarmInfo?.scheduledTime)
+        ? alarmInfo.scheduledTime
+        : Date.now(),
+    ).toISOString();
+    const sql = this.requireSqlStorage();
+    let sweepResult = {
+      orphan_cleanup: [],
+      next_alarm_at: null,
+    };
+    withSqliteTransaction(sql, () => {
+      sweepResult = sweepPendingUploadGrants(this, now, { applyChanges: true });
+    });
+    await this.cleanupOrphanedMediaObjects(sweepResult.orphan_cleanup);
+    await this.scheduleMediaLifecycleAlarm(sweepResult.next_alarm_at);
   }
 }
 
@@ -4276,6 +4796,14 @@ export class RoomDO extends BaseDurableObject {
           now,
         });
       }
+      await this.enqueueDerivedUpdates({
+        event_id: eventId,
+        room_id: roomId,
+        room_pos: roomPos,
+        visibility_watermark: roomPos,
+        redaction_watermark: roomPos,
+        updated_at: now,
+      });
       return createSuccessResult({
         decision: 'accepted',
         event_id: eventId,
@@ -5345,6 +5873,171 @@ export class RoomDO extends BaseDurableObject {
         error,
       };
     }
+  }
+
+  async enqueueDerivedUpdates({
+    event_id,
+    room_id,
+    room_pos,
+    visibility_watermark,
+    redaction_watermark,
+    updated_at = new Date().toISOString(),
+  }) {
+    if (!this.env?.JOBS_WORKER) {
+      return;
+    }
+    try {
+      await enqueueDerivedWork(this.env, {
+        schema_version: RUNTIME_JOB_SCHEMA_VERSION,
+        batch_id: makeId('derived'),
+        requested_by: 'RoomDO.admitEvent',
+        work_items: [
+          {
+            work_type: 'search_index',
+            idempotency_key: normalizeString(event_id, 'event_id'),
+            scope: {
+              scope_kind: 'room_id',
+              scope_id: normalizeString(room_id, 'room_id'),
+            },
+            source_refs: {
+              room_id,
+              event_id,
+              room_pos: normalizeInteger(room_pos, 'room_pos', { min: 1 }),
+              visibility_watermark: normalizeInteger(visibility_watermark, 'visibility_watermark', { min: 1 }),
+              redaction_watermark: normalizeInteger(redaction_watermark, 'redaction_watermark', { min: 1 }),
+            },
+            enqueued_at: updated_at,
+          },
+          {
+            work_type: 'public_room_directory',
+            idempotency_key: `public_room_directory:${room_id}`,
+            scope: {
+              scope_kind: 'room_id',
+              scope_id: room_id,
+            },
+            source_refs: {
+              room_id,
+            },
+            enqueued_at: updated_at,
+          },
+        ],
+      });
+    } catch {
+      // Derived work is best-effort. Rebuild remains the repair path.
+    }
+  }
+
+  async getDerivedEventProjection() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const [request = {}] = arguments;
+    const eventId = normalizeString(request?.event_id, 'request.event_id');
+    return createSuccessResult({
+      search_index: buildSearchIndexProjection(this, eventId, request?.updated_at ?? new Date().toISOString()),
+    });
+  }
+
+  async getPublicRoomDirectoryEntry() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    return createSuccessResult({
+      entry: buildRoomDirectoryProjection(this),
+    });
+  }
+
+  async resolveRoomAlias() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const [request = {}] = arguments;
+    const alias = normalizeString(request?.alias, 'request.alias');
+    const entry = buildRoomDirectoryProjection(this);
+    if (entry?.canonical_alias === alias) {
+      return createSuccessResult({
+        room_id: entry.room_id,
+      });
+    }
+    return createSuccessResult({
+      room_id: null,
+    });
+  }
+
+  async loadRoomEventForRebuild(eventId) {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const metadata = this.persistence.eventMetadata.get({ event_id: normalizeString(eventId, 'eventId') });
+    if (!metadata) {
+      throw createRoomInternalError('event_not_found', `Event ${eventId} does not exist`);
+    }
+    const hotEvent = this.persistence.hotEventJson.get({ event_id: eventId });
+    if (hotEvent) {
+      return {
+        metadata,
+        event: parseCanonicalRoomEvent(hotEvent),
+      };
+    }
+    const archiveKey = metadata.archive_object_key_or_segment_id ?? null;
+    if (typeof archiveKey !== 'string' || archiveKey.length === 0) {
+      throw createInternalErrorEnvelope({
+        code: 'archive_missing',
+        message: `Room event ${eventId} JSON is missing`,
+        retryable: false,
+      });
+    }
+    const archiveBucket = this.env.MATRIX_ARCHIVE_BUCKET;
+    const archived = archiveBucket && typeof archiveBucket.get === 'function'
+      ? await archiveBucket.get(archiveKey)
+      : null;
+    if (!archived) {
+      throw createInternalErrorEnvelope({
+        code: 'archive_missing',
+        message: `Room event ${eventId} archive object ${archiveKey} is missing`,
+        retryable: false,
+      });
+    }
+    let event;
+    if (typeof archived.json === 'function') {
+      event = await archived.json();
+    } else if (typeof archived.text === 'function') {
+      event = JSON.parse(await archived.text());
+    } else {
+      event = JSON.parse(Buffer.from(archived.body).toString('utf8'));
+    }
+    return {
+      metadata,
+      event,
+    };
+  }
+
+  async exportDerivedShard() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const [request = {}] = arguments;
+    const updatedAt = request?.updated_at ?? new Date().toISOString();
+    const searchIndexRows = [];
+    for (const metadata of this.listVisibleTimelineMetadata()) {
+      const loaded = await this.loadRoomEventForRebuild(metadata.event_id);
+      searchIndexRows.push({
+        event_id: metadata.event_id,
+        room_id: this.persistence.getRuntimeState()?.room_id ?? loaded.event.room_id ?? null,
+        event_type: metadata.event_type,
+        origin_server_ts: metadata.origin_server_ts,
+        sender_user_id: metadata.sender_user_id,
+        search_vector_text: buildSearchVectorText(loaded.event),
+        visibility_scope: metadata.membership_visibility_class ?? metadata.history_visibility_class ?? 'shared',
+        updated_at: updatedAt,
+        record_json: {
+          room_pos: metadata.room_pos,
+          room_version: metadata.record?.room_version ?? null,
+          redacts_event_id_or_null: metadata.redacts_event_id_or_null ?? null,
+          archive_object_key_or_segment_id: metadata.archive_object_key_or_segment_id ?? null,
+        },
+      });
+    }
+    return createSuccessResult({
+      room_id: this.persistence.getRuntimeState()?.room_id ?? null,
+      search_index_rows: searchIndexRows,
+      public_room_directory_entry: buildRoomDirectoryProjection(this, { updatedAt }),
+    });
   }
 
   async alarm(alarmInfo = {}) {

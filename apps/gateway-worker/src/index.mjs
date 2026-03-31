@@ -1,13 +1,37 @@
 import { createMatrixUnrecognizedErrorBody } from '../../../packages/contracts/src/index.mjs';
 import {
+  CONTROL_PLANE_SCHEMA_VERSION,
+  createD1ControlPlanePersistence,
+} from '../../../packages/control-plane/src/index.mjs';
+import {
   RemoteServerDO,
   RoomDO,
   UserDO,
+  buildLocalMediaObjectKey,
+  buildMediaConfig,
+  buildMxcUri,
+  buildRemoteMediaObjectKey,
+  buildThumbnailBody,
+  buildThumbnailDescriptor,
+  computeLegacyUnauthAccessFlag,
   createCanonicalFilterHash,
   createRequestFingerprint,
   createRequestContext,
+  ensureDerivedSchema,
+  enqueueDerivedWork,
+  extractPublicRoomsQuery,
+  getDerivedPersistence,
   getWellKnownCacheEntry,
   loadWorkerRuntimeConfig,
+  lookupRoomAlias,
+  normalizeDownloadOptions,
+  normalizeLocalMediaObjectMetadata,
+  normalizeRemoteMediaObjectMetadata,
+  parseLegacyUnauthFreezeAt,
+  queryPublicRooms,
+  querySearchIndex,
+  queryUserDirectory,
+  readBodyWithDigest,
   putWellKnownCacheEntry,
 } from '../../../packages/runtime-core/src/index.mjs';
 import {
@@ -141,6 +165,117 @@ function getRoomDoStub(env, roomId) {
     throw new TypeError('env.ROOM_DO must expose a Durable Object namespace');
   }
   return namespace.get(namespace.idFromName(roomId));
+}
+
+function getControlPlanePersistence(env) {
+  if (!env.__CONTROL_PLANE_PERSISTENCE__) {
+    env.__CONTROL_PLANE_PERSISTENCE__ = createD1ControlPlanePersistence(env.MATRIX_CONTROL_D1);
+  }
+  return env.__CONTROL_PLANE_PERSISTENCE__;
+}
+
+async function registerShardSeen(env, {
+  shardType,
+  shardKey,
+}) {
+  if (!env?.MATRIX_CONTROL_D1) {
+    return;
+  }
+  const persistence = getControlPlanePersistence(env);
+  const now = new Date().toISOString();
+  await persistence.ensureSchema();
+  await persistence.upsertShardRegistry({
+    shard_type: shardType,
+    shard_key: shardKey,
+    created_at: now,
+    last_seen_at: now,
+    schema_version: CONTROL_PLANE_SCHEMA_VERSION,
+    disabled_at: null,
+  });
+}
+
+function getMediaFreezePolicy(env) {
+  if (!('__MEDIA_FREEZE_POLICY__' in env)) {
+    env.__MEDIA_FREEZE_POLICY__ = parseLegacyUnauthFreezeAt(env.MATRIX_MEDIA_LEGACY_UNAUTH_FREEZE_AT);
+  }
+  return env.__MEDIA_FREEZE_POLICY__;
+}
+
+async function dispatchDerivedWork(env, requestedBy, workItems) {
+  if (!Array.isArray(workItems) || workItems.length === 0) {
+    return;
+  }
+  try {
+    await enqueueDerivedWork(env, {
+      schema_version: 1,
+      batch_id: `gateway_${Date.now()}`,
+      requested_by: requestedBy,
+      work_items: workItems,
+    });
+  } catch {
+    // Derived projection must not block truth-path completion.
+  }
+}
+
+function toResponseBody(body) {
+  if (body == null) {
+    return null;
+  }
+  if (typeof body === 'string' || body instanceof Uint8Array || Buffer.isBuffer(body)) {
+    return body;
+  }
+  return String(body);
+}
+
+function buildMediaResponse(object, {
+  filename = null,
+  contentType = null,
+} = {}) {
+  const headers = new Headers();
+  const resolvedContentType = contentType
+    ?? object.httpMetadata?.contentType
+    ?? object.httpMetadata?.content_type
+    ?? object.customMetadata?.content_type
+    ?? 'application/octet-stream';
+  headers.set('content-type', resolvedContentType);
+  if (filename) {
+    headers.set('content-disposition', `inline; filename*=UTF-8''${encodeURIComponent(filename)}`);
+  }
+  return new Response(toResponseBody(object.body), {
+    status: 200,
+    headers,
+  });
+}
+
+async function withMediaKeyBackoff(env, objectKey, operation) {
+  const cache = env.MATRIX_EDGE_CACHE;
+  const cacheKey = `media_write_backoff:${objectKey}`;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const existing = cache && typeof cache.get === 'function'
+      ? await cache.get(cacheKey)
+      : null;
+    if (!existing) {
+      try {
+        if (cache && typeof cache.put === 'function') {
+          await cache.put(cacheKey, JSON.stringify({ locked_at: new Date().toISOString() }), {
+            expirationTtl: 5,
+          });
+        }
+        return await operation();
+      } finally {
+        await cache?.delete?.(cacheKey);
+      }
+    }
+    await sleep(10 + Math.floor(Math.random() * 25));
+  }
+  throw {
+    code: 'quota_exceeded',
+    message: `Media object ${objectKey} is busy; retry later`,
+  };
+}
+
+function isLegacyUnauthMediaAllowed(metadata) {
+  return metadata?.legacy_unauth_access_flag === true;
 }
 
 function getOptionalUiaLocalpart(auth, serverName) {
@@ -338,6 +473,18 @@ function mapInternalErrorToResponse(error) {
   }
   if (error.code === 'invalid_cursor' || error.code === 'filter_mismatch' || error.code === 'cursor_from_future') {
     return matrixErrorResponse(400, 'M_INVALID_PARAM', error.message ?? 'Invalid sync token');
+  }
+  if (error.code === 'content_too_large') {
+    return matrixErrorResponse(413, 'M_TOO_LARGE', error.message ?? 'Media body exceeds the configured limit');
+  }
+  if (error.code === 'quota_exceeded') {
+    return matrixErrorResponse(429, 'M_LIMIT_EXCEEDED', error.message ?? 'Rate or quota limit exceeded');
+  }
+  if (error.code === 'upload_not_found' || error.code === 'media_not_found') {
+    return matrixErrorResponse(404, 'M_NOT_FOUND', error.message ?? 'Requested media does not exist');
+  }
+  if (error.code === 'media_forbidden') {
+    return matrixErrorResponse(403, 'M_FORBIDDEN', error.message ?? 'The requested media is not accessible');
   }
   return matrixErrorResponse(500, 'M_UNKNOWN', error.message ?? 'Internal error');
 }
@@ -939,6 +1086,22 @@ async function handleRegister(request, env) {
   if (!registerResult.ok) {
     return jsonResponse(registerResult.matrix_error.body, registerResult.matrix_error.status);
   }
+  await registerShardSeen(env, {
+    shardType: 'UserDO',
+    shardKey: targetUserId,
+  });
+  await dispatchDerivedWork(env, 'gateway.register', [{
+    work_type: 'user_directory',
+    idempotency_key: `user_directory:${targetUserId}`,
+    scope: {
+      scope_kind: 'user_id',
+      scope_id: targetUserId,
+    },
+    source_refs: {
+      user_id: targetUserId,
+    },
+    enqueued_at: new Date().toISOString(),
+  }]);
   return jsonResponse(registerResult.response);
 }
 
@@ -1174,6 +1337,18 @@ async function handleDeactivateAccount(request, env) {
   if (!result.ok) {
     return jsonResponse(result.matrix_error.body, result.matrix_error.status);
   }
+  await dispatchDerivedWork(env, 'gateway.deactivate', [{
+    work_type: 'user_directory',
+    idempotency_key: `user_directory:${stage.user_id}`,
+    scope: {
+      scope_kind: 'user_id',
+      scope_id: stage.user_id,
+    },
+    source_refs: {
+      user_id: stage.user_id,
+    },
+    enqueued_at: new Date().toISOString(),
+  }]);
   return jsonResponse(result.response);
 }
 
@@ -1224,6 +1399,18 @@ async function handleProfileFieldWrite(request, env, pathUserId, keyName, { meth
     if (!result.ok) {
       return jsonResponse(result.matrix_error.body, result.matrix_error.status);
     }
+    await dispatchDerivedWork(env, 'gateway.profile.delete', [{
+      work_type: 'user_directory',
+      idempotency_key: `user_directory:${targetUserId}`,
+      scope: {
+        scope_kind: 'user_id',
+        scope_id: targetUserId,
+      },
+      source_refs: {
+        user_id: targetUserId,
+      },
+      enqueued_at: new Date().toISOString(),
+    }]);
     return jsonResponse({});
   }
 
@@ -1253,6 +1440,18 @@ async function handleProfileFieldWrite(request, env, pathUserId, keyName, { meth
   if (!result.ok) {
     return jsonResponse(result.matrix_error.body, result.matrix_error.status);
   }
+  await dispatchDerivedWork(env, 'gateway.profile.put', [{
+    work_type: 'user_directory',
+    idempotency_key: `user_directory:${targetUserId}`,
+    scope: {
+      scope_kind: 'user_id',
+      scope_id: targetUserId,
+    },
+    source_refs: {
+      user_id: targetUserId,
+    },
+    enqueued_at: new Date().toISOString(),
+  }]);
   return jsonResponse({});
 }
 
@@ -1622,6 +1821,634 @@ async function handlePushRulesRequest(request, env, {
   return matrixErrorResponse(404, 'M_UNRECOGNIZED', 'Unrecognized or unsupported endpoint');
 }
 
+function readLocalMediaMetadata(object) {
+  return normalizeLocalMediaObjectMetadata({
+    first_ingested_at: object.customMetadata?.first_ingested_at ?? new Date().toISOString(),
+    legacy_unauth_access_flag: object.customMetadata?.legacy_unauth_access_flag === 'true',
+    content_type: object.customMetadata?.content_type ?? object.httpMetadata?.contentType ?? 'application/octet-stream',
+    byte_size: object.customMetadata?.byte_size == null
+      ? (object.size ?? 0)
+      : Number.parseInt(object.customMetadata.byte_size, 10),
+    content_hash: object.customMetadata?.content_hash ?? null,
+  });
+}
+
+function readRemoteMediaMetadata(object, originServerName) {
+  return normalizeRemoteMediaObjectMetadata({
+    first_cached_at: object.customMetadata?.first_cached_at ?? new Date().toISOString(),
+    legacy_unauth_access_flag: object.customMetadata?.legacy_unauth_access_flag === 'true',
+    origin_server_name: object.customMetadata?.origin_server_name ?? originServerName,
+    content_type: object.customMetadata?.content_type ?? object.httpMetadata?.contentType ?? 'application/octet-stream',
+    byte_size: object.customMetadata?.byte_size == null
+      ? (object.size ?? 0)
+      : Number.parseInt(object.customMetadata.byte_size, 10),
+    content_hash: object.customMetadata?.content_hash ?? null,
+  });
+}
+
+async function queueMediaDerivedWork(env, {
+  mxcUri,
+  sourceKind,
+  r2ObjectKey,
+  contentType,
+  variants,
+  requestedBy,
+}) {
+  await dispatchDerivedWork(env, requestedBy, [{
+    work_type: 'media_thumbnail',
+    idempotency_key: mxcUri,
+    scope: {
+      scope_kind: 'global',
+      scope_id: null,
+    },
+    source_refs: {
+      mxc_uri: mxcUri,
+      source_kind: sourceKind,
+      r2_object_key: r2ObjectKey,
+      content_type: contentType,
+      variants,
+    },
+    enqueued_at: new Date().toISOString(),
+  }]);
+}
+
+async function handleMediaConfigRequest(request, env) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  return jsonResponse(buildMediaConfig(Number.parseInt(env.MATRIX_MEDIA_MAX_UPLOAD_BYTES, 10)));
+}
+
+async function commitLocalMediaUpload(request, env, access, {
+  mediaId = null,
+  requireExisting = false,
+} = {}) {
+  const url = new URL(request.url);
+  const filename = url.searchParams.get('filename') ?? null;
+  const contentType = request.headers.get('content-type') ?? 'application/octet-stream';
+  const declaredSize = /^[0-9]+$/.test(request.headers.get('content-length') ?? '')
+    ? Number.parseInt(request.headers.get('content-length'), 10)
+    : 0;
+  const grantResult = await access.user_do.beginMediaUpload({
+    user_id: access.session.user_id,
+    device_id: access.session.device_id,
+    filename,
+    content_type: contentType,
+    declared_size: declaredSize,
+    ...(mediaId == null ? {} : { media_id: mediaId }),
+    ...(requireExisting ? { require_existing: true } : {}),
+  });
+  if (!grantResult?.ok) {
+    return {
+      ok: false,
+      response: mapInternalErrorToResponse(grantResult?.error),
+    };
+  }
+  const grant = grantResult.grant;
+  let bodyInfo;
+  try {
+    bodyInfo = await readBodyWithDigest(request, {
+      maxBytes: grant.max_bytes,
+    });
+  } catch (error) {
+    await access.user_do.finalizeMediaUpload({
+      pending_upload_id: grant.pending_upload_id,
+      finalize_state: 'reverted',
+      error_message: error.message,
+      upload_completed_at: new Date().toISOString(),
+    });
+    return {
+      ok: false,
+      response: mapInternalErrorToResponse(error),
+    };
+  }
+  const objectKey = buildLocalMediaObjectKey(grant.media_id);
+  const uploadedAt = new Date().toISOString();
+  const legacyFlag = computeLegacyUnauthAccessFlag(uploadedAt, getMediaFreezePolicy(env));
+  try {
+    await withMediaKeyBackoff(env, objectKey, () => env.MATRIX_MEDIA_BUCKET.put(objectKey, bodyInfo.bytes, {
+      customMetadata: {
+        first_ingested_at: uploadedAt,
+        legacy_unauth_access_flag: legacyFlag ? 'true' : 'false',
+        content_type: contentType,
+        byte_size: String(bodyInfo.byte_size),
+        content_hash: bodyInfo.sha256,
+      },
+      httpMetadata: {
+        contentType,
+      },
+    }));
+  } catch (error) {
+    await access.user_do.finalizeMediaUpload({
+      pending_upload_id: grant.pending_upload_id,
+      finalize_state: 'reverted',
+      error_message: error.message ?? 'R2 upload failed',
+      upload_completed_at: uploadedAt,
+    });
+    return {
+      ok: false,
+      response: mapInternalErrorToResponse(error),
+    };
+  }
+  const finalize = await access.user_do.finalizeMediaUpload({
+    pending_upload_id: grant.pending_upload_id,
+    finalize_state: 'completed',
+    r2_object_key: objectKey,
+    byte_size: bodyInfo.byte_size,
+    content_type: contentType,
+    sha256: bodyInfo.sha256,
+    upload_completed_at: uploadedAt,
+  });
+  if (!finalize?.ok) {
+    await access.user_do.finalizeMediaUpload({
+      pending_upload_id: grant.pending_upload_id,
+      finalize_state: 'orphaned',
+      r2_object_key: objectKey,
+      error_message: finalize?.error?.message ?? 'Finalize failed after object write',
+      upload_completed_at: uploadedAt,
+    });
+    return {
+      ok: false,
+      response: mapInternalErrorToResponse(finalize?.error),
+    };
+  }
+  await queueMediaDerivedWork(env, {
+    mxcUri: finalize.ack.mxc_uri,
+    sourceKind: 'local',
+    r2ObjectKey: objectKey,
+    contentType,
+    variants: [{ width: 96, height: 96, method: 'scale', animated: false }],
+    requestedBy: 'gateway.media.upload',
+  });
+  return {
+    ok: true,
+    response: jsonResponse({
+      content_uri: finalize.ack.mxc_uri,
+    }),
+  };
+}
+
+async function handleMediaCreateRequest(request, env) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const grantResult = await access.user_do.beginMediaUpload({
+    user_id: access.session.user_id,
+    device_id: access.session.device_id,
+    content_type: 'application/octet-stream',
+    declared_size: 0,
+    reservation_only: true,
+  });
+  if (!grantResult?.ok) {
+    return mapInternalErrorToResponse(grantResult?.error);
+  }
+  return jsonResponse({
+    content_uri: grantResult.grant.mxc_uri,
+    unused_expires_at: grantResult.grant.expires_at,
+  });
+}
+
+async function handleMediaUploadRequest(request, env, {
+  mediaId = null,
+  requireExisting = false,
+} = {}) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const committed = await commitLocalMediaUpload(request, env, access, {
+    mediaId,
+    requireExisting,
+  });
+  return committed.response;
+}
+
+async function fetchRemoteMediaIntoCache(env, {
+  serverName,
+  mediaId,
+  timeoutMs,
+} = {}) {
+  const objectKey = buildRemoteMediaObjectKey(serverName, mediaId);
+  const existing = await env.MATRIX_MEDIA_BUCKET.get(objectKey);
+  if (existing) {
+    return {
+      object: existing,
+      metadata: readRemoteMediaMetadata(existing, serverName),
+      object_key: objectKey,
+      cache_status: 'hit',
+    };
+  }
+  if (String(env.FF_MEDIA_REMOTE_FETCH ?? 'false').trim().toLowerCase() !== 'true') {
+    return null;
+  }
+  const remoteUrl = `https://${encodeURIComponent(serverName)}/_matrix/media/v3/download/${encodeURIComponent(serverName)}/${encodeURIComponent(mediaId)}`;
+  const fetchImpl = typeof env.__REMOTE_MEDIA_FETCH__ === 'function'
+    ? env.__REMOTE_MEDIA_FETCH__
+    : fetch;
+  const fetched = await withMediaKeyBackoff(env, objectKey, async () => {
+    const secondCheck = await env.MATRIX_MEDIA_BUCKET.get(objectKey);
+    if (secondCheck) {
+      return {
+        object: secondCheck,
+        metadata: readRemoteMediaMetadata(secondCheck, serverName),
+        object_key: objectKey,
+        cache_status: 'hit',
+      };
+    }
+    const response = await fetchImpl(remoteUrl, {
+      redirect: 'follow',
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!response.ok) {
+      if (response.status === 404) {
+        return null;
+      }
+      throw {
+        code: 'media_not_found',
+        message: `Remote media fetch failed with status ${response.status}`,
+      };
+    }
+    const bodyInfo = await readBodyWithDigest(response, {
+      maxBytes: Number.parseInt(env.MATRIX_MEDIA_MAX_UPLOAD_BYTES, 10),
+    });
+    const cachedAt = new Date().toISOString();
+    const legacyFlag = computeLegacyUnauthAccessFlag(cachedAt, getMediaFreezePolicy(env));
+    await env.MATRIX_MEDIA_BUCKET.put(objectKey, bodyInfo.bytes, {
+      customMetadata: {
+        first_cached_at: cachedAt,
+        legacy_unauth_access_flag: legacyFlag ? 'true' : 'false',
+        origin_server_name: serverName,
+        content_type: response.headers.get('content-type') ?? 'application/octet-stream',
+        byte_size: String(bodyInfo.byte_size),
+        content_hash: bodyInfo.sha256,
+      },
+      httpMetadata: {
+        contentType: response.headers.get('content-type') ?? 'application/octet-stream',
+      },
+    });
+    const cachedObject = await env.MATRIX_MEDIA_BUCKET.get(objectKey);
+    await queueMediaDerivedWork(env, {
+      mxcUri: buildMxcUri(serverName, mediaId),
+      sourceKind: 'remote_cache',
+      r2ObjectKey: objectKey,
+      contentType: response.headers.get('content-type') ?? 'application/octet-stream',
+      variants: [{ width: 96, height: 96, method: 'scale', animated: false }],
+      requestedBy: 'gateway.media.remote_fetch',
+    });
+    return cachedObject == null ? null : {
+      object: cachedObject,
+      metadata: readRemoteMediaMetadata(cachedObject, serverName),
+      object_key: objectKey,
+      cache_status: 'miss_filled',
+    };
+  });
+  return fetched;
+}
+
+async function resolveMediaObject(env, {
+  serverName,
+  mediaId,
+  allowRemote,
+  timeoutMs,
+  legacyCompatibility = false,
+} = {}) {
+  if (serverName === env.MATRIX_SERVER_NAME) {
+    const objectKey = buildLocalMediaObjectKey(mediaId);
+    const object = await env.MATRIX_MEDIA_BUCKET.get(objectKey);
+    if (!object) {
+      return null;
+    }
+    const metadata = readLocalMediaMetadata(object);
+    if (legacyCompatibility && !isLegacyUnauthMediaAllowed(metadata)) {
+      return null;
+    }
+    return {
+      object,
+      metadata,
+      object_key: objectKey,
+      source_kind: 'local',
+    };
+  }
+  const cached = await env.MATRIX_MEDIA_BUCKET.get(buildRemoteMediaObjectKey(serverName, mediaId));
+  if (cached) {
+    const metadata = readRemoteMediaMetadata(cached, serverName);
+    if (legacyCompatibility && !isLegacyUnauthMediaAllowed(metadata)) {
+      return null;
+    }
+    return {
+      object: cached,
+      metadata,
+      object_key: buildRemoteMediaObjectKey(serverName, mediaId),
+      source_kind: 'remote_cache',
+    };
+  }
+  if (!allowRemote || legacyCompatibility) {
+    return null;
+  }
+  return fetchRemoteMediaIntoCache(env, {
+    serverName,
+    mediaId,
+    timeoutMs,
+  });
+}
+
+async function handleMediaDownloadRequest(request, env, {
+  serverName,
+  mediaId,
+  fileName = null,
+  legacyCompatibility = false,
+} = {}) {
+  if (!legacyCompatibility) {
+    const access = await requireAccessSession(request, env);
+    if (!access.ok) {
+      return access.response;
+    }
+  }
+  const url = new URL(request.url);
+  let options;
+  try {
+    options = normalizeDownloadOptions(url);
+  } catch (error) {
+    return matrixErrorResponse(400, 'M_INVALID_PARAM', error.message);
+  }
+  const objectHandle = await resolveMediaObject(env, {
+    serverName,
+    mediaId,
+    allowRemote: options.allow_remote,
+    timeoutMs: options.timeout_ms,
+    legacyCompatibility,
+  });
+  if (!objectHandle?.object) {
+    return matrixErrorResponse(404, 'M_NOT_FOUND', 'Media does not exist');
+  }
+  return buildMediaResponse(objectHandle.object, {
+    filename: fileName,
+    contentType: objectHandle.metadata.content_type,
+  });
+}
+
+async function handleMediaThumbnailRequest(request, env, {
+  serverName,
+  mediaId,
+  legacyCompatibility = false,
+} = {}) {
+  if (!legacyCompatibility) {
+    const access = await requireAccessSession(request, env);
+    if (!access.ok) {
+      return access.response;
+    }
+  }
+  const url = new URL(request.url);
+  let options;
+  try {
+    options = normalizeDownloadOptions(url, {
+      requireThumbnail: true,
+    });
+  } catch (error) {
+    return matrixErrorResponse(400, 'M_INVALID_PARAM', error.message);
+  }
+  const source = await resolveMediaObject(env, {
+    serverName,
+    mediaId,
+    allowRemote: options.allow_remote,
+    timeoutMs: options.timeout_ms,
+    legacyCompatibility,
+  });
+  if (!source?.object) {
+    return matrixErrorResponse(404, 'M_NOT_FOUND', 'Media does not exist');
+  }
+  const descriptor = buildThumbnailDescriptor({
+    sourceKind: source.source_kind === 'remote_cache' ? 'remote' : 'local',
+    originServerName: source.source_kind === 'remote_cache' ? serverName : null,
+    mediaId,
+    width: options.width,
+    height: options.height,
+    method: options.method,
+    animated: options.animated === true,
+  });
+  let thumbnail = await env.MATRIX_MEDIA_BUCKET.get(descriptor.key);
+  if (!thumbnail) {
+    const sourceBytes = typeof source.object.arrayBuffer === 'function'
+      ? Buffer.from(await source.object.arrayBuffer())
+      : Buffer.from(await source.object.text(), 'utf8');
+    const thumbnailBody = buildThumbnailBody(sourceBytes, {
+      width: options.width,
+      height: options.height,
+      method: options.method,
+      animated: options.animated === true,
+    });
+    await withMediaKeyBackoff(env, descriptor.key, () => env.MATRIX_MEDIA_BUCKET.put(descriptor.key, thumbnailBody, {
+      customMetadata: {
+        ...descriptor.metadata,
+        created_at: new Date().toISOString(),
+        legacy_unauth_access_flag: isLegacyUnauthMediaAllowed(source.metadata) ? 'true' : 'false',
+      },
+      httpMetadata: {
+        contentType: source.metadata.content_type,
+      },
+    }));
+    thumbnail = await env.MATRIX_MEDIA_BUCKET.get(descriptor.key);
+  }
+  if (!thumbnail) {
+    return matrixErrorResponse(404, 'M_NOT_FOUND', 'Thumbnail does not exist');
+  }
+  if (legacyCompatibility && thumbnail.customMetadata?.legacy_unauth_access_flag !== 'true') {
+    return matrixErrorResponse(404, 'M_NOT_FOUND', 'Thumbnail does not exist');
+  }
+  return buildMediaResponse(thumbnail, {
+    contentType: source.metadata.content_type,
+  });
+}
+
+function buildRoomSummaryFromDirectoryRow(row) {
+  if (!row) {
+    return null;
+  }
+  return {
+    room_id: row.room_id,
+    canonical_alias: row.canonical_alias ?? undefined,
+    name: row.name ?? undefined,
+    topic: row.topic ?? undefined,
+    avatar_url: row.avatar_url ?? undefined,
+    num_joined_members: row.joined_members ?? 0,
+    world_readable: row.world_readable === true,
+    guest_can_join: row.guest_can_join === true,
+    join_rule: row.join_rules ?? 'invite',
+  };
+}
+
+async function handleSearchRequest(request, env) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const body = await readJsonObject(request);
+  if (body instanceof Response) {
+    return body;
+  }
+  const roomEvents = body.search_categories?.room_events;
+  if (!roomEvents || typeof roomEvents !== 'object' || Array.isArray(roomEvents)) {
+    return matrixErrorResponse(400, 'M_BAD_JSON', 'search_categories.room_events is required');
+  }
+  const searchTerm = typeof roomEvents.search_term === 'string' ? roomEvents.search_term : '';
+  if (searchTerm.length === 0) {
+    return matrixErrorResponse(400, 'M_MISSING_PARAM', 'search_term is required');
+  }
+  const rows = await querySearchIndex(env, {
+    searchTerm,
+    roomIds: Array.isArray(roomEvents.filter?.rooms) ? roomEvents.filter.rooms : null,
+    limit: Number.isInteger(roomEvents.filter?.limit) ? roomEvents.filter.limit : 10,
+    nextBatch: roomEvents.next_batch ?? null,
+  });
+  const results = [];
+  const state = {};
+  for (const row of rows.rows) {
+    const roomDo = getRoomDoStub(env, row.room_id);
+    const eventResult = await roomDo.queryRoom({
+      kind: 'event',
+      room_id: row.room_id,
+      requester_user_id: access.session.user_id,
+      event_id: row.event_id,
+    });
+    let event = eventResult?.ok ? eventResult.event ?? null : null;
+    if (!event && eventResult?.error?.code === 'archive_missing') {
+      try {
+        event = (await roomDo.loadRoomEventForRebuild(row.event_id)).event ?? null;
+      } catch {
+        event = null;
+      }
+    }
+    if (!event) {
+      continue;
+    }
+    results.push({
+      rank: row.origin_server_ts,
+      result: event,
+      context: {
+        events_before: [],
+        events_after: [],
+        start: null,
+        end: null,
+        profile_info: {},
+      },
+    });
+    if (!state[row.room_id]) {
+      state[row.room_id] = [];
+    }
+  }
+  return jsonResponse({
+    search_categories: {
+      room_events: {
+        count: results.length,
+        results,
+        state,
+        groups: {
+          room_id: {
+            groups: {},
+          },
+        },
+        highlights: [searchTerm],
+        next_batch: rows.next_batch ?? undefined,
+      },
+    },
+  });
+}
+
+async function handleUserDirectorySearchRequest(request, env) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const body = await readJsonObject(request);
+  if (body instanceof Response) {
+    return body;
+  }
+  const searchTerm = typeof body.search_term === 'string' ? body.search_term : '';
+  if (searchTerm.length === 0) {
+    return matrixErrorResponse(400, 'M_MISSING_PARAM', 'search_term is required');
+  }
+  const result = await queryUserDirectory(env, {
+    searchTerm,
+    limit: Number.isInteger(body.limit) ? body.limit : 10,
+  });
+  return jsonResponse(result);
+}
+
+async function handlePublicRoomsRequest(request, env, { method }) {
+  if (method === 'POST') {
+    const access = await requireAccessSession(request, env);
+    if (!access.ok) {
+      return access.response;
+    }
+  }
+  let queryInput;
+  try {
+    if (method === 'GET') {
+      const url = new URL(request.url);
+      queryInput = extractPublicRoomsQuery({
+        limit: url.searchParams.get('limit') == null ? 10 : Number.parseInt(url.searchParams.get('limit'), 10),
+        since: url.searchParams.get('since') ?? null,
+        filter: {
+          generic_search_term: url.searchParams.get('search_term') ?? null,
+        },
+      });
+    } else {
+      const body = await readJsonObject(request);
+      if (body instanceof Response) {
+        return body;
+      }
+      queryInput = extractPublicRoomsQuery(body);
+    }
+  } catch (error) {
+    return matrixErrorResponse(400, 'M_INVALID_PARAM', error.message);
+  }
+  const result = await queryPublicRooms(env, queryInput);
+  return jsonResponse(result);
+}
+
+async function handleRoomHierarchyRequest(request, env, roomId) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const decodedRoomId = normalizePathRoomId(roomId);
+  if (!decodedRoomId) {
+    return matrixErrorResponse(404, 'M_NOT_FOUND', 'Room does not exist');
+  }
+  await ensureDerivedSchema(env);
+  const derived = getDerivedPersistence(env);
+  const roomDo = getRoomDoStub(env, decodedRoomId);
+  const stateResult = await roomDo.queryRoom({
+    kind: 'state',
+    room_id: decodedRoomId,
+    requester_user_id: access.session.user_id,
+  });
+  if (!stateResult?.ok) {
+    return mapInternalErrorToResponse(stateResult?.error);
+  }
+  const currentRow = await derived.publicRoomDirectory.get({ room_id: decodedRoomId });
+  const childrenState = (stateResult.state ?? [])
+    .filter((event) => event.type === 'm.space.child')
+    .map((event) => event.state_key)
+    .filter((childRoomId) => typeof childRoomId === 'string' && childRoomId.startsWith('!'));
+  const children = [];
+  for (const childRoomId of childrenState) {
+    const row = await derived.publicRoomDirectory.get({ room_id: childRoomId });
+    if (row?.is_public === true) {
+      children.push(buildRoomSummaryFromDirectoryRow(row));
+    }
+  }
+  return jsonResponse({
+    room: buildRoomSummaryFromDirectoryRow(currentRow) ?? {
+      room_id: decodedRoomId,
+    },
+    children,
+    inaccessible_children: childrenState.filter((childRoomId) => !children.some((entry) => entry.room_id === childRoomId)),
+  });
+}
+
 async function handleSendToDevice(request, env, eventType, txnId) {
   const access = await requireAccessSession(request, env);
   if (!access.ok) {
@@ -1691,6 +2518,10 @@ async function admitRoomClientEvent(roomDo, {
       response: mapInternalErrorToResponse(result?.error),
     };
   }
+  await registerShardSeen(roomDo.env ?? {}, {
+    shardType: 'RoomDO',
+    shardKey: roomId,
+  }).catch(() => {});
   return {
     ok: true,
     result,
@@ -1724,6 +2555,9 @@ async function handleCreateRoom(request, env) {
     request_fingerprint: requestFingerprint,
     server_name: env.MATRIX_SERVER_NAME,
   });
+  const directoryVisibility = body.visibility === 'public' || body.preset === 'public_chat'
+    ? 'public'
+    : 'private';
   const roomDo = getRoomDoStub(env, identity.room_id);
 
   const createResult = await admitRoomClientEvent(roomDo, {
@@ -1740,6 +2574,9 @@ async function handleCreateRoom(request, env) {
         room_version: roomVersion,
       },
       unsigned: {
+        public: {
+          directory_visibility: directoryVisibility,
+        },
         client_context: buildRoomClientContext(access, '/_matrix/client/v3/createRoom', requestFingerprint),
       },
     },
@@ -1803,6 +2640,14 @@ async function handleCreateRoom(request, env) {
       : []),
     ...(typeof body.topic === 'string' && body.topic.length > 0
       ? [{ type: 'm.room.topic', content: { topic: body.topic } }]
+      : []),
+    ...(typeof body.room_alias_name === 'string' && body.room_alias_name.trim().length > 0
+      ? [{
+        type: 'm.room.canonical_alias',
+        content: {
+          alias: `#${body.room_alias_name.trim()}:${env.MATRIX_SERVER_NAME}`,
+        },
+      }]
       : []),
     ...(Array.isArray(body.initial_state)
       ? body.initial_state.filter((entry) => entry && typeof entry === 'object' && !Array.isArray(entry))
@@ -1897,9 +2742,16 @@ async function handleRoomMembershipRequest(request, env, {
   if (body instanceof Response) {
     return body;
   }
-  const decodedRoomId = roomId != null
+  let decodedRoomId = roomId != null
     ? normalizePathRoomId(roomId)
     : normalizePathRoomId(roomIdOrAlias);
+  if (!decodedRoomId && roomIdOrAlias != null) {
+    const decodedAlias = decodePathComponent(roomIdOrAlias);
+    if (decodedAlias?.startsWith('#')) {
+      const aliasEntry = await lookupRoomAlias(env, decodedAlias);
+      decodedRoomId = aliasEntry?.room_id ?? null;
+    }
+  }
   if (!decodedRoomId) {
     return matrixErrorResponse(404, 'M_NOT_FOUND', 'Room does not exist');
   }
@@ -2628,6 +3480,78 @@ async function handleRequest(request, env) {
     });
   }
 
+  if (pathname === '/_matrix/client/v1/media/config' && method === 'GET') {
+    return handleMediaConfigRequest(request, env);
+  }
+  const currentMediaDownloadMatch = /^\/_matrix\/client\/v1\/media\/download\/([^/]+)\/([^/]+)(?:\/([^/]+))?$/.exec(pathname);
+  if (currentMediaDownloadMatch && method === 'GET') {
+    return handleMediaDownloadRequest(request, env, {
+      serverName: decodePathComponent(currentMediaDownloadMatch[1]),
+      mediaId: decodePathComponent(currentMediaDownloadMatch[2]),
+      fileName: currentMediaDownloadMatch[3] == null ? null : decodePathComponent(currentMediaDownloadMatch[3]),
+      legacyCompatibility: false,
+    });
+  }
+  const currentMediaThumbnailMatch = /^\/_matrix\/client\/v1\/media\/thumbnail\/([^/]+)\/([^/]+)$/.exec(pathname);
+  if (currentMediaThumbnailMatch && method === 'GET') {
+    return handleMediaThumbnailRequest(request, env, {
+      serverName: decodePathComponent(currentMediaThumbnailMatch[1]),
+      mediaId: decodePathComponent(currentMediaThumbnailMatch[2]),
+      legacyCompatibility: false,
+    });
+  }
+  if (/^\/_matrix\/media\/[^/]+\/config$/.test(pathname) && method === 'GET') {
+    return handleMediaConfigRequest(request, env);
+  }
+  if (/^\/_matrix\/media\/[^/]+\/create$/.test(pathname) && method === 'POST') {
+    return handleMediaCreateRequest(request, env);
+  }
+  if (/^\/_matrix\/media\/[^/]+\/upload$/.test(pathname) && method === 'POST') {
+    return handleMediaUploadRequest(request, env);
+  }
+  const uploadByIdMatch = /^\/_matrix\/media\/[^/]+\/upload\/([^/]+)\/([^/]+)$/.exec(pathname);
+  if (uploadByIdMatch && method === 'PUT') {
+    const serverName = decodePathComponent(uploadByIdMatch[1]);
+    const mediaId = decodePathComponent(uploadByIdMatch[2]);
+    if (serverName !== env.MATRIX_SERVER_NAME) {
+      return matrixErrorResponse(404, 'M_NOT_FOUND', 'Only locally reserved MXC URIs are supported');
+    }
+    return handleMediaUploadRequest(request, env, {
+      mediaId,
+      requireExisting: true,
+    });
+  }
+  const compatMediaDownloadMatch = /^\/_matrix\/media\/[^/]+\/download\/([^/]+)\/([^/]+)(?:\/([^/]+))?$/.exec(pathname);
+  if (compatMediaDownloadMatch && method === 'GET') {
+    return handleMediaDownloadRequest(request, env, {
+      serverName: decodePathComponent(compatMediaDownloadMatch[1]),
+      mediaId: decodePathComponent(compatMediaDownloadMatch[2]),
+      fileName: compatMediaDownloadMatch[3] == null ? null : decodePathComponent(compatMediaDownloadMatch[3]),
+      legacyCompatibility: true,
+    });
+  }
+  const compatMediaThumbnailMatch = /^\/_matrix\/media\/[^/]+\/thumbnail\/([^/]+)\/([^/]+)$/.exec(pathname);
+  if (compatMediaThumbnailMatch && method === 'GET') {
+    return handleMediaThumbnailRequest(request, env, {
+      serverName: decodePathComponent(compatMediaThumbnailMatch[1]),
+      mediaId: decodePathComponent(compatMediaThumbnailMatch[2]),
+      legacyCompatibility: true,
+    });
+  }
+
+  if (pathname === '/_matrix/client/v3/search' && method === 'POST') {
+    return handleSearchRequest(request, env);
+  }
+  if (pathname === '/_matrix/client/v3/user_directory/search' && method === 'POST') {
+    return handleUserDirectorySearchRequest(request, env);
+  }
+  if (pathname === '/_matrix/client/v3/publicRooms' && method === 'GET') {
+    return handlePublicRoomsRequest(request, env, { method });
+  }
+  if (pathname === '/_matrix/client/v3/publicRooms' && method === 'POST') {
+    return handlePublicRoomsRequest(request, env, { method });
+  }
+
   if (pathname === '/_matrix/client/v3/createRoom' && method === 'POST') {
     return handleCreateRoom(request, env);
   }
@@ -2797,6 +3721,10 @@ async function handleRequest(request, env) {
     return handleRoomQueryRequest(request, env, roomTimestampMatch[1], {
       kind: 'timestamp_lookup',
     });
+  }
+  const roomHierarchyMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/hierarchy$/.exec(pathname);
+  if (roomHierarchyMatch && method === 'GET') {
+    return handleRoomHierarchyRequest(request, env, roomHierarchyMatch[1]);
   }
   const roomTypingMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/typing\/([^/]+)$/.exec(pathname);
   if (roomTypingMatch && method === 'PUT') {
