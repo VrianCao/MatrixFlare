@@ -1,6 +1,7 @@
+import { Buffer } from 'node:buffer';
+
 import { createMatrixUnrecognizedErrorBody } from '../../../packages/contracts/src/index.mjs';
 import {
-  CONTROL_PLANE_SCHEMA_VERSION,
   createD1ControlPlanePersistence,
 } from '../../../packages/control-plane/src/index.mjs';
 import {
@@ -23,16 +24,15 @@ import {
   getDerivedPersistence,
   getWellKnownCacheEntry,
   loadWorkerRuntimeConfig,
-  lookupRoomAlias,
   normalizeDownloadOptions,
   normalizeLocalMediaObjectMetadata,
   normalizeRemoteMediaObjectMetadata,
   parseLegacyUnauthFreezeAt,
-  queryPublicRooms,
   querySearchIndex,
   queryUserDirectory,
   readBodyWithDigest,
   putWellKnownCacheEntry,
+  teeBodyStreamWithDigest,
 } from '../../../packages/runtime-core/src/index.mjs';
 import {
   buildProfileCapabilities,
@@ -174,24 +174,177 @@ function getControlPlanePersistence(env) {
   return env.__CONTROL_PLANE_PERSISTENCE__;
 }
 
-async function registerShardSeen(env, {
-  shardType,
-  shardKey,
-}) {
-  if (!env?.MATRIX_CONTROL_D1) {
-    return;
+function resolveConfiguredMaxUploadBytes(env) {
+  const configured = Number.parseInt(env.MATRIX_MEDIA_MAX_UPLOAD_BYTES, 10);
+  const zoneLimit = /^[0-9]+$/.test(String(env.CF_ZONE_BODY_LIMIT_BYTES ?? '').trim())
+    ? Number.parseInt(env.CF_ZONE_BODY_LIMIT_BYTES, 10)
+    : Number.POSITIVE_INFINITY;
+  return Math.min(configured, zoneLimit);
+}
+
+function encodePublicRoomsCursor(payload) {
+  return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+}
+
+function decodePublicRoomsCursor(value) {
+  if (value == null || value === '') {
+    return null;
   }
+  return JSON.parse(Buffer.from(String(value), 'base64url').toString('utf8'));
+}
+
+function isPublicDirectoryRowComplete(row) {
+  return row != null
+    && typeof row.room_id === 'string'
+    && typeof row.join_rules === 'string'
+    && typeof row.history_visibility === 'string'
+    && Number.isInteger(row.room_serial)
+    && Number.isInteger(row.visibility_watermark)
+    && typeof row.is_public === 'boolean';
+}
+
+function isPublicDirectoryRowCurrent(derivedRow, truthRow) {
+  return derivedRow.room_serial === truthRow.room_serial
+    && derivedRow.visibility_watermark === truthRow.visibility_watermark
+    && derivedRow.is_public === truthRow.is_public
+    && derivedRow.join_rules === truthRow.join_rules
+    && derivedRow.history_visibility === truthRow.history_visibility
+    && derivedRow.world_readable === truthRow.world_readable
+    && derivedRow.guest_can_join === truthRow.guest_can_join
+    && (derivedRow.canonical_alias ?? null) === (truthRow.canonical_alias ?? null);
+}
+
+async function listRegisteredRoomIds(env) {
   const persistence = getControlPlanePersistence(env);
-  const now = new Date().toISOString();
   await persistence.ensureSchema();
-  await persistence.upsertShardRegistry({
-    shard_type: shardType,
-    shard_key: shardKey,
-    created_at: now,
-    last_seen_at: now,
-    schema_version: CONTROL_PLANE_SCHEMA_VERSION,
-    disabled_at: null,
+  const rows = await persistence.listShardRegistry({});
+  return rows
+    .filter((row) => row.shard_type === 'RoomDO' && row.disabled_at == null)
+    .map((row) => row.shard_key);
+}
+
+async function hasActiveGlobalRebuild(env) {
+  const persistence = getControlPlanePersistence(env);
+  await persistence.ensureSchema();
+  const jobs = await persistence.listJobs({
+    job_type: 'rebuild',
+    internal_states: ['pending', 'checkpointed', 'scanning'],
+    limit: 100,
   });
+  return jobs.some((job) => job.scope?.scope_kind === 'global');
+}
+
+async function resolveValidatedPublicRoomRow(env, roomId, {
+  derivedRow = null,
+  forceTruth = false,
+} = {}) {
+  const roomDo = getRoomDoStub(env, roomId);
+  const truthResult = await roomDo.getPublicRoomDirectoryEntry({
+    room_id: roomId,
+    updated_at: new Date().toISOString(),
+  });
+  if (!truthResult?.ok || !truthResult.entry || truthResult.entry.is_public !== true) {
+    return null;
+  }
+  if (forceTruth || !isPublicDirectoryRowComplete(derivedRow) || !isPublicDirectoryRowCurrent(derivedRow, truthResult.entry)) {
+    return truthResult.entry;
+  }
+  return derivedRow;
+}
+
+function applyPublicRoomsQuery(rows, {
+  limit = 10,
+  since = null,
+  searchTerm = null,
+} = {}) {
+  const normalizedLimit = Number.isInteger(limit) ? limit : 10;
+  const cursor = decodePublicRoomsCursor(since);
+  const offset = cursor?.offset == null ? 0 : Number.parseInt(cursor.offset, 10);
+  const loweredSearchTerm = typeof searchTerm === 'string' ? searchTerm.toLowerCase() : '';
+  const filteredRows = rows
+    .filter((row) => row.is_public === true)
+    .filter((row) => loweredSearchTerm.length === 0 || (
+      (row.name ?? '').toLowerCase().includes(loweredSearchTerm)
+      || (row.topic ?? '').toLowerCase().includes(loweredSearchTerm)
+      || (row.canonical_alias ?? '').toLowerCase().includes(loweredSearchTerm)
+      || row.room_id.toLowerCase().includes(loweredSearchTerm)
+    ))
+    .sort((left, right) => right.joined_members - left.joined_members || left.room_id.localeCompare(right.room_id));
+  const page = filteredRows.slice(offset, offset + normalizedLimit);
+  return {
+    chunk: page.map((row) => ({
+      room_id: row.room_id,
+      name: row.name ?? undefined,
+      topic: row.topic ?? undefined,
+      canonical_alias: row.canonical_alias ?? undefined,
+      avatar_url: row.avatar_url ?? undefined,
+      num_joined_members: row.joined_members,
+      world_readable: row.world_readable === true,
+      guest_can_join: row.guest_can_join === true,
+      join_rule: row.join_rules ?? 'invite',
+    })),
+    next_batch: offset + normalizedLimit < filteredRows.length
+      ? encodePublicRoomsCursor({ offset: offset + normalizedLimit })
+      : undefined,
+    prev_batch: offset > 0
+      ? encodePublicRoomsCursor({ offset: Math.max(0, offset - normalizedLimit) })
+      : undefined,
+    total_room_count_estimate: filteredRows.length,
+  };
+}
+
+async function queryPublicRoomsWithTruthFallback(env, queryInput) {
+  await ensureDerivedSchema(env);
+  const derived = getDerivedPersistence(env);
+  const derivedRows = await derived.publicRoomDirectory.list();
+  const derivedByRoomId = new Map(derivedRows.map((row) => [row.room_id, row]));
+  const rebuildInProgress = await hasActiveGlobalRebuild(env);
+  const roomIds = await listRegisteredRoomIds(env);
+  const validatedRows = [];
+  for (const roomId of roomIds) {
+    const row = await resolveValidatedPublicRoomRow(env, roomId, {
+      derivedRow: derivedByRoomId.get(roomId) ?? null,
+      forceTruth: rebuildInProgress,
+    });
+    if (row) {
+      validatedRows.push(row);
+    }
+  }
+  return applyPublicRoomsQuery(validatedRows, queryInput);
+}
+
+async function resolveRoomAliasWithTruthFallback(env, alias) {
+  const normalizedAlias = String(alias);
+  await ensureDerivedSchema(env);
+  const derived = getDerivedPersistence(env);
+  const derivedRows = await derived.publicRoomDirectory.list();
+  const firstDerivedMatch = derivedRows.find((row) => row.canonical_alias === normalizedAlias) ?? null;
+  if (firstDerivedMatch) {
+    const validated = await resolveValidatedPublicRoomRow(env, firstDerivedMatch.room_id, {
+      derivedRow: firstDerivedMatch,
+      forceTruth: true,
+    });
+    if (validated?.canonical_alias === normalizedAlias) {
+      return validated;
+    }
+  }
+  for (const roomId of await listRegisteredRoomIds(env)) {
+    if (firstDerivedMatch?.room_id === roomId) {
+      continue;
+    }
+    const roomDo = getRoomDoStub(env, roomId);
+    const resolved = await roomDo.resolveRoomAlias({ alias: normalizedAlias });
+    if (!resolved?.ok || resolved.room_id == null) {
+      continue;
+    }
+    const validated = await resolveValidatedPublicRoomRow(env, resolved.room_id, {
+      forceTruth: true,
+    });
+    if (validated?.canonical_alias === normalizedAlias) {
+      return validated;
+    }
+  }
+  return null;
 }
 
 function getMediaFreezePolicy(env) {
@@ -199,6 +352,42 @@ function getMediaFreezePolicy(env) {
     env.__MEDIA_FREEZE_POLICY__ = parseLegacyUnauthFreezeAt(env.MATRIX_MEDIA_LEGACY_UNAUTH_FREEZE_AT);
   }
   return env.__MEDIA_FREEZE_POLICY__;
+}
+
+async function deleteMediaObjectBestEffort(env, objectKey) {
+  if (typeof objectKey !== 'string' || objectKey.length === 0) {
+    return false;
+  }
+  if (!env?.MATRIX_MEDIA_BUCKET || typeof env.MATRIX_MEDIA_BUCKET.delete !== 'function') {
+    return false;
+  }
+  try {
+    await env.MATRIX_MEDIA_BUCKET.delete(objectKey);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function normalizeRemoteMediaFetchError(error, {
+  serverName,
+  mediaId,
+} = {}) {
+  if (error?.code === 'content_too_large' || error?.code === 'quota_exceeded' || error?.code === 'backpressure') {
+    return error;
+  }
+  if (error?.name === 'TimeoutError' || error?.name === 'AbortError') {
+    return Object.assign(new Error(`Remote media fetch timed out for mxc://${serverName}/${mediaId}`), {
+      code: 'backpressure',
+      retryable: true,
+    });
+  }
+  return Object.assign(new Error(
+    error?.message ?? `Remote media fetch failed for mxc://${serverName}/${mediaId}`,
+  ), {
+    code: 'backpressure',
+    retryable: true,
+  });
 }
 
 async function dispatchDerivedWork(env, requestedBy, workItems) {
@@ -416,6 +605,28 @@ function isObjectRecord(value) {
   return value != null && typeof value === 'object' && !Array.isArray(value);
 }
 
+async function loadIgnoredUserIds(userDo) {
+  const ignoredUserIds = new Set();
+  const ignoredList = await userDo.getGlobalAccountData({
+    type: 'm.ignored_user_list',
+  });
+  if (!ignoredList?.ok || !isObjectRecord(ignoredList.content)) {
+    return ignoredUserIds;
+  }
+  const ignoredUsers = isObjectRecord(ignoredList.content.ignored_users)
+    ? ignoredList.content.ignored_users
+    : null;
+  if (!ignoredUsers) {
+    return ignoredUserIds;
+  }
+  for (const userId of Object.keys(ignoredUsers)) {
+    if (typeof userId === 'string' && userId.length > 0) {
+      ignoredUserIds.add(userId);
+    }
+  }
+  return ignoredUserIds;
+}
+
 function ensureSelfAccess(access, pathUserId) {
   if (access.session.user_id !== pathUserId) {
     return matrixErrorResponse(403, 'M_FORBIDDEN', 'This route is only available for the authenticated user');
@@ -485,6 +696,9 @@ function mapInternalErrorToResponse(error) {
   }
   if (error.code === 'media_forbidden') {
     return matrixErrorResponse(403, 'M_FORBIDDEN', error.message ?? 'The requested media is not accessible');
+  }
+  if (error.code === 'backpressure' || error.retryable === true) {
+    return matrixErrorResponse(503, 'M_UNKNOWN', error.message ?? 'Temporary internal backpressure');
   }
   return matrixErrorResponse(500, 'M_UNKNOWN', error.message ?? 'Internal error');
 }
@@ -1086,10 +1300,13 @@ async function handleRegister(request, env) {
   if (!registerResult.ok) {
     return jsonResponse(registerResult.matrix_error.body, registerResult.matrix_error.status);
   }
-  await registerShardSeen(env, {
-    shardType: 'UserDO',
-    shardKey: targetUserId,
+  const registryResult = await getUserDoStub(env, targetUserId).ensureShardRegistry({
+    user_id: targetUserId,
+    now: new Date().toISOString(),
   });
+  if (!registryResult?.ok) {
+    return mapInternalErrorToResponse(registryResult?.error);
+  }
   await dispatchDerivedWork(env, 'gateway.register', [{
     work_type: 'user_directory',
     idempotency_key: `user_directory:${targetUserId}`,
@@ -1851,6 +2068,8 @@ async function queueMediaDerivedWork(env, {
   sourceKind,
   r2ObjectKey,
   contentType,
+  byteSize = null,
+  contentHash = null,
   variants,
   requestedBy,
 }) {
@@ -1866,6 +2085,8 @@ async function queueMediaDerivedWork(env, {
       source_kind: sourceKind,
       r2_object_key: r2ObjectKey,
       content_type: contentType,
+      ...(byteSize == null ? {} : { byte_size: byteSize }),
+      ...(contentHash == null ? {} : { content_hash: contentHash }),
       variants,
     },
     enqueued_at: new Date().toISOString(),
@@ -1877,7 +2098,7 @@ async function handleMediaConfigRequest(request, env) {
   if (!access.ok) {
     return access.response;
   }
-  return jsonResponse(buildMediaConfig(Number.parseInt(env.MATRIX_MEDIA_MAX_UPLOAD_BYTES, 10)));
+  return jsonResponse(buildMediaConfig(resolveConfiguredMaxUploadBytes(env)));
 }
 
 async function commitLocalMediaUpload(request, env, access, {
@@ -1896,6 +2117,7 @@ async function commitLocalMediaUpload(request, env, access, {
     filename,
     content_type: contentType,
     declared_size: declaredSize,
+    max_bytes: resolveConfiguredMaxUploadBytes(env),
     ...(mediaId == null ? {} : { media_id: mediaId }),
     ...(requireExisting ? { require_existing: true } : {}),
   });
@@ -1907,42 +2129,49 @@ async function commitLocalMediaUpload(request, env, access, {
   }
   const grant = grantResult.grant;
   let bodyInfo;
-  try {
-    bodyInfo = await readBodyWithDigest(request, {
-      maxBytes: grant.max_bytes,
-    });
-  } catch (error) {
-    await access.user_do.finalizeMediaUpload({
-      pending_upload_id: grant.pending_upload_id,
-      finalize_state: 'reverted',
-      error_message: error.message,
-      upload_completed_at: new Date().toISOString(),
-    });
-    return {
-      ok: false,
-      response: mapInternalErrorToResponse(error),
-    };
-  }
-  const objectKey = buildLocalMediaObjectKey(grant.media_id);
   const uploadedAt = new Date().toISOString();
   const legacyFlag = computeLegacyUnauthAccessFlag(uploadedAt, getMediaFreezePolicy(env));
+  const objectKey = buildLocalMediaObjectKey(grant.media_id);
   try {
-    await withMediaKeyBackoff(env, objectKey, () => env.MATRIX_MEDIA_BUCKET.put(objectKey, bodyInfo.bytes, {
-      customMetadata: {
-        first_ingested_at: uploadedAt,
-        legacy_unauth_access_flag: legacyFlag ? 'true' : 'false',
-        content_type: contentType,
-        byte_size: String(bodyInfo.byte_size),
-        content_hash: bodyInfo.sha256,
-      },
-      httpMetadata: {
-        contentType,
-      },
-    }));
+    const streamedBody = teeBodyStreamWithDigest(request, {
+      maxBytes: grant.max_bytes,
+    });
+    if (streamedBody) {
+      const [, streamedInfo] = await Promise.all([
+        withMediaKeyBackoff(env, objectKey, () => env.MATRIX_MEDIA_BUCKET.put(objectKey, streamedBody.upload_stream, {
+          customMetadata: {
+            first_ingested_at: uploadedAt,
+            legacy_unauth_access_flag: legacyFlag ? 'true' : 'false',
+            content_type: contentType,
+          },
+          httpMetadata: {
+            contentType,
+          },
+        })),
+        streamedBody.digest_promise,
+      ]);
+      bodyInfo = streamedInfo;
+    } else {
+      bodyInfo = await readBodyWithDigest(request, {
+        maxBytes: grant.max_bytes,
+      });
+      await withMediaKeyBackoff(env, objectKey, () => env.MATRIX_MEDIA_BUCKET.put(objectKey, bodyInfo.bytes, {
+        customMetadata: {
+          first_ingested_at: uploadedAt,
+          legacy_unauth_access_flag: legacyFlag ? 'true' : 'false',
+          content_type: contentType,
+        },
+        httpMetadata: {
+          contentType,
+        },
+      }));
+    }
   } catch (error) {
+    const reverted = await deleteMediaObjectBestEffort(env, objectKey);
     await access.user_do.finalizeMediaUpload({
       pending_upload_id: grant.pending_upload_id,
-      finalize_state: 'reverted',
+      finalize_state: reverted ? 'reverted' : 'orphaned',
+      ...(reverted ? {} : { r2_object_key: objectKey }),
       error_message: error.message ?? 'R2 upload failed',
       upload_completed_at: uploadedAt,
     });
@@ -1954,7 +2183,7 @@ async function commitLocalMediaUpload(request, env, access, {
   const finalize = await access.user_do.finalizeMediaUpload({
     pending_upload_id: grant.pending_upload_id,
     finalize_state: 'completed',
-    r2_object_key: objectKey,
+    r2_object_key: buildLocalMediaObjectKey(grant.media_id),
     byte_size: bodyInfo.byte_size,
     content_type: contentType,
     sha256: bodyInfo.sha256,
@@ -1976,8 +2205,10 @@ async function commitLocalMediaUpload(request, env, access, {
   await queueMediaDerivedWork(env, {
     mxcUri: finalize.ack.mxc_uri,
     sourceKind: 'local',
-    r2ObjectKey: objectKey,
+    r2ObjectKey: buildLocalMediaObjectKey(grant.media_id),
     contentType,
+    byteSize: bodyInfo.byte_size,
+    contentHash: bodyInfo.sha256,
     variants: [{ width: 96, height: 96, method: 'scale', animated: false }],
     requestedBy: 'gateway.media.upload',
   });
@@ -2030,20 +2261,22 @@ async function fetchRemoteMediaIntoCache(env, {
   mediaId,
   timeoutMs,
 } = {}) {
-  const objectKey = buildRemoteMediaObjectKey(serverName, mediaId);
+  const normalizedServerName = String(serverName);
+  const objectKey = buildRemoteMediaObjectKey(normalizedServerName, mediaId);
   const existing = await env.MATRIX_MEDIA_BUCKET.get(objectKey);
   if (existing) {
     return {
       object: existing,
-      metadata: readRemoteMediaMetadata(existing, serverName),
+      metadata: readRemoteMediaMetadata(existing, normalizedServerName),
       object_key: objectKey,
       cache_status: 'hit',
+      source_kind: 'remote_cache',
     };
   }
   if (String(env.FF_MEDIA_REMOTE_FETCH ?? 'false').trim().toLowerCase() !== 'true') {
     return null;
   }
-  const remoteUrl = `https://${encodeURIComponent(serverName)}/_matrix/media/v3/download/${encodeURIComponent(serverName)}/${encodeURIComponent(mediaId)}`;
+  const remoteUrl = `https://${normalizedServerName}/_matrix/media/v3/download/${encodeURIComponent(normalizedServerName)}/${encodeURIComponent(mediaId)}`;
   const fetchImpl = typeof env.__REMOTE_MEDIA_FETCH__ === 'function'
     ? env.__REMOTE_MEDIA_FETCH__
     : fetch;
@@ -2052,9 +2285,10 @@ async function fetchRemoteMediaIntoCache(env, {
     if (secondCheck) {
       return {
         object: secondCheck,
-        metadata: readRemoteMediaMetadata(secondCheck, serverName),
+        metadata: readRemoteMediaMetadata(secondCheck, normalizedServerName),
         object_key: objectKey,
         cache_status: 'hit',
+        source_kind: 'remote_cache',
       };
     }
     const response = await fetchImpl(remoteUrl, {
@@ -2065,44 +2299,76 @@ async function fetchRemoteMediaIntoCache(env, {
       if (response.status === 404) {
         return null;
       }
-      throw {
-        code: 'media_not_found',
-        message: `Remote media fetch failed with status ${response.status}`,
-      };
+      throw Object.assign(new Error(`Remote media fetch failed with status ${response.status}`), {
+        code: 'backpressure',
+        retryable: true,
+      });
     }
-    const bodyInfo = await readBodyWithDigest(response, {
-      maxBytes: Number.parseInt(env.MATRIX_MEDIA_MAX_UPLOAD_BYTES, 10),
-    });
-    const cachedAt = new Date().toISOString();
-    const legacyFlag = computeLegacyUnauthAccessFlag(cachedAt, getMediaFreezePolicy(env));
-    await env.MATRIX_MEDIA_BUCKET.put(objectKey, bodyInfo.bytes, {
-      customMetadata: {
-        first_cached_at: cachedAt,
-        legacy_unauth_access_flag: legacyFlag ? 'true' : 'false',
-        origin_server_name: serverName,
-        content_type: response.headers.get('content-type') ?? 'application/octet-stream',
-        byte_size: String(bodyInfo.byte_size),
-        content_hash: bodyInfo.sha256,
-      },
-      httpMetadata: {
-        contentType: response.headers.get('content-type') ?? 'application/octet-stream',
-      },
-    });
-    const cachedObject = await env.MATRIX_MEDIA_BUCKET.get(objectKey);
-    await queueMediaDerivedWork(env, {
-      mxcUri: buildMxcUri(serverName, mediaId),
-      sourceKind: 'remote_cache',
-      r2ObjectKey: objectKey,
-      contentType: response.headers.get('content-type') ?? 'application/octet-stream',
-      variants: [{ width: 96, height: 96, method: 'scale', animated: false }],
-      requestedBy: 'gateway.media.remote_fetch',
-    });
-    return cachedObject == null ? null : {
-      object: cachedObject,
-      metadata: readRemoteMediaMetadata(cachedObject, serverName),
-      object_key: objectKey,
-      cache_status: 'miss_filled',
-    };
+    try {
+      let bodyInfo;
+      const cachedAt = new Date().toISOString();
+      const legacyFlag = computeLegacyUnauthAccessFlag(cachedAt, getMediaFreezePolicy(env));
+      const contentType = response.headers.get('content-type') ?? 'application/octet-stream';
+      const streamedBody = teeBodyStreamWithDigest(response, {
+        maxBytes: resolveConfiguredMaxUploadBytes(env),
+      });
+      if (streamedBody) {
+        const [, streamedInfo] = await Promise.all([
+          env.MATRIX_MEDIA_BUCKET.put(objectKey, streamedBody.upload_stream, {
+            customMetadata: {
+              first_cached_at: cachedAt,
+              legacy_unauth_access_flag: legacyFlag ? 'true' : 'false',
+              origin_server_name: normalizedServerName,
+              content_type: contentType,
+            },
+            httpMetadata: {
+              contentType,
+            },
+          }),
+          streamedBody.digest_promise,
+        ]);
+        bodyInfo = streamedInfo;
+      } else {
+        bodyInfo = await readBodyWithDigest(response, {
+          maxBytes: resolveConfiguredMaxUploadBytes(env),
+        });
+        await env.MATRIX_MEDIA_BUCKET.put(objectKey, bodyInfo.bytes, {
+          customMetadata: {
+            first_cached_at: cachedAt,
+            legacy_unauth_access_flag: legacyFlag ? 'true' : 'false',
+            origin_server_name: normalizedServerName,
+            content_type: contentType,
+          },
+          httpMetadata: {
+            contentType,
+          },
+        });
+      }
+      const cachedObject = await env.MATRIX_MEDIA_BUCKET.get(objectKey);
+      await queueMediaDerivedWork(env, {
+        mxcUri: buildMxcUri(normalizedServerName, mediaId),
+        sourceKind: 'remote_cache',
+        r2ObjectKey: objectKey,
+        contentType,
+        byteSize: bodyInfo.byte_size,
+        contentHash: bodyInfo.sha256,
+        variants: [{ width: 96, height: 96, method: 'scale', animated: false }],
+        requestedBy: 'gateway.media.remote_fetch',
+      });
+      return cachedObject == null ? null : {
+        object: cachedObject,
+        metadata: readRemoteMediaMetadata(cachedObject, normalizedServerName),
+        object_key: objectKey,
+        cache_status: 'miss_filled',
+        source_kind: 'remote_cache',
+      };
+    } catch (error) {
+      await deleteMediaObjectBestEffort(env, objectKey);
+      throw normalizeRemoteMediaFetchError(error, {
+        serverName: normalizedServerName,
+        mediaId,
+      });
+    }
   });
   return fetched;
 }
@@ -2173,13 +2439,18 @@ async function handleMediaDownloadRequest(request, env, {
   } catch (error) {
     return matrixErrorResponse(400, 'M_INVALID_PARAM', error.message);
   }
-  const objectHandle = await resolveMediaObject(env, {
-    serverName,
-    mediaId,
-    allowRemote: options.allow_remote,
-    timeoutMs: options.timeout_ms,
-    legacyCompatibility,
-  });
+  let objectHandle;
+  try {
+    objectHandle = await resolveMediaObject(env, {
+      serverName,
+      mediaId,
+      allowRemote: options.allow_remote,
+      timeoutMs: options.timeout_ms,
+      legacyCompatibility,
+    });
+  } catch (error) {
+    return mapInternalErrorToResponse(error);
+  }
   if (!objectHandle?.object) {
     return matrixErrorResponse(404, 'M_NOT_FOUND', 'Media does not exist');
   }
@@ -2209,13 +2480,18 @@ async function handleMediaThumbnailRequest(request, env, {
   } catch (error) {
     return matrixErrorResponse(400, 'M_INVALID_PARAM', error.message);
   }
-  const source = await resolveMediaObject(env, {
-    serverName,
-    mediaId,
-    allowRemote: options.allow_remote,
-    timeoutMs: options.timeout_ms,
-    legacyCompatibility,
-  });
+  let source;
+  try {
+    source = await resolveMediaObject(env, {
+      serverName,
+      mediaId,
+      allowRemote: options.allow_remote,
+      timeoutMs: options.timeout_ms,
+      legacyCompatibility,
+    });
+  } catch (error) {
+    return mapInternalErrorToResponse(error);
+  }
   if (!source?.object) {
     return matrixErrorResponse(404, 'M_NOT_FOUND', 'Media does not exist');
   }
@@ -2230,26 +2506,30 @@ async function handleMediaThumbnailRequest(request, env, {
   });
   let thumbnail = await env.MATRIX_MEDIA_BUCKET.get(descriptor.key);
   if (!thumbnail) {
-    const sourceBytes = typeof source.object.arrayBuffer === 'function'
-      ? Buffer.from(await source.object.arrayBuffer())
-      : Buffer.from(await source.object.text(), 'utf8');
-    const thumbnailBody = buildThumbnailBody(sourceBytes, {
-      width: options.width,
-      height: options.height,
-      method: options.method,
-      animated: options.animated === true,
-    });
-    await withMediaKeyBackoff(env, descriptor.key, () => env.MATRIX_MEDIA_BUCKET.put(descriptor.key, thumbnailBody, {
-      customMetadata: {
-        ...descriptor.metadata,
-        created_at: new Date().toISOString(),
-        legacy_unauth_access_flag: isLegacyUnauthMediaAllowed(source.metadata) ? 'true' : 'false',
-      },
-      httpMetadata: {
-        contentType: source.metadata.content_type,
-      },
-    }));
-    thumbnail = await env.MATRIX_MEDIA_BUCKET.get(descriptor.key);
+    try {
+      const sourceBytes = typeof source.object.arrayBuffer === 'function'
+        ? Buffer.from(await source.object.arrayBuffer())
+        : Buffer.from(await source.object.text(), 'utf8');
+      const thumbnailBody = buildThumbnailBody(sourceBytes, {
+        width: options.width,
+        height: options.height,
+        method: options.method,
+        animated: options.animated === true,
+      });
+      await withMediaKeyBackoff(env, descriptor.key, () => env.MATRIX_MEDIA_BUCKET.put(descriptor.key, thumbnailBody, {
+        customMetadata: {
+          ...descriptor.metadata,
+          created_at: new Date().toISOString(),
+          legacy_unauth_access_flag: isLegacyUnauthMediaAllowed(source.metadata) ? 'true' : 'false',
+        },
+        httpMetadata: {
+          contentType: source.metadata.content_type,
+        },
+      }));
+      thumbnail = await env.MATRIX_MEDIA_BUCKET.get(descriptor.key);
+    } catch (error) {
+      return mapInternalErrorToResponse(error);
+    }
   }
   if (!thumbnail) {
     return matrixErrorResponse(404, 'M_NOT_FOUND', 'Thumbnail does not exist');
@@ -2369,9 +2649,11 @@ async function handleUserDirectorySearchRequest(request, env) {
   if (searchTerm.length === 0) {
     return matrixErrorResponse(400, 'M_MISSING_PARAM', 'search_term is required');
   }
+  const ignoredUserIds = await loadIgnoredUserIds(access.user_do);
   const result = await queryUserDirectory(env, {
     searchTerm,
     limit: Number.isInteger(body.limit) ? body.limit : 10,
+    ignoredUserIds,
   });
   return jsonResponse(result);
 }
@@ -2404,7 +2686,7 @@ async function handlePublicRoomsRequest(request, env, { method }) {
   } catch (error) {
     return matrixErrorResponse(400, 'M_INVALID_PARAM', error.message);
   }
-  const result = await queryPublicRooms(env, queryInput);
+  const result = await queryPublicRoomsWithTruthFallback(env, queryInput);
   return jsonResponse(result);
 }
 
@@ -2428,15 +2710,21 @@ async function handleRoomHierarchyRequest(request, env, roomId) {
   if (!stateResult?.ok) {
     return mapInternalErrorToResponse(stateResult?.error);
   }
-  const currentRow = await derived.publicRoomDirectory.get({ room_id: decodedRoomId });
+  const currentRow = await resolveValidatedPublicRoomRow(env, decodedRoomId, {
+    derivedRow: await derived.publicRoomDirectory.get({ room_id: decodedRoomId }),
+    forceTruth: true,
+  });
   const childrenState = (stateResult.state ?? [])
     .filter((event) => event.type === 'm.space.child')
     .map((event) => event.state_key)
     .filter((childRoomId) => typeof childRoomId === 'string' && childRoomId.startsWith('!'));
   const children = [];
   for (const childRoomId of childrenState) {
-    const row = await derived.publicRoomDirectory.get({ room_id: childRoomId });
-    if (row?.is_public === true) {
+    const row = await resolveValidatedPublicRoomRow(env, childRoomId, {
+      derivedRow: await derived.publicRoomDirectory.get({ room_id: childRoomId }),
+      forceTruth: true,
+    });
+    if (row) {
       children.push(buildRoomSummaryFromDirectoryRow(row));
     }
   }
@@ -2518,10 +2806,16 @@ async function admitRoomClientEvent(roomDo, {
       response: mapInternalErrorToResponse(result?.error),
     };
   }
-  await registerShardSeen(roomDo.env ?? {}, {
-    shardType: 'RoomDO',
-    shardKey: roomId,
-  }).catch(() => {});
+  const registryResult = await roomDo.ensureShardRegistry({
+    room_id: roomId,
+    now: new Date().toISOString(),
+  });
+  if (!registryResult?.ok) {
+    return {
+      ok: false,
+      response: mapInternalErrorToResponse(registryResult?.error),
+    };
+  }
   return {
     ok: true,
     result,
@@ -2748,7 +3042,7 @@ async function handleRoomMembershipRequest(request, env, {
   if (!decodedRoomId && roomIdOrAlias != null) {
     const decodedAlias = decodePathComponent(roomIdOrAlias);
     if (decodedAlias?.startsWith('#')) {
-      const aliasEntry = await lookupRoomAlias(env, decodedAlias);
+      const aliasEntry = await resolveRoomAliasWithTruthFallback(env, decodedAlias);
       decodedRoomId = aliasEntry?.room_id ?? null;
     }
   }

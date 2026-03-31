@@ -1301,6 +1301,15 @@ test('ops-worker supports rebuild, restore, repair, and cancel control-plane rou
     const bundleManifestKey = [...rig.archiveBucket.objects.keys()].find((key) => key.includes('/bundle-manifest/'));
     assert.ok(bundleManifestKey);
     const bundleManifest = rig.archiveBucket.getJson(bundleManifestKey);
+    const now = new Date().toISOString();
+    await rig.persistence.upsertShardRegistry({
+      shard_type: 'RoomDO',
+      shard_key: '!room:test',
+      created_at: now,
+      last_seen_at: now,
+      schema_version: 1,
+      disabled_at: null,
+    });
 
     const rebuildResponse = await rig.opsWorker(
       rig.makeOpsRequest('/_ops/v1/rebuilds', {
@@ -2997,6 +3006,16 @@ test('ops-worker cancel idempotency is linearized by job_id instead of shared sc
   });
 
   try {
+    const now = new Date().toISOString();
+    await rig.persistence.upsertShardRegistry({
+      shard_type: 'RoomDO',
+      shard_key: '!room:test',
+      created_at: now,
+      last_seen_at: now,
+      schema_version: 1,
+      disabled_at: null,
+    });
+
     const makeRebuild = (idempotencyKey, ticketId) =>
       rig.opsWorker(
         rig.makeOpsRequest('/_ops/v1/rebuilds', {

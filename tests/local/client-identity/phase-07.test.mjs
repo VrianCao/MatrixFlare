@@ -13,6 +13,7 @@ import {
   buildMxcUri,
   buildRemoteMediaObjectKey,
   buildRoomArchiveObjectKey,
+  buildThumbnailObjectKey,
   createD1DerivedDataPersistence,
   clearDerivedTarget,
 } from '../../../packages/runtime-core/src/index.mjs';
@@ -389,6 +390,63 @@ test('Phase 07 covers local media upload/download, compatibility routes, thumbna
   assert.equal(cleanedGrant.state, 'cleaned');
 });
 
+test('Phase 07 media upload failures fail closed and preserve orphan cleanup state', async (t) => {
+  const rig = createGatewayPhase04Rig({
+    MATRIX_MEDIA_MAX_UPLOAD_BYTES: '8',
+  });
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, { username: 'phase07-media-failure-alice' });
+  const userDo = rig.getUserDo(alice.user_id);
+
+  const tooLargeResponse = await rig.gatewayFetch('/_matrix/media/v3/upload?filename=too-large.txt', {
+    method: 'POST',
+    headers: {
+      ...rig.authHeaders(alice.access_token),
+      'content-type': 'text/plain; charset=utf-8',
+    },
+    body: '0123456789',
+  });
+  await expectMatrixError(tooLargeResponse, 413, 'M_TOO_LARGE');
+
+  const revertedGrant = userDo.persistence.pendingUploadGrants.list()
+    .find((row) => row.record?.filename === 'too-large.txt');
+  assert.ok(revertedGrant);
+  assert.equal(revertedGrant.state, 'reverted');
+  assert.equal(await rig.buckets.media.get(buildLocalMediaObjectKey(revertedGrant.media_id)), null);
+
+  const originalFinalize = userDo.finalizeMediaUpload.bind(userDo);
+  userDo.finalizeMediaUpload = async function finalizeMediaUploadWithSyntheticFailure(request) {
+    if (request?.finalize_state === 'completed') {
+      return {
+        ok: false,
+        error: {
+          code: 'backpressure',
+          message: 'synthetic finalize failure',
+          retryable: true,
+        },
+      };
+    }
+    return originalFinalize(request);
+  };
+
+  const finalizeFailureResponse = await rig.gatewayFetch('/_matrix/media/v3/upload?filename=orphan-after-finalize.txt', {
+    method: 'POST',
+    headers: {
+      ...rig.authHeaders(alice.access_token),
+      'content-type': 'text/plain; charset=utf-8',
+    },
+    body: 'orphan',
+  });
+  await expectMatrixError(finalizeFailureResponse, 503, 'M_UNKNOWN');
+
+  const orphanedGrant = userDo.persistence.pendingUploadGrants.list()
+    .find((row) => row.record?.filename === 'orphan-after-finalize.txt');
+  assert.ok(orphanedGrant);
+  assert.equal(orphanedGrant.state, 'orphaned');
+  assert.ok(await rig.buckets.media.get(buildLocalMediaObjectKey(orphanedGrant.media_id)));
+});
+
 test('Phase 07 enforces legacy freeze semantics and remote-media cache-miss guards', async (t) => {
   const rig = createGatewayPhase04Rig({
     FF_MEDIA_REMOTE_FETCH: 'true',
@@ -431,6 +489,38 @@ test('Phase 07 enforces legacy freeze semantics and remote-media cache-miss guar
   assert.ok(remoteObject);
   assert.equal(remoteObject.customMetadata?.legacy_unauth_access_flag, 'false');
 
+  const currentThumbnailOnMiss = await rig.gatewayFetch(
+    '/_matrix/client/v1/media/thumbnail/remote.example/thumb-first-after-freeze?width=48&height=48&method=scale',
+    {
+      headers: rig.authHeaders(alice.access_token),
+    },
+  );
+  assert.equal(currentThumbnailOnMiss.status, 200);
+  assert.match(await readResponseText(currentThumbnailOnMiss), /^thumbnail:48x48:scale:static\n/);
+  assert.equal(remoteFetchCount, 2);
+  assert.ok(
+    await rig.buckets.media.get(buildThumbnailObjectKey({
+      sourceKind: 'remote',
+      originServerName: 'remote.example',
+      mediaId: 'thumb-first-after-freeze',
+      width: 48,
+      height: 48,
+      method: 'scale',
+      animated: false,
+    })),
+  );
+  assert.equal(
+    await rig.buckets.media.get(buildThumbnailObjectKey({
+      sourceKind: 'local',
+      mediaId: 'thumb-first-after-freeze',
+      width: 48,
+      height: 48,
+      method: 'scale',
+      animated: false,
+    })),
+    null,
+  );
+
   const currentRemoteCached = await rig.gatewayFetch(
     '/_matrix/client/v1/media/download/remote.example/media-after-freeze',
     {
@@ -438,28 +528,28 @@ test('Phase 07 enforces legacy freeze semantics and remote-media cache-miss guar
     },
   );
   assert.equal(currentRemoteCached.status, 200);
-  assert.equal(remoteFetchCount, 1);
+  assert.equal(remoteFetchCount, 2);
 
   await expectMatrixError(
     await rig.gatewayFetch('/_matrix/media/v3/download/remote.example/media-after-freeze'),
     404,
     'M_NOT_FOUND',
   );
-  assert.equal(remoteFetchCount, 1);
+  assert.equal(remoteFetchCount, 2);
 
   await expectMatrixError(
     await rig.gatewayFetch('/_matrix/media/v3/download/remote.example/cache-miss-after-freeze'),
     404,
     'M_NOT_FOUND',
   );
-  assert.equal(remoteFetchCount, 1);
+  assert.equal(remoteFetchCount, 2);
 
   await expectMatrixError(
     await rig.gatewayFetch('/_matrix/media/v3/thumbnail/remote.example/cache-miss-after-freeze?width=32&height=32&method=scale'),
     404,
     'M_NOT_FOUND',
   );
-  assert.equal(remoteFetchCount, 1);
+  assert.equal(remoteFetchCount, 2);
 
   const currentThumbnail = await rig.gatewayFetch(
     '/_matrix/client/v1/media/thumbnail/remote.example/media-after-freeze?width=32&height=32&method=scale',
@@ -474,7 +564,107 @@ test('Phase 07 enforces legacy freeze semantics and remote-media cache-miss guar
     404,
     'M_NOT_FOUND',
   );
-  assert.equal(remoteFetchCount, 1);
+  assert.equal(remoteFetchCount, 2);
+});
+
+test('Phase 07 remote-media fetch failures are deterministic and do not leave cache residue', async (t) => {
+  const rig = createGatewayPhase04Rig({
+    FF_MEDIA_REMOTE_FETCH: 'true',
+    MATRIX_MEDIA_MAX_UPLOAD_BYTES: '8',
+  });
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, { username: 'phase07-remote-failure-alice' });
+
+  rig.env.__REMOTE_MEDIA_FETCH__ = async () => new Response('0123456789', {
+    status: 200,
+    headers: {
+      'content-type': 'image/png',
+    },
+  });
+
+  const oversizedDownload = await rig.gatewayFetch(
+    '/_matrix/client/v1/media/download/remote.example/oversized-remote-object',
+    {
+      headers: rig.authHeaders(alice.access_token),
+    },
+  );
+  await expectMatrixError(oversizedDownload, 413, 'M_TOO_LARGE');
+  assert.equal(
+    await rig.buckets.media.get(buildRemoteMediaObjectKey('remote.example', 'oversized-remote-object')),
+    null,
+  );
+
+  rig.env.__REMOTE_MEDIA_FETCH__ = async () => new Response('upstream-failure', {
+    status: 500,
+    headers: {
+      'content-type': 'text/plain; charset=utf-8',
+    },
+  });
+
+  const failedDownload = await rig.gatewayFetch(
+    '/_matrix/client/v1/media/download/remote.example/upstream-500',
+    {
+      headers: rig.authHeaders(alice.access_token),
+    },
+  );
+  await expectMatrixError(failedDownload, 503, 'M_UNKNOWN');
+  assert.equal(
+    await rig.buckets.media.get(buildRemoteMediaObjectKey('remote.example', 'upstream-500')),
+    null,
+  );
+
+  const failedThumbnail = await rig.gatewayFetch(
+    '/_matrix/client/v1/media/thumbnail/remote.example/upstream-500-thumb?width=32&height=32&method=scale',
+    {
+      headers: rig.authHeaders(alice.access_token),
+    },
+  );
+  await expectMatrixError(failedThumbnail, 503, 'M_UNKNOWN');
+  assert.equal(
+    await rig.buckets.media.get(buildRemoteMediaObjectKey('remote.example', 'upstream-500-thumb')),
+    null,
+  );
+});
+
+test('Phase 07 thumbnail backoff failures surface as deterministic Matrix limit errors', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, { username: 'phase07-thumbnail-lock-alice' });
+  const uploadResponse = await rig.gatewayFetch('/_matrix/media/v3/upload?filename=thumb-lock.txt', {
+    method: 'POST',
+    headers: {
+      ...rig.authHeaders(alice.access_token),
+      'content-type': 'text/plain; charset=utf-8',
+    },
+    body: 'thumbnail-lock-source',
+  });
+  assert.equal(uploadResponse.status, 200);
+  const uploaded = parseMxc((await uploadResponse.json()).content_uri);
+
+  rig.env.MATRIX_EDGE_CACHE.get = async () => JSON.stringify({
+    locked_at: new Date().toISOString(),
+  });
+
+  const lockedThumbnail = await rig.gatewayFetch(
+    `/_matrix/client/v1/media/thumbnail/${encodeURIComponent(uploaded.serverName)}/${encodeURIComponent(uploaded.mediaId)}?width=32&height=32&method=scale`,
+    {
+      headers: rig.authHeaders(alice.access_token),
+    },
+  );
+  await expectMatrixError(lockedThumbnail, 429, 'M_LIMIT_EXCEEDED');
+  assert.equal(
+    await rig.buckets.media.get(buildThumbnailObjectKey({
+      sourceKind: 'local',
+      mediaId: uploaded.mediaId,
+      width: 32,
+      height: 32,
+      method: 'scale',
+      animated: false,
+    })),
+    null,
+  );
 });
 
 test('Phase 07 covers derived queries, alias lookup, hierarchy, and rebuild from truth plus archive', async (t) => {
@@ -565,6 +755,21 @@ test('Phase 07 covers derived queries, alias lookup, hierarchy, and rebuild from
     },
   );
 
+  const privateRoom = await postJson(rig, alice.access_token, '/_matrix/client/v3/createRoom', {
+    visibility: 'private',
+    room_alias_name: 'phase07-private-room',
+    name: 'Phase 07 Private Room',
+  });
+  const privateRoomId = privateRoom.room_id;
+  await putJson(
+    rig,
+    alice.access_token,
+    `/_matrix/client/v3/rooms/${encodeURIComponent(spaceRoomId)}/state/m.space.child/${encodeURIComponent(privateRoomId)}`,
+    {
+      via: [rig.env.MATRIX_SERVER_NAME],
+    },
+  );
+
   await rig.drainJobsQueues();
   const archivedEventKey = await archiveEventForRebuild(rig, publicRoomId, messageBody.event_id);
 
@@ -591,6 +796,30 @@ test('Phase 07 covers derived queries, alias lookup, hierarchy, and rebuild from
     'M_MISSING_TOKEN',
   );
 
+  await putJson(
+    rig,
+    alice.access_token,
+    `/_matrix/client/v3/user/${encodeURIComponent(alice.user_id)}/account_data/${encodeURIComponent('m.ignored_user_list')}`,
+    {
+      ignored_users: {
+        [bob.user_id]: {},
+      },
+    },
+  );
+  const ignoredUserDirectory = await postJson(rig, alice.access_token, '/_matrix/client/v3/user_directory/search', {
+    search_term: 'Needle',
+    limit: 10,
+  });
+  assert.ok(!ignoredUserDirectory.results.some((entry) => entry.user_id === bob.user_id));
+
+  await putJson(
+    rig,
+    alice.access_token,
+    `/_matrix/client/v3/user/${encodeURIComponent(alice.user_id)}/account_data/${encodeURIComponent('m.ignored_user_list')}`,
+    {
+      ignored_users: {},
+    },
+  );
   const userDirectory = await postJson(rig, alice.access_token, '/_matrix/client/v3/user_directory/search', {
     search_term: 'Needle',
     limit: 10,
@@ -620,14 +849,88 @@ test('Phase 07 covers derived queries, alias lookup, hierarchy, and rebuild from
     `/_matrix/client/v3/rooms/${encodeURIComponent(spaceRoomId)}/hierarchy`,
   );
   assert.ok(hierarchy.children.some((entry) => entry.room_id === publicRoomId));
+  assert.ok(!hierarchy.children.some((entry) => entry.room_id === privateRoomId));
 
   const derived = createD1DerivedDataPersistence(rig.d1);
   await derived.ensureSchema();
+  const privateTruthEntry = await rig.getRoomDo(privateRoomId).getPublicRoomDirectoryEntry({
+    room_id: privateRoomId,
+  });
+  assert.equal(privateTruthEntry.entry.is_public, false);
+  await derived.publicRoomDirectory.put({
+    ...privateTruthEntry.entry,
+    canonical_alias: `#phase07-private-room:${rig.env.MATRIX_SERVER_NAME}`,
+    join_rules: 'public',
+    history_visibility: 'world_readable',
+    world_readable: true,
+    guest_can_join: true,
+    is_public: true,
+    updated_at: new Date().toISOString(),
+    record_json: {
+      stale_visibility_injected: true,
+    },
+  });
+
+  const privateRoomsResponse = await rig.gatewayFetch('/_matrix/client/v3/publicRooms?limit=10&search_term=Private');
+  assert.equal(privateRoomsResponse.status, 200);
+  const privateRooms = await privateRoomsResponse.json();
+  assert.ok(!privateRooms.chunk.some((entry) => entry.room_id === privateRoomId));
+
+  const hierarchyAfterPrivateInjection = await getJson(
+    rig,
+    alice.access_token,
+    `/_matrix/client/v3/rooms/${encodeURIComponent(spaceRoomId)}/hierarchy`,
+  );
+  assert.ok(!hierarchyAfterPrivateInjection.children.some((entry) => entry.room_id === privateRoomId));
+
+  await expectMatrixError(
+    await rig.gatewayFetch(
+      `/_matrix/client/v3/join/${encodeURIComponent(`#phase07-private-room:${rig.env.MATRIX_SERVER_NAME}`)}`,
+      {
+        method: 'POST',
+        headers: rig.authHeaders(bob.access_token),
+        json: {},
+      },
+    ),
+    404,
+    'M_NOT_FOUND',
+  );
+
+  await derived.publicRoomDirectory.delete({ room_id: publicRoomId });
+  const charlie = await registerUser(rig, { username: 'phase07-derived-charlie' });
+  const joinByAliasAfterDerivedDelete = await rig.gatewayFetch(
+    `/_matrix/client/v3/join/${encodeURIComponent(`#phase07-public-room:${rig.env.MATRIX_SERVER_NAME}`)}`,
+    {
+      method: 'POST',
+      headers: rig.authHeaders(charlie.access_token),
+      json: {},
+    },
+  );
+  assert.equal(joinByAliasAfterDerivedDelete.status, 200);
+  assert.deepEqual(await joinByAliasAfterDerivedDelete.json(), {
+    room_id: publicRoomId,
+  });
+
+  const publicRoomsAfterDerivedDelete = await rig.gatewayFetch('/_matrix/client/v3/publicRooms?limit=10&search_term=Public');
+  assert.equal(publicRoomsAfterDerivedDelete.status, 200);
+  const publicRoomsAfterDelete = await publicRoomsAfterDerivedDelete.json();
+  assert.ok(publicRoomsAfterDelete.chunk.some((entry) => entry.room_id === publicRoomId));
+
+  const hierarchyAfterDerivedDelete = await getJson(
+    rig,
+    alice.access_token,
+    `/_matrix/client/v3/rooms/${encodeURIComponent(spaceRoomId)}/hierarchy`,
+  );
+  assert.ok(hierarchyAfterDerivedDelete.children.some((entry) => entry.room_id === publicRoomId));
+
+  await rig.drainJobsQueues();
+
   const expectedSearch = await derived.searchIndex.list();
   const expectedUsers = await derived.userDirectory.list();
   const expectedPublicRooms = await derived.publicRoomDirectory.list();
   assert.ok(expectedSearch.some((row) => row.event_id === messageBody.event_id));
   assert.ok(expectedUsers.some((row) => row.user_id === bob.user_id));
+  assert.ok(expectedUsers.some((row) => row.user_id === charlie.user_id));
   assert.ok(expectedPublicRooms.some((row) => row.room_id === publicRoomId));
 
   await clearDerivedTarget(rig.env, { target: 'all_derived' });
@@ -647,6 +950,51 @@ test('Phase 07 covers derived queries, alias lookup, hierarchy, and rebuild from
     },
   });
   assert.equal(emptySearch.search_categories.room_events.results.length, 0);
+
+  await derived.searchIndex.put({
+    event_id: '$phase07-stale-search',
+    room_id: '!stale-room:matrix.example.test',
+    event_type: 'm.room.message',
+    origin_server_ts: 1,
+    sender_user_id: alice.user_id,
+    search_vector_text: 'phase07 stale search row',
+    visibility_scope: 'shared',
+    updated_at: new Date().toISOString(),
+    record_json: {
+      stale: true,
+    },
+  });
+  await derived.userDirectory.put({
+    user_id: '@phase07-stale:matrix.example.test',
+    displayname: 'Phase 07 Stale User',
+    avatar_url: null,
+    profile_version: 1,
+    directory_visibility: 'visible',
+    discovery_flags_json: {},
+    updated_at: new Date().toISOString(),
+    record_json: {
+      stale: true,
+    },
+  });
+  await derived.publicRoomDirectory.put({
+    room_id: '!phase07-stale-room:matrix.example.test',
+    canonical_alias: '#phase07-stale:matrix.example.test',
+    name: 'Phase 07 Stale Room',
+    topic: 'stale derived row',
+    avatar_url: null,
+    join_rules: 'public',
+    history_visibility: 'world_readable',
+    world_readable: true,
+    guest_can_join: false,
+    joined_members: 1,
+    room_serial: 1,
+    visibility_watermark: 1,
+    is_public: true,
+    updated_at: new Date().toISOString(),
+    record_json: {
+      stale: true,
+    },
+  });
 
   const opsHarness = await createOpsHarness(rig);
   const rebuildResponse = await opsWorkerModule.fetch(
@@ -701,6 +1049,9 @@ test('Phase 07 covers derived queries, alias lookup, hierarchy, and rebuild from
         && row.canonical_alias === `#phase07-public-room:${rig.env.MATRIX_SERVER_NAME}`,
     ),
   );
+  assert.equal(rebuiltSearch.find((row) => row.event_id === '$phase07-stale-search'), undefined);
+  assert.equal(rebuiltUsers.find((row) => row.user_id === '@phase07-stale:matrix.example.test'), undefined);
+  assert.equal(rebuiltPublicRooms.find((row) => row.room_id === '!phase07-stale-room:matrix.example.test'), undefined);
 
   const rebuiltSearchResponse = await postJson(rig, alice.access_token, '/_matrix/client/v3/search', {
     search_categories: {
@@ -726,6 +1077,230 @@ test('Phase 07 covers derived queries, alias lookup, hierarchy, and rebuild from
   assert.equal(rebuiltJob.result_summary?.terminal_state, 'succeeded');
   assert.equal(rebuiltJob.result_summary?.rebuild_summary?.rebuild_target, 'all_derived');
   assert.ok(rebuiltJob.checkpoint_state?.last_completed_checkpoint_id);
+});
+
+test('Phase 07 rebuild fails closed when a shard snapshot exceeds the single-invocation D1 budget', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, { username: 'phase07-budget-alice' });
+  const room = await postJson(rig, alice.access_token, '/_matrix/client/v3/createRoom', {
+    visibility: 'public',
+    preset: 'public_chat',
+    room_alias_name: 'phase07-budget-room',
+    name: 'Phase 07 Budget Room',
+  });
+  const roomId = room.room_id;
+  const roomDo = rig.getRoomDo(roomId);
+  roomDo.exportDerivedShard = async function exportOversizedDerivedShard() {
+    return {
+      ok: true,
+      room_id: roomId,
+      search_index_rows: Array.from({ length: 11_000 }, (_, index) => ({
+        event_id: `$phase07-budget-${index}`,
+        room_id: roomId,
+        event_type: 'm.room.message',
+        origin_server_ts: index + 1,
+        sender_user_id: alice.user_id,
+        search_vector_text: `phase07 budget row ${index}`,
+        visibility_scope: 'shared',
+        updated_at: new Date().toISOString(),
+        record_json: {
+          room_pos: index + 1,
+        },
+      })),
+      public_room_directory_entry: null,
+    };
+  };
+
+  const opsHarness = await createOpsHarness(rig);
+  const rebuildResponse = await opsWorkerModule.fetch(
+    opsHarness.makeOpsRequest('/_ops/v1/rebuilds', {
+      method: 'POST',
+      body: {
+        rebuild_target: 'search_index',
+        scope: {
+          scope_kind: 'global',
+          scope_id: null,
+        },
+        reason: 'phase07 rebuild budget guard',
+        ticket_id: 'OPS-PHASE07-BUDGET',
+        force_full_scan: false,
+      },
+      headers: {
+        'Idempotency-Key': 'phase07-rebuild-budget-idem',
+      },
+    }),
+    opsHarness.opsEnv,
+  );
+  assert.equal(rebuildResponse.status, 202);
+  const rebuildHandle = await rebuildResponse.json();
+  assert.equal(rebuildHandle.job_type, 'rebuild');
+  assert.equal(rig.queues.rebuild.messages.length, 1);
+
+  await rig.drainJobsQueues();
+
+  const failedJob = await opsHarness.persistence.getJob(rebuildHandle.job_id);
+  assert.ok(failedJob);
+  assert.equal(failedJob.internal_state, 'failed');
+  assert.equal(failedJob.last_error.code, 'precondition_failed');
+  assert.match(failedJob.last_error.message, /single-invocation D1 budget/i);
+});
+
+test('Phase 07 retries shard-registry barriers without duplicating room truth', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, { username: 'phase07-registry-alice' });
+  const createRoomBody = {
+    visibility: 'public',
+    preset: 'public_chat',
+    room_alias_name: 'phase07-registry-room',
+    name: 'Phase 07 Registry Room',
+  };
+
+  const originalPrepare = rig.env.MATRIX_CONTROL_D1.prepare.bind(rig.env.MATRIX_CONTROL_D1);
+  let failRoomRegistryUpsert = true;
+  rig.env.MATRIX_CONTROL_D1.prepare = (sql) => {
+    const statement = originalPrepare(sql);
+    if (!sql.includes('INSERT INTO shard_registry')) {
+      return statement;
+    }
+    return {
+      bind(...bindings) {
+        const bound = statement.bind(...bindings);
+        return {
+          run: async () => {
+            if (failRoomRegistryUpsert && bindings[0] === 'RoomDO') {
+              failRoomRegistryUpsert = false;
+              throw new Error('synthetic shard registry failure');
+            }
+            return bound.run();
+          },
+          first: async () => bound.first(),
+          all: async () => bound.all(),
+        };
+      },
+    };
+  };
+
+  await expectMatrixError(
+    await rig.gatewayFetch('/_matrix/client/v3/createRoom', {
+      method: 'POST',
+      headers: rig.authHeaders(alice.access_token),
+      json: createRoomBody,
+    }),
+    503,
+    'M_UNKNOWN',
+  );
+
+  const roomId = [...rig.env.ROOM_DO.instances.keys()][0];
+  assert.ok(roomId);
+  const roomDo = rig.getRoomDo(roomId);
+  const createEvent = roomDo.persistence.eventMetadata.list().find((row) => row.event_type === 'm.room.create');
+  assert.ok(createEvent);
+  assert.ok(roomDo.getRegistryRetryMarker());
+
+  const controlPlane = createD1ControlPlanePersistence(rig.env.MATRIX_CONTROL_D1);
+  await controlPlane.ensureSchema();
+  assert.ok(!(await controlPlane.listShardRegistry({})).some((row) => row.shard_type === 'RoomDO' && row.shard_key === roomId));
+
+  const opsHarness = await createOpsHarness(rig);
+  const rebuildDuringGapResponse = await opsWorkerModule.fetch(
+    opsHarness.makeOpsRequest('/_ops/v1/rebuilds', {
+      method: 'POST',
+      body: {
+        rebuild_target: 'public_room_directory',
+        scope: {
+          scope_kind: 'global',
+          scope_id: null,
+        },
+        reason: 'phase07 registry gap rebuild validation',
+        ticket_id: 'OPS-PHASE07-GAP',
+        force_full_scan: false,
+      },
+      headers: {
+        'Idempotency-Key': 'phase07-rebuild-gap-idem',
+      },
+    }),
+    opsHarness.opsEnv,
+  );
+  assert.equal(rebuildDuringGapResponse.status, 409);
+  const rebuildDuringGapBody = await rebuildDuringGapResponse.json();
+  assert.equal(rebuildDuringGapBody.code, 'precondition_failed');
+  assert.equal(rig.queues.rebuild.messages.length, 0);
+
+  rig.env.MATRIX_CONTROL_D1.prepare = originalPrepare;
+  const scheduledAlarm = await rig.env.ROOM_DO.instances.get(roomId).storage.getAlarm();
+  assert.equal(typeof scheduledAlarm, 'number');
+  await roomDo.alarm({ scheduledTime: scheduledAlarm });
+
+  const registryRows = await controlPlane.listShardRegistry({});
+  assert.ok(registryRows.some((row) => row.shard_type === 'RoomDO' && row.shard_key === roomId));
+  assert.equal(roomDo.getRegistryRetryMarker(), null);
+
+  const retryResponse = await rig.gatewayFetch('/_matrix/client/v3/createRoom', {
+    method: 'POST',
+    headers: rig.authHeaders(alice.access_token),
+    json: createRoomBody,
+  });
+  assert.equal(retryResponse.status, 200);
+  const retriedPayload = await retryResponse.json();
+  assert.equal(retriedPayload.room_id, roomId);
+
+  const createEvents = roomDo.persistence.eventMetadata.list().filter((row) => row.event_type === 'm.room.create');
+  assert.equal(createEvents.length, 1);
+});
+
+test('Phase 07 global rebuild ignores disabled shard-registry rows', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, { username: 'phase07-disabled-registry-alice' });
+  const room = await postJson(rig, alice.access_token, '/_matrix/client/v3/createRoom', {
+    visibility: 'public',
+    preset: 'public_chat',
+    room_alias_name: 'phase07-disabled-registry-room',
+    name: 'Phase 07 Disabled Registry Room',
+  });
+  const roomId = room.room_id;
+
+  const controlPlane = createD1ControlPlanePersistence(rig.env.MATRIX_CONTROL_D1);
+  await controlPlane.ensureSchema();
+  const disabledAt = new Date().toISOString();
+  await controlPlane.upsertShardRegistry({
+    shard_type: 'RoomDO',
+    shard_key: roomId,
+    created_at: disabledAt,
+    last_seen_at: disabledAt,
+    schema_version: 1,
+    disabled_at: disabledAt,
+  });
+
+  const opsHarness = await createOpsHarness(rig);
+  const rebuildResponse = await opsWorkerModule.fetch(
+    opsHarness.makeOpsRequest('/_ops/v1/rebuilds', {
+      method: 'POST',
+      body: {
+        rebuild_target: 'public_room_directory',
+        scope: {
+          scope_kind: 'global',
+          scope_id: null,
+        },
+        reason: 'phase07 disabled registry rows must not rebuild',
+        ticket_id: 'OPS-PHASE07-DISABLED',
+        force_full_scan: false,
+      },
+      headers: {
+        'Idempotency-Key': 'phase07-rebuild-disabled-idem',
+      },
+    }),
+    opsHarness.opsEnv,
+  );
+  assert.equal(rebuildResponse.status, 409);
+  const rebuildBody = await rebuildResponse.json();
+  assert.equal(rebuildBody.code, 'precondition_failed');
+  assert.equal(rig.queues.rebuild.messages.length, 0);
 });
 
 test('Phase 07 upload failures do not leave pending grants in a live state', async (t) => {

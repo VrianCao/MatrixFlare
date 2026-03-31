@@ -110,9 +110,7 @@ export async function readReadableStreamWithDigest(stream, {
     const chunk = Buffer.from(value);
     total += chunk.byteLength;
     if (Number.isInteger(maxBytes) && total > maxBytes) {
-      throw Object.assign(new Error(`Media body exceeds ${maxBytes} bytes`), {
-        code: 'content_too_large',
-      });
+      throw createContentTooLargeError(maxBytes);
     }
     hash.update(chunk);
     chunks.push(chunk);
@@ -121,6 +119,108 @@ export async function readReadableStreamWithDigest(stream, {
     bytes: Buffer.concat(chunks),
     byte_size: total,
     sha256: hash.digest('base64url'),
+  };
+}
+
+export async function readReadableStreamDigest(stream, {
+  maxBytes,
+} = {}) {
+  if (!stream || typeof stream.getReader !== 'function') {
+    return {
+      byte_size: 0,
+      sha256: createHash('sha256').digest('base64url'),
+    };
+  }
+  const reader = stream.getReader();
+  const hash = createHash('sha256');
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    const chunk = Buffer.from(value);
+    total += chunk.byteLength;
+    if (Number.isInteger(maxBytes) && total > maxBytes) {
+      throw createContentTooLargeError(maxBytes);
+    }
+    hash.update(chunk);
+  }
+  return {
+    byte_size: total,
+    sha256: hash.digest('base64url'),
+  };
+}
+
+export function teeBodyStreamWithDigest(source, {
+  maxBytes,
+} = {}) {
+  if (!source?.body || typeof source.body.getReader !== 'function') {
+    return null;
+  }
+  const reader = source.body.getReader();
+  const hash = createHash('sha256');
+  let total = 0;
+  let digestSettled = false;
+  let resolveDigest = null;
+  let rejectDigest = null;
+  const settleDigestSuccess = () => {
+    if (digestSettled) {
+      return;
+    }
+    digestSettled = true;
+    resolveDigest({
+      byte_size: total,
+      sha256: hash.digest('base64url'),
+    });
+  };
+  const settleDigestError = (reason) => {
+    if (digestSettled) {
+      return;
+    }
+    digestSettled = true;
+    rejectDigest(reason instanceof Error ? reason : new Error('Media stream cancelled'));
+  };
+  const digestPromise = new Promise((resolve, reject) => {
+    resolveDigest = resolve;
+    rejectDigest = reject;
+  });
+  return {
+    upload_stream: new ReadableStream({
+      async pull(controller) {
+        try {
+          const { done, value } = await reader.read();
+          if (done) {
+            settleDigestSuccess();
+            controller.close();
+            return;
+          }
+          const chunk = Buffer.from(value);
+          total += chunk.byteLength;
+          if (Number.isInteger(maxBytes) && total > maxBytes) {
+            const error = createContentTooLargeError(maxBytes);
+            settleDigestError(error);
+            await reader.cancel(error).catch(() => {});
+            controller.error(error);
+            return;
+          }
+          hash.update(chunk);
+          controller.enqueue(chunk);
+        } catch (error) {
+          settleDigestError(error);
+          controller.error(error);
+        }
+      },
+      async cancel(reason) {
+        try {
+          await reader.cancel(reason);
+        } catch {
+          // Ignore reader cancellation failures during consumer abort.
+        }
+        settleDigestError(reason);
+      },
+    }),
+    digest_promise: digestPromise,
   };
 }
 
@@ -133,9 +233,7 @@ export async function readBodyWithDigest(source, {
   if (typeof source?.arrayBuffer === 'function') {
     const buffer = Buffer.from(await source.arrayBuffer());
     if (Number.isInteger(maxBytes) && buffer.byteLength > maxBytes) {
-      throw Object.assign(new Error(`Media body exceeds ${maxBytes} bytes`), {
-        code: 'content_too_large',
-      });
+      throw createContentTooLargeError(maxBytes);
     }
     return {
       bytes: buffer,
@@ -148,6 +246,12 @@ export async function readBodyWithDigest(source, {
     byte_size: 0,
     sha256: createHash('sha256').digest('base64url'),
   };
+}
+
+function createContentTooLargeError(maxBytes) {
+  return Object.assign(new Error(`Media body exceeds ${maxBytes} bytes`), {
+    code: 'content_too_large',
+  });
 }
 
 export function normalizeMediaThumbnailJobVariant(value, index) {
@@ -181,6 +285,8 @@ export function createDefaultThumbnailJob({
   sourceKind,
   r2ObjectKey,
   contentType,
+  byteSize = null,
+  contentHash = null,
   enqueuedAt = new Date().toISOString(),
   variants = DEFAULT_MEDIA_THUMBNAIL_VARIANTS,
 }) {
@@ -190,6 +296,12 @@ export function createDefaultThumbnailJob({
     source_kind: normalizeString(sourceKind, 'sourceKind'),
     r2_object_key: normalizeString(r2ObjectKey, 'r2ObjectKey'),
     content_type: normalizeString(contentType, 'contentType'),
+    ...(byteSize == null ? {} : {
+      byte_size: normalizeInteger(byteSize, 'byteSize', { min: 0 }),
+    }),
+    ...(contentHash == null ? {} : {
+      content_hash: normalizeString(contentHash, 'contentHash'),
+    }),
     enqueued_at: normalizeString(enqueuedAt, 'enqueuedAt'),
     variants: variants.map((variant, index) => normalizeMediaThumbnailJobVariant(variant, index)),
   };

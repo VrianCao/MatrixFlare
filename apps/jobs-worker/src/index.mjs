@@ -47,6 +47,39 @@ function parseMxcUri(mxcUri) {
   };
 }
 
+function sleep(milliseconds) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, milliseconds);
+  });
+}
+
+async function withMediaKeyBackoff(env, objectKey, operation) {
+  const cache = env.MATRIX_EDGE_CACHE;
+  const cacheKey = `media_write_backoff:${objectKey}`;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const existing = cache && typeof cache.get === 'function'
+      ? await cache.get(cacheKey)
+      : null;
+    if (!existing) {
+      try {
+        if (cache && typeof cache.put === 'function') {
+          await cache.put(cacheKey, JSON.stringify({ locked_at: new Date().toISOString() }), {
+            expirationTtl: 5,
+          });
+        }
+        return await operation();
+      } finally {
+        await cache?.delete?.(cacheKey);
+      }
+    }
+    await sleep(10 + Math.floor(Math.random() * 25));
+  }
+  throw Object.assign(new Error(`Media object ${objectKey} is busy; retry later`), {
+    code: 'quota_exceeded',
+    retryable: true,
+  });
+}
+
 async function handleRuntimeDerivedFetch(request, env) {
   let body;
   try {
@@ -100,6 +133,8 @@ async function handleRuntimeDerivedFetch(request, env) {
         sourceKind: item.source_refs.source_kind,
         r2ObjectKey: item.source_refs.r2_object_key,
         contentType: item.source_refs.content_type,
+        byteSize: item.source_refs.byte_size ?? null,
+        contentHash: item.source_refs.content_hash ?? null,
         enqueuedAt: item.enqueued_at,
         variants: item.source_refs.variants,
       }));
@@ -163,7 +198,7 @@ async function processMediaThumbnailMessage(messageBody, env) {
       animated: variant.animated === true,
     });
     const thumbnailBody = buildThumbnailBody(sourceBytes, variant);
-    await env.MATRIX_MEDIA_BUCKET.put(descriptor.key, thumbnailBody, {
+    await withMediaKeyBackoff(env, descriptor.key, () => env.MATRIX_MEDIA_BUCKET.put(descriptor.key, thumbnailBody, {
       customMetadata: {
         ...descriptor.metadata,
         created_at: messageBody.enqueued_at,
@@ -172,7 +207,7 @@ async function processMediaThumbnailMessage(messageBody, env) {
       httpMetadata: {
         contentType: messageBody.content_type,
       },
-    });
+    }));
   }
   await applyMediaCatalogProjection(env, {
     mxc_uri: messageBody.mxc_uri,
@@ -180,8 +215,15 @@ async function processMediaThumbnailMessage(messageBody, env) {
     origin_server_name: messageBody.source_kind === 'remote_cache' ? originServerName : null,
     media_id: mediaId,
     content_type: messageBody.content_type,
-    byte_size: Number.parseInt(sourceMetadata.byte_size ?? String(sourceBytes.byteLength), 10),
-    content_hash: sourceMetadata.content_hash ?? null,
+    byte_size: Number.parseInt(
+      messageBody.byte_size
+        ?? sourceMetadata.byte_size
+        ?? String(sourceBytes.byteLength),
+      10,
+    ),
+    content_hash: typeof messageBody.content_hash === 'string'
+      ? messageBody.content_hash
+      : (sourceMetadata.content_hash ?? null),
     legacy_unauth_access_flag: legacyFlag,
     source_object_key: messageBody.r2_object_key,
     created_at: messageBody.enqueued_at,

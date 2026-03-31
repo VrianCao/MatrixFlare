@@ -13,12 +13,14 @@ export {
 export {
   DERIVED_DATA_SCHEMA_SQL,
   DERIVED_DATA_SCHEMA_VERSION,
+  SEARCH_INDEX_BATCH_ROWS_PER_STATEMENT,
   createD1DerivedDataPersistence,
 } from './derived-d1-persistence.mjs';
 export {
   applyMediaCatalogProjection,
   applyPublicRoomDirectoryProjection,
   applySearchIndexProjection,
+  applySearchIndexProjectionBatch,
   applyUserDirectoryProjection,
   clearDerivedTarget,
   ensureDerivedSchema,
@@ -44,7 +46,9 @@ export {
   normalizeDownloadOptions,
   parseLegacyUnauthFreezeAt,
   readBodyWithDigest,
+  readReadableStreamDigest,
   readReadableStreamWithDigest,
+  teeBodyStreamWithDigest,
 } from './media-domain.mjs';
 export {
   buildNormalizedRequestObject,

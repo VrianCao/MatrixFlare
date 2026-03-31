@@ -38,6 +38,11 @@ export async function applySearchIndexProjection(env, record) {
   return derived.searchIndex.put(record);
 }
 
+export async function applySearchIndexProjectionBatch(env, records) {
+  const derived = await ensureDerivedSchema(env);
+  await derived.putSearchIndexBatch(records ?? []);
+}
+
 export async function applyUserDirectoryProjection(env, record) {
   const derived = await ensureDerivedSchema(env);
   if (!record) {
@@ -73,24 +78,24 @@ export async function clearDerivedTarget(env, {
     throw new RangeError('target must be search_index, user_directory, public_room_directory, or all_derived');
   }
   if (normalizedTarget === 'search_index' || normalizedTarget === 'all_derived') {
-    for (const row of await derived.searchIndex.list()) {
-      if (roomId == null || row.room_id === roomId) {
-        await derived.searchIndex.delete({ event_id: row.event_id });
-      }
+    if (roomId == null) {
+      await derived.clearAllSearchIndex();
+    } else {
+      await derived.clearSearchIndexByRoomId(roomId);
     }
   }
   if (normalizedTarget === 'user_directory' || normalizedTarget === 'all_derived') {
-    for (const row of await derived.userDirectory.list()) {
-      if (userId == null || row.user_id === userId) {
-        await derived.userDirectory.delete({ user_id: row.user_id });
-      }
+    if (userId == null) {
+      await derived.clearAllUserDirectory();
+    } else {
+      await derived.clearUserDirectoryByUserId(userId);
     }
   }
   if (normalizedTarget === 'public_room_directory' || normalizedTarget === 'all_derived') {
-    for (const row of await derived.publicRoomDirectory.list()) {
-      if (roomId == null || row.room_id === roomId) {
-        await derived.publicRoomDirectory.delete({ room_id: row.room_id });
-      }
+    if (roomId == null) {
+      await derived.clearAllPublicRoomDirectory();
+    } else {
+      await derived.clearPublicRoomDirectoryByRoomId(roomId);
     }
   }
 }
@@ -105,13 +110,18 @@ export async function lookupRoomAlias(env, alias) {
 export async function queryUserDirectory(env, {
   searchTerm,
   limit = 10,
+  ignoredUserIds = null,
 } = {}) {
   const derived = await ensureDerivedSchema(env);
   const normalizedLimit = normalizeInteger(limit, 'limit', { min: 1 });
   const normalizedSearchTerm = normalizeString(searchTerm ?? '', 'searchTerm');
   const lowered = normalizedSearchTerm.toLowerCase();
+  const ignoredUserIdSet = ignoredUserIds == null
+    ? null
+    : new Set([...ignoredUserIds].map((userId) => normalizeString(userId, 'ignoredUserId')));
   const results = (await derived.userDirectory.list())
     .filter((row) => row.directory_visibility !== 'hidden')
+    .filter((row) => ignoredUserIdSet == null || !ignoredUserIdSet.has(row.user_id))
     .filter((row) => (
       lowered.length === 0
         || row.user_id.toLowerCase().includes(lowered)

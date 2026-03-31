@@ -425,6 +425,159 @@ function buildToDeviceEvent(entry) {
 }
 
 const ROOM_SYNC_VISIBLE_BUCKETS = new Set(['join', 'invite', 'knock', 'leave']);
+const SHARD_REGISTRY_SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS shard_registry (
+  shard_type TEXT NOT NULL,
+  shard_key TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL,
+  schema_version INTEGER NOT NULL,
+  disabled_at TEXT,
+  PRIMARY KEY (shard_type, shard_key)
+);
+`;
+const REGISTRY_RETRY_BASE_MS = 2_000;
+const REGISTRY_RETRY_MAX_MS = 60_000;
+const MEDIA_CLEANUP_RETRY_MS = 60_000;
+
+async function ensureShardRegistrySchema(env) {
+  const db = env?.MATRIX_CONTROL_D1;
+  if (!db || typeof db.prepare !== 'function' || typeof db.exec !== 'function') {
+    throw createInternalErrorEnvelope({
+      code: 'internal',
+      message: 'Missing MATRIX_CONTROL_D1 binding for shard registry barrier',
+      retryable: false,
+    });
+  }
+  if (!env.__SHARD_REGISTRY_SCHEMA_READY__) {
+    env.__SHARD_REGISTRY_SCHEMA_READY__ = db.exec(SHARD_REGISTRY_SCHEMA_SQL);
+  }
+  await env.__SHARD_REGISTRY_SCHEMA_READY__;
+  return db;
+}
+
+async function upsertShardRegistryBarrier(env, {
+  shardType,
+  shardKey,
+  schemaVersion,
+  nowIso,
+}) {
+  const db = await ensureShardRegistrySchema(env);
+  await db.prepare(`
+    INSERT INTO shard_registry (
+      shard_type, shard_key, created_at, last_seen_at, schema_version, disabled_at
+    ) VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(shard_type, shard_key) DO UPDATE SET
+      last_seen_at = CASE
+        WHEN shard_registry.last_seen_at > excluded.last_seen_at THEN shard_registry.last_seen_at
+        ELSE excluded.last_seen_at
+      END,
+      schema_version = CASE
+        WHEN shard_registry.schema_version > excluded.schema_version THEN shard_registry.schema_version
+        ELSE excluded.schema_version
+      END,
+      disabled_at = CASE
+        WHEN shard_registry.disabled_at IS NULL THEN excluded.disabled_at
+        WHEN excluded.disabled_at IS NULL THEN shard_registry.disabled_at
+        WHEN shard_registry.disabled_at > excluded.disabled_at THEN shard_registry.disabled_at
+        ELSE excluded.disabled_at
+      END
+  `).bind(
+    normalizeString(shardType, 'shardType'),
+    normalizeString(shardKey, 'shardKey'),
+    normalizeString(nowIso, 'nowIso'),
+    normalizeString(nowIso, 'nowIso'),
+    normalizeInteger(schemaVersion, 'schemaVersion', { min: 1 }),
+    null,
+  ).run();
+}
+
+function readRegistryRetryMarker(record) {
+  const marker = record?.registry_upsert_pending;
+  return marker && typeof marker === 'object' && !Array.isArray(marker)
+    ? structuredClone(marker)
+    : null;
+}
+
+function clearRegistryRetryMarker(record) {
+  const next = {
+    ...(record ?? {}),
+  };
+  delete next.registry_upsert_pending;
+  return next;
+}
+
+function withRegistryRetryMarker(record, marker) {
+  return {
+    ...(record ?? {}),
+    registry_upsert_pending: structuredClone(marker),
+  };
+}
+
+function getRegistryRetryAtMillis(marker) {
+  const nextRetryAt = typeof marker?.next_retry_at === 'string' ? marker.next_retry_at : '';
+  const retryAtMs = Date.parse(nextRetryAt);
+  return Number.isFinite(retryAtMs) ? retryAtMs : null;
+}
+
+function buildRegistryRetryMarker({
+  existingMarker = null,
+  shardType,
+  shardKey,
+  schemaVersion,
+  nowIso,
+  error,
+}) {
+  const previousAttemptCount = Number.isInteger(existingMarker?.attempt_count) && existingMarker.attempt_count >= 0
+    ? existingMarker.attempt_count
+    : 0;
+  const attemptCount = previousAttemptCount + 1;
+  const delayMs = Math.min(
+    REGISTRY_RETRY_BASE_MS * (2 ** Math.min(attemptCount - 1, 5)),
+    REGISTRY_RETRY_MAX_MS,
+  );
+  return {
+    shard_type: normalizeString(shardType, 'shardType'),
+    shard_key: normalizeString(shardKey, 'shardKey'),
+    schema_version: normalizeInteger(schemaVersion, 'schemaVersion', { min: 1 }),
+    attempt_count: attemptCount,
+    first_failed_at: typeof existingMarker?.first_failed_at === 'string'
+      ? existingMarker.first_failed_at
+      : normalizeString(nowIso, 'nowIso'),
+    last_failed_at: normalizeString(nowIso, 'nowIso'),
+    next_retry_at: new Date(Date.parse(nowIso) + delayMs).toISOString(),
+    last_error: error?.message ?? String(error ?? 'Shard registry barrier failed'),
+  };
+}
+
+function createShardRegistryBarrierError({ shardType, shardKey, error }) {
+  if (error?.code && error?.message) {
+    return error;
+  }
+  return createInternalErrorEnvelope({
+    code: 'backpressure',
+    message: `Shard registry upsert failed for ${shardType}/${shardKey}: ${error?.message ?? String(error)}`,
+    retryable: true,
+    details: {
+      shard_type: shardType,
+      shard_key: shardKey,
+    },
+  });
+}
+
+function getUserMediaLifecycleNextAlarm(userDo, nowIso) {
+  return sweepPendingUploadGrants(userDo, nowIso, { applyChanges: false }).next_alarm_at;
+}
+
+function earlierIso(leftIso, rightIso) {
+  if (leftIso == null) {
+    return rightIso ?? null;
+  }
+  if (rightIso == null) {
+    return leftIso;
+  }
+  return Date.parse(leftIso) <= Date.parse(rightIso) ? leftIso : rightIso;
+}
 
 function getUserDoStub(env, userId) {
   const namespace = env?.USER_DO;
@@ -1166,7 +1319,7 @@ function sweepPendingUploadGrants(userDo, nowIso, { applyChanges = false } = {})
           media_id: grant.media_id,
           content_type: grant.content_type,
           max_bytes: grant.max_bytes,
-          state: 'cleaned',
+          state: 'orphaned',
           granted_at: grant.granted_at,
           expires_at: grant.expires_at,
           finalized_at: grant.finalized_at ?? nowIso,
@@ -1176,6 +1329,7 @@ function sweepPendingUploadGrants(userDo, nowIso, { applyChanges = false } = {})
           },
         });
       }
+      nextAlarmAtMs = Math.min(nextAlarmAtMs, nowMs + MEDIA_CLEANUP_RETRY_MS);
       continue;
     }
     if (Number.isFinite(orphanDeadlineMs)) {
@@ -3641,31 +3795,194 @@ export class UserDO extends BaseDurableObject {
   }
 
   async scheduleMediaLifecycleAlarm(nextAlarmAt) {
-    if (nextAlarmAt) {
-      await this.ctx.storage.setAlarm(Date.parse(nextAlarmAt));
+    const effectiveAlarmAt = earlierIso(nextAlarmAt, this.getRegistryRetryMarker()?.next_retry_at ?? null);
+    if (effectiveAlarmAt) {
+      await this.ctx.storage.setAlarm(Date.parse(effectiveAlarmAt));
       return;
     }
     await this.ctx.storage.deleteAlarm?.();
   }
 
-  async cleanupOrphanedMediaObjects(entries = []) {
+  getRegistryRetryMarker() {
+    const principal = this.persistence.userPrincipal.get();
+    return readRegistryRetryMarker(principal?.record);
+  }
+
+  persistRegistryRetryMarker(marker) {
+    const principal = this.persistence.userPrincipal.get();
+    if (!principal) {
+      return null;
+    }
+    return this.persistence.userPrincipal.put(principalRowToPutRecord(principal, {
+      record: marker == null
+        ? clearRegistryRetryMarker(principal.record)
+        : withRegistryRetryMarker(principal.record, marker),
+    }));
+  }
+
+  async ensureShardRegistry() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const [request = {}] = arguments;
+    const principal = this.persistence.userPrincipal.get();
+    if (!principal?.user_id) {
+      return createSuccessResult({
+        registered: false,
+      });
+    }
+    const now = normalizeString(request?.now ?? new Date().toISOString(), 'request.now');
+    try {
+      await upsertShardRegistryBarrier(this.env, {
+        shardType: 'UserDO',
+        shardKey: principal.user_id,
+        schemaVersion: USER_DO_SCHEMA_VERSION,
+        nowIso: now,
+      });
+      if (this.getRegistryRetryMarker()) {
+        this.persistRegistryRetryMarker(null);
+      }
+      await this.scheduleMediaLifecycleAlarm(getUserMediaLifecycleNextAlarm(this, now));
+      return createSuccessResult({
+        registered: true,
+        shard_type: 'UserDO',
+        shard_key: principal.user_id,
+      });
+    } catch (error) {
+      const mappedError = createShardRegistryBarrierError({
+        shardType: 'UserDO',
+        shardKey: principal.user_id,
+        error,
+      });
+      this.persistRegistryRetryMarker(buildRegistryRetryMarker({
+        existingMarker: this.getRegistryRetryMarker(),
+        shardType: 'UserDO',
+        shardKey: principal.user_id,
+        schemaVersion: USER_DO_SCHEMA_VERSION,
+        nowIso: now,
+        error: mappedError,
+      }));
+      await this.scheduleMediaLifecycleAlarm(getUserMediaLifecycleNextAlarm(this, now));
+      return {
+        ok: false,
+        error: mappedError,
+      };
+    }
+  }
+
+  async retryPendingShardRegistry({ now = new Date().toISOString() } = {}) {
+    const principal = this.persistence.userPrincipal.get();
+    const marker = this.getRegistryRetryMarker();
+    if (!principal?.user_id || !marker) {
+      return {
+        attempted: false,
+      };
+    }
+    const retryAtMs = getRegistryRetryAtMillis(marker);
+    if (retryAtMs != null && retryAtMs > Date.parse(now)) {
+      return {
+        attempted: false,
+        next_retry_at: marker.next_retry_at,
+      };
+    }
+    try {
+      await upsertShardRegistryBarrier(this.env, {
+        shardType: 'UserDO',
+        shardKey: principal.user_id,
+        schemaVersion: USER_DO_SCHEMA_VERSION,
+        nowIso: now,
+      });
+      this.persistRegistryRetryMarker(null);
+      return {
+        attempted: true,
+        repaired: true,
+      };
+    } catch (error) {
+      const mappedError = createShardRegistryBarrierError({
+        shardType: 'UserDO',
+        shardKey: principal.user_id,
+        error,
+      });
+      const nextMarker = buildRegistryRetryMarker({
+        existingMarker: marker,
+        shardType: 'UserDO',
+        shardKey: principal.user_id,
+        schemaVersion: USER_DO_SCHEMA_VERSION,
+        nowIso: now,
+        error: mappedError,
+      });
+      this.persistRegistryRetryMarker(nextMarker);
+      return {
+        attempted: true,
+        repaired: false,
+        next_retry_at: nextMarker.next_retry_at,
+      };
+    }
+  }
+
+  async cleanupOrphanedMediaObjects(entries = [], { now = new Date().toISOString() } = {}) {
     if (!Array.isArray(entries) || entries.length === 0) {
-      return;
+      return {
+        cleaned: 0,
+      };
     }
     const bucket = this.env.MATRIX_MEDIA_BUCKET;
     if (!bucket || typeof bucket.delete !== 'function') {
-      return;
+      return {
+        cleaned: 0,
+      };
     }
+    const cleanedIds = [];
     for (const entry of entries) {
       if (typeof entry?.r2_object_key !== 'string' || entry.r2_object_key.length === 0) {
         continue;
       }
       try {
         await bucket.delete(entry.r2_object_key);
+        cleanedIds.push(entry.pending_upload_id);
       } catch {
-        // Cleanup is best-effort; a later sweep can retry.
+        const grant = this.persistence.pendingUploadGrants.get({ pending_upload_id: entry.pending_upload_id });
+        if (!grant) {
+          continue;
+        }
+        this.persistence.pendingUploadGrants.put({
+          pending_upload_id: grant.pending_upload_id,
+          media_id: grant.media_id,
+          content_type: grant.content_type,
+          max_bytes: grant.max_bytes,
+          state: 'orphaned',
+          granted_at: grant.granted_at,
+          expires_at: grant.expires_at,
+          finalized_at: grant.finalized_at,
+          record_json: {
+            ...(grant.record ?? {}),
+            cleanup_last_failed_at: now,
+          },
+        });
       }
     }
+    for (const pendingUploadId of cleanedIds) {
+      const grant = this.persistence.pendingUploadGrants.get({ pending_upload_id: pendingUploadId });
+      if (!grant || normalizePendingUploadState(grant.state) !== 'orphaned') {
+        continue;
+      }
+      this.persistence.pendingUploadGrants.put({
+        pending_upload_id: grant.pending_upload_id,
+        media_id: grant.media_id,
+        content_type: grant.content_type,
+        max_bytes: grant.max_bytes,
+        state: 'cleaned',
+        granted_at: grant.granted_at,
+        expires_at: grant.expires_at,
+        finalized_at: grant.finalized_at,
+        record_json: {
+          ...(grant.record ?? {}),
+          cleanup_completed_at: now,
+        },
+      });
+    }
+    return {
+      cleaned: cleanedIds.length,
+    };
   }
 
   async beginMediaUpload() {
@@ -3764,8 +4081,8 @@ export class UserDO extends BaseDurableObject {
         next_alarm_at: alarmAt,
       };
     });
-    await this.scheduleMediaLifecycleAlarm(sweepResult.next_alarm_at);
-    await this.cleanupOrphanedMediaObjects(sweepResult.orphan_cleanup);
+    await this.cleanupOrphanedMediaObjects(sweepResult.orphan_cleanup, { now });
+    await this.scheduleMediaLifecycleAlarm(getUserMediaLifecycleNextAlarm(this, now));
     return createSuccessResult({
       grant,
     });
@@ -3857,8 +4174,8 @@ export class UserDO extends BaseDurableObject {
         };
       }
     });
-    await this.scheduleMediaLifecycleAlarm(sweepResult.next_alarm_at);
-    await this.cleanupOrphanedMediaObjects(sweepResult.orphan_cleanup);
+    await this.cleanupOrphanedMediaObjects(sweepResult.orphan_cleanup, { now });
+    await this.scheduleMediaLifecycleAlarm(getUserMediaLifecycleNextAlarm(this, now));
     return createSuccessResult({
       ack,
     });
@@ -4145,8 +4462,9 @@ export class UserDO extends BaseDurableObject {
     withSqliteTransaction(sql, () => {
       sweepResult = sweepPendingUploadGrants(this, now, { applyChanges: true });
     });
-    await this.cleanupOrphanedMediaObjects(sweepResult.orphan_cleanup);
-    await this.scheduleMediaLifecycleAlarm(sweepResult.next_alarm_at);
+    await this.cleanupOrphanedMediaObjects(sweepResult.orphan_cleanup, { now });
+    await this.retryPendingShardRegistry({ now });
+    await this.scheduleMediaLifecycleAlarm(getUserMediaLifecycleNextAlarm(this, now));
   }
 }
 
@@ -5293,18 +5611,144 @@ export class RoomDO extends BaseDurableObject {
     return Number.isFinite(nextExpiry) ? nextExpiry : null;
   }
 
+  getRegistryRetryMarker() {
+    const stateMap = this.getCurrentStateMap();
+    const createState = getTypedStateEvent(stateMap, 'm.room.create', '');
+    if (!createState) {
+      return null;
+    }
+    const metadata = this.persistence.eventMetadata.get({ event_id: createState.event_id });
+    return readRegistryRetryMarker(metadata?.record);
+  }
+
+  persistRegistryRetryMarker(marker) {
+    const stateMap = this.getCurrentStateMap();
+    const createState = getTypedStateEvent(stateMap, 'm.room.create', '');
+    if (!createState) {
+      return null;
+    }
+    const metadata = this.persistence.eventMetadata.get({ event_id: createState.event_id });
+    if (!metadata) {
+      return null;
+    }
+    return this.persistence.eventMetadata.put({
+      ...metadata,
+      record_json: marker == null
+        ? clearRegistryRetryMarker(metadata.record)
+        : withRegistryRetryMarker(metadata.record, marker),
+    });
+  }
+
   async syncTypingAlarm(now = new Date().toISOString()) {
     const storage = this.getTypingAlarmStorage();
     if (!storage) {
       return null;
     }
     const nextExpiry = this.getNextTypingExpiryMillis(now);
-    if (nextExpiry == null) {
+    const nextRegistryRetry = getRegistryRetryAtMillis(this.getRegistryRetryMarker());
+    const nextAlarmAt = [nextExpiry, nextRegistryRetry]
+      .filter((value) => Number.isFinite(value))
+      .reduce((earliest, value) => Math.min(earliest, value), Number.POSITIVE_INFINITY);
+    if (!Number.isFinite(nextAlarmAt)) {
       await storage.deleteAlarm();
       return null;
     }
-    await storage.setAlarm(nextExpiry);
-    return nextExpiry;
+    await storage.setAlarm(nextAlarmAt);
+    return nextAlarmAt;
+  }
+
+  async ensureShardRegistry() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const [request = {}] = arguments;
+    const roomId = normalizeString(request?.room_id ?? this.persistence.getRuntimeState()?.room_id, 'request.room_id');
+    const now = normalizeString(request?.now ?? new Date().toISOString(), 'request.now');
+    try {
+      await upsertShardRegistryBarrier(this.env, {
+        shardType: 'RoomDO',
+        shardKey: roomId,
+        schemaVersion: ROOM_DO_SCHEMA_VERSION,
+        nowIso: now,
+      });
+      if (this.getRegistryRetryMarker()) {
+        this.persistRegistryRetryMarker(null);
+      }
+      await this.syncTypingAlarm(now);
+      return createSuccessResult({
+        registered: true,
+        shard_type: 'RoomDO',
+        shard_key: roomId,
+      });
+    } catch (error) {
+      const mappedError = createShardRegistryBarrierError({
+        shardType: 'RoomDO',
+        shardKey: roomId,
+        error,
+      });
+      this.persistRegistryRetryMarker(buildRegistryRetryMarker({
+        existingMarker: this.getRegistryRetryMarker(),
+        shardType: 'RoomDO',
+        shardKey: roomId,
+        schemaVersion: ROOM_DO_SCHEMA_VERSION,
+        nowIso: now,
+        error: mappedError,
+      }));
+      await this.syncTypingAlarm(now);
+      return {
+        ok: false,
+        error: mappedError,
+      };
+    }
+  }
+
+  async retryPendingShardRegistry({ now = new Date().toISOString() } = {}) {
+    const runtimeState = this.persistence.getRuntimeState();
+    const marker = this.getRegistryRetryMarker();
+    if (!runtimeState?.room_id || !marker) {
+      return {
+        attempted: false,
+      };
+    }
+    const retryAtMs = getRegistryRetryAtMillis(marker);
+    if (retryAtMs != null && retryAtMs > Date.parse(now)) {
+      return {
+        attempted: false,
+        next_retry_at: marker.next_retry_at,
+      };
+    }
+    try {
+      await upsertShardRegistryBarrier(this.env, {
+        shardType: 'RoomDO',
+        shardKey: runtimeState.room_id,
+        schemaVersion: ROOM_DO_SCHEMA_VERSION,
+        nowIso: now,
+      });
+      this.persistRegistryRetryMarker(null);
+      return {
+        attempted: true,
+        repaired: true,
+      };
+    } catch (error) {
+      const mappedError = createShardRegistryBarrierError({
+        shardType: 'RoomDO',
+        shardKey: runtimeState.room_id,
+        error,
+      });
+      const nextMarker = buildRegistryRetryMarker({
+        existingMarker: marker,
+        shardType: 'RoomDO',
+        shardKey: runtimeState.room_id,
+        schemaVersion: ROOM_DO_SCHEMA_VERSION,
+        nowIso: now,
+        error: mappedError,
+      });
+      this.persistRegistryRetryMarker(nextMarker);
+      return {
+        attempted: true,
+        repaired: false,
+        next_retry_at: nextMarker.next_retry_at,
+      };
+    }
   }
 
   async setTyping() {
@@ -6046,9 +6490,9 @@ export class RoomDO extends BaseDurableObject {
     const scheduledTime = Number.isFinite(alarmInfo?.scheduledTime)
       ? alarmInfo.scheduledTime
       : Date.now();
-    await this.expireTypingAlarm({
-      now: new Date(scheduledTime).toISOString(),
-    });
+    const now = new Date(scheduledTime).toISOString();
+    await this.retryPendingShardRegistry({ now });
+    await this.expireTypingAlarm({ now });
   }
 }
 

@@ -5,6 +5,7 @@ import {
 } from './persistence-common.mjs';
 
 export const DERIVED_DATA_SCHEMA_VERSION = 1;
+export const SEARCH_INDEX_BATCH_ROWS_PER_STATEMENT = 11;
 
 const DERIVED_SCHEMA_STATE_TABLE = 'derived_schema_state';
 const REQUIRED_DERIVED_TABLES = Object.freeze([
@@ -310,6 +311,82 @@ export function createD1DerivedDataPersistence(database) {
     },
     async getSchemaState() {
       return await statementFirst(db.prepare(`SELECT * FROM ${DERIVED_SCHEMA_STATE_TABLE} WHERE singleton = 1`));
+    },
+    async putSearchIndexBatch(records) {
+      const rows = Array.isArray(records) ? records : [];
+      if (rows.length === 0) {
+        return;
+      }
+      const columns = [
+        'event_id',
+        'room_id',
+        'event_type',
+        'origin_server_ts',
+        'sender_user_id',
+        'search_vector_text',
+        'visibility_scope',
+        'updated_at',
+        'record_json',
+      ];
+      const rowSql = `(${columns.map(() => '?').join(', ')})`;
+      const chunkSize = SEARCH_INDEX_BATCH_ROWS_PER_STATEMENT;
+      for (let offset = 0; offset < rows.length; offset += chunkSize) {
+        const chunk = rows.slice(offset, offset + chunkSize);
+        const bindings = [];
+        for (const row of chunk) {
+          bindings.push(
+            normalizeString(row.event_id, 'record.event_id'),
+            normalizeString(row.room_id, 'record.room_id'),
+            normalizeString(row.event_type, 'record.event_type'),
+            normalizeInteger(row.origin_server_ts, 'record.origin_server_ts', { min: 0 }),
+            row.sender_user_id ?? null,
+            normalizeString(row.search_vector_text, 'record.search_vector_text'),
+            row.visibility_scope ?? null,
+            normalizeString(row.updated_at, 'record.updated_at'),
+            row.record_json == null ? null : JSON.stringify(row.record_json),
+          );
+        }
+        await statementRun(db.prepare(`
+          INSERT INTO search_index_rows (${columns.join(', ')})
+          VALUES ${chunk.map(() => rowSql).join(', ')}
+          ON CONFLICT(event_id) DO UPDATE SET
+            room_id = excluded.room_id,
+            event_type = excluded.event_type,
+            origin_server_ts = excluded.origin_server_ts,
+            sender_user_id = excluded.sender_user_id,
+            search_vector_text = excluded.search_vector_text,
+            visibility_scope = excluded.visibility_scope,
+            updated_at = excluded.updated_at,
+            record_json = excluded.record_json
+        `), ...bindings);
+      }
+    },
+    async clearSearchIndexByRoomId(roomId) {
+      await statementRun(
+        db.prepare('DELETE FROM search_index_rows WHERE room_id = ?'),
+        normalizeString(roomId, 'roomId'),
+      );
+    },
+    async clearAllSearchIndex() {
+      await statementRun(db.prepare('DELETE FROM search_index_rows'));
+    },
+    async clearUserDirectoryByUserId(userId) {
+      await statementRun(
+        db.prepare('DELETE FROM user_directory_entries WHERE user_id = ?'),
+        normalizeString(userId, 'userId'),
+      );
+    },
+    async clearAllUserDirectory() {
+      await statementRun(db.prepare('DELETE FROM user_directory_entries'));
+    },
+    async clearPublicRoomDirectoryByRoomId(roomId) {
+      await statementRun(
+        db.prepare('DELETE FROM public_room_directory_entries WHERE room_id = ?'),
+        normalizeString(roomId, 'roomId'),
+      );
+    },
+    async clearAllPublicRoomDirectory() {
+      await statementRun(db.prepare('DELETE FROM public_room_directory_entries'));
     },
     searchIndex,
     userDirectory,

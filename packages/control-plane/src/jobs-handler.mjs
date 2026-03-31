@@ -2,11 +2,13 @@ import { createInternalErrorEnvelope } from '../../contracts/src/index.mjs';
 import {
   applyPublicRoomDirectoryProjection,
   applySearchIndexProjection,
+  applySearchIndexProjectionBatch,
   applyUserDirectoryProjection,
   clearDerivedTarget,
   createAsyncTaskContext,
   loadWorkerRuntimeConfig,
   makeId,
+  SEARCH_INDEX_BATCH_ROWS_PER_STATEMENT,
 } from '../../runtime-core/src/index.mjs';
 import {
   CONTROL_PLANE_SCHEMA_VERSION,
@@ -34,6 +36,32 @@ import {
 } from './services.mjs';
 
 const TERMINAL_JOB_STATES = new Set(['completed', 'finalized', 'failed', 'canceled']);
+const MAX_D1_QUERIES_PER_INVOCATION = 1_000;
+const REBUILD_D1_QUERY_HEADROOM = 32;
+
+function assertRebuildInvocationBudget({ target, searchRowCount = 0 }) {
+  const normalizedSearchRowCount = Number.isInteger(searchRowCount) && searchRowCount > 0
+    ? searchRowCount
+    : 0;
+  let estimatedQueries = 1 + REBUILD_D1_QUERY_HEADROOM;
+  if (target === 'search_index' || target === 'all_derived') {
+    estimatedQueries += 1 + Math.ceil(normalizedSearchRowCount / SEARCH_INDEX_BATCH_ROWS_PER_STATEMENT);
+  }
+  if (target === 'public_room_directory' || target === 'all_derived') {
+    estimatedQueries += 2;
+  }
+  if (target === 'user_directory' || target === 'all_derived') {
+    estimatedQueries += 2;
+  }
+  if (estimatedQueries > MAX_D1_QUERIES_PER_INVOCATION) {
+    throw Object.assign(new Error(
+      `Rebuild shard exceeds the single-invocation D1 budget (${estimatedQueries} estimated queries > ${MAX_D1_QUERIES_PER_INVOCATION})`,
+    ), {
+      code: 'job_conflict',
+      retryable: false,
+    });
+  }
+}
 
 function assertSupportedExportMaterializationTarget({ shardType, shardKey }) {
   if (shardType === 'control-plane' && shardKey === 'ops-core') {
@@ -128,6 +156,26 @@ function checkpointTargetForPayload({ kind, payload }) {
     shard_type: payload.shard_type,
     shard_key: payload.shard_key,
   };
+}
+
+function isRebuildShardRelevant(rebuildTarget, shardType) {
+  if (rebuildTarget === 'search_index') {
+    return shardType === 'RoomDO';
+  }
+  if (rebuildTarget === 'public_room_directory') {
+    return shardType === 'RoomDO';
+  }
+  if (rebuildTarget === 'user_directory') {
+    return shardType === 'UserDO';
+  }
+  if (rebuildTarget === 'all_derived') {
+    return shardType === 'RoomDO' || shardType === 'UserDO';
+  }
+  return false;
+}
+
+function isActiveShardRegistryRow(row) {
+  return row?.disabled_at == null;
 }
 
 function classifyFanOutError(error, { job, kind }) {
@@ -359,13 +407,31 @@ async function fanOutJobTasks({ env, persistence, job, kind }) {
               : 'control-plane',
         shard_key: job.scope.scope_id ?? 'ops-core',
       }];
-    payloads = rows.map((row) => buildRebuildShardJob({
-      jobId: job.job_id,
-      rebuildTarget: job.spec.rebuild_target,
-      shardType: row.shard_type,
-      shardKey: row.shard_key,
-      attempt: 0,
-    }));
+    const relevantRows = rows
+      .filter((row) => job.scope.scope_kind !== 'global' || isActiveShardRegistryRow(row))
+      .filter((row) => isRebuildShardRelevant(job.spec.rebuild_target, row.shard_type));
+    if (job.scope.scope_kind === 'global' && relevantRows.length === 0) {
+      throw Object.assign(
+        new Error(`Global rebuild target ${job.spec.rebuild_target} has no relevant shard registry rows; retry after registry repair completes`),
+        {
+          code: 'job_conflict',
+          retryable: false,
+        },
+      );
+    }
+    if (job.scope.scope_kind === 'global') {
+      await clearDerivedTarget(env, {
+        target: job.spec.rebuild_target,
+      });
+    }
+    payloads = relevantRows
+      .map((row) => buildRebuildShardJob({
+        jobId: job.job_id,
+        rebuildTarget: job.spec.rebuild_target,
+        shardType: row.shard_type,
+        shardKey: row.shard_key,
+        attempt: 0,
+      }));
   } else if (kind === 'start-restore') {
     const restoreCheckpoints = await resolveRestoreCheckpointRefs({
       persistence,
@@ -525,14 +591,16 @@ async function executeRebuildAction({
     if (!snapshot?.ok) {
       throw snapshot?.error ?? new Error(`RoomDO exportDerivedShard failed for ${messageBody.shard_key}`);
     }
+    assertRebuildInvocationBudget({
+      target,
+      searchRowCount: snapshot.search_index_rows?.length ?? 0,
+    });
     if (target === 'search_index' || target === 'all_derived') {
       await clearDerivedTarget(env, {
         target: 'search_index',
         roomId: messageBody.shard_key,
       });
-      for (const row of snapshot.search_index_rows ?? []) {
-        await applySearchIndexProjection(env, row);
-      }
+      await applySearchIndexProjectionBatch(env, snapshot.search_index_rows ?? []);
     }
     if (target === 'public_room_directory' || target === 'all_derived') {
       await clearDerivedTarget(env, {
@@ -560,6 +628,9 @@ async function executeRebuildAction({
     if (!snapshot?.ok) {
       throw snapshot?.error ?? new Error(`UserDO getUserDirectoryEntry failed for ${messageBody.shard_key}`);
     }
+    assertRebuildInvocationBudget({
+      target,
+    });
     if (target === 'user_directory' || target === 'all_derived') {
       await clearDerivedTarget(env, {
         target: 'user_directory',
