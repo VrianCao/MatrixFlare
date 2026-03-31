@@ -443,6 +443,24 @@ test('Phase 05 profile, presence, and sync propagation are wired end-to-end', as
   await expectMatrixError(avatarFieldAfterDelete, 404, 'M_NOT_FOUND');
 });
 
+test('Phase 05 profile field read rejects malformed path encoding deterministically', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  await registerUser(rig, {
+    username: 'alice',
+    password: 'correct horse battery staple',
+    deviceId: 'ALICEPHONE',
+  });
+
+  const malformedRead = await rig.gatewayFetch('/_matrix/client/v3/profile/@alice:matrix.example.test/%ZZ');
+  await expectMatrixError(malformedRead, 400, 'M_INVALID_PARAM');
+
+  const healthyRead = await rig.gatewayFetch('/_matrix/client/v3/profile/@alice:matrix.example.test');
+  assert.equal(healthyRead.status, 200);
+  assert.deepEqual(await healthyRead.json(), {});
+});
+
 test('Phase 05 /sync defaults mark clients online and return immediately without timeout', async (t) => {
   const rig = createGatewayPhase04Rig();
   t.after(() => rig.close());

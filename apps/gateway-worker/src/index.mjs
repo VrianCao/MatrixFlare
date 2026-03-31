@@ -1137,9 +1137,16 @@ async function handleProfileDocumentRead(env, pathUserId, keyName = null) {
     return matrixErrorResponse(404, 'M_NOT_FOUND', 'Profile does not exist');
   }
   const userDo = getUserDoStub(env, targetUserId);
-  const result = keyName == null
-    ? await userDo.getProfileDocument({ user_id: targetUserId })
-    : await userDo.getProfileField({ user_id: targetUserId, key_name: decodePathComponent(keyName) });
+  let result;
+  if (keyName == null) {
+    result = await userDo.getProfileDocument({ user_id: targetUserId });
+  } else {
+    const decodedKeyName = decodePathComponent(keyName);
+    if (!decodedKeyName) {
+      return matrixErrorResponse(400, 'M_INVALID_PARAM', 'Invalid profile key');
+    }
+    result = await userDo.getProfileField({ user_id: targetUserId, key_name: decodedKeyName });
+  }
   if (!result.ok) {
     return jsonResponse(result.matrix_error.body, result.matrix_error.status);
   }
