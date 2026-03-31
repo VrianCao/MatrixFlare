@@ -536,6 +536,39 @@ test('Phase 05 /sync defaults mark clients online and return immediately without
   assert.equal(emptySync.next_batch, backOnlineSync.next_batch);
 });
 
+test('Phase 05 /sync rejects invalid set_presence before mutating session sync metadata', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, {
+    username: 'alice',
+    password: 'correct horse battery staple',
+    deviceId: 'ALICEPHONE',
+  });
+
+  const initialSync = await syncRequest(rig, alice.access_token);
+  const sessionId = rig.getUserDo('alice').persistence.sessions.list()[0].session_id;
+  const sessionBefore = structuredClone(rig.getUserDo('alice').persistence.sessions.get(sessionId));
+
+  const invalidSync = await rig.gatewayFetch(
+    `/_matrix/client/v3/sync?since=${encodeURIComponent(initialSync.next_batch)}&set_presence=bogus`,
+    {
+      headers: rig.authHeaders(alice.access_token),
+    },
+  );
+  await expectMatrixError(invalidSync, 400, 'M_INVALID_PARAM');
+
+  const sessionAfter = rig.getUserDo('alice').persistence.sessions.get(sessionId);
+  assert.equal(sessionAfter.record.last_seen_sync_pos, sessionBefore.record.last_seen_sync_pos);
+  assert.equal(sessionAfter.record.last_sync_at, sessionBefore.record.last_sync_at);
+
+  const presenceAfterInvalidSync = await rig.gatewayFetch('/_matrix/client/v3/presence/@alice:matrix.example.test/status', {
+    headers: rig.authHeaders(alice.access_token),
+  });
+  assert.equal(presenceAfterInvalidSync.status, 200);
+  assert.equal((await presenceAfterInvalidSync.json()).presence, 'online');
+});
+
 test('Phase 05 account data, filters, sync waiting, and room account-data deltas are surfaced', async (t) => {
   const rig = createGatewayPhase04Rig();
   t.after(() => rig.close());
@@ -880,6 +913,92 @@ test('Phase 05 room fanout projections surface timeline and unread counts throug
   assert.equal(roomDo.persistence.fanoutOutbox.get({ room_pos: filteredDelta.roomPos, user_id: aliceUserId }).status, 'acked');
 });
 
+test('Phase 05 stale profile refreshes do not overwrite newer room membership or fan out', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  await registerUser(rig, {
+    username: 'alice',
+    password: 'correct horse battery staple',
+    deviceId: 'ALICEPHONE',
+  });
+  const aliceUserId = '@alice:matrix.example.test';
+  const roomId = '!profile-refresh:matrix.example.test';
+
+  const { roomDo } = await seedJoinedRoom(rig, {
+    roomId,
+    userId: aliceUserId,
+    profileVersion: 1,
+  });
+
+  const currentRefresh = await roomDo.enqueueProfileRefresh({
+    room_id: roomId,
+    user_id: aliceUserId,
+    profile_version: 3,
+    displayname: 'Alice Current',
+    avatar_url: 'mxc://matrix.example.test/alice-current',
+    now: '2026-03-30T00:00:02.000Z',
+  });
+  assert.equal(currentRefresh.ok, true);
+  assert.equal(currentRefresh.delivered, true);
+
+  const staleRefresh = await roomDo.enqueueProfileRefresh({
+    room_id: roomId,
+    user_id: aliceUserId,
+    profile_version: 2,
+    displayname: 'Alice Stale',
+    avatar_url: 'mxc://matrix.example.test/alice-stale',
+    now: '2026-03-30T00:00:03.000Z',
+  });
+  assert.equal(staleRefresh.ok, true);
+  assert.equal(staleRefresh.delivered, false);
+  assert.equal(staleRefresh.reason, 'stale_profile_version');
+
+  const membership = roomDo.persistence.membershipProjection.get({ user_id: aliceUserId });
+  assert.equal(membership.profile_version, 3);
+  assert.equal(membership.displayname, 'Alice Current');
+  assert.equal(membership.avatar_url, 'mxc://matrix.example.test/alice-current');
+
+  const staleRoomPos = 999;
+  roomDo.persistence.fanoutOutbox.put({
+    room_pos: staleRoomPos,
+    user_id: aliceUserId,
+    event_id: '$profile-refresh-stale',
+    status: 'pending',
+    last_attempt_at: null,
+    attempt_count: 0,
+    acked_stream_pos: null,
+    acked_at: null,
+    delta_json: {
+      room_id: roomId,
+      room_pos: staleRoomPos,
+      user_id: aliceUserId,
+      membership_bucket: 'join',
+      event_id: '$profile-refresh-stale',
+      state_event_ids: ['$profile-refresh-stale'],
+    },
+    last_error_json: null,
+    created_at: '2026-03-30T00:00:04.000Z',
+    record_json: {
+      profile_version: 2,
+      propagation_kind: 'profile_refresh',
+    },
+  });
+  const roomFanoutCountBefore = rig.getUserDo('alice').persistence.userStream.list()
+    .filter((entry) => entry.stream_kind === 'room_fanout').length;
+  const repairDelivery = await roomDo.deliverPendingFanout({
+    limit: 10,
+    now: '2026-03-30T00:00:05.000Z',
+  });
+  assert.equal(repairDelivery.ok, true);
+  assert.equal(repairDelivery.results.find((entry) => entry.room_pos === staleRoomPos)?.status, 'skipped_stale');
+  assert.equal(
+    rig.getUserDo('alice').persistence.userStream.list().filter((entry) => entry.stream_kind === 'room_fanout').length,
+    roomFanoutCountBefore,
+  );
+  assert.equal(roomDo.persistence.fanoutOutbox.get({ room_pos: staleRoomPos, user_id: aliceUserId }).status, 'acked');
+});
+
 test('Phase 05 push rules and to-device idempotency are enforced through routes', async (t) => {
   const rig = createGatewayPhase04Rig();
   t.after(() => rig.close());
@@ -1106,4 +1225,28 @@ test('Phase 05 push rules and to-device idempotency are enforced through routes'
     },
   });
   await expectMatrixError(retryDifferentPayload, 409, 'M_CONFLICT');
+});
+
+test('Phase 05 push rule action updates enforce storage limits', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, {
+    username: 'alice',
+    password: 'correct horse battery staple',
+    deviceId: 'ALICEPHONE',
+  });
+
+  const response = await rig.gatewayFetch('/_matrix/client/v3/pushrules/global/override/.m.rule.reaction/actions', {
+    method: 'PUT',
+    headers: rig.authHeaders(alice.access_token),
+    json: {
+      actions: Array.from({ length: 9000 }, () => 'notify'),
+    },
+  });
+  await expectMatrixError(response, 400, 'M_LIMIT_EXCEEDED');
+  assert.equal(
+    rig.getUserDo('alice').persistence.pushRules.get({ scope: 'global', kind: 'override', rule_id: '.m.rule.reaction' }),
+    null,
+  );
 });

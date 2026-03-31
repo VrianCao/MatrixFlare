@@ -87,6 +87,18 @@ function createSuccessResult(payload = {}) {
   };
 }
 
+function mapPushRuleWriteErrorToMatrixError(error) {
+  try {
+    const decoded = JSON.parse(error.message);
+    if (decoded?.errcode) {
+      return createMatrixError(decoded.status, decoded.errcode, decoded.error);
+    }
+  } catch {
+    // Fall through to the generic invalid-parameter envelope.
+  }
+  return createMatrixError(400, 'M_INVALID_PARAM', error?.message ?? 'Invalid push rule update');
+}
+
 function isoAfter(nowIso, ttlMs) {
   return new Date(Date.parse(nowIso) + ttlMs).toISOString();
 }
@@ -529,6 +541,19 @@ function buildRoomFanoutDedupeKey(delta) {
 
 function buildProfileRefreshEventId(roomId, userId, profileVersion) {
   return `$profile_refresh_${Buffer.from(`${roomId}|${userId}|${profileVersion}`, 'utf8').toString('base64url')}`;
+}
+
+function isStaleProfileRefreshOutboxItem(persistence, item) {
+  if (item?.record?.propagation_kind !== 'profile_refresh') {
+    return false;
+  }
+  const userId = item?.user_id ?? item?.delta?.user_id ?? null;
+  const itemProfileVersion = Number.isInteger(item?.record?.profile_version) ? item.record.profile_version : null;
+  if (!userId || itemProfileVersion == null) {
+    return false;
+  }
+  const membership = persistence.membershipProjection.get({ user_id: userId });
+  return Number.isInteger(membership?.profile_version) && membership.profile_version > itemProfileVersion;
 }
 
 function parseCanonicalRoomEvent(row) {
@@ -2113,15 +2138,7 @@ export class UserDO extends BaseDurableObject {
         wakePos = streamEntry.stream_pos;
       });
     } catch (error) {
-      try {
-        const decoded = JSON.parse(error.message);
-        if (decoded?.errcode) {
-          return createMatrixError(decoded.status, decoded.errcode, decoded.error);
-        }
-      } catch {
-        return createMatrixError(400, 'M_INVALID_PARAM', error.message);
-      }
-      return createMatrixError(400, 'M_INVALID_PARAM', error.message);
+      return mapPushRuleWriteErrorToMatrixError(error);
     }
     wakeSyncWaiters(this.env, {
       user_id: userId,
@@ -2216,49 +2233,53 @@ export class UserDO extends BaseDurableObject {
     }
     let wakePos = 0;
     const sql = this.requireSqlStorage();
-    withSqliteTransaction(sql, () => {
-      const nextRow = existingCustom
-        ? {
-          scope: existingCustom.scope,
-          kind: existingCustom.kind,
-          rule_id: existingCustom.rule_id,
-          enabled: request.enabled,
-          priority_class: existingCustom.priority_class,
-          priority_index: existingCustom.priority_index,
-          updated_at: now,
-          actions_json: structuredClone(existingCustom.actions),
-          conditions_json: structuredClone(existingCustom.conditions),
-          record_json: structuredClone(existingCustom.record),
+    try {
+      withSqliteTransaction(sql, () => {
+        const nextRow = existingCustom
+          ? {
+            scope: existingCustom.scope,
+            kind: existingCustom.kind,
+            rule_id: existingCustom.rule_id,
+            enabled: request.enabled,
+            priority_class: existingCustom.priority_class,
+            priority_index: existingCustom.priority_index,
+            updated_at: now,
+            actions_json: structuredClone(existingCustom.actions),
+            conditions_json: structuredClone(existingCustom.conditions),
+            record_json: structuredClone(existingCustom.record),
+          }
+          : {
+            scope: 'global',
+            kind,
+            rule_id: ruleId,
+            enabled: request.enabled,
+            priority_class: 'default',
+            priority_index: 0,
+            updated_at: now,
+            actions_json: structuredClone(defaultRule.actions ?? []),
+            conditions_json: structuredClone(defaultRule.conditions ?? []),
+            record_json: {
+              default_rule: true,
+              rule_kind: kind,
+              pattern: defaultRule.pattern ?? null,
+            },
+          };
+        this.persistence.pushRules.put(nextRow);
+        const limitCheck = assertPushRulesStorageLimits(this.persistence.pushRules.list());
+        if (!limitCheck.ok) {
+          throw new Error(JSON.stringify(limitCheck));
         }
-        : {
-          scope: 'global',
-          kind,
-          rule_id: ruleId,
-          enabled: request.enabled,
-          priority_class: 'default',
-          priority_index: 0,
-          updated_at: now,
-          actions_json: structuredClone(defaultRule.actions ?? []),
-          conditions_json: structuredClone(defaultRule.conditions ?? []),
-          record_json: {
-            default_rule: true,
-            rule_kind: kind,
-            pattern: defaultRule.pattern ?? null,
-          },
-        };
-      this.persistence.pushRules.put(nextRow);
-      const limitCheck = assertPushRulesStorageLimits(this.persistence.pushRules.list());
-      if (!limitCheck.ok) {
-        throw new Error(JSON.stringify(limitCheck));
-      }
-      const streamEntry = this.persistence.appendUserStreamWithinTransaction({
-        user_id: userId,
-        stream_kind: 'push_rules',
-        created_at: now,
-        payload: { type: 'm.push_rules' },
+        const streamEntry = this.persistence.appendUserStreamWithinTransaction({
+          user_id: userId,
+          stream_kind: 'push_rules',
+          created_at: now,
+          payload: { type: 'm.push_rules' },
+        });
+        wakePos = streamEntry.stream_pos;
       });
-      wakePos = streamEntry.stream_pos;
-    });
+    } catch (error) {
+      return mapPushRuleWriteErrorToMatrixError(error);
+    }
     wakeSyncWaiters(this.env, {
       user_id: userId,
       user_stream_pos: wakePos,
@@ -2294,45 +2315,53 @@ export class UserDO extends BaseDurableObject {
     }
     let wakePos = 0;
     const sql = this.requireSqlStorage();
-    withSqliteTransaction(sql, () => {
-      const nextRow = existingCustom
-        ? {
-          scope: existingCustom.scope,
-          kind: existingCustom.kind,
-          rule_id: existingCustom.rule_id,
-          enabled: existingCustom.enabled,
-          priority_class: existingCustom.priority_class,
-          priority_index: existingCustom.priority_index,
-          updated_at: now,
-          actions_json: structuredClone(request.actions),
-          conditions_json: structuredClone(existingCustom.conditions),
-          record_json: structuredClone(existingCustom.record),
+    try {
+      withSqliteTransaction(sql, () => {
+        const nextRow = existingCustom
+          ? {
+            scope: existingCustom.scope,
+            kind: existingCustom.kind,
+            rule_id: existingCustom.rule_id,
+            enabled: existingCustom.enabled,
+            priority_class: existingCustom.priority_class,
+            priority_index: existingCustom.priority_index,
+            updated_at: now,
+            actions_json: structuredClone(request.actions),
+            conditions_json: structuredClone(existingCustom.conditions),
+            record_json: structuredClone(existingCustom.record),
+          }
+          : {
+            scope: 'global',
+            kind,
+            rule_id: ruleId,
+            enabled: defaultRule.enabled !== false,
+            priority_class: 'default',
+            priority_index: 0,
+            updated_at: now,
+            actions_json: structuredClone(request.actions),
+            conditions_json: structuredClone(defaultRule.conditions ?? []),
+            record_json: {
+              default_rule: true,
+              rule_kind: kind,
+              pattern: defaultRule.pattern ?? null,
+            },
+          };
+        this.persistence.pushRules.put(nextRow);
+        const limitCheck = assertPushRulesStorageLimits(this.persistence.pushRules.list());
+        if (!limitCheck.ok) {
+          throw new Error(JSON.stringify(limitCheck));
         }
-        : {
-          scope: 'global',
-          kind,
-          rule_id: ruleId,
-          enabled: defaultRule.enabled !== false,
-          priority_class: 'default',
-          priority_index: 0,
-          updated_at: now,
-          actions_json: structuredClone(request.actions),
-          conditions_json: structuredClone(defaultRule.conditions ?? []),
-          record_json: {
-            default_rule: true,
-            rule_kind: kind,
-            pattern: defaultRule.pattern ?? null,
-          },
-        };
-      this.persistence.pushRules.put(nextRow);
-      const streamEntry = this.persistence.appendUserStreamWithinTransaction({
-        user_id: userId,
-        stream_kind: 'push_rules',
-        created_at: now,
-        payload: { type: 'm.push_rules' },
+        const streamEntry = this.persistence.appendUserStreamWithinTransaction({
+          user_id: userId,
+          stream_kind: 'push_rules',
+          created_at: now,
+          payload: { type: 'm.push_rules' },
+        });
+        wakePos = streamEntry.stream_pos;
       });
-      wakePos = streamEntry.stream_pos;
-    });
+    } catch (error) {
+      return mapPushRuleWriteErrorToMatrixError(error);
+    }
     wakeSyncWaiters(this.env, {
       user_id: userId,
       user_stream_pos: wakePos,
@@ -3116,6 +3145,20 @@ export class RoomDO extends BaseDurableObject {
     const pendingItems = this.persistence.listPendingFanoutOutbox(limit);
     const results = [];
     for (const item of pendingItems) {
+      if (isStaleProfileRefreshOutboxItem(this.persistence, item)) {
+        this.persistence.acknowledgeFanoutOutbox({
+          room_pos: item.room_pos,
+          user_id: item.user_id,
+          acked_stream_pos: null,
+          acked_at: now,
+        });
+        results.push({
+          room_pos: item.room_pos,
+          user_id: item.user_id,
+          status: 'skipped_stale',
+        });
+        continue;
+      }
       const delta = {
         ...structuredClone(item.delta ?? {}),
         room_id: item.delta?.room_id ?? this.persistence.getRuntimeState()?.room_id,
@@ -3185,6 +3228,12 @@ export class RoomDO extends BaseDurableObject {
       return createSuccessResult({
         delivered: false,
         reason: 'not_joined',
+      });
+    }
+    if (Number.isInteger(membership.profile_version) && membership.profile_version > profileVersion) {
+      return createSuccessResult({
+        delivered: false,
+        reason: 'stale_profile_version',
       });
     }
 

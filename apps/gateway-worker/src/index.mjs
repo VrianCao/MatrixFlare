@@ -1633,6 +1633,9 @@ async function handleSync(request, env, url) {
   const fullState = url.searchParams.get('full_state') === 'true';
   const useStateAfter = url.searchParams.get('use_state_after') === 'true';
   const setPresence = url.searchParams.get('set_presence') ?? 'online';
+  if (!['online', 'offline', 'unavailable'].includes(setPresence)) {
+    return matrixErrorResponse(400, 'M_INVALID_PARAM', 'Presence must be one of online, offline, or unavailable');
+  }
 
   const sinceToken = url.searchParams.get('since') ?? null;
   const parsedToken = parseSyncToken(sinceToken, {

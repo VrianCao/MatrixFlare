@@ -824,6 +824,7 @@ export function reindexPushRuleRows(rows, kind) {
 
 export function assertPushRulesStorageLimits(rows) {
   const customRows = rows.filter((row) => row.scope === 'global' && row.record?.default_rule !== true);
+  const overrideRows = rows.filter((row) => row.scope === 'global');
   if (customRows.length > MAX_PUSH_RULES_PER_USER) {
     return {
       ok: false,
@@ -832,7 +833,7 @@ export function assertPushRulesStorageLimits(rows) {
       error: 'Push rule limit exceeded',
     };
   }
-  const payload = JSON.stringify(customRows.map((row) => ({
+  const payload = JSON.stringify(overrideRows.map((row) => ({
     scope: row.scope,
     kind: row.kind,
     rule_id: row.rule_id,
