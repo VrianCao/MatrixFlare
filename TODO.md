@@ -576,7 +576,7 @@
   完成标准:
   `L1` 至少支持 `12`；`L2` 进入前要完成 `11/12` 差异路径。
   当前状态:
-  `packages/runtime-core/src/room-domain.mjs` 已封装 room version 默认值、支持集、create-room identity、cursor 与 redaction 策略；本地测试已验证默认 `12`、显式 `11`、不支持版本拒绝，以及 `11/12` redaction 差异。
+  `packages/runtime-core/src/room-domain.mjs` 已封装 room version 默认值、支持集、create-room identity、cursor 与 redaction helper；`RoomDO` admission/auth 当前已通过本地测试验证默认 `12`、显式 `11`、`creation_content` 不得覆写已裁决的 room version、缺失事件 fail-closed、`11` redaction auth 差异与 `11/12` redaction 结果差异。`TEST/EVID-ROOM-*` 的 CI/staging 闭环仍以后续 `08.04` / `08.05` 为准。
 
 ## Phase 07: Media And Derived Services
 

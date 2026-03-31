@@ -1735,9 +1735,9 @@ async function handleCreateRoom(request, env) {
       sender: access.session.user_id,
       state_key: '',
       content: {
+        ...(isObjectRecord(body.creation_content) ? structuredClone(body.creation_content) : {}),
         creator: access.session.user_id,
         room_version: roomVersion,
-        ...(isObjectRecord(body.creation_content) ? structuredClone(body.creation_content) : {}),
       },
       unsigned: {
         client_context: buildRoomClientContext(access, '/_matrix/client/v3/createRoom', requestFingerprint),
@@ -1904,9 +1904,28 @@ async function handleRoomMembershipRequest(request, env, {
     return matrixErrorResponse(404, 'M_NOT_FOUND', 'Room does not exist');
   }
   if (kind === 'forget') {
+    const roomDo = getRoomDoStub(env, decodedRoomId);
+    const projectionResult = await roomDo.projectForSync({
+      user_id: access.session.user_id,
+      room_id: decodedRoomId,
+      filter_flags: {
+        include_leave: true,
+      },
+      timeline_event_ids: [],
+      state_event_ids: [],
+    });
+    if (!projectionResult?.ok) {
+      return mapInternalErrorToResponse(projectionResult?.error);
+    }
+    const authoritativeProjection = projectionResult.projection;
+    if (authoritativeProjection?.membership_bucket !== 'leave') {
+      return matrixErrorResponse(403, 'M_FORBIDDEN', 'Room must be left before it can be forgotten');
+    }
     const result = await access.user_do.forgetRoom({
       user_id: access.session.user_id,
       room_id: decodedRoomId,
+      room_pos: authoritativeProjection.room_pos ?? null,
+      authoritative_membership_bucket: authoritativeProjection.membership_bucket,
       request_fingerprint: createRequestFingerprint({
         method: 'POST',
         routeTemplate: '/_matrix/client/v3/rooms/{roomId}/forget',
@@ -2162,7 +2181,7 @@ async function handleRoomQueryRequest(request, env, roomId, {
   if (!roomVisibility?.ok) {
     return mapInternalErrorToResponse(roomVisibility?.error);
   }
-  if (!roomVisibility.entry || !isReadableRoomSyncMembershipBucket(roomVisibility.entry.membership_bucket)) {
+  if (roomVisibility.entry?.membership_bucket === 'forgotten') {
     return matrixErrorResponse(403, 'M_FORBIDDEN', 'The room is not visible to this user');
   }
   const url = new URL(request.url);

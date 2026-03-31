@@ -241,6 +241,22 @@ test('Phase 06 covers room send/state/query/redaction surfaces', async (t) => {
     roomPath(roomId, `/event/${encodeURIComponent(firstMessage.event_id)}`),
   );
   assert.equal(eventBody.content.body, 'hello from phase 06');
+  await expectMatrixError(
+    await rig.gatewayFetch(roomPath(roomId, '/event/%24phase06-missing-event'), {
+      headers: rig.authHeaders(alice.access_token),
+    }),
+    404,
+    'M_NOT_FOUND',
+  );
+  await expectMatrixError(
+    await rig.gatewayFetch(roomPath(roomId, '/redact/%24phase06-missing-event/redact-missing'), {
+      method: 'PUT',
+      headers: rig.authHeaders(alice.access_token),
+      json: {},
+    }),
+    404,
+    'M_NOT_FOUND',
+  );
 
   const members = await getJson(rig, alice.access_token, roomPath(roomId, '/members'));
   assert.ok(members.chunk.some((event) => event.state_key === alice.user_id));
@@ -360,6 +376,218 @@ test('Phase 06 rejects malformed room-query and typing inputs with deterministic
   );
 });
 
+test('Phase 06 bounds leave visibility at the leave event for queries and incremental sync', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, { username: 'phase06-alice-leave-boundary' });
+  const bob = await registerUser(rig, { username: 'phase06-bob-leave-boundary' });
+
+  const room = await createRoom(rig, alice.access_token, {
+    invite: [bob.user_id],
+  });
+  const roomId = room.room_id;
+  const leaveFilter = encodeURIComponent(JSON.stringify({
+    room: {
+      include_leave: true,
+    },
+  }));
+
+  await postJson(rig, bob.access_token, roomPath(roomId, '/join'));
+  const beforeLeaveEvent = await putJson(
+    rig,
+    alice.access_token,
+    roomPath(roomId, '/send/m.room.message/leave-boundary-before'),
+    {
+      msgtype: 'm.text',
+      body: 'visible before leave',
+    },
+  );
+  const baselineSync = await syncRequest(rig, bob.access_token, `filter=${leaveFilter}`);
+  await postJson(rig, bob.access_token, roomPath(roomId, '/leave'));
+  const leaveSync = await syncRequest(
+    rig,
+    bob.access_token,
+    `filter=${leaveFilter}&since=${encodeURIComponent(baselineSync.next_batch)}`,
+  );
+  assert.ok(leaveSync.rooms.leave[roomId]);
+  assert.ok(leaveSync.rooms.leave[roomId].timeline.events.some((event) => (
+    event.type === 'm.room.member'
+    && event.state_key === bob.user_id
+    && event.content?.membership === 'leave'
+  )));
+
+  const afterLeaveEvent = await putJson(
+    rig,
+    alice.access_token,
+    roomPath(roomId, '/send/m.room.message/leave-boundary-after'),
+    {
+      msgtype: 'm.text',
+      body: 'hidden after leave',
+    },
+  );
+
+  const messages = await getJson(rig, bob.access_token, `${roomPath(roomId, '/messages')}?dir=b&limit=20`);
+  assert.ok(messages.chunk.some((event) => event.event_id === beforeLeaveEvent.event_id));
+  assert.ok(!messages.chunk.some((event) => event.event_id === afterLeaveEvent.event_id));
+
+  await expectMatrixError(
+    await rig.gatewayFetch(roomPath(roomId, `/event/${encodeURIComponent(afterLeaveEvent.event_id)}`), {
+      headers: rig.authHeaders(bob.access_token),
+    }),
+    404,
+    'M_NOT_FOUND',
+  );
+
+  const afterLeaveSync = await syncRequest(
+    rig,
+    bob.access_token,
+    `filter=${leaveFilter}&since=${encodeURIComponent(leaveSync.next_batch)}`,
+  );
+  assert.ok(!afterLeaveSync.rooms?.leave?.[roomId]);
+
+  const bobUserDo = rig.getUserDo(bob.user_id);
+  const afterLeaveMetadata = rig.getRoomDo(roomId).persistence.eventMetadata.get({ event_id: afterLeaveEvent.event_id });
+  await bobUserDo.appendRoomFanout({
+    room_id: roomId,
+    room_pos: afterLeaveMetadata.room_pos,
+    user_id: bob.user_id,
+    membership_bucket: 'leave',
+    timeline_event_ids: [afterLeaveEvent.event_id],
+    state_event_ids: [],
+  });
+  const driftedSync = await syncRequest(
+    rig,
+    bob.access_token,
+    `filter=${leaveFilter}&since=${encodeURIComponent(afterLeaveSync.next_batch)}`,
+  );
+  assert.ok(!driftedSync.rooms?.leave?.[roomId]?.timeline?.events?.some((event) => event.event_id === afterLeaveEvent.event_id));
+});
+
+test('Phase 06 room queries, projection, and forget follow RoomDO truth under visibility drift', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, { username: 'phase06-alice-room-truth' });
+  const bob = await registerUser(rig, { username: 'phase06-bob-room-truth' });
+
+  const room = await createRoom(rig, alice.access_token, {
+    invite: [bob.user_id],
+  });
+  const roomId = room.room_id;
+  const roomDo = rig.getRoomDo(roomId);
+  const bobUserDo = rig.getUserDo(bob.user_id);
+  const originalAppendRoomFanout = bobUserDo.appendRoomFanout.bind(bobUserDo);
+  let failJoinFanout = true;
+  bobUserDo.appendRoomFanout = async (request) => {
+    if (failJoinFanout && request?.membership_bucket === 'join') {
+      failJoinFanout = false;
+      throw new Error('join fanout failed');
+    }
+    return originalAppendRoomFanout(request);
+  };
+  await postJson(rig, bob.access_token, roomPath(roomId, '/join'));
+  bobUserDo.appendRoomFanout = originalAppendRoomFanout;
+
+  const driftedJoinVisibility = await bobUserDo.getRoomSyncMembership({
+    user_id: bob.user_id,
+    room_id: roomId,
+  });
+  assert.equal(driftedJoinVisibility.entry.membership_bucket, 'invite');
+
+  const members = await getJson(rig, bob.access_token, roomPath(roomId, '/members'));
+  assert.ok(members.chunk.some((event) => event.state_key === bob.user_id && event.content.membership === 'join'));
+
+  let failLeaveFanout = true;
+  bobUserDo.appendRoomFanout = async (request) => {
+    if (failLeaveFanout && request?.membership_bucket === 'leave') {
+      failLeaveFanout = false;
+      throw new Error('leave fanout failed');
+    }
+    return originalAppendRoomFanout(request);
+  };
+  await postJson(rig, bob.access_token, roomPath(roomId, '/leave'));
+  bobUserDo.appendRoomFanout = originalAppendRoomFanout;
+
+  const leaveProjection = await roomDo.projectForSync({
+    user_id: bob.user_id,
+    room_id: roomId,
+    membership_bucket: 'join',
+    filter_flags: {
+      include_leave: true,
+    },
+    timeline_event_ids: [],
+    state_event_ids: [],
+  });
+  assert.equal(leaveProjection.projection.membership_bucket, 'leave');
+  assert.equal(
+    leaveProjection.projection.room_pos,
+    roomDo.persistence.membershipProjection.get({ user_id: bob.user_id }).room_pos,
+  );
+
+  await postJson(rig, bob.access_token, roomPath(roomId, '/forget'));
+  await expectMatrixError(
+    await rig.gatewayFetch(roomPath(roomId, '/members'), {
+      headers: rig.authHeaders(bob.access_token),
+    }),
+    403,
+    'M_FORBIDDEN',
+  );
+});
+
+test('Phase 06 membership replays stay authorized and failed membership dedupe keys stay state-scoped', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, { username: 'phase06-alice-membership-replay' });
+  const bob = await registerUser(rig, { username: 'phase06-bob-membership-replay' });
+  const carol = await registerUser(rig, { username: 'phase06-carol-membership-replay' });
+
+  const room = await createRoom(rig, alice.access_token, {
+    preset: 'public_chat',
+    invite: [bob.user_id],
+  });
+  const roomId = room.room_id;
+  const roomDo = rig.getRoomDo(roomId);
+
+  await postJson(rig, bob.access_token, roomPath(roomId, '/join'));
+  const bobMembershipEventId = roomDo.persistence.membershipProjection.get({ user_id: bob.user_id }).event_id;
+  await expectMatrixError(
+    await rig.gatewayFetch(roomPath(roomId, '/unban'), {
+      method: 'POST',
+      headers: rig.authHeaders(alice.access_token),
+      json: {
+        user_id: bob.user_id,
+      },
+    }),
+    403,
+    'M_FORBIDDEN',
+  );
+  const failedUnbanDedupe = roomDo.persistence.clientTxnDedupe.list().find(
+    (row) => row.route_template === '/_matrix/client/v3/rooms/{roomId}/unban',
+  );
+  assert.ok(failedUnbanDedupe);
+  assert.ok(failedUnbanDedupe.txn_id_or_request_hash.endsWith(`|${bobMembershipEventId}`));
+
+  await postJson(rig, alice.access_token, roomPath(roomId, '/invite'), {
+    user_id: carol.user_id,
+  });
+  await postJson(rig, alice.access_token, roomPath(roomId, '/leave'));
+  const eventCountBeforeFailedReplay = roomDo.persistence.eventMetadata.list().length;
+  await expectMatrixError(
+    await rig.gatewayFetch(roomPath(roomId, '/invite'), {
+      method: 'POST',
+      headers: rig.authHeaders(alice.access_token),
+      json: {
+        user_id: carol.user_id,
+      },
+    }),
+    403,
+    'M_FORBIDDEN',
+  );
+  assert.equal(roomDo.persistence.eventMetadata.list().length, eventCountBeforeFailedReplay);
+});
+
 test('Phase 06 covers membership transitions including invite, kick, ban, unban, knock, and forget', async (t) => {
   const rig = createGatewayPhase04Rig();
   t.after(() => rig.close());
@@ -434,6 +662,18 @@ test('Phase 06 covers membership transitions including invite, kick, ban, unban,
   assert.equal(
     publicRoomDo.persistence.membershipProjection.get({ user_id: bob.user_id }).membership,
     'leave',
+  );
+  await expectMatrixError(
+    await rig.gatewayFetch(roomPath(publicRoomId, '/unban'), {
+      method: 'POST',
+      headers: rig.authHeaders(alice.access_token),
+      json: {
+        user_id: bob.user_id,
+        reason: 'kicked once',
+      },
+    }),
+    403,
+    'M_FORBIDDEN',
   );
 
   await postJson(rig, bob.access_token, roomPath(publicRoomId, '/join'));
@@ -899,6 +1139,21 @@ test('Phase 06 covers room version defaults, unsupported versions, and 11/12 red
   const defaultRoom = await createRoom(rig, defaultUser.access_token, {});
   const defaultRoomDo = rig.getRoomDo(defaultRoom.room_id);
   assert.equal(defaultRoomDo.persistence.getRuntimeState().room_version, '12');
+  const creationContentOverrideRoom = await createRoom(rig, defaultUser.access_token, {
+    creation_content: {
+      room_version: '99',
+      marker: 'preserved',
+    },
+  });
+  const creationContentOverrideRoomDo = rig.getRoomDo(creationContentOverrideRoom.room_id);
+  const creationContentOverrideCreateEntry = creationContentOverrideRoomDo.persistence.stateEntries.list().find(
+    (row) => row.event_type === 'm.room.create' && row.state_key === '',
+  );
+  const creationContentOverrideCreateEvent = creationContentOverrideRoomDo.loadRoomEventById(
+    creationContentOverrideCreateEntry.event_id,
+  ).event;
+  assert.equal(creationContentOverrideCreateEvent.content.room_version, '12');
+  assert.equal(creationContentOverrideCreateEvent.content.marker, 'preserved');
 
   await expectMatrixError(
     await rig.gatewayFetch('/_matrix/client/v3/createRoom', {
@@ -928,6 +1183,42 @@ test('Phase 06 covers room version defaults, unsupported versions, and 11/12 red
   const v11PowerEntry = v11RoomDo.persistence.stateEntries.list().find(
     (row) => row.event_type === 'm.room.power_levels' && row.state_key === '',
   );
+  const v11Bob = await registerUser(rig, { username: 'phase06-roomv-11-bob' });
+  await postJson(rig, v11User.access_token, roomPath(v11Room.room_id, '/invite'), {
+    user_id: v11Bob.user_id,
+  });
+  await postJson(rig, v11Bob.access_token, roomPath(v11Room.room_id, '/join'));
+  const v11PowerLevels = structuredClone(v11RoomDo.loadRoomEventById(v11PowerEntry.event_id).event.content);
+  await putJson(
+    rig,
+    v11User.access_token,
+    roomPath(v11Room.room_id, '/state/m.room.power_levels'),
+    {
+      ...v11PowerLevels,
+      redact: 100,
+      events: {
+        ...(v11PowerLevels.events ?? {}),
+        'm.room.redaction': 0,
+      },
+    },
+  );
+  const v11Target = await putJson(
+    rig,
+    v11User.access_token,
+    roomPath(v11Room.room_id, '/send/m.room.message/rv11-redaction-auth'),
+    {
+      msgtype: 'm.text',
+      body: 'room version 11 redaction auth target',
+    },
+  );
+  await putJson(
+    rig,
+    v11Bob.access_token,
+    roomPath(v11Room.room_id, `/redact/${encodeURIComponent(v11Target.event_id)}/rv11-auth-redact`),
+    {},
+  );
+  const v11RedactedTarget = v11RoomDo.loadRoomEventById(v11Target.event_id).event;
+  assert.deepEqual(v11RedactedTarget.content, {});
   await putJson(
     rig,
     v11User.access_token,

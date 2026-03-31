@@ -674,6 +674,30 @@ function buildRoomSyncSummary(persistence) {
   };
 }
 
+function buildRoomSyncSummaryFromSnapshot(roomDo, snapshotId) {
+  if (typeof snapshotId !== 'string' || snapshotId.length === 0) {
+    return buildRoomSyncSummary(roomDo.persistence);
+  }
+  let joinedMemberCount = 0;
+  let invitedMemberCount = 0;
+  for (const row of roomDo.persistence.stateEntries.list()) {
+    if (row.snapshot_id !== snapshotId || row.event_type !== 'm.room.member') {
+      continue;
+    }
+    const event = roomDo.loadRoomEventById(row.event_id).event;
+    const membership = typeof event?.content?.membership === 'string' ? event.content.membership : null;
+    if (membership === 'join') {
+      joinedMemberCount += 1;
+    } else if (membership === 'invite') {
+      invitedMemberCount += 1;
+    }
+  }
+  return {
+    joined_member_count: joinedMemberCount,
+    invited_member_count: invitedMemberCount,
+  };
+}
+
 function cloneJson(value) {
   return value == null ? value : structuredClone(value);
 }
@@ -823,7 +847,7 @@ function getUserPowerLevel(roomDo, roomVersion, stateMap, userId) {
 
 function getRequiredEventPowerLevel(roomDo, roomVersion, stateMap, candidateEvent) {
   const powerLevels = getCurrentPowerLevelsContent(roomDo, stateMap);
-  if (candidateEvent?.type === 'm.room.redaction') {
+  if (candidateEvent?.type === 'm.room.redaction' && roomVersion !== '11') {
     return Number.isInteger(powerLevels.redact) ? powerLevels.redact : 50;
   }
   if (stateKeyForEvent(candidateEvent) != null) {
@@ -1590,10 +1614,16 @@ export class UserDO extends BaseDurableObject {
     }
     const currentRoomSync = readRoomSyncMembershipMap(principal)[roomId] ?? null;
     const forgottenRoom = readForgottenRoomTombstones(principal)[roomId] ?? null;
-    if (currentRoomSync && currentRoomSync.membership_bucket !== 'leave') {
+    const authoritativeMembershipBucket = request?.authoritative_membership_bucket == null
+      ? null
+      : normalizeRoomMembershipBucket(request.authoritative_membership_bucket, { allowNull: true });
+    const roomWasLeft = authoritativeMembershipBucket === 'leave'
+      || currentRoomSync?.membership_bucket === 'leave'
+      || forgottenRoom != null;
+    if (currentRoomSync && currentRoomSync.membership_bucket !== 'leave' && authoritativeMembershipBucket !== 'leave') {
       return createMatrixError(403, 'M_FORBIDDEN', 'Room must be left before it can be forgotten');
     }
-    if (!currentRoomSync && !forgottenRoom) {
+    if (!roomWasLeft) {
       return createMatrixError(403, 'M_FORBIDDEN', 'Room must be left before it can be forgotten');
     }
     const forgetRoomPos = Number.isInteger(request?.room_pos)
@@ -1652,8 +1682,15 @@ export class UserDO extends BaseDurableObject {
       });
     }
     const roomId = normalizeString(request?.room_id, 'request.room_id');
+    const roomSyncMembership = readRoomSyncMembershipMap(principal)[roomId] ?? null;
+    const forgottenRoom = readForgottenRoomTombstones(principal)[roomId] ?? null;
     return createSuccessResult({
-      entry: readRoomSyncMembershipMap(principal)[roomId] ?? null,
+      entry: roomSyncMembership ?? (forgottenRoom == null ? null : {
+        room_id: roomId,
+        membership_bucket: 'forgotten',
+        room_pos: Number.isInteger(forgottenRoom.room_pos) ? forgottenRoom.room_pos : 0,
+        updated_at: typeof forgottenRoom.updated_at === 'string' ? forgottenRoom.updated_at : null,
+      }),
     });
   }
 
@@ -3704,7 +3741,6 @@ export class RoomDO extends BaseDurableObject {
     const senderUserId = candidateEvent.sender;
     const targetUserId = candidateEvent.state_key;
     const membership = normalizeString(candidateEvent.content.membership, 'candidate_event.content.membership');
-    const profileRefresh = getProfileRefreshInfo(candidateEvent);
     const routeTemplate = typeof candidateEvent?.unsigned?.client_context?.route_template === 'string'
       ? candidateEvent.unsigned.client_context.route_template
       : null;
@@ -3726,7 +3762,7 @@ export class RoomDO extends BaseDurableObject {
       if (targetMembership === 'ban') {
         throw createRoomInternalError('room_forbidden', 'Banned users may not join');
       }
-      if (targetMembership === 'join' && profileRefresh) {
+      if (targetMembership === 'join') {
         return membership;
       }
       const creatorBootstrap = createEvent
@@ -3837,12 +3873,14 @@ export class RoomDO extends BaseDurableObject {
 
     if (candidateEvent.type === 'm.room.redaction') {
       const targetEvent = this.loadRoomEventById(candidateEvent.redacts).event;
-      const senderPower = getUserPowerLevel(this, roomVersion, stateMap, candidateEvent.sender);
-      const redactLevel = getRequiredEventPowerLevel(this, roomVersion, stateMap, candidateEvent);
-      if (candidateEvent.sender !== targetEvent.sender && senderPower < redactLevel) {
-        throw createRoomInternalError('room_forbidden', 'Redaction power level is insufficient');
+      if (roomVersion !== '11') {
+        const senderPower = getUserPowerLevel(this, roomVersion, stateMap, candidateEvent.sender);
+        const redactLevel = getRequiredEventPowerLevel(this, roomVersion, stateMap, candidateEvent);
+        if (candidateEvent.sender !== targetEvent.sender && senderPower < redactLevel) {
+          throw createRoomInternalError('room_forbidden', 'Redaction power level is insufficient');
+        }
+        return;
       }
-      return;
     }
 
     const senderPower = getUserPowerLevel(this, roomVersion, stateMap, candidateEvent.sender);
@@ -3940,6 +3978,8 @@ export class RoomDO extends BaseDurableObject {
         });
       }
 
+      this.authorizeCandidateEvent(roomVersion, stateMap, candidateEvent);
+
       if (eventType === 'm.room.member' && currentMembershipState) {
         const currentMembershipEvent = this.loadRoomEventById(currentMembershipState.event_id).event;
         if (currentMembershipEvent?.sender === sender
@@ -3953,8 +3993,6 @@ export class RoomDO extends BaseDurableObject {
           });
         }
       }
-
-      this.authorizeCandidateEvent(roomVersion, stateMap, candidateEvent);
       const prevEventIds = this.persistence.forwardExtremities.list()
         .sort((left, right) => left.room_pos - right.room_pos || left.event_id.localeCompare(right.event_id))
         .map((row) => row.event_id);
@@ -4247,7 +4285,8 @@ export class RoomDO extends BaseDurableObject {
     } catch (error) {
       if (request?.candidate_event?.unsigned?.client_context && request?.request_fingerprint) {
         try {
-          const clientContext = request.candidate_event.unsigned.client_context;
+          const candidateEvent = request.candidate_event;
+          const clientContext = candidateEvent.unsigned.client_context;
           const roomId = request.room_id ?? request.candidate_event.room_id ?? this.persistence.getRuntimeState()?.room_id
             ?? deriveCreateRoomIdentity({
               creator_user_id: request.candidate_event.sender,
@@ -4255,13 +4294,20 @@ export class RoomDO extends BaseDurableObject {
               request_fingerprint: request.request_fingerprint,
               server_name: this.env.MATRIX_SERVER_NAME,
             }).room_id;
+          const failedStateMap = this.getCurrentStateMap();
+          const currentMembershipState = candidateEvent?.type === 'm.room.member' && typeof candidateEvent?.state_key === 'string'
+            ? getTypedStateEvent(failedStateMap, 'm.room.member', candidateEvent.state_key)
+            : null;
+          const txnIdOrRequestHash = candidateEvent?.type === 'm.room.member'
+            ? `${clientContext.txn_id_or_request_hash ?? request.request_fingerprint}|${currentMembershipState?.event_id ?? 'none'}`
+            : (clientContext.txn_id_or_request_hash ?? request.request_fingerprint);
           this.persistence.clientTxnDedupe.put({
-            txn_dedupe_key: `${clientContext.user_id}|${clientContext.device_id}|${roomId}|${clientContext.route_template}|${clientContext.txn_id_or_request_hash ?? request.request_fingerprint}`,
+            txn_dedupe_key: `${clientContext.user_id}|${clientContext.device_id}|${roomId}|${clientContext.route_template}|${txnIdOrRequestHash}`,
             user_id: clientContext.user_id,
             device_id: clientContext.device_id,
             room_id: roomId,
             route_template: clientContext.route_template,
-            txn_id_or_request_hash: clientContext.txn_id_or_request_hash ?? request.request_fingerprint,
+            txn_id_or_request_hash: txnIdOrRequestHash,
             request_fingerprint: request.request_fingerprint,
             terminal_state: 'failed',
             result_event_id: null,
@@ -4342,6 +4388,9 @@ export class RoomDO extends BaseDurableObject {
       if (membershipBucket === 'forgotten') {
         continue;
       }
+      if (membershipBucket !== 'join' && roomPos > membership.room_pos) {
+        continue;
+      }
       const delta = {
         room_id: roomId,
         room_pos: roomPos,
@@ -4376,11 +4425,7 @@ export class RoomDO extends BaseDurableObject {
   loadRoomEventById(eventId) {
     const metadata = this.persistence.eventMetadata.get({ event_id: eventId });
     if (!metadata) {
-      throw createInternalErrorEnvelope({
-        code: 'archive_missing',
-        message: `Room event ${eventId} metadata is missing`,
-        retryable: false,
-      });
+      throw createRoomInternalError('event_not_found', `Event ${eventId} does not exist`);
     }
     const hotEvent = this.persistence.hotEventJson.get({ event_id: eventId });
     if (!hotEvent) {
@@ -4410,9 +4455,11 @@ export class RoomDO extends BaseDurableObject {
     lazyLoadMembers = false,
     timelineEvents = [],
     snapshotId = null,
+    maxRoomPos = null,
   } = {}) {
     const runtimeState = this.persistence.getRuntimeState();
-    const resolvedSnapshotId = snapshotId ?? runtimeState?.current_snapshot_id ?? null;
+    const resolvedSnapshotId = snapshotId
+      ?? (maxRoomPos == null ? runtimeState?.current_snapshot_id ?? null : this.resolveSnapshotIdForRoomPos(maxRoomPos));
     if (!resolvedSnapshotId) {
       return [];
     }
@@ -4934,14 +4981,26 @@ export class RoomDO extends BaseDurableObject {
     return membership;
   }
 
-  listVisibleTimelineMetadata() {
+  listVisibleTimelineMetadata({ maxRoomPos = null } = {}) {
     return this.persistence.eventMetadata.list()
       .filter((row) => row.soft_failed_flag !== true && row.waiting_missing_flag !== true)
+      .filter((row) => maxRoomPos == null || row.room_pos <= maxRoomPos)
       .sort((left, right) => left.room_pos - right.room_pos || left.event_id.localeCompare(right.event_id));
   }
 
-  readTimelineChunk({ from = null, dir = 'b', limit = 10 }) {
-    const visible = this.listVisibleTimelineMetadata();
+  loadVisibleRoomEventById(eventId, { maxRoomPos = null } = {}) {
+    const loaded = this.loadRoomEventById(eventId);
+    if (maxRoomPos != null && loaded.metadata.room_pos > maxRoomPos) {
+      throw createRoomInternalError('event_not_found', `Event ${eventId} does not exist`);
+    }
+    if (loaded.metadata.soft_failed_flag === true || loaded.metadata.waiting_missing_flag === true) {
+      throw createRoomInternalError('event_not_found', `Event ${eventId} does not exist`);
+    }
+    return loaded;
+  }
+
+  readTimelineChunk({ from = null, dir = 'b', limit = 10, maxRoomPos = null }) {
+    const visible = this.listVisibleTimelineMetadata({ maxRoomPos });
     const normalizedLimit = normalizeInteger(limit, 'limit', { min: 1 });
     if (dir === 'f') {
       const startPos = from == null ? 0 : decodeRoomCursor(from);
@@ -4949,7 +5008,7 @@ export class RoomDO extends BaseDurableObject {
         .filter((row) => row.room_pos > startPos)
         .slice(0, normalizedLimit);
       return {
-        chunk: rows.map((row) => this.loadRoomEventById(row.event_id).event),
+        chunk: rows.map((row) => this.loadVisibleRoomEventById(row.event_id, { maxRoomPos }).event),
         start: encodeRoomCursor(startPos),
         end: rows.length > 0 ? encodeRoomCursor(rows.at(-1).room_pos) : encodeRoomCursor(startPos),
       };
@@ -4962,21 +5021,21 @@ export class RoomDO extends BaseDurableObject {
       .toReversed()
       .slice(0, normalizedLimit);
     return {
-      chunk: rows.map((row) => this.loadRoomEventById(row.event_id).event),
+      chunk: rows.map((row) => this.loadVisibleRoomEventById(row.event_id, { maxRoomPos }).event),
       start: encodeRoomCursor(startPos),
       end: rows.length > 0 ? encodeRoomCursor(rows.at(-1).room_pos) : encodeRoomCursor(startPos),
     };
   }
 
-  readContextWindow(eventId, requesterUserId, limit = 10) {
-    const targetMetadata = this.persistence.eventMetadata.get({ event_id: eventId });
-    if (!targetMetadata) {
-      throw createRoomInternalError('event_not_found', `Event ${eventId} does not exist`);
-    }
+  readContextWindow(eventId, requesterUserId, limit = 10, {
+    maxRoomPos = null,
+  } = {}) {
+    const target = this.loadVisibleRoomEventById(eventId, { maxRoomPos });
+    const targetMetadata = target.metadata;
     const snapshotId = typeof targetMetadata.record?.snapshot_id === 'string' && targetMetadata.record.snapshot_id.length > 0
       ? targetMetadata.record.snapshot_id
       : this.resolveSnapshotIdForRoomPos(targetMetadata.room_pos);
-    const visible = this.listVisibleTimelineMetadata();
+    const visible = this.listVisibleTimelineMetadata({ maxRoomPos });
     const normalizedLimit = normalizeInteger(limit, 'limit', { min: 1 });
     const beforeRows = visible
       .filter((row) => row.room_pos < targetMetadata.room_pos)
@@ -4985,9 +5044,9 @@ export class RoomDO extends BaseDurableObject {
       .filter((row) => row.room_pos > targetMetadata.room_pos)
       .slice(0, normalizedLimit);
     return {
-      event: this.loadRoomEventById(eventId).event,
-      events_before: beforeRows.map((row) => this.loadRoomEventById(row.event_id).event),
-      events_after: afterRows.map((row) => this.loadRoomEventById(row.event_id).event),
+      event: target.event,
+      events_before: beforeRows.map((row) => this.loadVisibleRoomEventById(row.event_id, { maxRoomPos }).event),
+      events_after: afterRows.map((row) => this.loadVisibleRoomEventById(row.event_id, { maxRoomPos }).event),
       state: this.buildStateSnapshotEventsForUser(requesterUserId, {
         snapshotId,
       }),
@@ -5007,30 +5066,50 @@ export class RoomDO extends BaseDurableObject {
       ? request.filter_flags
       : getSyncFilterFlags(request?.filter_json ?? {});
     const membership = this.persistence.membershipProjection.get({ user_id: userId });
-    const membershipBucket = normalizeRoomMembershipBucket(
-      request?.membership_bucket ?? membership?.membership ?? null,
-      { allowNull: true },
-    );
+    const membershipBucket = normalizeRoomMembershipBucket(membership?.membership ?? null, { allowNull: true });
     if (!membershipBucket || membershipBucket === 'forgotten') {
       return createSuccessResult({ projection: null });
     }
     if (membershipBucket === 'leave' && filterFlags.include_leave !== true) {
       return createSuccessResult({ projection: null });
     }
+    const visibilityRoomPos = membershipBucket === 'join'
+      ? null
+      : (Number.isInteger(membership?.room_pos) && membership.room_pos >= 1 ? membership.room_pos : null);
+    const snapshotId = visibilityRoomPos == null ? null : this.resolveSnapshotIdForRoomPos(visibilityRoomPos);
 
     const timelineEventIds = uniqueStringArray(request?.timeline_event_ids);
     const stateEventIds = uniqueStringArray(request?.state_event_ids);
-    let timelineEvents;
-    let deltaStateEvents;
-    try {
-      timelineEvents = timelineEventIds.map((eventId) => this.loadRoomEventById(eventId).event);
-      deltaStateEvents = stateEventIds.map((eventId) => this.loadRoomEventById(eventId).event);
-    } catch (error) {
+    const loadProjectedEvents = (eventIds) => {
+      const events = [];
+      for (const eventId of eventIds) {
+        try {
+          events.push(this.loadVisibleRoomEventById(eventId, { maxRoomPos: visibilityRoomPos }).event);
+        } catch (error) {
+          if (error?.code === 'event_not_found') {
+            continue;
+          }
+          return {
+            ok: false,
+            error,
+          };
+        }
+      }
       return {
-        ok: false,
-        error,
+        ok: true,
+        events,
       };
+    };
+    const timelineEventsResult = loadProjectedEvents(timelineEventIds);
+    if (!timelineEventsResult.ok) {
+      return timelineEventsResult;
     }
+    const deltaStateEventsResult = loadProjectedEvents(stateEventIds);
+    if (!deltaStateEventsResult.ok) {
+      return deltaStateEventsResult;
+    }
+    const timelineEvents = timelineEventsResult.events;
+    const deltaStateEvents = deltaStateEventsResult.events;
 
     let currentStateEvents = [];
     try {
@@ -5038,6 +5117,7 @@ export class RoomDO extends BaseDurableObject {
         currentStateEvents = this.buildStateSnapshotEventsForUser(userId, {
           lazyLoadMembers: filterFlags.lazy_load_members === true,
           timelineEvents,
+          snapshotId,
         });
       }
     } catch (error) {
@@ -5049,7 +5129,7 @@ export class RoomDO extends BaseDurableObject {
 
     const summary = request?.summary && typeof request.summary === 'object' && !Array.isArray(request.summary)
       ? structuredClone(request.summary)
-      : buildRoomSyncSummary(this.persistence);
+      : buildRoomSyncSummaryFromSnapshot(this, snapshotId);
     const projection = {
       room_id: roomId,
       membership_bucket: membershipBucket,
@@ -5074,7 +5154,9 @@ export class RoomDO extends BaseDurableObject {
         ? structuredClone(request.unread_thread_notifications)
         : null,
       summary,
-      room_pos: request?.room_pos ?? membership?.room_pos ?? 0,
+      room_pos: membershipBucket === 'join'
+        ? (request?.room_pos ?? membership?.room_pos ?? 0)
+        : (visibilityRoomPos ?? 0),
     };
     return createSuccessResult({
       projection,
@@ -5089,7 +5171,11 @@ export class RoomDO extends BaseDurableObject {
       const kind = normalizeRoomReadKind(request?.kind);
       const roomId = normalizeString(request?.room_id ?? this.persistence.getRuntimeState()?.room_id, 'request.room_id');
       const requesterUserId = normalizeString(request?.requester_user_id, 'request.requester_user_id');
-      this.assertRoomReadableBy(requesterUserId);
+      const membership = this.assertRoomReadableBy(requesterUserId);
+      const maxVisibleRoomPos = membership.membership === 'join'
+        ? null
+        : normalizeInteger(membership.room_pos, 'membership.room_pos', { min: 1 });
+      const boundarySnapshotId = maxVisibleRoomPos == null ? null : this.resolveSnapshotIdForRoomPos(maxVisibleRoomPos);
       if (this.persistence.getRuntimeState()?.room_id && this.persistence.getRuntimeState().room_id !== roomId) {
         throw createRoomInternalError('room_not_found', `Room ${roomId} does not exist`);
       }
@@ -5099,6 +5185,7 @@ export class RoomDO extends BaseDurableObject {
           from: request?.cursor?.from ?? null,
           dir: request?.cursor?.dir === 'f' ? 'f' : 'b',
           limit: request?.limit ?? 10,
+          maxRoomPos: maxVisibleRoomPos,
         });
         return createSuccessResult({
           kind,
@@ -5112,6 +5199,9 @@ export class RoomDO extends BaseDurableObject {
           normalizeString(request?.event_id, 'request.event_id'),
           requesterUserId,
           request?.limit ?? 10,
+          {
+            maxRoomPos: maxVisibleRoomPos,
+          },
         );
         return createSuccessResult({
           kind,
@@ -5124,33 +5214,43 @@ export class RoomDO extends BaseDurableObject {
         return createSuccessResult({
           kind,
           room_id: roomId,
-          event: this.loadRoomEventById(normalizeString(request?.event_id, 'request.event_id')).event,
+          event: this.loadVisibleRoomEventById(
+            normalizeString(request?.event_id, 'request.event_id'),
+            { maxRoomPos: maxVisibleRoomPos },
+          ).event,
         });
       }
 
       if (kind === 'state') {
+        const stateMap = boundarySnapshotId == null
+          ? this.getCurrentStateMap()
+          : getRoomStateMapForSnapshot(this.persistence, boundarySnapshotId);
         const eventType = typeof request?.cursor?.event_type === 'string' ? request.cursor.event_type : null;
         const stateKey = typeof request?.cursor?.state_key === 'string' ? request.cursor.state_key : '';
         if (eventType) {
-          const stateEntry = getTypedStateEvent(this.getCurrentStateMap(), eventType, stateKey);
+          const stateEntry = getTypedStateEvent(stateMap, eventType, stateKey);
           if (!stateEntry) {
             throw createRoomInternalError('event_not_found', `State event ${eventType}/${stateKey} does not exist`);
           }
           return createSuccessResult({
             kind,
             room_id: roomId,
-            event: this.loadRoomEventById(stateEntry.event_id).event,
+            event: this.loadVisibleRoomEventById(stateEntry.event_id, { maxRoomPos: maxVisibleRoomPos }).event,
           });
         }
         return createSuccessResult({
           kind,
           room_id: roomId,
-          state: this.buildStateSnapshotEventsForUser(requesterUserId, {}),
+          state: this.buildStateSnapshotEventsForUser(requesterUserId, {
+            snapshotId: boundarySnapshotId,
+          }),
         });
       }
 
       if (kind === 'members') {
-        const stateEvents = this.buildStateSnapshotEventsForUser(requesterUserId, {});
+        const stateEvents = this.buildStateSnapshotEventsForUser(requesterUserId, {
+          snapshotId: boundarySnapshotId,
+        });
         return createSuccessResult({
           kind,
           room_id: roomId,
@@ -5160,10 +5260,12 @@ export class RoomDO extends BaseDurableObject {
 
       if (kind === 'joined_members') {
         const joined = {};
-        for (const membership of this.persistence.membershipProjection.list().filter((row) => row.membership === 'join')) {
-          joined[membership.user_id] = {
-            avatar_url: membership.avatar_url ?? undefined,
-            display_name: membership.displayname ?? undefined,
+        for (const event of this.buildStateSnapshotEventsForUser(requesterUserId, {
+          snapshotId: boundarySnapshotId,
+        }).filter((candidate) => candidate.type === 'm.room.member' && candidate.content?.membership === 'join')) {
+          joined[event.state_key] = {
+            avatar_url: event.content?.avatar_url ?? undefined,
+            display_name: event.content?.displayname ?? undefined,
           };
         }
         return createSuccessResult({
@@ -5177,7 +5279,7 @@ export class RoomDO extends BaseDurableObject {
         const eventId = normalizeString(request?.event_id, 'request.event_id');
         const relType = typeof request?.cursor?.rel_type === 'string' ? request.cursor.rel_type : null;
         const eventType = typeof request?.cursor?.event_type === 'string' ? request.cursor.event_type : null;
-        const rows = this.persistence.eventMetadata.list()
+        const rows = this.listVisibleTimelineMetadata({ maxRoomPos: maxVisibleRoomPos })
           .filter((row) => row.relates_to_event_id_or_null === eventId)
           .filter((row) => relType == null || row.relation_type_or_null === relType)
           .filter((row) => eventType == null || row.event_type === eventType)
@@ -5186,7 +5288,7 @@ export class RoomDO extends BaseDurableObject {
         return createSuccessResult({
           kind,
           room_id: roomId,
-          chunk: rows.map((row) => this.loadRoomEventById(row.event_id).event),
+          chunk: rows.map((row) => this.loadVisibleRoomEventById(row.event_id, { maxRoomPos: maxVisibleRoomPos }).event),
           start: rows.length > 0 ? encodeRoomCursor(rows[0].room_pos) : null,
           end: rows.length > 0 ? encodeRoomCursor(rows.at(-1).room_pos) : null,
         });
@@ -5194,19 +5296,20 @@ export class RoomDO extends BaseDurableObject {
 
       if (kind === 'threads') {
         const rootIds = [...new Set(
-          this.persistence.eventMetadata.list()
+          this.listVisibleTimelineMetadata({ maxRoomPos: maxVisibleRoomPos })
             .map((row) => row.thread_root_event_id_or_null)
             .filter((value) => typeof value === 'string' && value.length > 0),
         )];
         const rows = rootIds
           .map((eventId) => this.persistence.eventMetadata.get({ event_id: eventId }))
+          .filter((row) => row && (maxVisibleRoomPos == null || row.room_pos <= maxVisibleRoomPos))
           .filter(Boolean)
           .sort((left, right) => right.room_pos - left.room_pos)
           .slice(0, normalizeInteger(request?.limit ?? 10, 'limit', { min: 1 }));
         return createSuccessResult({
           kind,
           room_id: roomId,
-          chunk: rows.map((row) => this.loadRoomEventById(row.event_id).event),
+          chunk: rows.map((row) => this.loadVisibleRoomEventById(row.event_id, { maxRoomPos: maxVisibleRoomPos }).event),
           start: rows.length > 0 ? encodeRoomCursor(rows[0].room_pos) : null,
           end: rows.length > 0 ? encodeRoomCursor(rows.at(-1).room_pos) : null,
         });
@@ -5215,7 +5318,7 @@ export class RoomDO extends BaseDurableObject {
       if (kind === 'timestamp_lookup') {
         const timestamp = normalizeInteger(request?.timestamp, 'request.timestamp', { min: 0 });
         const direction = request?.cursor?.dir === 'f' ? 'f' : 'b';
-        const visible = this.listVisibleTimelineMetadata();
+        const visible = this.listVisibleTimelineMetadata({ maxRoomPos: maxVisibleRoomPos });
         const match = direction === 'f'
           ? visible.find((row) => row.origin_server_ts >= timestamp)
           : [...visible].reverse().find((row) => row.origin_server_ts <= timestamp);
@@ -5225,7 +5328,7 @@ export class RoomDO extends BaseDurableObject {
         return createSuccessResult({
           kind,
           room_id: roomId,
-          event: this.loadRoomEventById(match.event_id).event,
+          event: this.loadVisibleRoomEventById(match.event_id, { maxRoomPos: maxVisibleRoomPos }).event,
         });
       }
 
