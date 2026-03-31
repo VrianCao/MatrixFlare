@@ -443,6 +443,99 @@ test('Phase 05 profile, presence, and sync propagation are wired end-to-end', as
   await expectMatrixError(avatarFieldAfterDelete, 404, 'M_NOT_FOUND');
 });
 
+test('Phase 05 /sync defaults mark clients online and return immediately without timeout', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, {
+    username: 'alice',
+    password: 'correct horse battery staple',
+    deviceId: 'ALICEPHONE',
+  });
+
+  const initialSync = await syncRequest(rig, alice.access_token);
+  assert.equal(initialSync.presence.events[0].content.presence, 'online');
+  assert.equal(initialSync.presence.events[0].content.currently_active, true);
+
+  const presenceAfterInitialSync = await rig.gatewayFetch('/_matrix/client/v3/presence/@alice:matrix.example.test/status', {
+    headers: rig.authHeaders(alice.access_token),
+  });
+  assert.equal(presenceAfterInitialSync.status, 200);
+  assert.equal((await presenceAfterInitialSync.json()).presence, 'online');
+
+  const explicitPresence = await rig.gatewayFetch('/_matrix/client/v3/presence/@alice:matrix.example.test/status', {
+    method: 'PUT',
+    headers: rig.authHeaders(alice.access_token),
+    json: {
+      presence: 'online',
+      status_msg: 'focus mode',
+    },
+  });
+  assert.equal(explicitPresence.status, 200);
+
+  const afterExplicitPresence = await syncRequest(
+    rig,
+    alice.access_token,
+    `since=${encodeURIComponent(initialSync.next_batch)}`,
+  );
+  assert.equal(afterExplicitPresence.presence.events[0].content.status_msg, 'focus mode');
+
+  const offlineSync = await syncRequest(
+    rig,
+    alice.access_token,
+    `since=${encodeURIComponent(afterExplicitPresence.next_batch)}&set_presence=offline`,
+  );
+  assert.equal(offlineSync.presence.events[0].content.presence, 'offline');
+  assert.equal(offlineSync.presence.events[0].content.status_msg, 'focus mode');
+
+  const presenceAfterOffline = await rig.gatewayFetch('/_matrix/client/v3/presence/@alice:matrix.example.test/status', {
+    headers: rig.authHeaders(alice.access_token),
+  });
+  assert.equal(presenceAfterOffline.status, 200);
+  assert.deepEqual(await presenceAfterOffline.json(), {
+    presence: 'offline',
+    currently_active: false,
+    status_msg: 'focus mode',
+    last_active_at: (await rig.getUserDo('alice').getPresence({ user_id: '@alice:matrix.example.test' })).content.last_active_at,
+  });
+  const tamperedToken = `${offlineSync.next_batch.slice(0, -1)}${offlineSync.next_batch.endsWith('A') ? 'B' : 'A'}`;
+  const tamperedSync = await rig.gatewayFetch(`/_matrix/client/v3/sync?since=${encodeURIComponent(tamperedToken)}`, {
+    headers: rig.authHeaders(alice.access_token),
+  });
+  await expectMatrixError(tamperedSync, 400, 'M_INVALID_PARAM');
+  const presenceAfterTamperedSync = await rig.gatewayFetch('/_matrix/client/v3/presence/@alice:matrix.example.test/status', {
+    headers: rig.authHeaders(alice.access_token),
+  });
+  assert.equal(presenceAfterTamperedSync.status, 200);
+  assert.deepEqual(await presenceAfterTamperedSync.json(), {
+    presence: 'offline',
+    currently_active: false,
+    status_msg: 'focus mode',
+    last_active_at: (await rig.getUserDo('alice').getPresence({ user_id: '@alice:matrix.example.test' })).content.last_active_at,
+  });
+
+  const backOnlineSync = await syncRequest(
+    rig,
+    alice.access_token,
+    `since=${encodeURIComponent(offlineSync.next_batch)}`,
+  );
+  assert.equal(backOnlineSync.presence.events[0].content.presence, 'online');
+  assert.equal(backOnlineSync.presence.events[0].content.status_msg, 'focus mode');
+
+  const emptySyncStart = Date.now();
+  const emptySync = await syncRequest(
+    rig,
+    alice.access_token,
+    `since=${encodeURIComponent(backOnlineSync.next_batch)}`,
+  );
+  const emptySyncElapsedMs = Date.now() - emptySyncStart;
+  assert.ok(
+    emptySyncElapsedMs < 1000,
+    `Expected /sync without timeout to return immediately, got ${emptySyncElapsedMs}ms`,
+  );
+  assert.equal(emptySync.next_batch, backOnlineSync.next_batch);
+});
+
 test('Phase 05 account data, filters, sync waiting, and room account-data deltas are surfaced', async (t) => {
   const rig = createGatewayPhase04Rig();
   t.after(() => rig.close());
@@ -736,17 +829,55 @@ test('Phase 05 room fanout projections surface timeline and unread counts throug
     highlight_count: 1,
     notification_count: 3,
   });
-  assert.deepEqual(joinedRoom.unread_thread_notifications, {
-    '$thread-root': {
-      notification_count: 2,
-      highlight_count: 1,
-    },
-  });
+  assert.equal('unread_thread_notifications' in joinedRoom, false);
   assert.deepEqual(joinedRoom.summary, {
     joined_member_count: 1,
     invited_member_count: 0,
   });
   assert.equal(roomDo.persistence.fanoutOutbox.get({ room_pos: delta.roomPos, user_id: aliceUserId }).status, 'acked');
+
+  const unreadThreadFilter = encodeURIComponent(JSON.stringify({
+    room: {
+      unread_thread_notifications: true,
+    },
+  }));
+  const filteredInitialSync = await syncRequest(
+    rig,
+    alice.access_token,
+    `filter=${unreadThreadFilter}`,
+  );
+  const filteredDelta = await appendRoomMessageDelta(roomDo, {
+    roomId,
+    userId: aliceUserId,
+    eventId: '$phase05-message-2',
+    notificationCount: 4,
+    highlightCount: 0,
+    unreadThreadNotifications: {
+      '$thread-root-2': {
+        notification_count: 1,
+        highlight_count: 0,
+      },
+    },
+  });
+  const filteredIncrementalSync = await syncRequest(
+    rig,
+    alice.access_token,
+    `since=${encodeURIComponent(filteredInitialSync.next_batch)}&filter=${unreadThreadFilter}`,
+  );
+  const filteredJoinedRoom = getJoinedRoomEntry(filteredIncrementalSync, roomId);
+  assert.ok(filteredJoinedRoom);
+  assert.equal(filteredJoinedRoom.timeline.events.at(-1).event_id, '$phase05-message-2');
+  assert.deepEqual(filteredJoinedRoom.unread_notifications, {
+    highlight_count: 0,
+    notification_count: 4,
+  });
+  assert.deepEqual(filteredJoinedRoom.unread_thread_notifications, {
+    '$thread-root-2': {
+      notification_count: 1,
+      highlight_count: 0,
+    },
+  });
+  assert.equal(roomDo.persistence.fanoutOutbox.get({ room_pos: filteredDelta.roomPos, user_id: aliceUserId }).status, 'acked');
 });
 
 test('Phase 05 push rules and to-device idempotency are enforced through routes', async (t) => {

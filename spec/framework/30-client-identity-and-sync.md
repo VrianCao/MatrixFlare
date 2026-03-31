@@ -303,6 +303,7 @@
 
 * token 至少包含版本前缀与 `user_stream_pos`。引用：`DATA-ID-001`。
 * token 不得要求服务端保留 mutable waiter state 才能解析。
+* token 必须具备完整性保护，防止客户端通过篡改 `user_stream_pos`、`device_id` 或 `filter_hash` 伪造更远的游标；任何签名/校验失败都必须 deterministic `400 M_INVALID_PARAM`。
 * token 可选包含 `device_id_hash`、`filter_hash`、`capability_bits` 以做误用检测，但授权仍以 access token 为准。
 * 无新数据时允许返回新的 `next_batch` 等于旧 token 对应位置。
 
@@ -341,6 +342,9 @@
 * stored filter 与 inline filter 都必须先解析到同一个 `canonical_filter_hash`
 * waiter 去重必须基于 `SyncRequestKey`，而不是原始 query string
 * 若两个并发请求只有 `timeout_ms_normalized` 不同，则实现可以保留较新的请求并结束较旧请求，但不得让二者同时长期驻留
+* 若请求未显式给出 `timeout`，其规范默认值必须按 Matrix `v1.17` 解释为 `0`，即服务器在无新数据时也要立即返回，而不是擅自升级为长轮询。
+* 若请求未显式给出 `set_presence`，其规范默认值必须按 Matrix `v1.17` 解释为 `online`；`set_presence = offline` 只表示“本次 `/sync` 不把该会话标成 online”，`set_presence = unavailable` 表示 idle，且这些 `/sync` 自动 presence touch 不得顺带清空既有 `status_msg`。
+* `/sync` 自动 presence touch 只有在 `since` token、filter 绑定、session/device 等请求校验通过后才允许写入 `DATA-USER-009` / `DATA-USER-010`；任何 deterministic `4xx` `/sync` 错误都不得产生 presence side effect。
 
 ## 8. Worker-Held Long Poll 设计
 
@@ -352,13 +356,15 @@
 ### 8.2 请求处理流程
 
 1. `gateway-worker` 调用 `IF-INT-USER-001` 解析 access token。
-2. 解析 `since` token，并将其作为该 session 的 `last_seen_sync_pos` 候选前移。
+2. 规范化 filter、`set_presence`、`timeout` 与 `since`，并完成 `SyncRequestKey` 校验。
 3. 调用 `IF-INT-USER-002` 获取当前是否已有用户流增量。
-4. 若已有增量，立即投影并响应。
-5. 若无增量，创建本地 waiter，并通过唤醒通道等待。
-6. 被唤醒后再次执行 `collectSince`。
-7. 对涉及房间的 delta 调用 `IF-INT-ROOM-002`。
-8. 组合响应并返回新的 `next_batch`。
+4. 若该请求在通过校验后仍需按 `/sync` 语义更新当前 presence，则调用 `IF-INT-USER-007` 写入 `DATA-USER-009` / `DATA-USER-010`。
+5. 若 step 4 产生了新的用户流写入，则重新执行 `IF-INT-USER-002`。
+6. 若已有增量，立即投影并响应。
+7. 若无增量，创建本地 waiter，并通过唤醒通道等待。
+8. 被唤醒后再次执行 `collectSince`。
+9. 对涉及房间的 delta 调用 `IF-INT-ROOM-002`。
+10. 组合响应并返回新的 `next_batch`。
 
 ### 8.3 唤醒通道
 
@@ -461,7 +467,7 @@ membership 到 `/sync` bucket 的映射必须固定为：
 | presence | `IF-CS-016` | `IF-INT-USER-002` | `DATA-USER-009`,`DATA-USER-010` |
 | to-device | `IF-CS-041` | `IF-INT-USER-005` | `DATA-USER-008`,`DATA-USER-010`,`DATA-USER-016` |
 | keys / cross-signing / backup | `IF-CS-042`,`IF-CS-043`,`IF-CS-044`,`IF-CS-045` | `IF-INT-USER-004` | `DATA-USER-003`,`DATA-USER-004`,`DATA-USER-005`,`DATA-USER-011`,`DATA-R2-006` |
-| `/sync` | `IF-CS-020` | `IF-INT-USER-002`,`IF-INT-ROOM-002` | `DATA-ID-001`,`DATA-USER-010` |
+| `/sync` | `IF-CS-020` | `IF-INT-USER-002`,`IF-INT-USER-007`,`IF-INT-ROOM-002` | `DATA-ID-001`,`DATA-USER-009`,`DATA-USER-010` |
 
 ## 12. 完成标准
 

@@ -296,6 +296,30 @@ function mapInternalErrorToResponse(error) {
   return matrixErrorResponse(500, 'M_UNKNOWN', error.message ?? 'Internal error');
 }
 
+function hasVisibleSyncChanges(batch, {
+  since_token,
+  full_state,
+  parsed_since_pos,
+}) {
+  return (
+    since_token == null
+    || full_state
+    || batch.account_data_events.length > 0
+    || batch.presence_events.length > 0
+    || batch.to_device_events.length > 0
+    || (batch.room_deltas?.length ?? 0) > 0
+    || (batch.room_account_data_deltas?.length ?? 0) > 0
+    || (batch.room_ephemeral_deltas?.length ?? 0) > 0
+    || batch.to_stream_pos > parsed_since_pos
+  );
+}
+
+function sleep(milliseconds) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, milliseconds);
+  });
+}
+
 async function resolveSyncFilter(access, url) {
   const filterParam = url.searchParams.get('filter');
   if (filterParam == null || filterParam === '') {
@@ -1610,21 +1634,11 @@ async function handleSync(request, env, url) {
   const useStateAfter = url.searchParams.get('use_state_after') === 'true';
   const setPresence = url.searchParams.get('set_presence') ?? 'online';
 
-  if (setPresence && setPresence !== 'online') {
-    const presenceResult = await access.user_do.setPresence({
-      user_id: access.session.user_id,
-      presence: setPresence,
-      currently_active: setPresence === 'online',
-    });
-    if (!presenceResult.ok) {
-      return jsonResponse(presenceResult.matrix_error.body, presenceResult.matrix_error.status);
-    }
-  }
-
   const sinceToken = url.searchParams.get('since') ?? null;
   const parsedToken = parseSyncToken(sinceToken, {
     expected_user_id: access.session.user_id,
     expected_device_id: access.session.device_id,
+    secret_value: env.SESSION_ROOT_KEY_RING,
   });
   if (!parsedToken.ok) {
     return jsonResponse(parsedToken.matrix_error.body, parsedToken.matrix_error.status);
@@ -1640,33 +1654,57 @@ async function handleSync(request, env, url) {
     use_state_after: useStateAfter,
   };
 
-  const firstCollect = await access.user_do.collectSince(collectRequest);
-  if (!firstCollect.ok) {
-    return jsonResponse(firstCollect.matrix_error.body, firstCollect.matrix_error.status);
+  const collectAndAssemble = async () => {
+    const collected = await access.user_do.collectSince(collectRequest);
+    if (!collected.ok) {
+      return {
+        ok: false,
+        response: jsonResponse(collected.matrix_error.body, collected.matrix_error.status),
+      };
+    }
+    const assembled = await assembleSyncResponse(env, collected.batch, {
+      user_id: access.session.user_id,
+      filter_json: filterResolution.filter_json,
+      filter_hash: filterResolution.filter_hash,
+      initial_sync: sinceToken == null || sinceToken === '',
+    });
+    if (!assembled.ok) {
+      return {
+        ok: false,
+        response: mapInternalErrorToResponse(assembled.error),
+      };
+    }
+    return {
+      ok: true,
+      collected,
+      assembled,
+    };
+  };
+
+  let syncSnapshot = await collectAndAssemble();
+  if (!syncSnapshot.ok) {
+    return syncSnapshot.response;
   }
-  const firstAssembled = await assembleSyncResponse(env, firstCollect.batch, {
+  const presenceResult = await access.user_do.syncPresence({
     user_id: access.session.user_id,
-    filter_json: filterResolution.filter_json,
-    filter_hash: filterResolution.filter_hash,
-    initial_sync: sinceToken == null || sinceToken === '',
+    presence: setPresence,
   });
-  if (!firstAssembled.ok) {
-    return mapInternalErrorToResponse(firstAssembled.error);
+  if (!presenceResult.ok) {
+    return jsonResponse(presenceResult.matrix_error.body, presenceResult.matrix_error.status);
+  }
+  if (presenceResult.response?.changed === true) {
+    syncSnapshot = await collectAndAssemble();
+    if (!syncSnapshot.ok) {
+      return syncSnapshot.response;
+    }
   }
 
-  const hasVisibleChanges = (
-    sinceToken == null
-    || fullState
-    || firstCollect.batch.account_data_events.length > 0
-    || firstCollect.batch.presence_events.length > 0
-    || firstCollect.batch.to_device_events.length > 0
-    || (firstCollect.batch.room_deltas?.length ?? 0) > 0
-    || (firstCollect.batch.room_account_data_deltas?.length ?? 0) > 0
-    || (firstCollect.batch.room_ephemeral_deltas?.length ?? 0) > 0
-    || firstCollect.batch.to_stream_pos > parsedToken.since_pos
-  );
-  if (hasVisibleChanges || timeoutMs === 0) {
-    return jsonResponse(firstAssembled.response);
+  if (hasVisibleSyncChanges(syncSnapshot.collected.batch, {
+    since_token: sinceToken,
+    full_state: fullState,
+    parsed_since_pos: parsedToken.since_pos,
+  }) || timeoutMs === 0) {
+    return jsonResponse(syncSnapshot.assembled.response);
   }
 
   const waiterKey = JSON.stringify({
@@ -1679,28 +1717,52 @@ async function handleSync(request, env, url) {
     full_state: fullState,
     use_state_after: useStateAfter,
     set_presence: setPresence,
+    timeout_ms_normalized: timeoutMs,
   });
-  await registerSyncWaiter(env, {
+  const waiter = registerSyncWaiter(env, {
     user_id: access.session.user_id,
     session_id: access.session.session_id,
     waiter_key: waiterKey,
     timeout_ms: timeoutMs,
   });
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      syncSnapshot = await collectAndAssemble();
+      if (!syncSnapshot.ok) {
+        waiter.cancel();
+        return syncSnapshot.response;
+      }
+      waiter.cancel();
+      return jsonResponse(syncSnapshot.assembled.response);
+    }
 
-  const secondCollect = await access.user_do.collectSince(collectRequest);
-  if (!secondCollect.ok) {
-    return jsonResponse(secondCollect.matrix_error.body, secondCollect.matrix_error.status);
+    const waitOutcome = await Promise.race([
+      waiter.promise,
+      sleep(Math.min(remainingMs, 250)).then(() => ({ reason: 'poll' })),
+    ]);
+
+    syncSnapshot = await collectAndAssemble();
+    if (!syncSnapshot.ok) {
+      waiter.cancel();
+      return syncSnapshot.response;
+    }
+
+    if (hasVisibleSyncChanges(syncSnapshot.collected.batch, {
+      since_token: sinceToken,
+      full_state: fullState,
+      parsed_since_pos: parsedToken.since_pos,
+    })) {
+      waiter.cancel();
+      return jsonResponse(syncSnapshot.assembled.response);
+    }
+
+    if (waitOutcome.reason !== 'poll') {
+      waiter.cancel();
+      return jsonResponse(syncSnapshot.assembled.response);
+    }
   }
-  const secondAssembled = await assembleSyncResponse(env, secondCollect.batch, {
-    user_id: access.session.user_id,
-    filter_json: filterResolution.filter_json,
-    filter_hash: filterResolution.filter_hash,
-    initial_sync: sinceToken == null || sinceToken === '',
-  });
-  if (!secondAssembled.ok) {
-    return mapInternalErrorToResponse(secondAssembled.error);
-  }
-  return jsonResponse(secondAssembled.response);
 }
 
 async function handleRequest(request, env) {

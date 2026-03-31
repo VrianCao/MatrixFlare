@@ -461,19 +461,19 @@
   stored filter、inline filter 规范化、`next_batch` 编码、collectSince。
   完成标准:
   token 对客户端 opaque，内部至少编码版本与 `user_stream_pos`。
-  当前状态:
-  stored/inline filter 解析、opaque `next_batch`、`collectSince()`、room/account-data/ephemeral 分类收集，以及 `RoomDO` durable fanout -> `DATA-USER-010` append 路径已验证。
+当前状态:
+  stored/inline filter 解析、带完整性保护的 opaque `next_batch`、`collectSince()`、room/account-data/ephemeral 分类收集，以及 `RoomDO` durable fanout -> `DATA-USER-010` append 路径已验证。
 
 ### 05.07 实现 Worker-held `/sync`
 
-- [x] 完成 `IF-CS-020`,`STATE-SYNC-WAITER`,`FLOW-CS-SYNC-LONGPOLL`。
+- [x] 完成 `IF-CS-020`,`IF-INT-USER-007`,`STATE-SYNC-WAITER`,`FLOW-CS-SYNC-LONGPOLL`。
   Spec refs: `30` 8-10, `25` `FLOW-CS-SYNC-LONGPOLL`,`STATE-SYNC-WAITER`, `13` `CF-WKR-001`
   产出:
   long-poll handler、single waiter 规则、wake channel、assemble path。
   完成标准:
   早返回不会推进 token，deploy 中断视为正常重试路径。
-  当前状态:
-  worker-held waiter、wake/timeout、single-session supersede、early-return 语义，以及基于 `RoomDO.projectForSync()` 的房间 `/sync` 装配已通过回归验证。
+当前状态:
+  worker-held waiter、single-session supersede、early-return 语义、默认 `set_presence=online` / 默认 `timeout=0` 的 Matrix `v1.17` `/sync` 语义、经 `IF-INT-USER-007` 落地且仅在请求校验成功后才生效的 auto-presence touch、完整性保护的 `next_batch`，以及按 `30` 8.3 降级路径落地的 bounded re-collect polling 长轮询已通过回归验证。
 
 ## Phase 06: Room Core, Room Versions, And Local Fanout
 

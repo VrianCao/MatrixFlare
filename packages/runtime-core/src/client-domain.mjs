@@ -1,10 +1,13 @@
+import { createHmac } from 'node:crypto';
+
 import { createCanonicalFilterHash } from './fingerprints.mjs';
 import { normalizeInteger, normalizeString } from './persistence-common.mjs';
+import { parseSessionRootKeyRing } from './user-identity.mjs';
 
 const textEncoder = new TextEncoder();
 
-export const SYNC_TOKEN_VERSION = 1;
-export const DEFAULT_SYNC_TIMEOUT_MS = 30_000;
+export const SYNC_TOKEN_VERSION = 2;
+export const DEFAULT_SYNC_TIMEOUT_MS = 0;
 export const MAX_SYNC_TIMEOUT_MS = 30_000;
 export const MAX_PROFILE_KEY_BYTES = 255;
 export const MAX_PROFILE_DOCUMENT_BYTES = 64 * 1024;
@@ -439,7 +442,10 @@ export function issueSyncToken({
   device_id,
   user_stream_pos,
   filter_hash = null,
+  secret_value,
 }) {
+  const ring = parseSessionRootKeyRing(secret_value);
+  const rootKeyVersion = ring.active_version;
   const payload = {
     version: SYNC_TOKEN_VERSION,
     user_id: normalizeString(user_id, 'user_id'),
@@ -447,12 +453,17 @@ export function issueSyncToken({
     user_stream_pos: normalizeInteger(user_stream_pos, 'user_stream_pos', { min: 0 }),
     filter_hash: filter_hash == null ? null : normalizeString(filter_hash, 'filter_hash'),
   };
-  return `s${SYNC_TOKEN_VERSION}.${Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url')}`;
+  const encodedPayload = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+  const signature = createHmac('sha256', ring.keys[rootKeyVersion])
+    .update(`${SYNC_TOKEN_VERSION}.${rootKeyVersion}.${encodedPayload}`)
+    .digest('base64url');
+  return `s${SYNC_TOKEN_VERSION}.${rootKeyVersion}.${encodedPayload}.${signature}`;
 }
 
 export function parseSyncToken(token, {
   expected_user_id = null,
   expected_device_id = null,
+  secret_value = null,
 } = {}) {
   if (token == null || token === '') {
     return {
@@ -475,7 +486,7 @@ export function parseSyncToken(token, {
       },
     };
   }
-  const match = /^s(\d+)\.([A-Za-z0-9_-]+)$/.exec(token);
+  const match = /^s(\d+)\.([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)$/.exec(token);
   if (!match) {
     return {
       ok: false,
@@ -504,7 +515,21 @@ export function parseSyncToken(token, {
     };
   }
   try {
-    const payload = JSON.parse(Buffer.from(match[2], 'base64url').toString('utf8'));
+    const ring = parseSessionRootKeyRing(secret_value);
+    const rootKeyVersion = normalizeString(match[2], 'syncToken.rootKeyVersion');
+    const secretBytes = ring.keys[rootKeyVersion];
+    if (!secretBytes) {
+      throw new RangeError('Sync token key version is not available');
+    }
+    const encodedPayload = normalizeString(match[3], 'syncToken.encodedPayload');
+    const presentedSignature = normalizeString(match[4], 'syncToken.signature');
+    const expectedSignature = createHmac('sha256', secretBytes)
+      .update(`${version}.${rootKeyVersion}.${encodedPayload}`)
+      .digest('base64url');
+    if (expectedSignature !== presentedSignature) {
+      throw new RangeError('Sync token signature is invalid');
+    }
+    const payload = JSON.parse(Buffer.from(encodedPayload, 'base64url').toString('utf8'));
     const userId = normalizeString(payload.user_id, 'payload.user_id');
     const deviceId = normalizeString(payload.device_id, 'payload.device_id');
     const sincePos = normalizeInteger(payload.user_stream_pos, 'payload.user_stream_pos', { min: 0 });
@@ -860,7 +885,8 @@ export function registerSyncWaiter(env, {
     const existingWaiter = userWaiters.get(existingWaiterKey);
     existingWaiter.resolve({ reason: 'superseded' });
   }
-  return new Promise((resolve) => {
+  let waiterRef = null;
+  const promise = new Promise((resolve) => {
     const waiter = {
       timer: null,
       session_key: sessionKey,
@@ -880,11 +906,18 @@ export function registerSyncWaiter(env, {
         resolve(payload);
       },
     };
+    waiterRef = waiter;
     waiter.timer = setTimeout(() => {
       waiter.resolve({ reason: 'timeout' });
     }, normalizedTimeoutMs);
     userWaiters.set(normalizedWaiterKey, waiter);
     hub.waiter_key_by_session.set(sessionKey, normalizedWaiterKey);
+  });
+  return Object.freeze({
+    promise,
+    cancel() {
+      waiterRef?.resolve({ reason: 'cancelled' });
+    },
   });
 }
 

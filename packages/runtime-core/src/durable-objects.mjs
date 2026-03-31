@@ -794,6 +794,7 @@ export class UserDO extends BaseDurableObject {
     await this.ensureCurrentness();
     await this.ensureSchema();
     const [request = {}] = arguments;
+    const sessionRootKeyRing = this.config.secrets.require('session_root_key_ring');
     const userId = normalizeString(request?.user_id, 'request.user_id');
     const sessionId = normalizeString(request?.session_id, 'request.session_id');
     const filterDefinition = request?.filter_json == null
@@ -804,6 +805,7 @@ export class UserDO extends BaseDurableObject {
     const useStateAfter = request?.use_state_after === true;
     const parsedToken = parseSyncToken(request?.since_token ?? null, {
       expected_user_id: userId,
+      secret_value: sessionRootKeyRing,
     });
     if (!parsedToken.ok) {
       return {
@@ -845,6 +847,7 @@ export class UserDO extends BaseDurableObject {
     const parsedForDevice = parseSyncToken(request?.since_token ?? null, {
       expected_user_id: userId,
       expected_device_id: session.device_id,
+      secret_value: sessionRootKeyRing,
     });
     if (!parsedForDevice.ok) {
       return {
@@ -972,6 +975,7 @@ export class UserDO extends BaseDurableObject {
       device_id: session.device_id,
       user_stream_pos: upperBound,
       filter_hash: filterHash,
+      secret_value: sessionRootKeyRing,
     });
 
     return createSuccessResult({
@@ -1782,6 +1786,94 @@ export class UserDO extends BaseDurableObject {
         profileDocument: serializeProfileDocumentFromPersistence(this.persistence),
         now,
       }),
+    });
+  }
+
+  async syncPresence() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const [request = {}] = arguments;
+    const userId = normalizeString(request?.user_id, 'request.user_id');
+    const principal = this.persistence.userPrincipal.get();
+    if (!principal || principal.user_id !== userId) {
+      return createMatrixError(403, 'M_FORBIDDEN', 'Presence updates are only allowed for the authenticated user');
+    }
+    const presence = normalizeString(request?.presence, 'request.presence');
+    if (!['online', 'offline', 'unavailable'].includes(presence)) {
+      return createMatrixError(400, 'M_INVALID_PARAM', 'Presence must be one of online, offline, or unavailable');
+    }
+    const now = request?.now ?? new Date().toISOString();
+    const existing = this.persistence.presence.get({ user_id: userId });
+    const nextStatusMessage = existing?.status_msg ?? null;
+    const nextCurrentlyActive = presence === 'online';
+    const nextLastActiveAt = presence === 'online'
+      ? now
+      : (existing?.last_active_at ?? now);
+    const changed = (
+      !existing
+      || existing.presence !== presence
+      || existing.currently_active !== nextCurrentlyActive
+      || (existing.status_msg ?? null) !== nextStatusMessage
+    );
+    if (!changed) {
+      return createSuccessResult({
+        response: {
+          changed: false,
+        },
+      });
+    }
+
+    let wakePos = 0;
+    const sql = this.requireSqlStorage();
+    withSqliteTransaction(sql, () => {
+      const nextRecord = {
+        ...(existing ?? buildDefaultPresenceRecord(userId, now)),
+        presence,
+        status_msg: nextStatusMessage,
+        currently_active: nextCurrentlyActive,
+        last_active_at: nextLastActiveAt,
+        presence_version: existing ? existing.presence_version + 1 : 1,
+        updated_at: now,
+        record: existing?.record ?? {},
+      };
+      this.persistence.presence.put({
+        user_id: userId,
+        presence: nextRecord.presence,
+        status_msg: nextRecord.status_msg,
+        currently_active: nextRecord.currently_active,
+        last_active_at: nextRecord.last_active_at,
+        presence_version: nextRecord.presence_version,
+        updated_at: now,
+        record_json: nextRecord.record,
+      });
+      const streamEntry = this.persistence.appendUserStreamWithinTransaction({
+        user_id: userId,
+        stream_kind: 'presence',
+        created_at: now,
+        payload: {
+          sender: userId,
+          type: 'm.presence',
+          content: buildPresenceContent({
+            userId,
+            presenceRecord: nextRecord,
+            profileDocument: serializeProfileDocumentFromPersistence(this.persistence),
+            now,
+          }),
+        },
+        record: {
+          source: 'sync_presence',
+        },
+      });
+      wakePos = streamEntry.stream_pos;
+    });
+    wakeSyncWaiters(this.env, {
+      user_id: userId,
+      user_stream_pos: wakePos,
+    });
+    return createSuccessResult({
+      response: {
+        changed: true,
+      },
     });
   }
 
@@ -3305,7 +3397,9 @@ export class RoomDO extends BaseDurableObject {
           notification_count: request?.notification_count ?? 0,
         }
         : null,
-      unread_thread_notifications: request?.unread_thread_notifications && typeof request.unread_thread_notifications === 'object'
+      unread_thread_notifications: filterFlags.unread_thread_notifications === true
+        && request?.unread_thread_notifications
+        && typeof request.unread_thread_notifications === 'object'
         ? structuredClone(request.unread_thread_notifications)
         : null,
       summary,
