@@ -230,9 +230,9 @@ test('Phase 04 session lifecycle covers register, login, refresh, logout, whoami
       'm.change_password': { enabled: true },
       'm.3pid_changes': { enabled: false },
       'm.get_login_token': { enabled: false },
-      'm.profile_fields': { enabled: false, allowed: [] },
-      'm.set_avatar_url': { enabled: false },
-      'm.set_displayname': { enabled: false },
+      'm.profile_fields': { enabled: true },
+      'm.set_avatar_url': { enabled: true },
+      'm.set_displayname': { enabled: true },
     },
   });
 

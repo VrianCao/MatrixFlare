@@ -1,5 +1,5 @@
 import gatewayWorkerModule from '../../../apps/gateway-worker/src/index.mjs';
-import { UserDO } from '../../../packages/runtime-core/src/index.mjs';
+import { RoomDO, UserDO } from '../../../packages/runtime-core/src/index.mjs';
 import { buildLocalUserId } from '../../../packages/runtime-core/src/user-identity.mjs';
 import {
   FakeKvNamespace,
@@ -85,7 +85,9 @@ function createDefaultEnv(overrides = {}) {
 export function createGatewayPhase04Rig(overrides = {}) {
   const env = createDefaultEnv(overrides);
   const userNamespace = new FakeDurableObjectNamespace(UserDO, env);
+  const roomNamespace = new FakeDurableObjectNamespace(RoomDO, env);
   env.USER_DO = userNamespace;
+  env.ROOM_DO = roomNamespace;
 
   async function gatewayFetch(pathname, {
     method = 'GET',
@@ -117,13 +119,19 @@ export function createGatewayPhase04Rig(overrides = {}) {
     return userNamespace.get(userNamespace.idFromName(userId));
   }
 
+  function getRoomDo(roomId) {
+    return roomNamespace.get(roomNamespace.idFromName(roomId));
+  }
+
   return {
     env,
     gatewayFetch,
     authHeaders,
     getUserDo,
+    getRoomDo,
     close() {
       userNamespace.close();
+      roomNamespace.close();
     },
   };
 }

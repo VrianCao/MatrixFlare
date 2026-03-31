@@ -406,16 +406,18 @@
 
 ### 05.01 实现 profile truth 与传播
 
-- [ ] 实现 `IF-CS-017`,`DATA-USER-012`,`FLOW-CS-PROFILE-PROPAGATION`。
+- [x] 实现 `IF-CS-017`,`DATA-USER-012`,`FLOW-CS-PROFILE-PROPAGATION`。
   Spec refs: `30` 5.2, `24` `DATA-USER-012`, `25` `FLOW-CS-PROFILE-PROPAGATION`
   产出:
   profile GET/PUT/DELETE、`displayname/avatar_url` 传播、`profile_version` 去重。
   完成标准:
   `m.tz` 与 custom field 语义也被正确支持。
+  当前状态:
+  profile truth、`m.tz`、custom field、`profile_version`、presence propagation 与 joined-room `m.room.member` refresh 已通过 `RoomDO` durable fanout / `/sync` 投影回归验证。
 
 ### 05.02 实现 account data / tags / read markers
 
-- [ ] 实现 `IF-CS-015`,`DATA-USER-006`,`DATA-USER-007`。
+- [x] 实现 `IF-CS-015`,`DATA-USER-006`,`DATA-USER-007`。
   Spec refs: `30` 5.3, `24` `DATA-USER-006`,`DATA-USER-007`
   产出:
   global/room account data、tags、read markers handlers。
@@ -424,16 +426,18 @@
 
 ### 05.03 实现 push rules 与 notification state
 
-- [ ] 实现 `IF-CS-018`,`DATA-USER-013`，并接入 `push rules` 基线。
+- [x] 实现 `IF-CS-018`,`DATA-USER-013`，并接入 `push rules` 基线。
   Spec refs: `30` 5.4, `43` 6
   产出:
   push rule CRUD、顺序调整、enabled 状态、默认规则基线装载。
   完成标准:
   运行时默认规则可与 `v1.17` 基线逐条比对。
+  当前状态:
+  push rule CRUD、`before/after` 顺序、`actions` / `enabled` 子资源、`v1.17` baseline 回归，以及经由房间 fanout / `RoomDO.projectForSync()` surfaced 的 unread / notification state 已验证。
 
 ### 05.04 实现 to-device 与幂等裁决
 
-- [ ] 实现 `IF-CS-041`,`IF-INT-USER-005`,`DATA-USER-008`,`DATA-USER-016`。
+- [x] 实现 `IF-CS-041`,`IF-INT-USER-005`,`DATA-USER-008`,`DATA-USER-016`。
   Spec refs: `30` 5.5, `24` `DATA-USER-008`,`DATA-USER-016`, `25` `FLOW-CS-SEND-TO-DEVICE`
   产出:
   public handler、local enqueue、dedupe registry、设备消费。
@@ -442,7 +446,7 @@
 
 ### 05.05 实现 presence
 
-- [ ] 实现 `IF-CS-016`,`DATA-USER-009`。
+- [x] 实现 `IF-CS-016`,`DATA-USER-009`。
   Spec refs: `30` 5.6
   产出:
   presence 读写、presence 版本推进、进入 `user_stream`。
@@ -451,25 +455,40 @@
 
 ### 05.06 实现 filters、sync token、user stream
 
-- [ ] 实现 `IF-CS-003`,`IF-CS-004`,`DATA-ID-001`,`DATA-USER-010`,`IF-INT-USER-002`。
+- [x] 实现 `IF-CS-003`,`IF-CS-004`,`DATA-ID-001`,`DATA-USER-010`,`IF-INT-USER-002`。
   Spec refs: `30` 5.1, 7, 8, 9; `22` 4
   产出:
   stored filter、inline filter 规范化、`next_batch` 编码、collectSince。
   完成标准:
   token 对客户端 opaque，内部至少编码版本与 `user_stream_pos`。
+  当前状态:
+  stored/inline filter 解析、opaque `next_batch`、`collectSince()`、room/account-data/ephemeral 分类收集，以及 `RoomDO` durable fanout -> `DATA-USER-010` append 路径已验证。
 
 ### 05.07 实现 Worker-held `/sync`
 
-- [ ] 完成 `IF-CS-020`,`STATE-SYNC-WAITER`,`FLOW-CS-SYNC-LONGPOLL`。
+- [x] 完成 `IF-CS-020`,`STATE-SYNC-WAITER`,`FLOW-CS-SYNC-LONGPOLL`。
   Spec refs: `30` 8-10, `25` `FLOW-CS-SYNC-LONGPOLL`,`STATE-SYNC-WAITER`, `13` `CF-WKR-001`
   产出:
   long-poll handler、single waiter 规则、wake channel、assemble path。
   完成标准:
   早返回不会推进 token，deploy 中断视为正常重试路径。
+  当前状态:
+  worker-held waiter、wake/timeout、single-session supersede、early-return 语义，以及基于 `RoomDO.projectForSync()` 的房间 `/sync` 装配已通过回归验证。
 
 ## Phase 06: Room Core, Room Versions, And Local Fanout
 
 目标：完成 L1 的房间正确性核心。
+
+### 06.00 补齐 `/sync` 房间投影前置
+
+- [x] 实现 `IF-INT-ROOM-002`、`RoomDO.projectForSync()` 与本地房间 fanout -> `UserDO` 用户流桥接前置。
+  Spec refs: `23` `IF-INT-ROOM-002`; `30` 7.3, 8.2 step 7, 9.1-9.5; `31` 8, 9; `24` `DATA-ROOM-007`,`DATA-ROOM-011`
+  产出:
+  `RoomProjectionRequest` / `RoomSyncProjection`、membership bucket truth、`DATA-ROOM-011` durable outbox -> `DATA-USER-010` append 路径、notification/unread 重算信号。
+  完成标准:
+  `gateway-worker` 不再合成 synthetic `rooms.join`；所有房间 `/sync` 片段都由 `RoomDO` 投影并按 user/room visibility context 组装。
+  当前状态:
+  `RoomDO.projectForSync()`、`UserDO.appendRoomFanout()`、`deliverPendingFanout()`、profile membership refresh fanout，以及 `gateway-worker` room projection assembly 已经落地并通过 Phase 05 `/sync` 回归与全量本地测试。
 
 ### 06.01 实现统一事件接纳流水线
 

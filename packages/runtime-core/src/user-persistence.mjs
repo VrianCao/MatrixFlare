@@ -662,6 +662,53 @@ export function createUserDurableObjectPersistence(sqlStorage) {
   const toDeviceTxnDedupe = createSqliteTableAccess(sql, USER_TABLES.toDeviceTxnDedupe);
   const userPrincipal = createUserPrincipalAccess(sql);
 
+  function appendUserStreamRecord(record) {
+    const createdAt = normalizeString(record.created_at ?? new Date().toISOString(), 'record.created_at');
+    const streamPos = record.stream_pos == null
+      ? allocateUserStreamPosWithinTransaction(sql, {
+        updatedAt: createdAt,
+        userId: record.user_id ?? null,
+      })
+      : normalizeInteger(record.stream_pos, 'record.stream_pos', { min: 1 });
+    if (record.stream_pos != null && userStream.get(streamPos)) {
+      throw new Error(`User stream position ${streamPos} already exists`);
+    }
+    userStream.put({
+      stream_pos: streamPos,
+      stream_kind: normalizeString(record.stream_kind, 'record.stream_kind'),
+      room_id: record.room_id ?? null,
+      event_id: record.event_id ?? null,
+      dedupe_key: record.dedupe_key ?? null,
+      created_at: createdAt,
+      payload_json: record.payload ?? {},
+      record_json: record.record ?? {},
+    });
+    return userStream.get(streamPos);
+  }
+
+  function enqueueToDeviceRecord(record) {
+    const enqueuedAt = normalizeString(record.enqueued_at ?? new Date().toISOString(), 'record.enqueued_at');
+    const streamPos = record.stream_pos ?? allocateUserStreamPosWithinTransaction(sql, {
+      updatedAt: enqueuedAt,
+      userId: record.user_id ?? null,
+    });
+    toDeviceQueue.put({
+      target_device_id: normalizeString(record.target_device_id, 'record.target_device_id'),
+      stream_pos: streamPos,
+      sender_user_id: normalizeString(record.sender_user_id, 'record.sender_user_id'),
+      event_type: normalizeString(record.event_type, 'record.event_type'),
+      enqueued_at: enqueuedAt,
+      expires_at: record.expires_at ?? null,
+      acknowledged_at: record.acknowledged_at ?? null,
+      payload_json: record.payload ?? {},
+      record_json: record.record ?? {},
+    });
+    return toDeviceQueue.get({
+      target_device_id: record.target_device_id,
+      stream_pos: streamPos,
+    });
+  }
+
   return Object.freeze({
     schemaVersion: USER_DO_SCHEMA_VERSION,
     async ensureSchema(now = new Date().toISOString()) {
@@ -729,29 +776,10 @@ export function createUserDurableObjectPersistence(sqlStorage) {
       });
     },
     appendUserStream(record) {
-      return withSqliteTransaction(sql, () => {
-        const createdAt = normalizeString(record.created_at ?? new Date().toISOString(), 'record.created_at');
-        const streamPos = record.stream_pos == null
-          ? allocateUserStreamPosWithinTransaction(sql, {
-            updatedAt: createdAt,
-            userId: record.user_id ?? null,
-          })
-          : normalizeInteger(record.stream_pos, 'record.stream_pos', { min: 1 });
-        if (record.stream_pos != null && userStream.get(streamPos)) {
-          throw new Error(`User stream position ${streamPos} already exists`);
-        }
-        userStream.put({
-          stream_pos: streamPos,
-          stream_kind: normalizeString(record.stream_kind, 'record.stream_kind'),
-          room_id: record.room_id ?? null,
-          event_id: record.event_id ?? null,
-          dedupe_key: record.dedupe_key ?? null,
-          created_at: createdAt,
-          payload_json: record.payload ?? {},
-          record_json: record.record ?? {},
-        });
-        return userStream.get(streamPos);
-      });
+      return withSqliteTransaction(sql, () => appendUserStreamRecord(record));
+    },
+    appendUserStreamWithinTransaction(record) {
+      return appendUserStreamRecord(record);
     },
     listUserStreamSince(streamPos = 0, limit = 100) {
       return sqlAll(
@@ -771,28 +799,10 @@ export function createUserDurableObjectPersistence(sqlStorage) {
       }));
     },
     enqueueToDevice(record) {
-      return withSqliteTransaction(sql, () => {
-        const enqueuedAt = normalizeString(record.enqueued_at ?? new Date().toISOString(), 'record.enqueued_at');
-        const streamPos = record.stream_pos ?? allocateUserStreamPosWithinTransaction(sql, {
-          updatedAt: enqueuedAt,
-          userId: record.user_id ?? null,
-        });
-        toDeviceQueue.put({
-          target_device_id: normalizeString(record.target_device_id, 'record.target_device_id'),
-          stream_pos: streamPos,
-          sender_user_id: normalizeString(record.sender_user_id, 'record.sender_user_id'),
-          event_type: normalizeString(record.event_type, 'record.event_type'),
-          enqueued_at: enqueuedAt,
-          expires_at: record.expires_at ?? null,
-          acknowledged_at: record.acknowledged_at ?? null,
-          payload_json: record.payload ?? {},
-          record_json: record.record ?? {},
-        });
-        return toDeviceQueue.get({
-          target_device_id: record.target_device_id,
-          stream_pos: streamPos,
-        });
-      });
+      return withSqliteTransaction(sql, () => enqueueToDeviceRecord(record));
+    },
+    enqueueToDeviceWithinTransaction(record) {
+      return enqueueToDeviceRecord(record);
     },
     listToDeviceForDevice(targetDeviceId, { after_stream_pos = 0, limit = 100 } = {}) {
       return sqlAll(
