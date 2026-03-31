@@ -61,6 +61,14 @@ const INTERNAL_ERROR_CODES = new Set([
   'pending_upload_missing',
   'object_missing',
   'idempotency_conflict',
+  'unsupported_room_version',
+  'incompatible_room_version',
+  'room_not_found',
+  'event_not_found',
+  'room_forbidden',
+  'not_allowed',
+  'bad_json',
+  'invalid_event',
 ]);
 
 function assertObjectLike(value, label) {

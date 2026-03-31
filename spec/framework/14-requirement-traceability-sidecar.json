@@ -273,6 +273,62 @@
       "test_ids": ["TEST-OPS-002"],
       "evid_ids": ["EVID-OPS-002"]
     },
+    "REQ-ROOM-001": {
+      "runtime_owners": ["gateway-worker", "RoomDO", "RemoteServerDO", "jobs-worker"],
+      "if_ids": ["IF-CS-030", "IF-CS-031", "IF-CS-032", "IF-CS-033", "IF-CS-035", "IF-FED-002", "IF-FED-003", "IF-INT-ROOM-001"],
+      "data_ids": ["DATA-ROOM-001", "DATA-ROOM-002", "DATA-ROOM-003", "DATA-ROOM-004", "DATA-ROOM-005", "DATA-ROOM-006", "DATA-ROOM-007", "DATA-ROOM-008"],
+      "flow_state_ids": ["FLOW-ROOM-EVENT-ADMISSION", "STATE-ROOM-EVENT-ADMISSION"],
+      "test_ids": ["TEST-ROOM-001", "TEST-ROOM-002"],
+      "evid_ids": ["EVID-ROOM-001", "EVID-ROOM-002"]
+    },
+    "REQ-ROOM-002": {
+      "runtime_owners": ["gateway-worker", "RoomDO", "UserDO"],
+      "if_ids": ["IF-CS-030", "IF-CS-031", "IF-INT-ROOM-001"],
+      "data_ids": ["DATA-ROOM-001", "DATA-ROOM-007", "DATA-ROOM-011"],
+      "flow_state_ids": ["FLOW-CS-ROOM-MEMBERSHIP", "STATE-ROOM-MEMBERSHIP"],
+      "test_ids": ["TEST-ROOM-001"],
+      "evid_ids": ["EVID-ROOM-001"]
+    },
+    "REQ-ROOM-003": {
+      "runtime_owners": ["gateway-worker", "RoomDO"],
+      "if_ids": ["IF-CS-030", "IF-CS-031", "IF-CS-032", "IF-CS-033", "IF-CS-035", "IF-INT-ROOM-001"],
+      "data_ids": ["DATA-ROOM-001", "DATA-ROOM-012"],
+      "flow_state_ids": ["FLOW-ROOM-EVENT-ADMISSION", "STATE-ROOM-EVENT-ADMISSION"],
+      "test_ids": ["TEST-ROOM-001"],
+      "evid_ids": ["EVID-ROOM-001"]
+    },
+    "REQ-ROOM-004": {
+      "runtime_owners": ["gateway-worker", "RoomDO"],
+      "if_ids": ["IF-CS-020", "IF-CS-034", "IF-INT-ROOM-002", "IF-INT-ROOM-003"],
+      "data_ids": ["DATA-ROOM-001", "DATA-ROOM-002", "DATA-ROOM-005", "DATA-ROOM-006", "DATA-ROOM-007", "DATA-ROOM-008", "DATA-ROOM-009", "DATA-ROOM-010", "DATA-R2-004"],
+      "flow_state_ids": ["FLOW-CS-SYNC-LONGPOLL", "FLOW-CS-ROOM-QUERY"],
+      "test_ids": ["TEST-CS-002", "TEST-ROOM-001"],
+      "evid_ids": ["EVID-CS-002", "EVID-ROOM-001"]
+    },
+    "REQ-ROOM-005": {
+      "runtime_owners": ["RoomDO", "UserDO", "jobs-worker", "ops-worker"],
+      "if_ids": ["IF-INT-USER-003"],
+      "data_ids": ["DATA-ROOM-011", "DATA-USER-010", "DATA-OPS-003", "DATA-OPS-004"],
+      "flow_state_ids": ["FLOW-ROOM-LOCAL-FANOUT", "FLOW-ROOM-FANOUT-REPAIR", "STATE-ROOM-FANOUT-DELIVERY"],
+      "test_ids": ["TEST-ROOM-001", "TEST-OPS-002"],
+      "evid_ids": ["EVID-ROOM-001", "EVID-OPS-002"]
+    },
+    "REQ-ROOM-006": {
+      "runtime_owners": ["gateway-worker", "RoomDO"],
+      "if_ids": ["IF-CS-030", "IF-INT-ROOM-001"],
+      "data_ids": ["DATA-ROOM-001", "DATA-ROOM-005", "DATA-ROOM-008"],
+      "flow_state_ids": ["FLOW-ROOM-EVENT-ADMISSION"],
+      "test_ids": ["TEST-ROOM-002"],
+      "evid_ids": ["EVID-ROOM-002"]
+    },
+    "REQ-ROOM-007": {
+      "runtime_owners": ["gateway-worker", "RoomDO", "UserDO"],
+      "if_ids": ["IF-CS-019", "IF-CS-020", "IF-ALARM-002"],
+      "data_ids": ["DATA-ROOM-009", "DATA-ROOM-010", "DATA-USER-010"],
+      "flow_state_ids": ["FLOW-CS-SYNC-LONGPOLL", "FLOW-ROOM-LOCAL-FANOUT"],
+      "test_ids": ["TEST-CS-002", "TEST-ROOM-001"],
+      "evid_ids": ["EVID-CS-002", "EVID-ROOM-001"]
+    },
     "REQ-SEC-001": {
       "runtime_owners": ["UserDO", "gateway-worker"],
       "if_ids": ["IF-INT-USER-001", "IF-CS-012", "IF-CS-013"],

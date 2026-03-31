@@ -8,6 +8,7 @@ function detectStatementType(sql) {
 
 export function createFakeSqlStorage() {
   const database = new DatabaseSync(':memory:');
+  let alarm = null;
   return {
     sql: {
       exec(sql, ...bindings) {
@@ -26,6 +27,27 @@ export function createFakeSqlStorage() {
       },
     },
     get: async () => null,
+    async setAlarm(scheduledTime) {
+      if (scheduledTime == null) {
+        alarm = null;
+        return;
+      }
+      if (scheduledTime instanceof Date) {
+        alarm = scheduledTime.getTime();
+        return;
+      }
+      if (typeof scheduledTime === 'number' && Number.isFinite(scheduledTime)) {
+        alarm = scheduledTime;
+        return;
+      }
+      throw new TypeError('scheduledTime must be a Date or finite epoch milliseconds');
+    },
+    async getAlarm() {
+      return alarm;
+    },
+    async deleteAlarm() {
+      alarm = null;
+    },
     close() {
       database.close();
     },

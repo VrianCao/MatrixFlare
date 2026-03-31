@@ -1419,6 +1419,184 @@ test('ops-worker supports rebuild, restore, repair, and cancel control-plane rou
   }
 });
 
+test('jobs-worker repair queue dispatches room_user_fanout jobs to scoped RoomDO reconciliation', async () => {
+  const teamDomain = `ops-room-fanout-${Date.now()}.cloudflareaccess.com`;
+  const rig = await createControlPlaneRig({
+    teamDomain,
+    policies: [
+      defaultPolicy({
+        principalId: 'human-1',
+        subjectValue: '@operator:example.test',
+        teamDomain,
+        audience: 'aud-ops',
+      }),
+    ],
+  });
+
+  try {
+    const roomCalls = [];
+    rig.jobsEnv.ROOM_DO = {
+      idFromName(name) {
+        return String(name);
+      },
+      get(id) {
+        return {
+          async reconcileFanout(request) {
+            roomCalls.push({
+              room_id: String(id),
+              request,
+            });
+            return {
+              ok: true,
+              results: [{
+                room_id: String(id),
+                status: request?.dry_run === true ? 'would_recreate_outbox' : 'acked',
+              }],
+            };
+          },
+        };
+      },
+    };
+    rig.jobsEnv.USER_DO = {
+      idFromName(name) {
+        return String(name);
+      },
+      get(id) {
+        return {
+          async listRoomSyncMemberships() {
+            assert.equal(String(id), '@alice:test');
+            return {
+              ok: true,
+              entries: [
+                { room_id: '!fanout-a:test', membership_bucket: 'join', room_pos: 1 },
+                { room_id: '!fanout-b:test', membership_bucket: 'leave', room_pos: 2 },
+              ],
+            };
+          },
+        };
+      },
+    };
+
+    const repairResponse = await rig.opsWorker(
+      rig.makeOpsRequest('/_ops/v1/repairs', {
+        method: 'POST',
+        body: {
+          repair_kind: 'room_user_fanout',
+          scope: {
+            scope_kind: 'user_id',
+            scope_id: '@alice:test',
+          },
+          reason: 'repair fanout truth',
+          ticket_id: 'OPS-202A',
+          dry_run: true,
+          source_bundle_uri: null,
+        },
+        headers: {
+          'Idempotency-Key': 'idem-room-user-fanout-1',
+        },
+      }),
+      rig.opsEnv,
+    );
+    assert.equal(repairResponse.status, 202);
+    const repairPayload = await repairResponse.json();
+
+    await rig.jobsWorker.queue(rig.queues.repair.drainBatch(), rig.jobsEnv);
+
+    assert.deepEqual(
+      roomCalls.map((entry) => entry.room_id),
+      ['!fanout-a:test', '!fanout-b:test'],
+    );
+    assert.ok(roomCalls.every((entry) => entry.request.target_user_id === '@alice:test'));
+    assert.ok(roomCalls.every((entry) => entry.request.dry_run === true));
+
+    const storedJob = await rig.persistence.getJob(repairPayload.job_id);
+    assert.equal(storedJob.internal_state, 'completed');
+    assert.equal(storedJob.result_summary.repair_summary.scope_count, 2);
+    assert.equal(storedJob.result_summary.repair_summary.dry_run, true);
+  } finally {
+    rig.close();
+  }
+});
+
+test('jobs-worker drains room-scoped fanout repair until RoomDO reports no remaining work', async () => {
+  const teamDomain = `ops-room-fanout-room-scope-${Date.now()}.cloudflareaccess.com`;
+  const rig = await createControlPlaneRig({
+    teamDomain,
+    policies: [
+      defaultPolicy({
+        principalId: 'human-1',
+        subjectValue: '@operator:example.test',
+        teamDomain,
+        audience: 'aud-ops',
+      }),
+    ],
+  });
+
+  try {
+    const roomCalls = [];
+    rig.jobsEnv.ROOM_DO = {
+      idFromName(name) {
+        return String(name);
+      },
+      get(id) {
+        return {
+          async reconcileFanout(request) {
+            roomCalls.push({
+              room_id: String(id),
+              request,
+            });
+            return {
+              ok: true,
+              has_more: roomCalls.length === 1,
+              results: [{
+                room_id: String(id),
+                status: roomCalls.length === 1 ? 'recreated_outbox' : 'acked',
+              }],
+            };
+          },
+        };
+      },
+    };
+
+    const repairResponse = await rig.opsWorker(
+      rig.makeOpsRequest('/_ops/v1/repairs', {
+        method: 'POST',
+        body: {
+          repair_kind: 'room_user_fanout',
+          scope: {
+            scope_kind: 'room_id',
+            scope_id: '!room:test',
+          },
+          reason: 'repair room fanout truth',
+          ticket_id: 'OPS-202B',
+          dry_run: false,
+          source_bundle_uri: null,
+        },
+        headers: {
+          'Idempotency-Key': 'idem-room-fanout-room-scope-1',
+        },
+      }),
+      rig.opsEnv,
+    );
+    assert.equal(repairResponse.status, 202);
+    const repairPayload = await repairResponse.json();
+
+    await rig.jobsWorker.queue(rig.queues.repair.drainBatch(), rig.jobsEnv);
+
+    assert.equal(roomCalls.length, 2);
+    assert.ok(roomCalls.every((entry) => entry.room_id === '!room:test'));
+    assert.ok(roomCalls.every((entry) => entry.request.target_user_id == null));
+    assert.ok(roomCalls.every((entry) => entry.request.dry_run === false));
+
+    const storedJob = await rig.persistence.getJob(repairPayload.job_id);
+    assert.equal(storedJob.internal_state, 'completed');
+    assert.equal(storedJob.result_summary.repair_summary.scope_count, 1);
+    assert.equal(storedJob.result_summary.repair_summary.results.length, 2);
+  } finally {
+    rig.close();
+  }
+});
+
 test('ops-worker restore preflight rejects bundle hash mismatches before queue fanout', async () => {
   const teamDomain = `ops-restore-preflight-${Date.now()}.cloudflareaccess.com`;
   const rig = await createControlPlaneRig({

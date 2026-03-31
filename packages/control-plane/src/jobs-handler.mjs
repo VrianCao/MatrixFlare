@@ -412,6 +412,97 @@ async function fanOutJobTasks({ env, persistence, job, kind }) {
   return payloads.length;
 }
 
+function getDurableObjectStub(namespace, id, bindingName) {
+  if (!namespace || typeof namespace.idFromName !== 'function' || typeof namespace.get !== 'function') {
+    throw Object.assign(new TypeError(`${bindingName} Durable Object binding is not available`), {
+      retryable: false,
+    });
+  }
+  return namespace.get(namespace.idFromName(id));
+}
+
+async function executeRepairAction({
+  job,
+  messageBody,
+  env,
+}) {
+  if (messageBody.repair_kind !== 'room_user_fanout') {
+    return {
+      scope_count: 0,
+      noop: true,
+    };
+  }
+
+  if (messageBody.scope_kind === 'room_id') {
+    const roomDo = getDurableObjectStub(env.ROOM_DO, messageBody.scope_id, 'ROOM_DO');
+    const result = await runScopedFanoutRepair({
+      roomDo,
+      dryRun: job.spec?.dry_run === true,
+    });
+    return {
+      scope_count: 1,
+      results: result,
+    };
+  }
+
+  if (messageBody.scope_kind === 'user_id') {
+    const userDo = getDurableObjectStub(env.USER_DO, messageBody.scope_id, 'USER_DO');
+    const memberships = await userDo.listRoomSyncMemberships({
+      user_id: messageBody.scope_id,
+    });
+    if (!memberships?.ok) {
+      throw memberships?.error ?? new Error('User membership enumeration failed');
+    }
+    const roomResults = [];
+    for (const entry of memberships.entries ?? []) {
+      const roomDo = getDurableObjectStub(env.ROOM_DO, entry.room_id, 'ROOM_DO');
+      const result = await runScopedFanoutRepair({
+        roomDo,
+        targetUserId: messageBody.scope_id,
+        dryRun: job.spec?.dry_run === true,
+      });
+      roomResults.push({
+        room_id: entry.room_id,
+        results: result,
+      });
+    }
+    return {
+      scope_count: roomResults.length,
+      rooms: roomResults,
+    };
+  }
+
+  return {
+    scope_count: 0,
+    noop: true,
+  };
+}
+
+async function runScopedFanoutRepair({
+  roomDo,
+  targetUserId = null,
+  dryRun = false,
+}) {
+  const allResults = [];
+  for (let pass = 0; pass < 128; pass += 1) {
+    const result = await roomDo.reconcileFanout({
+      limit: 1_000,
+      ...(targetUserId == null ? {} : { target_user_id: targetUserId }),
+      dry_run: dryRun,
+    });
+    if (!result?.ok) {
+      throw result?.error ?? new Error('Room fanout repair failed');
+    }
+    allResults.push(...(result.results ?? []));
+    if (dryRun || result.has_more !== true) {
+      return allResults;
+    }
+  }
+  throw Object.assign(new Error('Room fanout repair did not converge within 128 passes'), {
+    retryable: false,
+  });
+}
+
 async function processQueueMessage({
   queueName,
   messageBody,
@@ -567,6 +658,7 @@ async function processQueueMessage({
     object_entries: [],
     apply_phase: messageBody.apply_phase ?? null,
   };
+  let resultSummary = null;
 
   if (queueName === QUEUE_NAMES.export) {
     const keyRing = parseExportKeyRingFromEnv(loadWorkerRuntimeConfig('jobs-worker', env), env);
@@ -618,6 +710,19 @@ async function processQueueMessage({
       object_entries: matchedCheckpoint.checkpoint_manifest.objects ?? [],
       apply_phase: matchedCheckpoint.apply_phase,
     };
+  } else if (queueName === QUEUE_NAMES.repair) {
+    const repairSummary = await executeRepairAction({
+      job,
+      messageBody,
+      env,
+    });
+    resultSummary = {
+      repair_kind: messageBody.repair_kind,
+      scope_kind: messageBody.scope_kind,
+      scope_id: messageBody.scope_id ?? null,
+      dry_run: job.spec?.dry_run === true,
+      ...repairSummary,
+    };
   }
   await persistence.upsertJobCheckpoint({
     job_id: job.job_id,
@@ -664,6 +769,7 @@ async function processQueueMessage({
     resultSummary: isTerminal ? {
       terminal_state: mapInternalJobStateToPublicState(terminalState),
       last_checkpoint_id: checkpointId,
+      ...(resultSummary == null ? {} : { repair_summary: resultSummary }),
     } : null,
   });
   asyncContext.logger.info('jobs.queue.processed', {

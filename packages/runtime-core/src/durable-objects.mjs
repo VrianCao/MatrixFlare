@@ -8,6 +8,17 @@ import {
   createRoomDurableObjectPersistence,
 } from './room-persistence.mjs';
 import { normalizeInteger, normalizeString, withSqliteTransaction } from './persistence-common.mjs';
+import {
+  DEFAULT_ROOM_VERSION,
+  buildRoomStateTupleKey,
+  decodeRoomCursor,
+  deriveCreateRoomIdentity,
+  deriveDeterministicEventId,
+  encodeRoomCursor,
+  isSupportedRoomVersion,
+  redactEventForRoomVersion,
+  resolveRequestedRoomVersion,
+} from './room-domain.mjs';
 import { createAsyncTaskContext, createRequestContext } from './structured-logging.mjs';
 import { loadWorkerRuntimeConfig } from './runtime-manifest.mjs';
 import {
@@ -56,6 +67,7 @@ import {
   USER_DO_SCHEMA_VERSION,
   createUserDurableObjectPersistence,
 } from './user-persistence.mjs';
+import { canonicalJsonHash } from './fingerprints.mjs';
 
 function jsonResponse(payload, status = 200) {
   return new Response(JSON.stringify(payload), {
@@ -466,6 +478,25 @@ function readRoomSyncMembershipMap(principal) {
   return entries;
 }
 
+function readForgottenRoomTombstones(principal) {
+  const candidate = principal?.record?.forgotten_room_tombstones;
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+    return {};
+  }
+  const entries = {};
+  for (const [roomId, value] of Object.entries(candidate)) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      continue;
+    }
+    entries[roomId] = {
+      room_id: roomId,
+      room_pos: Number.isInteger(value.room_pos) && value.room_pos >= 0 ? value.room_pos : 0,
+      updated_at: typeof value.updated_at === 'string' ? value.updated_at : null,
+    };
+  }
+  return entries;
+}
+
 function listRoomSyncMembershipEntries(principal) {
   return Object.values(readRoomSyncMembershipMap(principal))
     .filter((entry) => ROOM_SYNC_VISIBLE_BUCKETS.has(entry.membership_bucket))
@@ -481,10 +512,16 @@ function mergeRoomSyncMembershipRecord(principal, {
   updated_at = new Date().toISOString(),
 }) {
   const existing = readRoomSyncMembershipMap(principal);
+  const forgotten = readForgottenRoomTombstones(principal);
   const normalizedRoomId = normalizeString(room_id, 'room_id');
   const normalizedBucket = normalizeRoomMembershipBucket(membership_bucket, { allowNull: false });
   if (normalizedBucket === 'forgotten') {
     delete existing[normalizedRoomId];
+    forgotten[normalizedRoomId] = {
+      room_id: normalizedRoomId,
+      room_pos: normalizeInteger(room_pos, 'room_pos', { min: 0 }),
+      updated_at: normalizeString(updated_at, 'updated_at'),
+    };
   } else {
     existing[normalizedRoomId] = {
       room_id: normalizedRoomId,
@@ -492,10 +529,12 @@ function mergeRoomSyncMembershipRecord(principal, {
       room_pos: normalizeInteger(room_pos, 'room_pos', { min: 0 }),
       updated_at: normalizeString(updated_at, 'updated_at'),
     };
+    delete forgotten[normalizedRoomId];
   }
   return {
     ...(principal?.record ?? {}),
     room_sync_memberships: existing,
+    forgotten_room_tombstones: forgotten,
   };
 }
 
@@ -513,6 +552,9 @@ function normalizeRoomFanoutDelta(delta = {}) {
     user_id: normalizeString(delta.user_id, 'delta.user_id'),
     membership_bucket: normalizeRoomMembershipBucket(delta.membership_bucket, { allowNull: false }),
     event_id: delta.event_id == null ? null : normalizeString(delta.event_id, 'delta.event_id'),
+    origin_server_ts: Number.isInteger(delta.origin_server_ts) && delta.origin_server_ts >= 0
+      ? delta.origin_server_ts
+      : null,
     timeline_event_ids: uniqueStringArray(delta.timeline_event_ids),
     state_event_ids: uniqueStringArray(delta.state_event_ids),
     limited: delta.limited === true,
@@ -539,15 +581,43 @@ function buildRoomFanoutDedupeKey(delta) {
   return `${delta.room_id}|${delta.room_pos}|${delta.user_id}`;
 }
 
+function parseSnapshotRoomPos(snapshot) {
+  if (Number.isInteger(snapshot?.record?.room_pos) && snapshot.record.room_pos >= 1) {
+    return snapshot.record.room_pos;
+  }
+  if (typeof snapshot?.snapshot_id !== 'string') {
+    return null;
+  }
+  const match = /^snapshot-(\d+)$/.exec(snapshot.snapshot_id);
+  if (!match) {
+    return null;
+  }
+  return normalizeInteger(Number.parseInt(match[1], 10), 'snapshot.room_pos', { min: 1 });
+}
+
 function buildProfileRefreshEventId(roomId, userId, profileVersion) {
   return `$profile_refresh_${Buffer.from(`${roomId}|${userId}|${profileVersion}`, 'utf8').toString('base64url')}`;
+}
+
+function getProfileRefreshInfo(candidateEvent) {
+  if (!isObjectRecord(candidateEvent?.unsigned?.public)) {
+    return null;
+  }
+  const propagationKind = candidateEvent.unsigned.public.propagation_kind;
+  const profileVersion = candidateEvent.unsigned.public.profile_version;
+  if (propagationKind !== 'profile_refresh' || !Number.isInteger(profileVersion)) {
+    return null;
+  }
+  return {
+    profileVersion,
+  };
 }
 
 function isStaleProfileRefreshOutboxItem(persistence, item) {
   if (item?.record?.propagation_kind !== 'profile_refresh') {
     return false;
   }
-  const userId = item?.user_id ?? item?.delta?.user_id ?? null;
+  const userId = item?.record?.profile_owner_user_id ?? item?.user_id ?? item?.delta?.user_id ?? null;
   const itemProfileVersion = Number.isInteger(item?.record?.profile_version) ? item.record.profile_version : null;
   if (!userId || itemProfileVersion == null) {
     return false;
@@ -604,6 +674,242 @@ function buildRoomSyncSummary(persistence) {
   };
 }
 
+function cloneJson(value) {
+  return value == null ? value : structuredClone(value);
+}
+
+function isObjectRecord(value) {
+  return value != null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function createRoomInternalError(code, message, { retryable = false, details = null } = {}) {
+  return createInternalErrorEnvelope({
+    code,
+    message,
+    retryable,
+    details,
+  });
+}
+
+function normalizeRoomEventType(value) {
+  return normalizeString(value, 'event.type');
+}
+
+function normalizeRoomReadKind(value) {
+  const normalized = normalizeString(value, 'request.kind');
+  if (!['timeline', 'context', 'event', 'state', 'members', 'joined_members', 'relations', 'threads', 'timestamp_lookup'].includes(normalized)) {
+    throw new TypeError('request.kind is not supported');
+  }
+  return normalized;
+}
+
+function normalizeRequestKind(value) {
+  const normalized = normalizeString(value, 'request.request_kind');
+  if (!['client', 'federation', 'repair', 'backfill', 'appservice'].includes(normalized)) {
+    throw new TypeError('request.request_kind is not supported');
+  }
+  return normalized;
+}
+
+function stateKeyForEvent(candidateEvent) {
+  return typeof candidateEvent?.state_key === 'string' ? candidateEvent.state_key : null;
+}
+
+function getRelationInfo(candidateEvent) {
+  const relatesTo = candidateEvent?.content?.['m.relates_to'];
+  if (!isObjectRecord(relatesTo) || typeof relatesTo.event_id !== 'string') {
+    return {
+      relates_to_event_id_or_null: null,
+      relation_type_or_null: null,
+      aggregation_event_type_or_null: null,
+      thread_root_event_id_or_null: null,
+    };
+  }
+  const relationType = typeof relatesTo.rel_type === 'string' ? relatesTo.rel_type : null;
+  return {
+    relates_to_event_id_or_null: relatesTo.event_id,
+    relation_type_or_null: relationType,
+    aggregation_event_type_or_null: relationType === 'm.annotation'
+      ? (typeof candidateEvent?.type === 'string' ? candidateEvent.type : null)
+      : null,
+    thread_root_event_id_or_null: relationType === 'm.thread' ? relatesTo.event_id : null,
+  };
+}
+
+function getRoomStateMapForSnapshot(persistence, snapshotId) {
+  const stateMap = new Map();
+  if (!snapshotId) {
+    return stateMap;
+  }
+  for (const row of persistence.stateEntries.list().filter((entry) => entry.snapshot_id === snapshotId)) {
+    stateMap.set(buildRoomStateTupleKey(row.event_type, row.state_key), row);
+  }
+  return stateMap;
+}
+
+function getTypedStateEvent(stateMap, eventType, stateKey = '') {
+  return stateMap.get(buildRoomStateTupleKey(eventType, stateKey)) ?? null;
+}
+
+function getCreateEventFromStateMap(roomDo, stateMap) {
+  const createState = getTypedStateEvent(stateMap, 'm.room.create', '');
+  if (!createState) {
+    return null;
+  }
+  return roomDo.loadRoomEventById(createState.event_id).event;
+}
+
+function getCurrentPowerLevelsContent(roomDo, stateMap) {
+  const powerLevelsState = getTypedStateEvent(stateMap, 'm.room.power_levels', '');
+  if (!powerLevelsState) {
+    const createEvent = getCreateEventFromStateMap(roomDo, stateMap);
+    const users = {};
+    if (typeof createEvent?.sender === 'string' && createEvent.sender.length > 0) {
+      users[createEvent.sender] = 100;
+    }
+    if (Array.isArray(createEvent?.content?.additional_creators)) {
+      for (const userId of createEvent.content.additional_creators) {
+        if (typeof userId === 'string' && userId.length > 0) {
+          users[userId] = 100;
+        }
+      }
+    }
+    return {
+      users_default: 0,
+      events_default: 0,
+      state_default: 50,
+      ban: 50,
+      kick: 50,
+      redact: 50,
+      invite: 0,
+      users,
+      events: {},
+    };
+  }
+  const event = roomDo.loadRoomEventById(powerLevelsState.event_id).event;
+  return isObjectRecord(event?.content) ? cloneJson(event.content) : {};
+}
+
+function getRoomCreators(roomDo, roomVersion, stateMap) {
+  const createEvent = getCreateEventFromStateMap(roomDo, stateMap);
+  if (!createEvent) {
+    return [];
+  }
+  const creators = new Set();
+  if (typeof createEvent.sender === 'string' && createEvent.sender.length > 0) {
+    creators.add(createEvent.sender);
+  }
+  if (roomVersion === '12' && Array.isArray(createEvent.content?.additional_creators)) {
+    for (const userId of createEvent.content.additional_creators) {
+      if (typeof userId === 'string' && userId.length > 0) {
+        creators.add(userId);
+      }
+    }
+  }
+  return [...creators];
+}
+
+function getUserPowerLevel(roomDo, roomVersion, stateMap, userId) {
+  const creators = new Set(getRoomCreators(roomDo, roomVersion, stateMap));
+  if (roomVersion === '12' && creators.has(userId)) {
+    return Number.POSITIVE_INFINITY;
+  }
+  const powerLevels = getCurrentPowerLevelsContent(roomDo, stateMap);
+  if (isObjectRecord(powerLevels.users) && Number.isInteger(powerLevels.users[userId])) {
+    return powerLevels.users[userId];
+  }
+  return Number.isInteger(powerLevels.users_default) ? powerLevels.users_default : 0;
+}
+
+function getRequiredEventPowerLevel(roomDo, roomVersion, stateMap, candidateEvent) {
+  const powerLevels = getCurrentPowerLevelsContent(roomDo, stateMap);
+  if (candidateEvent?.type === 'm.room.redaction') {
+    return Number.isInteger(powerLevels.redact) ? powerLevels.redact : 50;
+  }
+  if (stateKeyForEvent(candidateEvent) != null) {
+    if (isObjectRecord(powerLevels.events) && Number.isInteger(powerLevels.events[candidateEvent.type])) {
+      return powerLevels.events[candidateEvent.type];
+    }
+    return Number.isInteger(powerLevels.state_default) ? powerLevels.state_default : 50;
+  }
+  if (isObjectRecord(powerLevels.events) && Number.isInteger(powerLevels.events[candidateEvent.type])) {
+    return powerLevels.events[candidateEvent.type];
+  }
+  return Number.isInteger(powerLevels.events_default) ? powerLevels.events_default : 0;
+}
+
+function getJoinRule(roomDo, stateMap) {
+  const joinRulesState = getTypedStateEvent(stateMap, 'm.room.join_rules', '');
+  if (!joinRulesState) {
+    return 'invite';
+  }
+  const event = roomDo.loadRoomEventById(joinRulesState.event_id).event;
+  return typeof event?.content?.join_rule === 'string' ? event.content.join_rule : 'invite';
+}
+
+function getMembershipState(roomDo, stateMap, userId) {
+  const stateEntry = getTypedStateEvent(stateMap, 'm.room.member', userId);
+  if (!stateEntry) {
+    return null;
+  }
+  const event = roomDo.loadRoomEventById(stateEntry.event_id).event;
+  return {
+    state_entry: stateEntry,
+    event,
+    membership: typeof event?.content?.membership === 'string' ? event.content.membership : null,
+  };
+}
+
+function buildTypingEphemeralEvent(roomId, typingRows) {
+  return {
+    type: 'm.typing',
+    room_id: roomId,
+    content: {
+      user_ids: typingRows
+        .filter((row) => row.typing !== false)
+        .map((row) => row.user_id)
+        .sort((left, right) => left.localeCompare(right)),
+    },
+  };
+}
+
+function buildReceiptEphemeralEvent(roomId, receiptRow) {
+  return {
+    type: 'm.receipt',
+    room_id: roomId,
+    content: {
+      [receiptRow.event_id]: {
+        [receiptRow.receipt_type]: {
+          [receiptRow.user_id]: {
+            ts: receiptRow.receipt_ts ?? Date.now(),
+            ...(receiptRow.thread_id ? { thread_id: receiptRow.thread_id } : {}),
+          },
+        },
+      },
+    },
+  };
+}
+
+function mapMembershipVisibilityClass(membership) {
+  if (membership === 'join') {
+    return 'joined';
+  }
+  if (membership === 'invite') {
+    return 'invited';
+  }
+  if (membership === 'knock') {
+    return 'knocked';
+  }
+  if (membership === 'leave' || membership === 'ban') {
+    return 'left';
+  }
+  return null;
+}
+
+function isReadableRoomMembership(membership) {
+  return membership === 'join' || membership === 'leave';
+}
+
 function mapInternalCodeToMatrixError(error) {
   const code = error?.code ?? 'internal';
   if (code === 'idempotency_conflict') {
@@ -624,6 +930,51 @@ function mapInternalCodeToMatrixError(error) {
       },
     };
   }
+  if (code === 'unsupported_room_version') {
+    return {
+      status: 400,
+      body: {
+        errcode: 'M_UNSUPPORTED_ROOM_VERSION',
+        error: error?.message ?? 'Unsupported room version',
+      },
+    };
+  }
+  if (code === 'incompatible_room_version') {
+    return {
+      status: 400,
+      body: {
+        errcode: 'M_INCOMPATIBLE_ROOM_VERSION',
+        error: error?.message ?? 'Incompatible room version',
+      },
+    };
+  }
+  if (code === 'room_not_found' || code === 'event_not_found') {
+    return {
+      status: 404,
+      body: {
+        errcode: 'M_NOT_FOUND',
+        error: error?.message ?? 'Requested room resource does not exist',
+      },
+    };
+  }
+  if (code === 'room_forbidden' || code === 'not_allowed') {
+    return {
+      status: 403,
+      body: {
+        errcode: 'M_FORBIDDEN',
+        error: error?.message ?? 'The room operation is not allowed',
+      },
+    };
+  }
+  if (code === 'bad_json' || code === 'invalid_event') {
+    return {
+      status: 400,
+      body: {
+        errcode: 'M_BAD_JSON',
+        error: error?.message ?? 'Invalid JSON payload',
+      },
+    };
+  }
   if (code === 'unknown_session') {
     return {
       status: 401,
@@ -639,6 +990,15 @@ function mapInternalCodeToMatrixError(error) {
       body: {
         errcode: 'M_INVALID_PARAM',
         error: error?.message ?? 'Invalid sync cursor',
+      },
+    };
+  }
+  if (code === 'integrity_failure') {
+    return {
+      status: 500,
+      body: {
+        errcode: 'M_UNKNOWN',
+        error: error?.message ?? 'Integrity check failed',
       },
     };
   }
@@ -1047,6 +1407,34 @@ export class UserDO extends BaseDurableObject {
       };
     }
 
+    const forgottenRoom = readForgottenRoomTombstones(principal)[delta.room_id] ?? null;
+    const forgottenRoomPos = Number.isInteger(forgottenRoom?.room_pos) ? forgottenRoom.room_pos : 0;
+    const forgottenUpdatedAtMillis = typeof forgottenRoom?.updated_at === 'string'
+      ? Date.parse(forgottenRoom.updated_at)
+      : Number.NaN;
+    const staleForgottenDelta = forgottenRoom && (
+      delta.membership_bucket === 'leave'
+      || delta.room_pos <= forgottenRoomPos
+      || (
+        forgottenRoomPos <= 0
+        && (
+          !Number.isInteger(delta.origin_server_ts)
+          || !Number.isFinite(forgottenUpdatedAtMillis)
+          || delta.origin_server_ts <= forgottenUpdatedAtMillis
+        )
+      )
+    );
+    if (staleForgottenDelta) {
+      return createSuccessResult({
+        ack: {
+          accepted: true,
+          accepted_at: request?.now ?? new Date().toISOString(),
+          durable_stream_pos: null,
+          suppressed: 'forgotten_room',
+        },
+      });
+    }
+
     const dedupeKey = buildRoomFanoutDedupeKey(delta);
     const existing = this.persistence.userStream.list().find((entry) => entry.dedupe_key === dedupeKey);
     if (existing) {
@@ -1092,6 +1480,198 @@ export class UserDO extends BaseDurableObject {
         accepted_at: now,
         durable_stream_pos: wakePos,
       },
+    });
+  }
+
+  async appendRoomEphemeral() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const [request = {}] = arguments;
+    const principal = this.persistence.userPrincipal.get();
+    const userId = normalizeString(request?.user_id, 'request.user_id');
+    if (!principal || principal.user_id !== userId) {
+      return {
+        ok: false,
+        error: createRoomInternalError('target_not_local', 'Target user does not exist on this homeserver'),
+      };
+    }
+    const roomId = normalizeString(request?.room_id, 'request.room_id');
+    const event = isObjectRecord(request?.event) ? cloneJson(request.event) : null;
+    if (!event) {
+      return {
+        ok: false,
+        error: createRoomInternalError('bad_json', 'Ephemeral room event must be a JSON object'),
+      };
+    }
+    const dedupeKey = normalizeString(
+      request?.dedupe_key ?? canonicalJsonHash({
+        room_id: roomId,
+        user_id: userId,
+        event,
+      }),
+      'request.dedupe_key',
+    );
+    const existing = this.persistence.userStream.list().find((entry) => entry.dedupe_key === dedupeKey);
+    if (existing) {
+      return createSuccessResult({
+        ack: {
+          accepted: true,
+          accepted_at: existing.created_at,
+          durable_stream_pos: existing.stream_pos,
+        },
+      });
+    }
+    const now = request?.now ?? new Date().toISOString();
+    const streamEntry = this.persistence.appendUserStream({
+      user_id: userId,
+      stream_kind: 'room_ephemeral',
+      room_id: roomId,
+      event_id: typeof event.event_id === 'string' ? event.event_id : null,
+      dedupe_key: dedupeKey,
+      created_at: now,
+      payload: {
+        room_id: roomId,
+        event,
+      },
+    });
+    wakeSyncWaiters(this.env, {
+      user_id: userId,
+      user_stream_pos: streamEntry.stream_pos,
+    });
+    return createSuccessResult({
+      ack: {
+        accepted: true,
+        accepted_at: now,
+        durable_stream_pos: streamEntry.stream_pos,
+      },
+    });
+  }
+
+  async inspectRoomFanout() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const [request = {}] = arguments;
+    const roomId = normalizeString(request?.room_id, 'request.room_id');
+    const roomPos = normalizeInteger(request?.room_pos, 'request.room_pos', { min: 1 });
+    const userId = normalizeString(request?.user_id, 'request.user_id');
+    const dedupeKey = buildRoomFanoutDedupeKey({
+      room_id: roomId,
+      room_pos: roomPos,
+      user_id: userId,
+      membership_bucket: 'join',
+      timeline_event_ids: [],
+      state_event_ids: [],
+    });
+    const entry = this.persistence.userStream.list().find((candidate) => candidate.dedupe_key === dedupeKey) ?? null;
+    return createSuccessResult({
+      entry,
+    });
+  }
+
+  async forgetRoom() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const [request = {}] = arguments;
+    const principal = this.persistence.userPrincipal.get();
+    const userId = normalizeString(request?.user_id, 'request.user_id');
+    if (!principal || principal.user_id !== userId) {
+      return createMatrixError(403, 'M_FORBIDDEN', 'Room forget is only available to the authenticated user');
+    }
+    const roomId = normalizeString(request?.room_id, 'request.room_id');
+    const dedupeKey = normalizeString(
+      request?.request_fingerprint ?? canonicalJsonHash({ room_id: roomId, user_id: userId, kind: 'forget' }),
+      'request.request_fingerprint',
+    );
+    const existing = this.persistence.userStream.list().find((entry) => entry.dedupe_key === dedupeKey);
+    if (existing) {
+      return createSuccessResult({
+        response: {},
+      });
+    }
+    const currentRoomSync = readRoomSyncMembershipMap(principal)[roomId] ?? null;
+    const forgottenRoom = readForgottenRoomTombstones(principal)[roomId] ?? null;
+    if (currentRoomSync && currentRoomSync.membership_bucket !== 'leave') {
+      return createMatrixError(403, 'M_FORBIDDEN', 'Room must be left before it can be forgotten');
+    }
+    if (!currentRoomSync && !forgottenRoom) {
+      return createMatrixError(403, 'M_FORBIDDEN', 'Room must be left before it can be forgotten');
+    }
+    const forgetRoomPos = Number.isInteger(request?.room_pos)
+      ? request.room_pos
+      : currentRoomSync?.room_pos ?? forgottenRoom?.room_pos ?? 0;
+    const now = request?.now ?? new Date().toISOString();
+    let wakePos = 0;
+    const sql = this.requireSqlStorage();
+    withSqliteTransaction(sql, () => {
+      const streamEntry = this.persistence.appendUserStreamWithinTransaction({
+        user_id: userId,
+        stream_kind: 'room_fanout',
+        room_id: roomId,
+        event_id: null,
+        dedupe_key: dedupeKey,
+        created_at: now,
+        payload: {
+          room_id: roomId,
+          room_pos: forgetRoomPos,
+          user_id: userId,
+          membership_bucket: 'forgotten',
+          timeline_event_ids: [],
+          state_event_ids: [],
+        },
+      });
+      wakePos = streamEntry.stream_pos;
+      this.persistence.userPrincipal.put(principalRowToPutRecord(principal, {
+        record: mergeRoomSyncMembershipRecord(principal, {
+          room_id: roomId,
+          membership_bucket: 'forgotten',
+          room_pos: forgetRoomPos,
+          updated_at: now,
+        }),
+      }));
+    });
+    wakeSyncWaiters(this.env, {
+      user_id: userId,
+      user_stream_pos: wakePos,
+    });
+    return createSuccessResult({
+      response: {},
+    });
+  }
+
+  async getRoomSyncMembership() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const [request = {}] = arguments;
+    const principal = this.persistence.userPrincipal.get();
+    const userId = request?.user_id == null
+      ? principal?.user_id ?? null
+      : normalizeString(request.user_id, 'request.user_id');
+    if (!principal || principal.user_id !== userId) {
+      return createSuccessResult({
+        entry: null,
+      });
+    }
+    const roomId = normalizeString(request?.room_id, 'request.room_id');
+    return createSuccessResult({
+      entry: readRoomSyncMembershipMap(principal)[roomId] ?? null,
+    });
+  }
+
+  async listRoomSyncMemberships() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const [request = {}] = arguments;
+    const principal = this.persistence.userPrincipal.get();
+    const userId = request?.user_id == null
+      ? principal?.user_id ?? null
+      : normalizeString(request.user_id, 'request.user_id');
+    if (!principal || principal.user_id !== userId) {
+      return createSuccessResult({
+        entries: [],
+      });
+    }
+    return createSuccessResult({
+      entries: listRoomSyncMembershipEntries(principal),
     });
   }
 
@@ -3038,12 +3618,667 @@ export class RoomDO extends BaseDurableObject {
     return this.persistence.getRuntimeState();
   }
 
+  resolveRoomVersionOrThrow(requestedRoomVersion = null, { requestKind = 'client' } = {}) {
+    const runtimeState = this.persistence.getRuntimeState();
+    const candidate = requestedRoomVersion ?? runtimeState?.room_version ?? DEFAULT_ROOM_VERSION;
+    if (!isSupportedRoomVersion(candidate)) {
+      throw createRoomInternalError(
+        requestKind === 'federation' ? 'incompatible_room_version' : 'unsupported_room_version',
+        `Room version ${candidate} is not supported`,
+      );
+    }
+    return resolveRequestedRoomVersion(candidate);
+  }
+
+  getCurrentStateMap() {
+    return getRoomStateMapForSnapshot(this.persistence, this.persistence.getRuntimeState()?.current_snapshot_id ?? null);
+  }
+
+  buildAuthEventIds(roomVersion, stateMap, candidateEvent) {
+    const authEventIds = [];
+    if (roomVersion === '11') {
+      const createState = getTypedStateEvent(stateMap, 'm.room.create', '');
+      if (createState) {
+        authEventIds.push(createState.event_id);
+      }
+    }
+    const senderMembership = getMembershipState(this, stateMap, candidateEvent.sender);
+    if (senderMembership?.state_entry?.event_id) {
+      authEventIds.push(senderMembership.state_entry.event_id);
+    }
+    const powerLevelsState = getTypedStateEvent(stateMap, 'm.room.power_levels', '');
+    if (powerLevelsState) {
+      authEventIds.push(powerLevelsState.event_id);
+    }
+    const joinRulesState = getTypedStateEvent(stateMap, 'm.room.join_rules', '');
+    if (joinRulesState) {
+      authEventIds.push(joinRulesState.event_id);
+    }
+    if (candidateEvent.type === 'm.room.member' && typeof candidateEvent.state_key === 'string' && candidateEvent.state_key !== candidateEvent.sender) {
+      const targetMembership = getMembershipState(this, stateMap, candidateEvent.state_key);
+      if (targetMembership?.state_entry?.event_id) {
+        authEventIds.push(targetMembership.state_entry.event_id);
+      }
+    }
+    return [...new Set(authEventIds.filter(Boolean))];
+  }
+
+  validateCandidateEventShape(roomVersion, candidateEvent) {
+    if (!isObjectRecord(candidateEvent)) {
+      throw createRoomInternalError('bad_json', 'candidate_event must be a JSON object');
+    }
+    const eventType = normalizeRoomEventType(candidateEvent.type);
+    const sender = normalizeString(candidateEvent.sender, 'candidate_event.sender');
+    if (!isObjectRecord(candidateEvent.content)) {
+      throw createRoomInternalError('bad_json', 'candidate_event.content must be a JSON object');
+    }
+    const stateKey = stateKeyForEvent(candidateEvent);
+    if (eventType === 'm.room.member' && stateKey == null) {
+      throw createRoomInternalError('bad_json', 'm.room.member events require state_key');
+    }
+    if (eventType === 'm.room.create') {
+      if (stateKey !== '') {
+        throw createRoomInternalError('bad_json', 'm.room.create must use an empty state_key');
+      }
+      if (roomVersion === '12' && candidateEvent.room_id != null) {
+        throw createRoomInternalError('bad_json', 'Room version 12 m.room.create must not include room_id');
+      }
+      if (candidateEvent.content.additional_creators != null) {
+        if (!Array.isArray(candidateEvent.content.additional_creators)
+          || !candidateEvent.content.additional_creators.every((entry) => typeof entry === 'string' && entry.length > 0)) {
+          throw createRoomInternalError('bad_json', 'content.additional_creators must be an array of user IDs');
+        }
+      }
+    }
+    if (eventType === 'm.room.redaction' && typeof candidateEvent.redacts !== 'string') {
+      throw createRoomInternalError('bad_json', 'm.room.redaction events require redacts');
+    }
+    return {
+      eventType,
+      sender,
+      stateKey,
+    };
+  }
+
+  authorizeMembershipEvent(roomVersion, stateMap, candidateEvent) {
+    const senderUserId = candidateEvent.sender;
+    const targetUserId = candidateEvent.state_key;
+    const membership = normalizeString(candidateEvent.content.membership, 'candidate_event.content.membership');
+    const profileRefresh = getProfileRefreshInfo(candidateEvent);
+    const routeTemplate = typeof candidateEvent?.unsigned?.client_context?.route_template === 'string'
+      ? candidateEvent.unsigned.client_context.route_template
+      : null;
+    const senderMembership = getMembershipState(this, stateMap, senderUserId)?.membership ?? null;
+    const targetMembership = getMembershipState(this, stateMap, targetUserId)?.membership ?? null;
+    const joinRule = getJoinRule(this, stateMap);
+    const senderPower = getUserPowerLevel(this, roomVersion, stateMap, senderUserId);
+    const targetPower = getUserPowerLevel(this, roomVersion, stateMap, targetUserId);
+    const powerLevels = getCurrentPowerLevelsContent(this, stateMap);
+    const inviteLevel = Number.isInteger(powerLevels.invite) ? powerLevels.invite : 0;
+    const banLevel = Number.isInteger(powerLevels.ban) ? powerLevels.ban : 50;
+    const kickLevel = Number.isInteger(powerLevels.kick) ? powerLevels.kick : 50;
+    const createEvent = getCreateEventFromStateMap(this, stateMap);
+
+    if (membership === 'join') {
+      if (senderUserId !== targetUserId) {
+        throw createRoomInternalError('room_forbidden', 'Only the target user may join themselves');
+      }
+      if (targetMembership === 'ban') {
+        throw createRoomInternalError('room_forbidden', 'Banned users may not join');
+      }
+      if (targetMembership === 'join' && profileRefresh) {
+        return membership;
+      }
+      const creatorBootstrap = createEvent
+        && senderUserId === createEvent.sender
+        && targetMembership == null;
+      if (creatorBootstrap || targetMembership === 'invite' || targetMembership === 'knock' || joinRule === 'public') {
+        return membership;
+      }
+      throw createRoomInternalError('room_forbidden', 'User is not allowed to join this room');
+    }
+
+    if (membership === 'invite') {
+      if (senderMembership !== 'join') {
+        throw createRoomInternalError('room_forbidden', 'Only joined users may invite');
+      }
+      if (senderPower < inviteLevel) {
+        throw createRoomInternalError('room_forbidden', 'Invites require invite power level');
+      }
+      if (targetMembership === 'ban') {
+        throw createRoomInternalError('room_forbidden', 'Banned users may not be invited');
+      }
+      if (targetMembership === 'join') {
+        throw createRoomInternalError('room_forbidden', 'Joined users may not be invited again');
+      }
+      return membership;
+    }
+
+    if (membership === 'knock') {
+      if (senderUserId !== targetUserId) {
+        throw createRoomInternalError('room_forbidden', 'Only the target user may knock');
+      }
+      if (targetMembership === 'ban') {
+        throw createRoomInternalError('room_forbidden', 'Banned users may not knock');
+      }
+      if (['join', 'invite', 'knock'].includes(targetMembership ?? '')) {
+        throw createRoomInternalError('room_forbidden', 'Users with active room membership may not knock');
+      }
+      if (joinRule !== 'knock') {
+        throw createRoomInternalError('room_forbidden', 'This room does not allow knocking');
+      }
+      return membership;
+    }
+
+    if (membership === 'ban') {
+      if (senderMembership !== 'join') {
+        throw createRoomInternalError('room_forbidden', 'Only joined users may ban');
+      }
+      if (senderPower < banLevel || senderPower <= targetPower) {
+        throw createRoomInternalError('room_forbidden', 'Ban power level is insufficient');
+      }
+      return membership;
+    }
+
+    if (membership === 'leave') {
+      if (senderUserId === targetUserId) {
+        if (targetMembership === 'ban') {
+          throw createRoomInternalError('room_forbidden', 'Banned users may not unban themselves');
+        }
+        if (!['join', 'invite', 'knock', 'leave'].includes(targetMembership ?? '')) {
+          throw createRoomInternalError('room_forbidden', 'Only current room members may leave');
+        }
+        return membership;
+      }
+      if (routeTemplate === '/_matrix/client/v3/rooms/{roomId}/unban') {
+        if (targetMembership !== 'ban') {
+          throw createRoomInternalError('room_forbidden', 'Target user is not banned');
+        }
+        if (senderPower < banLevel || senderPower <= targetPower) {
+          throw createRoomInternalError('room_forbidden', 'Ban power level is insufficient');
+        }
+        return membership;
+      }
+      if (targetMembership === 'ban') {
+        throw createRoomInternalError('room_forbidden', 'Banned users may only be changed via /unban');
+      }
+      if (senderMembership !== 'join') {
+        throw createRoomInternalError('room_forbidden', 'Only joined users may kick');
+      }
+      if (!['join', 'invite', 'knock'].includes(targetMembership ?? '')) {
+        throw createRoomInternalError('room_forbidden', 'Only joined, invited, or knocked users may be kicked');
+      }
+      if (senderPower < kickLevel || senderPower <= targetPower) {
+        throw createRoomInternalError('room_forbidden', 'Kick power level is insufficient');
+      }
+      return membership;
+    }
+
+    throw createRoomInternalError('bad_json', `Unsupported membership transition: ${membership}`);
+  }
+
+  authorizeCandidateEvent(roomVersion, stateMap, candidateEvent) {
+    if (candidateEvent.type === 'm.room.create') {
+      if (getTypedStateEvent(stateMap, 'm.room.create', '')) {
+        throw createRoomInternalError('room_forbidden', 'Room create may only happen once');
+      }
+      return;
+    }
+
+    const senderMembership = getMembershipState(this, stateMap, candidateEvent.sender)?.membership ?? null;
+    if (candidateEvent.type === 'm.room.member') {
+      this.authorizeMembershipEvent(roomVersion, stateMap, candidateEvent);
+      return;
+    }
+
+    if (senderMembership !== 'join') {
+      throw createRoomInternalError('room_forbidden', 'Only joined users may send room events');
+    }
+
+    if (candidateEvent.type === 'm.room.redaction') {
+      const targetEvent = this.loadRoomEventById(candidateEvent.redacts).event;
+      const senderPower = getUserPowerLevel(this, roomVersion, stateMap, candidateEvent.sender);
+      const redactLevel = getRequiredEventPowerLevel(this, roomVersion, stateMap, candidateEvent);
+      if (candidateEvent.sender !== targetEvent.sender && senderPower < redactLevel) {
+        throw createRoomInternalError('room_forbidden', 'Redaction power level is insufficient');
+      }
+      return;
+    }
+
+    const senderPower = getUserPowerLevel(this, roomVersion, stateMap, candidateEvent.sender);
+    const requiredLevel = getRequiredEventPowerLevel(this, roomVersion, stateMap, candidateEvent);
+    if (senderPower < requiredLevel) {
+      throw createRoomInternalError('room_forbidden', 'Power level is insufficient for this event');
+    }
+  }
+
   async admitEvent() {
     await this.ensureCurrentness();
     await this.ensureSchema();
-    return this.createNotImplementedEnvelope('admitEvent', {
-      schema_version: RoomDO.schemaVersion,
-    });
+    const [request = {}] = arguments;
+    try {
+      const requestKind = normalizeRequestKind(request?.request_kind ?? 'client');
+      const requestFingerprint = normalizeString(request?.request_fingerprint, 'request.request_fingerprint');
+      const candidateEvent = isObjectRecord(request?.candidate_event) ? cloneJson(request.candidate_event) : null;
+      const runtimeState = this.persistence.getRuntimeState();
+      const requestedCreateRoomVersion = candidateEvent?.type === 'm.room.create'
+        ? candidateEvent?.content?.room_version ?? null
+        : null;
+      const roomVersion = this.resolveRoomVersionOrThrow(
+        request?.room_version ?? requestedCreateRoomVersion ?? runtimeState?.room_version ?? DEFAULT_ROOM_VERSION,
+        { requestKind },
+      );
+      const { eventType, sender, stateKey } = this.validateCandidateEventShape(roomVersion, candidateEvent);
+      const profileRefresh = eventType === 'm.room.member' ? getProfileRefreshInfo(candidateEvent) : null;
+      const isCreateEvent = eventType === 'm.room.create';
+      const createIdentity = isCreateEvent
+        ? deriveCreateRoomIdentity({
+          creator_user_id: sender,
+          room_version: roomVersion,
+          request_fingerprint: requestFingerprint,
+          server_name: this.env.MATRIX_SERVER_NAME,
+        })
+        : null;
+      const roomId = normalizeString(
+        request?.room_id
+          ?? candidateEvent?.room_id
+          ?? createIdentity?.room_id
+          ?? runtimeState?.room_id,
+        'request.room_id',
+      );
+      if (!isCreateEvent && runtimeState?.room_id == null) {
+        throw createRoomInternalError('room_not_found', `Room ${roomId} does not exist`);
+      }
+      if (runtimeState?.room_id && runtimeState.room_id !== roomId) {
+        throw createRoomInternalError('room_forbidden', `Room runtime state is already bound to ${runtimeState.room_id}`);
+      }
+      const stateMap = this.getCurrentStateMap();
+      const currentMembershipState = eventType === 'm.room.member' && stateKey != null
+        ? getTypedStateEvent(stateMap, 'm.room.member', stateKey)
+        : null;
+
+      const clientContext = isObjectRecord(candidateEvent?.unsigned?.client_context)
+        ? cloneJson(candidateEvent.unsigned.client_context)
+        : null;
+      const clientDedupeKey = clientContext
+        ? {
+          user_id: normalizeString(clientContext.user_id, 'candidate_event.unsigned.client_context.user_id'),
+          device_id: normalizeString(clientContext.device_id, 'candidate_event.unsigned.client_context.device_id'),
+          room_id: roomId,
+          route_template: normalizeString(clientContext.route_template, 'candidate_event.unsigned.client_context.route_template'),
+          txn_id_or_request_hash: normalizeString(
+            eventType === 'm.room.member'
+              ? `${clientContext.txn_id_or_request_hash ?? requestFingerprint}|${currentMembershipState?.event_id ?? 'none'}`
+              : (clientContext.txn_id_or_request_hash ?? requestFingerprint),
+            'candidate_event.unsigned.client_context.txn_id_or_request_hash',
+          ),
+        }
+        : null;
+      const existingDedupe = clientDedupeKey
+        ? this.persistence.clientTxnDedupe.get({
+          txn_dedupe_key: `${clientDedupeKey.user_id}|${clientDedupeKey.device_id}|${clientDedupeKey.room_id}|${clientDedupeKey.route_template}|${clientDedupeKey.txn_id_or_request_hash}`,
+        })
+        : null;
+      if (existingDedupe) {
+        if (existingDedupe.request_fingerprint !== requestFingerprint) {
+          throw createRoomInternalError('idempotency_conflict', 'This room write idempotency key was already used with a different request body');
+        }
+        if (existingDedupe.terminal_state === 'failed' && existingDedupe.error_json) {
+          return {
+            ok: false,
+            error: existingDedupe.error_json,
+          };
+        }
+        const existingMetadata = existingDedupe.result_event_id
+          ? this.persistence.eventMetadata.get({ event_id: existingDedupe.result_event_id })
+          : null;
+        return createSuccessResult({
+          decision: 'accepted',
+          event_id: existingDedupe.result_event_id ?? null,
+          room_pos: existingMetadata?.room_pos ?? null,
+          snapshot_id: this.persistence.getRuntimeState()?.current_snapshot_id ?? null,
+        });
+      }
+
+      if (eventType === 'm.room.member' && currentMembershipState) {
+        const currentMembershipEvent = this.loadRoomEventById(currentMembershipState.event_id).event;
+        if (currentMembershipEvent?.sender === sender
+          && canonicalJsonHash(currentMembershipEvent?.content ?? {}) === canonicalJsonHash(candidateEvent.content ?? {})) {
+          const currentMetadata = this.persistence.eventMetadata.get({ event_id: currentMembershipState.event_id });
+          return createSuccessResult({
+            decision: 'accepted',
+            event_id: currentMembershipState.event_id,
+            room_pos: currentMetadata?.room_pos ?? null,
+            snapshot_id: this.persistence.getRuntimeState()?.current_snapshot_id ?? null,
+          });
+        }
+      }
+
+      this.authorizeCandidateEvent(roomVersion, stateMap, candidateEvent);
+      const prevEventIds = this.persistence.forwardExtremities.list()
+        .sort((left, right) => left.room_pos - right.room_pos || left.event_id.localeCompare(right.event_id))
+        .map((row) => row.event_id);
+      const previousDepth = prevEventIds.reduce((maximumDepth, prevEventId) => {
+        const metadata = this.persistence.eventMetadata.get({ event_id: prevEventId });
+        return Math.max(maximumDepth, metadata?.depth ?? 0);
+      }, 0);
+      const authEventIds = this.buildAuthEventIds(roomVersion, stateMap, candidateEvent);
+      const originServerTs = Number.isInteger(candidateEvent.origin_server_ts)
+        ? candidateEvent.origin_server_ts
+        : Date.now();
+      const baseEvent = {
+        type: eventType,
+        sender,
+        content: cloneJson(candidateEvent.content),
+        origin_server_ts: originServerTs,
+        prev_events: prevEventIds,
+        auth_events: authEventIds,
+        ...(stateKey == null ? {} : { state_key: stateKey }),
+        ...(candidateEvent.redacts == null ? {} : { redacts: normalizeString(candidateEvent.redacts, 'candidate_event.redacts') }),
+        ...((!isCreateEvent || roomVersion !== '12') ? { room_id: roomId } : {}),
+      };
+      const eventId = createIdentity?.create_event_id ?? deriveDeterministicEventId({
+        kind: 'room_event',
+        room_id: roomId,
+        room_version: roomVersion,
+        request_fingerprint: requestFingerprint,
+        event: baseEvent,
+      });
+      const committedEvent = {
+        ...baseEvent,
+        event_id: eventId,
+        depth: previousDepth + 1,
+        hashes: {
+          sha256: canonicalJsonHash(baseEvent),
+        },
+        ...(isObjectRecord(candidateEvent.unsigned?.public) ? { unsigned: cloneJson(candidateEvent.unsigned.public) } : {}),
+      };
+
+      const now = request?.now ?? new Date().toISOString();
+      let roomPos = null;
+      let snapshotId = this.persistence.getRuntimeState()?.current_snapshot_id ?? null;
+      let fanoutDeltas = [];
+      let redactedTarget = null;
+      const sql = this.requireSqlStorage();
+      withSqliteTransaction(sql, () => {
+        roomPos = this.reserveRoomPosWithinTransaction(sql, {
+          roomId,
+          roomVersion,
+          updatedAt: now,
+        });
+        for (const prevEventId of prevEventIds) {
+          this.persistence.forwardExtremities.delete({ event_id: prevEventId });
+        }
+        this.persistence.forwardExtremities.put({
+          event_id: eventId,
+          room_pos: roomPos,
+          updated_at: now,
+          record_json: {},
+        });
+        for (const prevEventId of prevEventIds) {
+          this.persistence.prevEdges.put({
+            event_id: eventId,
+            prev_event_id: prevEventId,
+            record_json: {},
+          });
+        }
+        for (const authEventId of authEventIds) {
+          this.persistence.authEdges.put({
+            event_id: eventId,
+            auth_event_id: authEventId,
+            record_json: {},
+          });
+        }
+
+        if (stateKey != null || !this.persistence.getRuntimeState()?.current_snapshot_id) {
+          snapshotId = `snapshot-${roomPos}`;
+          const previousSnapshotId = this.persistence.getRuntimeState()?.current_snapshot_id ?? null;
+          if (previousSnapshotId) {
+            for (const entry of this.persistence.stateEntries.list().filter((row) => row.snapshot_id === previousSnapshotId)) {
+              this.persistence.stateEntries.put({
+                snapshot_id: snapshotId,
+                event_type: entry.event_type,
+                state_key: entry.state_key,
+                event_id: entry.event_id,
+                sender_user_id: entry.sender_user_id,
+                membership: entry.membership,
+                event_room_pos: entry.event_room_pos,
+                content_json: cloneJson(entry.content),
+                record_json: cloneJson(entry.record ?? {}),
+              });
+            }
+          }
+          if (stateKey != null) {
+            this.persistence.stateEntries.put({
+              snapshot_id: snapshotId,
+              event_type: eventType,
+              state_key: stateKey,
+              event_id: eventId,
+              sender_user_id: sender,
+              membership: eventType === 'm.room.member' ? candidateEvent.content.membership : null,
+              event_room_pos: roomPos,
+              content_json: cloneJson(candidateEvent.content),
+              record_json: {},
+            });
+          }
+          const snapshotRows = this.persistence.stateEntries.list()
+            .filter((row) => row.snapshot_id === snapshotId)
+            .map((row) => ({
+              event_type: row.event_type,
+              state_key: row.state_key,
+              event_id: row.event_id,
+            }))
+            .sort((left, right) => left.event_type.localeCompare(right.event_type) || left.state_key.localeCompare(right.state_key));
+          const snapshotHash = canonicalJsonHash(snapshotRows);
+          this.persistence.stateSnapshots.put({
+            snapshot_id: snapshotId,
+            snapshot_hash: snapshotHash,
+            extremity_set_hash: canonicalJsonHash([eventId]),
+            created_at: now,
+            record_json: {
+              room_pos: roomPos,
+            },
+          });
+          this.persistence.updateCurrentSnapshot({
+            snapshot_id: snapshotId,
+            snapshot_hash: snapshotHash,
+            updated_at: now,
+          });
+        }
+
+        if (eventType === 'm.room.member') {
+          const membership = normalizeString(candidateEvent.content.membership, 'candidate_event.content.membership');
+          this.persistence.membershipProjection.put({
+            user_id: stateKey,
+            membership,
+            event_id: eventId,
+            room_pos: roomPos,
+            displayname: candidateEvent.content.displayname ?? null,
+            avatar_url: candidateEvent.content.avatar_url ?? null,
+            profile_version: Number.isInteger(candidateEvent.unsigned?.public?.profile_version)
+              ? candidateEvent.unsigned.public.profile_version
+              : null,
+            membership_visibility_class: mapMembershipVisibilityClass(membership),
+            updated_at: now,
+            record_json: {},
+          });
+        }
+
+        if (eventType === 'm.room.redaction') {
+          const target = this.loadRoomEventById(candidateEvent.redacts);
+          redactedTarget = redactEventForRoomVersion(roomVersion, target.event, {
+            event_id: eventId,
+            sender,
+            type: 'm.room.redaction',
+            ...(roomVersion === '12' ? {} : { room_id: roomId }),
+            redacts: candidateEvent.redacts,
+            origin_server_ts: originServerTs,
+            content: {},
+          });
+          this.persistence.hotEventJson.put({
+            event_id: candidateEvent.redacts,
+            content_hash: canonicalJsonHash(redactedTarget),
+            stored_at: now,
+            canonical_json: JSON.stringify(redactedTarget),
+            record_json: {
+              ...(target.metadata.record ?? {}),
+              redacted_by_event_id: eventId,
+            },
+          });
+          if (target.metadata.state_key_or_null != null && snapshotId) {
+            this.persistence.stateEntries.put({
+              snapshot_id: snapshotId,
+              event_type: target.metadata.event_type,
+              state_key: target.metadata.state_key_or_null,
+              event_id: candidateEvent.redacts,
+              sender_user_id: target.metadata.sender_user_id,
+              membership: target.metadata.event_type === 'm.room.member'
+                ? (typeof redactedTarget.content?.membership === 'string' ? redactedTarget.content.membership : null)
+                : null,
+              event_room_pos: target.metadata.room_pos,
+              content_json: cloneJson(redactedTarget.content ?? {}),
+              record_json: {},
+            });
+          }
+        }
+
+        fanoutDeltas = this.buildCommittedFanoutDeltas({
+          committedEvent,
+          roomPos,
+          snapshotId,
+        });
+        const relationInfo = getRelationInfo(candidateEvent);
+        this.persistence.eventMetadata.put({
+          event_id: eventId,
+          room_pos: roomPos,
+          origin_server_ts: originServerTs,
+          depth: committedEvent.depth,
+          archive_object_key_or_segment_id: null,
+          archive_offset_or_index: null,
+          event_type: eventType,
+          state_key_or_null: stateKey,
+          sender_user_id: sender,
+          contains_url_flag: /(?:https?:\/\/|mxc:\/\/)/.test(JSON.stringify(candidateEvent.content)),
+          soft_failed_flag: false,
+          waiting_missing_flag: false,
+          redacts_event_id_or_null: committedEvent.redacts ?? null,
+          membership_target_user_id_or_null: eventType === 'm.room.member' ? stateKey : null,
+          history_visibility_class: 'shared',
+          membership_visibility_class: eventType === 'm.room.member'
+            ? mapMembershipVisibilityClass(candidateEvent.content.membership)
+            : (sender ? 'joined' : null),
+          relates_to_event_id_or_null: relationInfo.relates_to_event_id_or_null,
+          relation_type_or_null: relationInfo.relation_type_or_null,
+          aggregation_event_type_or_null: relationInfo.aggregation_event_type_or_null,
+          thread_root_event_id_or_null: relationInfo.thread_root_event_id_or_null,
+          record_json: {
+            room_version: roomVersion,
+            request_kind: requestKind,
+            snapshot_id: snapshotId,
+            ...(profileRefresh == null ? {} : {
+              propagation_kind: 'profile_refresh',
+              profile_version: profileRefresh.profileVersion,
+            }),
+            local_fanout_deltas: cloneJson(fanoutDeltas),
+          },
+        });
+        this.persistence.hotEventJson.put({
+          event_id: eventId,
+          content_hash: canonicalJsonHash(committedEvent),
+          stored_at: now,
+          canonical_json: JSON.stringify(committedEvent),
+          record_json: {
+            room_version: roomVersion,
+          },
+        });
+
+        for (const delta of fanoutDeltas) {
+          this.persistence.fanoutOutbox.put({
+            room_pos: roomPos,
+            user_id: delta.user_id,
+            event_id: eventId,
+            status: 'pending',
+            last_attempt_at: null,
+            attempt_count: 0,
+            acked_stream_pos: null,
+            acked_at: null,
+            delta_json: cloneJson(delta),
+            last_error_json: null,
+            created_at: now,
+            record_json: profileRefresh == null ? {} : {
+              propagation_kind: 'profile_refresh',
+              profile_version: profileRefresh.profileVersion,
+              profile_owner_user_id: stateKey,
+            },
+          });
+        }
+
+        if (clientDedupeKey) {
+          this.persistence.clientTxnDedupe.put({
+            txn_dedupe_key: `${clientDedupeKey.user_id}|${clientDedupeKey.device_id}|${clientDedupeKey.room_id}|${clientDedupeKey.route_template}|${clientDedupeKey.txn_id_or_request_hash}`,
+            user_id: clientDedupeKey.user_id,
+            device_id: clientDedupeKey.device_id,
+            room_id: clientDedupeKey.room_id,
+            route_template: clientDedupeKey.route_template,
+            txn_id_or_request_hash: clientDedupeKey.txn_id_or_request_hash,
+            request_fingerprint: requestFingerprint,
+            terminal_state: 'succeeded',
+            result_event_id: eventId,
+            error_json: null,
+            created_at: now,
+            updated_at: now,
+            record_json: {},
+          });
+        }
+      });
+
+      if (fanoutDeltas.length > 0) {
+        await this.deliverPendingFanout({
+          limit: fanoutDeltas.length,
+          now,
+        });
+      }
+      return createSuccessResult({
+        decision: 'accepted',
+        event_id: eventId,
+        room_pos: roomPos,
+        snapshot_id: snapshotId,
+      });
+    } catch (error) {
+      if (request?.candidate_event?.unsigned?.client_context && request?.request_fingerprint) {
+        try {
+          const clientContext = request.candidate_event.unsigned.client_context;
+          const roomId = request.room_id ?? request.candidate_event.room_id ?? this.persistence.getRuntimeState()?.room_id
+            ?? deriveCreateRoomIdentity({
+              creator_user_id: request.candidate_event.sender,
+              room_version: request?.room_version ?? request.candidate_event.content?.room_version ?? DEFAULT_ROOM_VERSION,
+              request_fingerprint: request.request_fingerprint,
+              server_name: this.env.MATRIX_SERVER_NAME,
+            }).room_id;
+          this.persistence.clientTxnDedupe.put({
+            txn_dedupe_key: `${clientContext.user_id}|${clientContext.device_id}|${roomId}|${clientContext.route_template}|${clientContext.txn_id_or_request_hash ?? request.request_fingerprint}`,
+            user_id: clientContext.user_id,
+            device_id: clientContext.device_id,
+            room_id: roomId,
+            route_template: clientContext.route_template,
+            txn_id_or_request_hash: clientContext.txn_id_or_request_hash ?? request.request_fingerprint,
+            request_fingerprint: request.request_fingerprint,
+            terminal_state: 'failed',
+            result_event_id: null,
+            error_json: error,
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+            record_json: {},
+          });
+        } catch {
+          // Ignore dedupe persistence failures for rejected requests.
+        }
+      }
+      return {
+        ok: false,
+        error: error?.matrix_error ? error.matrix_error : error,
+      };
+    }
   }
 
   reserveRoomPosWithinTransaction(sql, {
@@ -3074,6 +4309,68 @@ export class RoomDO extends BaseDurableObject {
       normalizeString(updatedAt, 'updatedAt'),
     );
     return nextRoomPos;
+  }
+
+  isLocalUserId(userId) {
+    return typeof userId === 'string' && userId.endsWith(`:${this.env.MATRIX_SERVER_NAME}`);
+  }
+
+  buildCommittedFanoutDeltas({
+    committedEvent,
+    roomPos,
+    snapshotId,
+  }) {
+    const roomId = this.persistence.getRuntimeState()?.room_id ?? committedEvent.room_id ?? null;
+    const stateKey = stateKeyForEvent(committedEvent);
+    const summary = buildRoomSyncSummary(this.persistence);
+    const currentSnapshotEventIds = snapshotId
+      ? this.persistence.stateEntries.list()
+        .filter((row) => row.snapshot_id === snapshotId)
+        .map((row) => row.event_id)
+      : [];
+    const deltas = [];
+    for (const membership of this.persistence.membershipProjection.list()) {
+      if (!this.isLocalUserId(membership.user_id)) {
+        continue;
+      }
+      let membershipBucket;
+      try {
+        membershipBucket = normalizeRoomMembershipBucket(membership.membership, { allowNull: false });
+      } catch {
+        continue;
+      }
+      if (membershipBucket === 'forgotten') {
+        continue;
+      }
+      const delta = {
+        room_id: roomId,
+        room_pos: roomPos,
+        user_id: membership.user_id,
+        membership_bucket: membershipBucket,
+        event_id: committedEvent.event_id,
+        timeline_event_ids: [],
+        state_event_ids: [],
+        limited: false,
+        prev_batch: roomPos > 1 ? encodeRoomCursor(roomPos - 1) : null,
+        notification_count: 0,
+        highlight_count: 0,
+        summary,
+      };
+      if (membershipBucket === 'join' || membershipBucket === 'leave') {
+        delta.timeline_event_ids.push(committedEvent.event_id);
+      }
+      if (stateKey != null) {
+        delta.state_event_ids.push(committedEvent.event_id);
+      }
+      if (committedEvent.type === 'm.room.member'
+        && membership.user_id === stateKey
+        && ['invite', 'knock'].includes(membershipBucket)) {
+        delta.timeline_event_ids = [];
+        delta.state_event_ids = [...new Set(currentSnapshotEventIds)];
+      }
+      deltas.push(delta);
+    }
+    return deltas;
   }
 
   loadRoomEventById(eventId) {
@@ -3112,13 +4409,15 @@ export class RoomDO extends BaseDurableObject {
   buildStateSnapshotEventsForUser(userId, {
     lazyLoadMembers = false,
     timelineEvents = [],
+    snapshotId = null,
   } = {}) {
     const runtimeState = this.persistence.getRuntimeState();
-    if (!runtimeState?.current_snapshot_id) {
+    const resolvedSnapshotId = snapshotId ?? runtimeState?.current_snapshot_id ?? null;
+    if (!resolvedSnapshotId) {
       return [];
     }
     const allStateEntries = this.persistence.stateEntries.list()
-      .filter((row) => row.snapshot_id === runtimeState.current_snapshot_id);
+      .filter((row) => row.snapshot_id === resolvedSnapshotId);
     if (!lazyLoadMembers) {
       return allStateEntries.map((row) => this.loadRoomEventById(row.event_id).event);
     }
@@ -3136,13 +4435,32 @@ export class RoomDO extends BaseDurableObject {
       .map((row) => this.loadRoomEventById(row.event_id).event);
   }
 
+  resolveSnapshotIdForRoomPos(roomPos) {
+    const normalizedRoomPos = normalizeInteger(roomPos, 'roomPos', { min: 1 });
+    const candidate = this.persistence.stateSnapshots.list()
+      .map((snapshot) => ({
+        snapshot_id: snapshot.snapshot_id,
+        room_pos: parseSnapshotRoomPos(snapshot),
+      }))
+      .filter((snapshot) => Number.isInteger(snapshot.room_pos) && snapshot.room_pos <= normalizedRoomPos)
+      .sort((left, right) => right.room_pos - left.room_pos || right.snapshot_id.localeCompare(left.snapshot_id))
+      .at(0);
+    return candidate?.snapshot_id ?? null;
+  }
+
   async deliverPendingFanout() {
     await this.ensureCurrentness();
     await this.ensureSchema();
     const [request = {}] = arguments;
     const limit = normalizeInteger(request?.limit ?? 100, 'request.limit', { min: 1 });
     const now = request?.now ?? new Date().toISOString();
-    const pendingItems = this.persistence.listPendingFanoutOutbox(limit);
+    const targetUserId = request?.target_user_id == null
+      ? null
+      : normalizeString(request.target_user_id, 'request.target_user_id');
+    const pendingItems = this.persistence
+      .listPendingFanoutOutbox(targetUserId == null ? limit : 10_000)
+      .filter((item) => targetUserId == null || item.user_id === targetUserId)
+      .slice(0, limit);
     const results = [];
     for (const item of pendingItems) {
       if (isStaleProfileRefreshOutboxItem(this.persistence, item)) {
@@ -3164,6 +4482,11 @@ export class RoomDO extends BaseDurableObject {
         room_id: item.delta?.room_id ?? this.persistence.getRuntimeState()?.room_id,
         room_pos: item.delta?.room_pos ?? item.room_pos,
         user_id: item.delta?.user_id ?? item.user_id,
+        origin_server_ts: Number.isInteger(item.delta?.origin_server_ts)
+          ? item.delta.origin_server_ts
+          : (item.event_id != null
+            ? this.persistence.eventMetadata.get({ event_id: item.event_id })?.origin_server_ts ?? null
+            : null),
       };
       try {
         const userDo = getUserDoStub(this.env, item.user_id);
@@ -3214,6 +4537,327 @@ export class RoomDO extends BaseDurableObject {
     });
   }
 
+  async reconcileFanout() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const [request = {}] = arguments;
+    const now = request?.now ?? new Date().toISOString();
+    const limit = normalizeInteger(request?.limit ?? 100, 'request.limit', { min: 1 });
+    const targetUserId = request?.target_user_id == null
+      ? null
+      : normalizeString(request.target_user_id, 'request.target_user_id');
+    const dryRun = request?.dry_run === true;
+    const results = [];
+    const pendingBatchLimit = dryRun ? 1_000_000 : (targetUserId == null ? limit : 10_000);
+    const pendingOutboxItems = this.persistence
+      .listPendingFanoutOutbox(pendingBatchLimit)
+      .filter((item) => targetUserId == null || item.user_id === targetUserId)
+      .slice(0, limit);
+    for (const item of pendingOutboxItems) {
+      const userDo = getUserDoStub(this.env, item.user_id);
+      const inspected = await userDo.inspectRoomFanout({
+        room_id: item.delta?.room_id ?? this.persistence.getRuntimeState()?.room_id,
+        room_pos: item.room_pos,
+        user_id: item.user_id,
+      });
+      if (inspected?.ok && inspected.entry) {
+        if (!dryRun) {
+          this.persistence.acknowledgeFanoutOutbox({
+            room_pos: item.room_pos,
+            user_id: item.user_id,
+            acked_stream_pos: inspected.entry.stream_pos,
+            acked_at: now,
+          });
+        }
+        results.push({
+          room_pos: item.room_pos,
+          user_id: item.user_id,
+          status: dryRun ? 'would_ack_existing' : 'acked_existing',
+        });
+      }
+    }
+
+    for (const metadata of this.persistence.eventMetadata.list()) {
+      const fanoutDeltas = Array.isArray(metadata.record?.local_fanout_deltas)
+        ? metadata.record.local_fanout_deltas
+        : [];
+      for (const delta of fanoutDeltas) {
+        if (!this.isLocalUserId(delta?.user_id)) {
+          continue;
+        }
+        if (targetUserId != null && delta.user_id !== targetUserId) {
+          continue;
+        }
+        const existingOutbox = this.persistence.fanoutOutbox.get({
+          room_pos: metadata.room_pos,
+          user_id: delta.user_id,
+        });
+        const userDo = getUserDoStub(this.env, delta.user_id);
+        const inspected = await userDo.inspectRoomFanout({
+          room_id: delta.room_id,
+          room_pos: metadata.room_pos,
+          user_id: delta.user_id,
+        });
+        if (existingOutbox && inspected?.ok && inspected.entry) {
+          if (!dryRun) {
+            this.persistence.acknowledgeFanoutOutbox({
+              room_pos: metadata.room_pos,
+              user_id: delta.user_id,
+              acked_stream_pos: inspected.entry.stream_pos,
+              acked_at: now,
+            });
+          }
+          continue;
+        }
+        if (!existingOutbox && (!inspected?.ok || !inspected.entry)) {
+          if (!dryRun) {
+            this.persistence.fanoutOutbox.put({
+              room_pos: metadata.room_pos,
+              user_id: delta.user_id,
+              event_id: metadata.event_id,
+              status: 'repaired',
+              last_attempt_at: null,
+              attempt_count: 0,
+              acked_stream_pos: null,
+              acked_at: null,
+              delta_json: cloneJson(delta),
+              last_error_json: null,
+              created_at: now,
+              record_json: {
+                repair_generated: true,
+              },
+            });
+          }
+          results.push({
+            room_pos: metadata.room_pos,
+            user_id: delta.user_id,
+            status: dryRun ? 'would_recreate_outbox' : 'recreated_outbox',
+          });
+        }
+      }
+    }
+
+    if (dryRun) {
+      return createSuccessResult({
+        results,
+        has_more: false,
+      });
+    }
+
+    const delivery = await this.deliverPendingFanout({
+      limit,
+      now,
+      target_user_id: targetUserId,
+    });
+    const hasMore = this.persistence
+      .listPendingFanoutOutbox(targetUserId == null ? 10_000 : 1_000_000)
+      .some((item) => targetUserId == null || item.user_id === targetUserId);
+    return createSuccessResult({
+      results: [
+        ...results,
+        ...(delivery.results ?? []),
+      ],
+      has_more: hasMore,
+    });
+  }
+
+  async emitEphemeralToJoinedMembers(ephemeralEvent, {
+    now = new Date().toISOString(),
+    dedupeSeed = null,
+  } = {}) {
+    const roomId = this.persistence.getRuntimeState()?.room_id;
+    const joinedMemberships = this.persistence.membershipProjection.list()
+      .filter((row) => row.membership === 'join' && this.isLocalUserId(row.user_id));
+    const results = [];
+    for (const membership of joinedMemberships) {
+      try {
+        const userDo = getUserDoStub(this.env, membership.user_id);
+        const appendResult = await userDo.appendRoomEphemeral({
+          room_id: roomId,
+          user_id: membership.user_id,
+          event: ephemeralEvent,
+          now,
+          dedupe_key: canonicalJsonHash({
+            room_id: roomId,
+            user_id: membership.user_id,
+            event: ephemeralEvent,
+            dedupe_seed: dedupeSeed,
+          }),
+        });
+        results.push({
+          user_id: membership.user_id,
+          ok: appendResult?.ok === true,
+        });
+      } catch (error) {
+        results.push({
+          user_id: membership.user_id,
+          ok: false,
+          error: error?.message ?? 'ephemeral delivery failed',
+        });
+      }
+    }
+    return results;
+  }
+
+  getTypingAlarmStorage() {
+    const storage = this.ctx?.storage;
+    if (!storage || typeof storage.setAlarm !== 'function' || typeof storage.deleteAlarm !== 'function') {
+      return null;
+    }
+    return storage;
+  }
+
+  getNextTypingExpiryMillis(now = new Date().toISOString()) {
+    const nowMillis = Date.parse(now);
+    const nextExpiry = this.persistence.typing.list()
+      .filter((row) => Date.parse(row.expires_at) > nowMillis)
+      .reduce((earliest, row) => {
+        const expiry = Date.parse(row.expires_at);
+        return Number.isFinite(expiry) && expiry < earliest ? expiry : earliest;
+      }, Number.POSITIVE_INFINITY);
+    return Number.isFinite(nextExpiry) ? nextExpiry : null;
+  }
+
+  async syncTypingAlarm(now = new Date().toISOString()) {
+    const storage = this.getTypingAlarmStorage();
+    if (!storage) {
+      return null;
+    }
+    const nextExpiry = this.getNextTypingExpiryMillis(now);
+    if (nextExpiry == null) {
+      await storage.deleteAlarm();
+      return null;
+    }
+    await storage.setAlarm(nextExpiry);
+    return nextExpiry;
+  }
+
+  async setTyping() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const [request = {}] = arguments;
+    const userId = normalizeString(request?.user_id, 'request.user_id');
+    const membership = this.persistence.membershipProjection.get({ user_id: userId });
+    if (!membership || membership.membership !== 'join') {
+      return {
+        ok: false,
+        error: createRoomInternalError('room_forbidden', 'Typing is only allowed for joined users'),
+      };
+    }
+    const now = request?.now ?? new Date().toISOString();
+    if (request?.typing === true) {
+      const timeoutMs = normalizeInteger(request?.timeout_ms ?? 30_000, 'request.timeout_ms', { min: 1 });
+      this.persistence.typing.put({
+        user_id: userId,
+        typing: true,
+        expires_at: new Date(Date.parse(now) + timeoutMs).toISOString(),
+        updated_at: now,
+        record_json: {},
+      });
+    } else {
+      this.persistence.typing.delete({ user_id: userId });
+    }
+    await this.syncTypingAlarm(now);
+    const currentTyping = this.persistence.typing.list()
+      .filter((row) => Date.parse(row.expires_at) > Date.parse(now));
+    await this.emitEphemeralToJoinedMembers(
+      buildTypingEphemeralEvent(this.persistence.getRuntimeState()?.room_id, currentTyping),
+      {
+        now,
+        dedupeSeed: `typing|${userId}|${now}`,
+      },
+    );
+    return createSuccessResult({
+      response: {},
+    });
+  }
+
+  async applyReceipt() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const [request = {}] = arguments;
+    const userId = normalizeString(request?.user_id, 'request.user_id');
+    const membership = this.persistence.membershipProjection.get({ user_id: userId });
+    if (!membership || membership.membership !== 'join') {
+      return {
+        ok: false,
+        error: createRoomInternalError('room_forbidden', 'Receipts are only allowed for joined users'),
+      };
+    }
+    const eventId = normalizeString(request?.event_id, 'request.event_id');
+    const metadata = this.persistence.eventMetadata.get({ event_id: eventId });
+    if (!metadata) {
+      return {
+        ok: false,
+        error: createRoomInternalError('event_not_found', `Event ${eventId} does not exist`),
+      };
+    }
+    const now = request?.now ?? new Date().toISOString();
+    const receiptType = normalizeString(request?.receipt_type, 'request.receipt_type');
+    const threadId = typeof request?.thread_id === 'string' ? request.thread_id : '';
+    this.persistence.receipts.put({
+      receipt_type: receiptType,
+      user_id: userId,
+      thread_id: threadId,
+      event_id: eventId,
+      room_pos: metadata.room_pos,
+      receipt_ts: Number.isInteger(request?.receipt_ts) ? request.receipt_ts : Date.now(),
+      updated_at: now,
+      record_json: {},
+    });
+    const receiptRow = this.persistence.receipts.get({
+      receipt_type: receiptType,
+      user_id: userId,
+      thread_id: threadId,
+    });
+    await this.emitEphemeralToJoinedMembers(
+      buildReceiptEphemeralEvent(this.persistence.getRuntimeState()?.room_id, receiptRow),
+      {
+        now,
+        dedupeSeed: `receipt|${receiptType}|${eventId}|${userId}|${threadId}|${now}`,
+      },
+    );
+    return createSuccessResult({
+      response: {},
+    });
+  }
+
+  async expireTypingAlarm() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const [request = {}] = arguments;
+    const now = request?.now ?? new Date().toISOString();
+    const expiredUsers = [];
+    for (const row of this.persistence.typing.list()) {
+      if (Date.parse(row.expires_at) <= Date.parse(now)) {
+        this.persistence.typing.delete({ user_id: row.user_id });
+        expiredUsers.push(row.user_id);
+      }
+    }
+    if (expiredUsers.length > 0) {
+      await this.emitEphemeralToJoinedMembers(
+        buildTypingEphemeralEvent(this.persistence.getRuntimeState()?.room_id, this.persistence.typing.list()),
+        {
+          now,
+          dedupeSeed: `typing-expire|${expiredUsers.join(',')}|${now}`,
+        },
+      );
+    }
+    await this.syncTypingAlarm(now);
+    return createSuccessResult({
+      expired_user_ids: expiredUsers,
+    });
+  }
+
+  async markForgotten() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    return createSuccessResult({
+      updated: false,
+      visibility_only: true,
+    });
+  }
+
   async enqueueProfileRefresh() {
     await this.ensureCurrentness();
     await this.ensureSchema();
@@ -3236,142 +4880,120 @@ export class RoomDO extends BaseDurableObject {
         reason: 'stale_profile_version',
       });
     }
-
-    const eventId = buildProfileRefreshEventId(roomId, userId, profileVersion);
-    const existingEvent = this.persistence.eventMetadata.get({ event_id: eventId });
-    let roomPos = existingEvent?.room_pos ?? null;
-    const sql = this.requireSqlStorage();
-    withSqliteTransaction(sql, () => {
-      if (runtimeState?.room_id == null) {
-        sql.exec(
-          `
-            UPDATE room_runtime_state
-            SET room_id = ?,
-                room_version = COALESCE(room_version, ?),
-                updated_at = ?
-            WHERE singleton = 1
-          `,
-          roomId,
-          request?.room_version ?? '12',
-          now,
-        );
-      }
-      if (roomPos == null) {
-        roomPos = this.reserveRoomPosWithinTransaction(sql, {
-          roomId,
-          roomVersion: request?.room_version ?? runtimeState?.room_version ?? '12',
-          updatedAt: now,
-        });
-      }
-      const memberEvent = buildRoomMemberRefreshEvent({
-        roomId,
-        userId,
-        eventId,
-        roomPos,
-        displayname: request?.displayname ?? null,
-        avatarUrl: request?.avatar_url ?? null,
-        profileVersion,
-        updatedAt: now,
-      });
-      this.persistence.eventMetadata.put({
-        event_id: eventId,
-        room_pos: roomPos,
-        origin_server_ts: memberEvent.origin_server_ts,
-        depth: roomPos,
-        archive_object_key_or_segment_id: null,
-        archive_offset_or_index: null,
-        event_type: 'm.room.member',
-        state_key_or_null: userId,
-        sender_user_id: userId,
-        contains_url_flag: false,
-        soft_failed_flag: false,
-        waiting_missing_flag: false,
-        redacts_event_id_or_null: null,
-        membership_target_user_id_or_null: userId,
-        history_visibility_class: 'shared',
-        membership_visibility_class: 'joined',
-        relates_to_event_id_or_null: null,
-        relation_type_or_null: null,
-        aggregation_event_type_or_null: null,
-        thread_root_event_id_or_null: null,
-        record_json: {
-          profile_version: profileVersion,
-          propagation_kind: 'profile_refresh',
-        },
-      });
-      this.persistence.hotEventJson.put({
-        event_id: eventId,
-        content_hash: null,
-        stored_at: now,
-        canonical_json: JSON.stringify(memberEvent),
-        record_json: {
-          profile_version: profileVersion,
-        },
-      });
-      if (runtimeState?.current_snapshot_id) {
-        this.persistence.stateEntries.put({
-          snapshot_id: runtimeState.current_snapshot_id,
-          event_type: 'm.room.member',
-          state_key: userId,
-          event_id: eventId,
-          sender_user_id: userId,
-          membership: 'join',
-          event_room_pos: roomPos,
-          content_json: structuredClone(memberEvent.content),
-          record_json: {
-            profile_version: profileVersion,
-          },
-        });
-      }
-      this.persistence.membershipProjection.put({
+    const result = await this.admitEvent({
+      request_kind: 'client',
+      room_id: roomId,
+      room_version: request?.room_version ?? runtimeState?.room_version ?? DEFAULT_ROOM_VERSION,
+      request_fingerprint: canonicalJsonHash({
+        kind: 'profile_refresh',
+        room_id: roomId,
         user_id: userId,
-        membership: 'join',
-        event_id: eventId,
-        room_pos: roomPos,
+        profile_version: profileVersion,
         displayname: request?.displayname ?? null,
         avatar_url: request?.avatar_url ?? null,
-        profile_version: profileVersion,
-        membership_visibility_class: membership.membership_visibility_class ?? 'joined',
-        updated_at: now,
-        record_json: {
-          ...(membership.record ?? {}),
-          propagation_kind: 'profile_refresh',
-        },
-      });
-      this.persistence.fanoutOutbox.put({
-        room_pos: roomPos,
-        user_id: userId,
-        event_id: eventId,
-        status: 'pending',
-        last_attempt_at: null,
-        attempt_count: 0,
-        acked_stream_pos: null,
-        acked_at: null,
-        delta_json: {
-          room_id: roomId,
-          room_pos: roomPos,
-          user_id: userId,
-          membership_bucket: 'join',
-          event_id: eventId,
-          state_event_ids: [eventId],
-        },
-        last_error_json: null,
-        created_at: now,
-        record_json: {
-          profile_version: profileVersion,
-          propagation_kind: 'profile_refresh',
-        },
-      });
-    });
-    await this.deliverPendingFanout({
-      limit: 1,
+      }),
       now,
+      candidate_event: {
+        type: 'm.room.member',
+        sender: userId,
+        state_key: userId,
+        content: {
+          membership: 'join',
+          ...(request?.displayname == null ? {} : { displayname: request.displayname }),
+          ...(request?.avatar_url == null ? {} : { avatar_url: request.avatar_url }),
+        },
+        unsigned: {
+          public: {
+            profile_version: profileVersion,
+            propagation_kind: 'profile_refresh',
+          },
+        },
+      },
     });
+    if (!result?.ok) {
+      return result;
+    }
     return createSuccessResult({
       delivered: true,
-      event_id: eventId,
-      room_pos: roomPos,
+      event_id: result.event_id ?? buildProfileRefreshEventId(roomId, userId, profileVersion),
+      room_pos: result.room_pos ?? null,
     });
+  }
+
+  assertRoomReadableBy(userId) {
+    const membership = this.persistence.membershipProjection.get({ user_id: userId });
+    if (!membership) {
+      throw createRoomInternalError('room_forbidden', 'The user cannot read this room');
+    }
+    if (membership.membership === 'forgotten') {
+      throw createRoomInternalError('room_forbidden', 'Forgotten rooms are no longer readable');
+    }
+    if (!isReadableRoomMembership(membership.membership)) {
+      throw createRoomInternalError('room_forbidden', 'The user cannot read this room');
+    }
+    return membership;
+  }
+
+  listVisibleTimelineMetadata() {
+    return this.persistence.eventMetadata.list()
+      .filter((row) => row.soft_failed_flag !== true && row.waiting_missing_flag !== true)
+      .sort((left, right) => left.room_pos - right.room_pos || left.event_id.localeCompare(right.event_id));
+  }
+
+  readTimelineChunk({ from = null, dir = 'b', limit = 10 }) {
+    const visible = this.listVisibleTimelineMetadata();
+    const normalizedLimit = normalizeInteger(limit, 'limit', { min: 1 });
+    if (dir === 'f') {
+      const startPos = from == null ? 0 : decodeRoomCursor(from);
+      const rows = visible
+        .filter((row) => row.room_pos > startPos)
+        .slice(0, normalizedLimit);
+      return {
+        chunk: rows.map((row) => this.loadRoomEventById(row.event_id).event),
+        start: encodeRoomCursor(startPos),
+        end: rows.length > 0 ? encodeRoomCursor(rows.at(-1).room_pos) : encodeRoomCursor(startPos),
+      };
+    }
+    const startPos = from == null
+      ? ((visible.at(-1)?.room_pos ?? 0) + 1)
+      : decodeRoomCursor(from);
+    const rows = visible
+      .filter((row) => row.room_pos < startPos)
+      .toReversed()
+      .slice(0, normalizedLimit);
+    return {
+      chunk: rows.map((row) => this.loadRoomEventById(row.event_id).event),
+      start: encodeRoomCursor(startPos),
+      end: rows.length > 0 ? encodeRoomCursor(rows.at(-1).room_pos) : encodeRoomCursor(startPos),
+    };
+  }
+
+  readContextWindow(eventId, requesterUserId, limit = 10) {
+    const targetMetadata = this.persistence.eventMetadata.get({ event_id: eventId });
+    if (!targetMetadata) {
+      throw createRoomInternalError('event_not_found', `Event ${eventId} does not exist`);
+    }
+    const snapshotId = typeof targetMetadata.record?.snapshot_id === 'string' && targetMetadata.record.snapshot_id.length > 0
+      ? targetMetadata.record.snapshot_id
+      : this.resolveSnapshotIdForRoomPos(targetMetadata.room_pos);
+    const visible = this.listVisibleTimelineMetadata();
+    const normalizedLimit = normalizeInteger(limit, 'limit', { min: 1 });
+    const beforeRows = visible
+      .filter((row) => row.room_pos < targetMetadata.room_pos)
+      .slice(-normalizedLimit);
+    const afterRows = visible
+      .filter((row) => row.room_pos > targetMetadata.room_pos)
+      .slice(0, normalizedLimit);
+    return {
+      event: this.loadRoomEventById(eventId).event,
+      events_before: beforeRows.map((row) => this.loadRoomEventById(row.event_id).event),
+      events_after: afterRows.map((row) => this.loadRoomEventById(row.event_id).event),
+      state: this.buildStateSnapshotEventsForUser(requesterUserId, {
+        snapshotId,
+      }),
+      start: beforeRows.length > 0 ? encodeRoomCursor(beforeRows[0].room_pos) : encodeRoomCursor(targetMetadata.room_pos),
+      end: afterRows.length > 0 ? encodeRoomCursor(afterRows.at(-1).room_pos) : encodeRoomCursor(targetMetadata.room_pos),
+    };
   }
 
   async projectForSync() {
@@ -3462,8 +5084,174 @@ export class RoomDO extends BaseDurableObject {
   async queryRoom() {
     await this.ensureCurrentness();
     await this.ensureSchema();
-    return this.createNotImplementedEnvelope('queryRoom', {
-      schema_version: RoomDO.schemaVersion,
+    try {
+      const [request = {}] = arguments;
+      const kind = normalizeRoomReadKind(request?.kind);
+      const roomId = normalizeString(request?.room_id ?? this.persistence.getRuntimeState()?.room_id, 'request.room_id');
+      const requesterUserId = normalizeString(request?.requester_user_id, 'request.requester_user_id');
+      this.assertRoomReadableBy(requesterUserId);
+      if (this.persistence.getRuntimeState()?.room_id && this.persistence.getRuntimeState().room_id !== roomId) {
+        throw createRoomInternalError('room_not_found', `Room ${roomId} does not exist`);
+      }
+
+      if (kind === 'timeline') {
+        const result = this.readTimelineChunk({
+          from: request?.cursor?.from ?? null,
+          dir: request?.cursor?.dir === 'f' ? 'f' : 'b',
+          limit: request?.limit ?? 10,
+        });
+        return createSuccessResult({
+          kind,
+          room_id: roomId,
+          ...result,
+        });
+      }
+
+      if (kind === 'context') {
+        const result = this.readContextWindow(
+          normalizeString(request?.event_id, 'request.event_id'),
+          requesterUserId,
+          request?.limit ?? 10,
+        );
+        return createSuccessResult({
+          kind,
+          room_id: roomId,
+          ...result,
+        });
+      }
+
+      if (kind === 'event') {
+        return createSuccessResult({
+          kind,
+          room_id: roomId,
+          event: this.loadRoomEventById(normalizeString(request?.event_id, 'request.event_id')).event,
+        });
+      }
+
+      if (kind === 'state') {
+        const eventType = typeof request?.cursor?.event_type === 'string' ? request.cursor.event_type : null;
+        const stateKey = typeof request?.cursor?.state_key === 'string' ? request.cursor.state_key : '';
+        if (eventType) {
+          const stateEntry = getTypedStateEvent(this.getCurrentStateMap(), eventType, stateKey);
+          if (!stateEntry) {
+            throw createRoomInternalError('event_not_found', `State event ${eventType}/${stateKey} does not exist`);
+          }
+          return createSuccessResult({
+            kind,
+            room_id: roomId,
+            event: this.loadRoomEventById(stateEntry.event_id).event,
+          });
+        }
+        return createSuccessResult({
+          kind,
+          room_id: roomId,
+          state: this.buildStateSnapshotEventsForUser(requesterUserId, {}),
+        });
+      }
+
+      if (kind === 'members') {
+        const stateEvents = this.buildStateSnapshotEventsForUser(requesterUserId, {});
+        return createSuccessResult({
+          kind,
+          room_id: roomId,
+          chunk: stateEvents.filter((event) => event.type === 'm.room.member'),
+        });
+      }
+
+      if (kind === 'joined_members') {
+        const joined = {};
+        for (const membership of this.persistence.membershipProjection.list().filter((row) => row.membership === 'join')) {
+          joined[membership.user_id] = {
+            avatar_url: membership.avatar_url ?? undefined,
+            display_name: membership.displayname ?? undefined,
+          };
+        }
+        return createSuccessResult({
+          kind,
+          room_id: roomId,
+          joined,
+        });
+      }
+
+      if (kind === 'relations') {
+        const eventId = normalizeString(request?.event_id, 'request.event_id');
+        const relType = typeof request?.cursor?.rel_type === 'string' ? request.cursor.rel_type : null;
+        const eventType = typeof request?.cursor?.event_type === 'string' ? request.cursor.event_type : null;
+        const rows = this.persistence.eventMetadata.list()
+          .filter((row) => row.relates_to_event_id_or_null === eventId)
+          .filter((row) => relType == null || row.relation_type_or_null === relType)
+          .filter((row) => eventType == null || row.event_type === eventType)
+          .sort((left, right) => right.room_pos - left.room_pos)
+          .slice(0, normalizeInteger(request?.limit ?? 10, 'limit', { min: 1 }));
+        return createSuccessResult({
+          kind,
+          room_id: roomId,
+          chunk: rows.map((row) => this.loadRoomEventById(row.event_id).event),
+          start: rows.length > 0 ? encodeRoomCursor(rows[0].room_pos) : null,
+          end: rows.length > 0 ? encodeRoomCursor(rows.at(-1).room_pos) : null,
+        });
+      }
+
+      if (kind === 'threads') {
+        const rootIds = [...new Set(
+          this.persistence.eventMetadata.list()
+            .map((row) => row.thread_root_event_id_or_null)
+            .filter((value) => typeof value === 'string' && value.length > 0),
+        )];
+        const rows = rootIds
+          .map((eventId) => this.persistence.eventMetadata.get({ event_id: eventId }))
+          .filter(Boolean)
+          .sort((left, right) => right.room_pos - left.room_pos)
+          .slice(0, normalizeInteger(request?.limit ?? 10, 'limit', { min: 1 }));
+        return createSuccessResult({
+          kind,
+          room_id: roomId,
+          chunk: rows.map((row) => this.loadRoomEventById(row.event_id).event),
+          start: rows.length > 0 ? encodeRoomCursor(rows[0].room_pos) : null,
+          end: rows.length > 0 ? encodeRoomCursor(rows.at(-1).room_pos) : null,
+        });
+      }
+
+      if (kind === 'timestamp_lookup') {
+        const timestamp = normalizeInteger(request?.timestamp, 'request.timestamp', { min: 0 });
+        const direction = request?.cursor?.dir === 'f' ? 'f' : 'b';
+        const visible = this.listVisibleTimelineMetadata();
+        const match = direction === 'f'
+          ? visible.find((row) => row.origin_server_ts >= timestamp)
+          : [...visible].reverse().find((row) => row.origin_server_ts <= timestamp);
+        if (!match) {
+          throw createRoomInternalError('event_not_found', 'No visible event matches the timestamp lookup');
+        }
+        return createSuccessResult({
+          kind,
+          room_id: roomId,
+          event: this.loadRoomEventById(match.event_id).event,
+        });
+      }
+
+      throw createRoomInternalError('invalid_event', `Unsupported room query kind: ${kind}`);
+    } catch (error) {
+      if (error instanceof TypeError || error instanceof RangeError) {
+        return {
+          ok: false,
+          error: createRoomInternalError('invalid_cursor', error.message),
+        };
+      }
+      return {
+        ok: false,
+        error,
+      };
+    }
+  }
+
+  async alarm(alarmInfo = {}) {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const scheduledTime = Number.isFinite(alarmInfo?.scheduledTime)
+      ? alarmInfo.scheduledTime
+      : Date.now();
+    await this.expireTypingAlarm({
+      now: new Date(scheduledTime).toISOString(),
     });
   }
 }

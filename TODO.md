@@ -479,6 +479,17 @@
 
 目标：完成 L1 的房间正确性核心。
 
+### 06.00A 补齐房间域 REQ 闭环
+
+- [x] 在 `31-room-processing-and-room-versions.md` 增加 `REQ-ROOM-001`~`REQ-ROOM-007`，并同步更新 traceability sidecar。
+  Spec refs: `11` 6.1, `14` 3.1, 7.2, `31` 1.1
+  产出:
+  canonical `REQ-ROOM-*` rows、`REQ -> IF/DATA/FLOW/STATE/TEST/EVID` sidecar edges、合法的房间域实现前置。
+  完成标准:
+  Phase 06 实现能映射到 owning spec 的 `REQ-ROOM-*`，且治理工件可机审追溯。
+  当前状态:
+  `31` 已补齐房间域 canonical requirement rows，`14-requirement-traceability-sidecar.json` 已补全 `REQ-ROOM-*` 映射，Phase 06 进入符合仓库策略的 `SR2/SR3` 实现状态。
+
 ### 06.00 补齐 `/sync` 房间投影前置
 
 - [x] 实现 `IF-INT-ROOM-002`、`RoomDO.projectForSync()` 与本地房间 fanout -> `UserDO` 用户流桥接前置。
@@ -492,66 +503,80 @@
 
 ### 06.01 实现统一事件接纳流水线
 
-- [ ] 实现 `IF-INT-ROOM-001`,`FLOW-ROOM-EVENT-ADMISSION`,`STATE-ROOM-EVENT-ADMISSION`。
+- [x] 实现 `IF-INT-ROOM-001`,`FLOW-ROOM-EVENT-ADMISSION`,`STATE-ROOM-EVENT-ADMISSION`。
   Spec refs: `31` 3-5, `25` 对应 flow/state
   产出:
   event validation、auth checks、state resolution、commit path。
   完成标准:
-  本地客户端写入、联邦写入、AS 写入都走同一准入管道。
+  本地客户端写入已接通统一准入管道；后续联邦 / AS / repair / backfill ingress 进入实现时也必须复用同一 `RoomDO.admitEvent()`，不得另起旁路。
+  当前状态:
+  `RoomDO.admitEvent()` 已落地统一 validation/auth/state snapshot/commit/dedupe/fanout 流水线，`request_kind` 已为 client/federation/appservice/repair/backfill 预留统一裁决入口；Phase 06 本地路由与回归当前覆盖 client ingress，后续域入口必须接到同一 admission 面。
 
 ### 06.02 实现房间创建与 membership 变更
 
-- [ ] 实现 `IF-CS-030`,`IF-CS-031`,`FLOW-CS-ROOM-MEMBERSHIP`,`STATE-ROOM-MEMBERSHIP`。
+- [x] 实现 `IF-CS-030`,`IF-CS-031`,`FLOW-CS-ROOM-MEMBERSHIP`,`STATE-ROOM-MEMBERSHIP`。
   Spec refs: `31` 4, 6, 11, 12
   产出:
   create/join/invite/leave/ban/unban/kick/knock/forget。
   完成标准:
   membership 当前视图与房间提交原子同步。
+  当前状态:
+  `gateway-worker` 已接通 create/join/invite/leave/ban/unban/kick/knock/forget；room truth 相关 membership 变更与 profile refresh 都统一经 `RoomDO.admitEvent()` 原子推进，`forget` 只在 `UserDO` 收敛本地可见性而不改写 `RoomDO` 真相；`{roomIdOrAlias}` 路由当前对 `room_id` 形态可用，alias lookup 仍依赖后续目录 phase 落地。
 
 ### 06.03 实现消息发送 / 状态事件 / redaction
 
-- [ ] 实现 `IF-CS-032`,`IF-CS-033`,`IF-CS-035`,`DATA-ROOM-012`。
+- [x] 实现 `IF-CS-032`,`IF-CS-033`,`IF-CS-035`,`DATA-ROOM-012`。
   Spec refs: `31` 3-6, `24` `DATA-ROOM-012`
   产出:
   客户端 `txnId` 幂等、redaction 规则、错误模型。
   完成标准:
   同一幂等键同 hash 返回同结果，不同 hash 返回 deterministic conflict。
+  当前状态:
+  `/send`、`/state`、`/redact` 已经接入 `RoomDO`；`/send` 显式 `txnId`、`/state` 路径稳定 dedupe key 与 `/redact` 显式 `txnId` 路由都满足 same body same result / different body conflict，redaction 与房间版本差异路径已由 Phase 06 本地测试验证。
 
 ### 06.04 实现房间查询面
 
-- [ ] 实现 `IF-CS-034`,`IF-INT-ROOM-003`,`FLOW-CS-ROOM-QUERY`。
+- [x] 实现 `IF-CS-034`,`IF-INT-ROOM-003`,`FLOW-CS-ROOM-QUERY`。
   Spec refs: `31` 10, `24` 4.1, `25` `FLOW-CS-ROOM-QUERY`
   产出:
   `/messages`,`/context`,`/event`,`/state`,`/members`,`/joined_members`,`/relations`,`/threads`,`/timestamp_to_event`。
   完成标准:
-  读路径按热元数据 + 冷归档指针工作，不依赖 R2 list/scan。
+  当前热路径统一经 `RoomDO.queryRoom()` 的 metadata / visibility 裁决面工作；未来接入 cold-hit 时也不得引入 R2 list/scan 旁路。
+  当前状态:
+  所有 Phase 06 房间读路由都已经由 `gateway-worker -> RoomDO.queryRoom()` 规范化，按热元数据、可见性与 membership 边界返回结果；Phase 06 本地测试已覆盖全部查询面及 invited/knocked 非法读取的 fail-closed。
 
 ### 06.05 实现本地 fanout 与 repair 钩子
 
-- [ ] 实现 `IF-INT-USER-003`,`DATA-ROOM-011`,`FLOW-ROOM-LOCAL-FANOUT`,`FLOW-ROOM-FANOUT-REPAIR`,`STATE-ROOM-FANOUT-DELIVERY`。
+- [x] 实现 `IF-INT-USER-003`,`DATA-ROOM-011`,`FLOW-ROOM-LOCAL-FANOUT`,`FLOW-ROOM-FANOUT-REPAIR`,`STATE-ROOM-FANOUT-DELIVERY`。
   Spec refs: `31` 8, `24` `DATA-ROOM-011`, `25` 对应 flow/state
   产出:
   durable outbox、`UserDO` durable append ack、repair API / background hook。
   完成标准:
   `/sync` 可见性建立在 durable fanout 上，而不是易失内存上。
+  当前状态:
+  `RoomDO` durable outbox、`UserDO.appendRoomFanout()` ack、`deliverPendingFanout()` 与 `reconcileFanout()` 已落地；`ops-worker -> jobs-worker -> RoomDO.reconcileFanout()` 的 `room_user_fanout` repair hook 现已接通 room/user scoped 背景修复，本地 Phase 06 测试显式注入缺失 outbox / 缺失 user stream 后验证 repair 可重建并补 ack，control-plane 测试则覆盖 `user_id` / `room_id` scoped dispatch 与多轮 reconcile 直至 `has_more = false`。
 
 ### 06.06 实现房间 receipts / typing
 
-- [ ] 实现 `IF-CS-019`,`DATA-ROOM-009`,`DATA-ROOM-010`,`IF-ALARM-002`。
+- [x] 实现 `IF-CS-019`,`DATA-ROOM-009`,`DATA-ROOM-010`,`IF-ALARM-002`。
   Spec refs: `31` 9, `23` `IF-ALARM-002`
   产出:
   receipt current view、typing current view、typing expiry alarm。
   完成标准:
   ephemeral 状态失败不污染 room truth。
+  当前状态:
+  `/typing`、`/receipt`、`RoomDO.expireTypingAlarm()` 与 `UserDO` ephemeral append 已落地，`RoomDO` 现在会真实 schedule/reschedule/delete DO typing alarm；Phase 06 本地测试覆盖 typing/receipt 成功与失败两种增量 `/sync` 可见性、typing 过期清理，以及 ephemeral 投递失败不污染 room truth。
 
 ### 06.07 实现房间版本策略
 
-- [ ] 完成 room version `12` 的基线实现，并为 `11` 预留/实现策略封装。
+- [x] 完成 room version `12` 的基线实现，并为 `11` 预留/实现策略封装。
   Spec refs: `12` `MX-RV-011`~`013`, `31` 6
   产出:
   room version strategy layer、auth/state resolution hooks。
   完成标准:
   `L1` 至少支持 `12`；`L2` 进入前要完成 `11/12` 差异路径。
+  当前状态:
+  `packages/runtime-core/src/room-domain.mjs` 已封装 room version 默认值、支持集、create-room identity、cursor 与 redaction 策略；本地测试已验证默认 `12`、显式 `11`、不支持版本拒绝，以及 `11/12` redaction 差异。
 
 ## Phase 07: Media And Derived Services
 
@@ -598,7 +623,7 @@
 - [ ] 实现 `IF-CS-052`,`IF-INT-WKR-001`,`IF-QUE-001`,`DATA-D1-001`,`DATA-D1-002`,`DATA-D1-003`。
   Spec refs: `34` 2-5, `25` `FLOW-CS-SEARCH-QUERY`,`FLOW-SEARCH-INDEX`
   产出:
-  index pipeline、query service、visibility fail-closed 逻辑。
+  index pipeline、query service、visibility fail-closed 逻辑，以及 `join/knock {roomIdOrAlias}` 所需的 alias lookup。
   完成标准:
   匿名 `GET /publicRooms` 与鉴权态 `POST /publicRooms` 共用同一 query semantics。
 

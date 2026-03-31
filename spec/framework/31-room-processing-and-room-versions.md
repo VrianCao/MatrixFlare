@@ -18,6 +18,18 @@
 * 不定义联邦外发重试正文；
 * 不定义搜索与目录正文。
 
+### 1.1 房间域规范要求
+
+| REQ-ID | Requirement | Normative Statement |
+| --- | --- | --- |
+| `REQ-ROOM-001` | Unified admission | 所有房间事件写入，包括本地客户端、Application Service、联邦恢复与 repair/backfill 重放，都必须进入 `RoomDO` 串行的统一 `IF-INT-ROOM-001 admitEvent()` 管道，并按同一 `FLOW-ROOM-EVENT-ADMISSION` / `STATE-ROOM-EVENT-ADMISSION` 裁决终态。 |
+| `REQ-ROOM-002` | Membership as events | create/join/invite/leave/ban/unban/kick/knock 以及 profile refresh 都必须表现为受房间版本规则约束的 membership 事件；提交成功后 `DATA-ROOM-007` 当前视图必须与事件真相原子同步。 |
+| `REQ-ROOM-003` | Client room-write idempotency | 客户端 create/membership/send/state/redact 写路径必须通过 `DATA-ROOM-012` 持久化幂等裁决；同一 dedupe key + 同一 request hash 必须返回同一终态，不同 hash 必须 deterministic conflict。 |
+| `REQ-ROOM-004` | Query truth via RoomDO | `/messages`、`/context`、`/event`、`/state`、`/members`、`/joined_members`、`/relations`、`/threads`、`/timestamp_to_event` 与 `/sync` 房间投影都必须以 `RoomDO` 的权威 metadata、visibility、redaction 与 membership 边界裁决为准，不得直接从 D1、KV 或 R2 绕过真相面。 |
+| `REQ-ROOM-005` | Durable local fanout | 房间提交成功后的本地用户可见变化必须先 durable 写入 `DATA-ROOM-011` outbox，再通过 `IF-INT-USER-003` 追加到 `DATA-USER-010`；若任何一侧缺失，repair 流程必须可重驱或补记，且 `/sync` 可见性不得依赖易失内存。 |
+| `REQ-ROOM-006` | Room-version strategy | 新建房间默认 room version 必须为 `12`，且必须允许显式请求 `11`；`11/12` 的 event shape、auth、redaction、room id 与 state resolution 差异都必须封装在 strategy 层，不得散落到 `RoomDO` 业务逻辑。 |
+| `REQ-ROOM-007` | Ephemeral room-state isolation | receipts / typing 只更新 `DATA-ROOM-009` / `DATA-ROOM-010` 等 ephemeral 真相，不得污染 timeline 或 current state；typing 必须通过 `IF-ALARM-002` 过期，ephemeral 写入失败也不得回滚已提交的房间事件真相。 |
+
 ## 2. `RoomDO` 责任模型
 
 `RoomDO(room_id)` 必须承担以下唯一主责：
@@ -95,7 +107,7 @@ membership 变更规则：
 
 ### 5.1 策略抽象
 
-`RoomDO` 必须通过 `RoomVersionStrategy` 暴露以下最小接口：
+`RoomDO` 必须通过集中化的 room-version strategy 模块或 helper 层暴露以下最小接口：
 
 * `validateEventShape`
 * `validateEventIdAndHash`
@@ -151,7 +163,7 @@ room version `12` 的以下差异必须封装在策略层：
 
 * 事件 ID 继续使用基于引用哈希的 URL-safe base64 形态。
 * state resolution 继续使用 room state resolution v2；任何差异都只能体现在策略层的输入校验、auth selection 与 redaction 规则上。
-* `RoomDO` 业务代码中禁止散落 `if (roomVersion === ...)` 分支。
+* room-version-specific 分支只允许收敛在 admission / auth / redaction 所使用的 strategy helper 区域；query、fanout、control-plane wiring 与其它无关路径中不得散落 `if (roomVersion === ...)` 分支。
 
 ### 6.3 老版本与未来版本
 
@@ -278,6 +290,8 @@ room version `12` 的以下差异必须封装在策略层：
 * `leave/invite/knock` 在 `/sync` 可见性上的差异
 
 forget 只影响客户端可见性，不删除房间真相。
+`/forget` 的权威落点在 `UserDO` 可见性平面；它必须收敛客户端可见 bucket，但不得改写 `RoomDO` membership 当前视图或新增 room truth event。
+client `join/knock {roomIdOrAlias}` 的 alias lookup 依赖目录派生面；在目录 phase 落地前，Phase 06 只对 `room_id` 形态闭环，alias token 必须 deterministic fail-closed。
 
 ## 12. 房间域接口归属
 

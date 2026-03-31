@@ -19,6 +19,12 @@ import {
   registerSyncWaiter,
 } from '../../../packages/runtime-core/src/client-domain.mjs';
 import {
+  DEFAULT_ROOM_VERSION,
+  deriveCreateRoomIdentity,
+  resolveRequestedRoomVersion,
+} from '../../../packages/runtime-core/src/room-domain.mjs';
+import { canonicalJsonHash } from '../../../packages/runtime-core/src/fingerprints.mjs';
+import {
   DEFAULT_UIA_CHALLENGE_TTL_MS,
   buildLocalUserId,
   extractLoginLocalpart,
@@ -250,6 +256,31 @@ function normalizePathUserId(pathValue, env) {
   }
 }
 
+function normalizePathRoomId(pathValue) {
+  const decoded = decodePathComponent(pathValue);
+  if (!decoded || !decoded.startsWith('!')) {
+    return null;
+  }
+  return decoded;
+}
+
+function isReadableRoomSyncMembershipBucket(membershipBucket) {
+  return membershipBucket === 'join' || membershipBucket === 'leave';
+}
+
+function buildRoomClientContext(access, routeTemplate, txnIdOrRequestHash) {
+  return {
+    user_id: access.session.user_id,
+    device_id: access.session.device_id,
+    route_template: routeTemplate,
+    txn_id_or_request_hash: txnIdOrRequestHash,
+  };
+}
+
+function isObjectRecord(value) {
+  return value != null && typeof value === 'object' && !Array.isArray(value);
+}
+
 function ensureSelfAccess(access, pathUserId) {
   if (access.session.user_id !== pathUserId) {
     return matrixErrorResponse(403, 'M_FORBIDDEN', 'This route is only available for the authenticated user');
@@ -286,6 +317,21 @@ function mapInternalErrorToResponse(error) {
   }
   if (error.code === 'target_not_local') {
     return matrixErrorResponse(400, 'M_INVALID_PARAM', error.message ?? 'Target user is not local');
+  }
+  if (error.code === 'unsupported_room_version') {
+    return matrixErrorResponse(400, 'M_UNSUPPORTED_ROOM_VERSION', error.message ?? 'Unsupported room version');
+  }
+  if (error.code === 'incompatible_room_version') {
+    return matrixErrorResponse(400, 'M_INCOMPATIBLE_ROOM_VERSION', error.message ?? 'Incompatible room version');
+  }
+  if (error.code === 'room_not_found' || error.code === 'event_not_found') {
+    return matrixErrorResponse(404, 'M_NOT_FOUND', error.message ?? 'Requested room resource does not exist');
+  }
+  if (error.code === 'room_forbidden' || error.code === 'not_allowed') {
+    return matrixErrorResponse(403, 'M_FORBIDDEN', error.message ?? 'The room operation is not allowed');
+  }
+  if (error.code === 'bad_json' || error.code === 'invalid_event') {
+    return matrixErrorResponse(400, 'M_BAD_JSON', error.message ?? 'Request body must be a JSON object');
   }
   if (error.code === 'unknown_session' || error.code === 'invalid_token') {
     return matrixErrorResponse(401, 'M_UNKNOWN_TOKEN', error.message ?? 'Unknown or unsupported token');
@@ -1626,6 +1672,636 @@ async function handleSendToDevice(request, env, eventType, txnId) {
   return jsonResponse({});
 }
 
+async function admitRoomClientEvent(roomDo, {
+  roomId,
+  roomVersion = null,
+  requestFingerprint,
+  candidateEvent,
+}) {
+  const result = await roomDo.admitEvent({
+    request_kind: 'client',
+    room_id: roomId,
+    room_version: roomVersion,
+    request_fingerprint: requestFingerprint,
+    candidate_event: candidateEvent,
+  });
+  if (!result?.ok) {
+    return {
+      ok: false,
+      response: mapInternalErrorToResponse(result?.error),
+    };
+  }
+  return {
+    ok: true,
+    result,
+  };
+}
+
+async function handleCreateRoom(request, env) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const body = await readJsonObject(request);
+  if (body instanceof Response) {
+    return body;
+  }
+  let roomVersion;
+  try {
+    roomVersion = resolveRequestedRoomVersion(body.room_version ?? DEFAULT_ROOM_VERSION);
+  } catch (error) {
+    return matrixErrorResponse(400, 'M_UNSUPPORTED_ROOM_VERSION', error.message);
+  }
+  const requestFingerprint = createRequestFingerprint({
+    method: 'POST',
+    routeTemplate: '/_matrix/client/v3/createRoom',
+    principalId: access.session.user_id,
+    body,
+  });
+  const identity = deriveCreateRoomIdentity({
+    creator_user_id: access.session.user_id,
+    room_version: roomVersion,
+    request_fingerprint: requestFingerprint,
+    server_name: env.MATRIX_SERVER_NAME,
+  });
+  const roomDo = getRoomDoStub(env, identity.room_id);
+
+  const createResult = await admitRoomClientEvent(roomDo, {
+    roomId: identity.room_id,
+    roomVersion,
+    requestFingerprint,
+    candidateEvent: {
+      type: 'm.room.create',
+      sender: access.session.user_id,
+      state_key: '',
+      content: {
+        creator: access.session.user_id,
+        room_version: roomVersion,
+        ...(isObjectRecord(body.creation_content) ? structuredClone(body.creation_content) : {}),
+      },
+      unsigned: {
+        client_context: buildRoomClientContext(access, '/_matrix/client/v3/createRoom', requestFingerprint),
+      },
+    },
+  });
+  if (!createResult.ok) {
+    return createResult.response;
+  }
+
+  const creatorJoinFingerprint = createRequestFingerprint({
+    method: 'POST',
+    routeTemplate: '/_matrix/client/v3/createRoom#creator_join',
+    principalId: access.session.user_id,
+    body: { room_id: identity.room_id },
+  });
+  const creatorJoinResult = await admitRoomClientEvent(roomDo, {
+    roomId: identity.room_id,
+    roomVersion,
+    requestFingerprint: creatorJoinFingerprint,
+    candidateEvent: {
+      type: 'm.room.member',
+      sender: access.session.user_id,
+      state_key: access.session.user_id,
+      content: {
+        membership: 'join',
+      },
+      unsigned: {
+        client_context: buildRoomClientContext(access, '/_matrix/client/v3/createRoom#creator_join', creatorJoinFingerprint),
+      },
+    },
+  });
+  if (!creatorJoinResult.ok) {
+    return creatorJoinResult.response;
+  }
+
+  const joinRule = body.preset === 'public_chat' ? 'public' : (body.preset === 'trusted_private_chat' ? 'invite' : 'invite');
+  const stateBootstrapEvents = [
+    {
+      type: 'm.room.power_levels',
+      content: {
+        users: {
+          [access.session.user_id]: 100,
+        },
+        users_default: 0,
+        events_default: 0,
+        state_default: 50,
+        ban: 50,
+        kick: 50,
+        redact: 50,
+        invite: 0,
+        ...(isObjectRecord(body.power_level_content_override) ? structuredClone(body.power_level_content_override) : {}),
+      },
+    },
+    {
+      type: 'm.room.join_rules',
+      content: {
+        join_rule: joinRule,
+      },
+    },
+    ...(typeof body.name === 'string' && body.name.length > 0
+      ? [{ type: 'm.room.name', content: { name: body.name } }]
+      : []),
+    ...(typeof body.topic === 'string' && body.topic.length > 0
+      ? [{ type: 'm.room.topic', content: { topic: body.topic } }]
+      : []),
+    ...(Array.isArray(body.initial_state)
+      ? body.initial_state.filter((entry) => entry && typeof entry === 'object' && !Array.isArray(entry))
+      : []),
+  ];
+  for (let index = 0; index < stateBootstrapEvents.length; index += 1) {
+    const event = stateBootstrapEvents[index];
+    const stateKey = typeof event.state_key === 'string' ? event.state_key : '';
+    const fingerprint = createRequestFingerprint({
+      method: 'PUT',
+      routeTemplate: '/_matrix/client/v3/createRoom#state_bootstrap',
+      principalId: access.session.user_id,
+      body: {
+        room_id: identity.room_id,
+        event_type: event.type,
+        state_key: stateKey,
+        content: event.content,
+        index,
+      },
+    });
+    const bootstrapResult = await admitRoomClientEvent(roomDo, {
+      roomId: identity.room_id,
+      roomVersion,
+      requestFingerprint: fingerprint,
+      candidateEvent: {
+        type: event.type,
+        sender: access.session.user_id,
+        state_key: stateKey,
+        content: structuredClone(event.content ?? {}),
+        unsigned: {
+          client_context: buildRoomClientContext(access, '/_matrix/client/v3/createRoom#state_bootstrap', fingerprint),
+        },
+      },
+    });
+    if (!bootstrapResult.ok) {
+      return bootstrapResult.response;
+    }
+  }
+
+  for (const invitedUser of Array.isArray(body.invite) ? body.invite : []) {
+    const invitedUserId = normalizePathUserId(invitedUser, env);
+    if (!invitedUserId) {
+      return matrixErrorResponse(400, 'M_INVALID_PARAM', `Invite target ${invitedUser} is not local or not valid`);
+    }
+    const fingerprint = createRequestFingerprint({
+      method: 'POST',
+      routeTemplate: '/_matrix/client/v3/createRoom#invite',
+      principalId: access.session.user_id,
+      body: {
+        room_id: identity.room_id,
+        user_id: invitedUserId,
+      },
+    });
+    const inviteResult = await admitRoomClientEvent(roomDo, {
+      roomId: identity.room_id,
+      roomVersion,
+      requestFingerprint: fingerprint,
+      candidateEvent: {
+        type: 'm.room.member',
+        sender: access.session.user_id,
+        state_key: invitedUserId,
+        content: {
+          membership: 'invite',
+        },
+        unsigned: {
+          client_context: buildRoomClientContext(access, '/_matrix/client/v3/createRoom#invite', fingerprint),
+        },
+      },
+    });
+    if (!inviteResult.ok) {
+      return inviteResult.response;
+    }
+  }
+
+  return jsonResponse({
+    room_id: identity.room_id,
+  });
+}
+
+async function handleRoomMembershipRequest(request, env, {
+  kind,
+  roomIdOrAlias = null,
+  roomId = null,
+}) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const body = request.method === 'POST'
+    ? await readJsonObject(request)
+    : {};
+  if (body instanceof Response) {
+    return body;
+  }
+  const decodedRoomId = roomId != null
+    ? normalizePathRoomId(roomId)
+    : normalizePathRoomId(roomIdOrAlias);
+  if (!decodedRoomId) {
+    return matrixErrorResponse(404, 'M_NOT_FOUND', 'Room does not exist');
+  }
+  if (kind === 'forget') {
+    const result = await access.user_do.forgetRoom({
+      user_id: access.session.user_id,
+      room_id: decodedRoomId,
+      request_fingerprint: createRequestFingerprint({
+        method: 'POST',
+        routeTemplate: '/_matrix/client/v3/rooms/{roomId}/forget',
+        principalId: access.session.user_id,
+        body: {
+          room_id: decodedRoomId,
+        },
+      }),
+    });
+    if (!result.ok) {
+      return jsonResponse(result.matrix_error.body, result.matrix_error.status);
+    }
+    return jsonResponse({});
+  }
+
+  const roomDo = getRoomDoStub(env, decodedRoomId);
+  let targetUserId = access.session.user_id;
+  let membership = kind;
+  const routeTemplateByKind = {
+    join: roomId != null ? '/_matrix/client/v3/rooms/{roomId}/join' : '/_matrix/client/v3/join/{roomIdOrAlias}',
+    leave: '/_matrix/client/v3/rooms/{roomId}/leave',
+    invite: '/_matrix/client/v3/rooms/{roomId}/invite',
+    ban: '/_matrix/client/v3/rooms/{roomId}/ban',
+    unban: '/_matrix/client/v3/rooms/{roomId}/unban',
+    kick: '/_matrix/client/v3/rooms/{roomId}/kick',
+    knock: '/_matrix/client/v3/knock/{roomIdOrAlias}',
+  };
+
+  if (['invite', 'ban', 'unban', 'kick'].includes(kind)) {
+    targetUserId = normalizePathUserId(body.user_id, env);
+    if (!targetUserId) {
+      return matrixErrorResponse(400, 'M_INVALID_PARAM', 'user_id must be a local Matrix user ID');
+    }
+  }
+  if (kind === 'unban' || kind === 'kick' || kind === 'leave') {
+    membership = 'leave';
+  }
+  const requestFingerprint = createRequestFingerprint({
+    method: 'POST',
+    routeTemplate: routeTemplateByKind[kind],
+    principalId: access.session.user_id,
+    body: {
+      room_id: decodedRoomId,
+      target_user_id: targetUserId,
+      membership,
+      reason: body.reason ?? null,
+    },
+  });
+  const result = await admitRoomClientEvent(roomDo, {
+    roomId: decodedRoomId,
+    requestFingerprint,
+    candidateEvent: {
+      type: 'm.room.member',
+      sender: access.session.user_id,
+      state_key: targetUserId,
+      content: {
+        membership,
+        ...(body.reason == null ? {} : { reason: body.reason }),
+      },
+      unsigned: {
+        client_context: buildRoomClientContext(access, routeTemplateByKind[kind], requestFingerprint),
+      },
+    },
+  });
+  if (!result.ok) {
+    return result.response;
+  }
+  if (kind === 'join') {
+    return jsonResponse({
+      room_id: decodedRoomId,
+    });
+  }
+  return jsonResponse({});
+}
+
+async function handleRoomSendEvent(request, env, roomId, eventType, txnId) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const decodedRoomId = normalizePathRoomId(roomId);
+  const decodedEventType = decodePathComponent(eventType);
+  const decodedTxnId = decodePathComponent(txnId);
+  if (!decodedRoomId || !decodedEventType || !decodedTxnId) {
+    return matrixErrorResponse(400, 'M_INVALID_PARAM', 'Invalid room send path');
+  }
+  const body = await readJsonObject(request);
+  if (body instanceof Response) {
+    return body;
+  }
+  const requestFingerprint = createRequestFingerprint({
+    method: 'PUT',
+    routeTemplate: '/_matrix/client/v3/rooms/{roomId}/send/{eventType}/{txnId}',
+    principalId: access.session.user_id,
+    body: {
+      room_id: decodedRoomId,
+      event_type: decodedEventType,
+      txn_id: decodedTxnId,
+      content: body,
+    },
+  });
+  const result = await admitRoomClientEvent(getRoomDoStub(env, decodedRoomId), {
+    roomId: decodedRoomId,
+    requestFingerprint,
+    candidateEvent: {
+      type: decodedEventType,
+      sender: access.session.user_id,
+      content: body,
+      unsigned: {
+        client_context: buildRoomClientContext(
+          access,
+          '/_matrix/client/v3/rooms/{roomId}/send/{eventType}/{txnId}',
+          decodedTxnId,
+        ),
+      },
+    },
+  });
+  if (!result.ok) {
+    return result.response;
+  }
+  return jsonResponse({
+    event_id: result.result.event_id,
+  });
+}
+
+async function handleRoomStateWrite(request, env, roomId, eventType, stateKey = '') {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const decodedRoomId = normalizePathRoomId(roomId);
+  const decodedEventType = decodePathComponent(eventType);
+  const decodedStateKey = stateKey == null ? '' : (decodePathComponent(stateKey) ?? null);
+  if (!decodedRoomId || !decodedEventType || decodedStateKey == null) {
+    return matrixErrorResponse(400, 'M_INVALID_PARAM', 'Invalid room state path');
+  }
+  const body = await readJsonObject(request);
+  if (body instanceof Response) {
+    return body;
+  }
+  const requestFingerprint = createRequestFingerprint({
+    method: 'PUT',
+    routeTemplate: '/_matrix/client/v3/rooms/{roomId}/state/{eventType}/{stateKey}',
+    principalId: access.session.user_id,
+    body: {
+      room_id: decodedRoomId,
+      event_type: decodedEventType,
+      state_key: decodedStateKey,
+      content: body,
+    },
+  });
+  const stateWriteDedupeKey = canonicalJsonHash({
+    room_id: decodedRoomId,
+    event_type: decodedEventType,
+    state_key: decodedStateKey,
+  });
+  const result = await admitRoomClientEvent(getRoomDoStub(env, decodedRoomId), {
+    roomId: decodedRoomId,
+    requestFingerprint,
+    candidateEvent: {
+      type: decodedEventType,
+      sender: access.session.user_id,
+      state_key: decodedStateKey,
+      content: body,
+      unsigned: {
+        client_context: buildRoomClientContext(
+          access,
+          '/_matrix/client/v3/rooms/{roomId}/state/{eventType}/{stateKey}',
+          stateWriteDedupeKey,
+        ),
+      },
+    },
+  });
+  if (!result.ok) {
+    return result.response;
+  }
+  return jsonResponse({
+    event_id: result.result.event_id,
+  });
+}
+
+async function handleRoomRedaction(request, env, roomId, eventId, txnId) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const decodedRoomId = normalizePathRoomId(roomId);
+  const decodedEventId = decodePathComponent(eventId);
+  const decodedTxnId = decodePathComponent(txnId);
+  if (!decodedRoomId || !decodedEventId || !decodedTxnId) {
+    return matrixErrorResponse(400, 'M_INVALID_PARAM', 'Invalid room redaction path');
+  }
+  const body = await readJsonObject(request);
+  if (body instanceof Response) {
+    return body;
+  }
+  const requestFingerprint = createRequestFingerprint({
+    method: 'PUT',
+    routeTemplate: '/_matrix/client/v3/rooms/{roomId}/redact/{eventId}/{txnId}',
+    principalId: access.session.user_id,
+    body: {
+      room_id: decodedRoomId,
+      event_id: decodedEventId,
+      txn_id: decodedTxnId,
+      content: body,
+    },
+  });
+  const result = await admitRoomClientEvent(getRoomDoStub(env, decodedRoomId), {
+    roomId: decodedRoomId,
+    requestFingerprint,
+    candidateEvent: {
+      type: 'm.room.redaction',
+      sender: access.session.user_id,
+      redacts: decodedEventId,
+      content: body,
+      unsigned: {
+        client_context: buildRoomClientContext(
+          access,
+          '/_matrix/client/v3/rooms/{roomId}/redact/{eventId}/{txnId}',
+          decodedTxnId,
+        ),
+      },
+    },
+  });
+  if (!result.ok) {
+    return result.response;
+  }
+  return jsonResponse({
+    event_id: result.result.event_id,
+  });
+}
+
+async function handleRoomQueryRequest(request, env, roomId, {
+  kind,
+  eventId = null,
+  eventType = null,
+  stateKey = '',
+  relType = null,
+  relationEventType = null,
+}) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const decodedRoomId = normalizePathRoomId(roomId);
+  if (!decodedRoomId) {
+    return matrixErrorResponse(404, 'M_NOT_FOUND', 'Room does not exist');
+  }
+  const roomVisibility = await access.user_do.getRoomSyncMembership({
+    user_id: access.session.user_id,
+    room_id: decodedRoomId,
+  });
+  if (!roomVisibility?.ok) {
+    return mapInternalErrorToResponse(roomVisibility?.error);
+  }
+  if (!roomVisibility.entry || !isReadableRoomSyncMembershipBucket(roomVisibility.entry.membership_bucket)) {
+    return matrixErrorResponse(403, 'M_FORBIDDEN', 'The room is not visible to this user');
+  }
+  const url = new URL(request.url);
+  const limit = url.searchParams.get('limit');
+  const roomDo = getRoomDoStub(env, decodedRoomId);
+  const result = await roomDo.queryRoom({
+    kind,
+    room_id: decodedRoomId,
+    requester_user_id: access.session.user_id,
+    event_id: eventId == null ? null : decodePathComponent(eventId),
+    timestamp: url.searchParams.get('ts') == null ? null : Number.parseInt(url.searchParams.get('ts'), 10),
+    limit: limit == null ? 10 : Number.parseInt(limit, 10),
+    cursor: {
+      from: url.searchParams.get('from') ?? null,
+      dir: url.searchParams.get('dir') ?? null,
+      event_type: kind === 'relations'
+        ? (relationEventType == null ? null : decodePathComponent(relationEventType))
+        : (eventType == null ? null : decodePathComponent(eventType)),
+      state_key: stateKey == null ? '' : (decodePathComponent(stateKey) ?? ''),
+      rel_type: relType == null ? null : decodePathComponent(relType),
+    },
+  });
+  if (!result?.ok) {
+    return mapInternalErrorToResponse(result?.error);
+  }
+  if (kind === 'timeline' || kind === 'relations' || kind === 'threads') {
+    return jsonResponse({
+      chunk: result.chunk ?? [],
+      start: result.start ?? null,
+      end: result.end ?? null,
+    });
+  }
+  if (kind === 'context') {
+    return jsonResponse({
+      event: result.event,
+      events_before: result.events_before ?? [],
+      events_after: result.events_after ?? [],
+      state: result.state ?? [],
+      start: result.start ?? null,
+      end: result.end ?? null,
+    });
+  }
+  if (kind === 'event') {
+    return jsonResponse(result.event);
+  }
+  if (kind === 'state') {
+    if (eventType != null) {
+      return jsonResponse(result.event?.content ?? {});
+    }
+    return jsonResponse(result.state ?? []);
+  }
+  if (kind === 'members') {
+    return jsonResponse({
+      chunk: result.chunk ?? [],
+    });
+  }
+  if (kind === 'joined_members') {
+    return jsonResponse({
+      joined: result.joined ?? {},
+    });
+  }
+  if (kind === 'timestamp_lookup') {
+    return jsonResponse({
+      event_id: result.event?.event_id ?? null,
+      origin_server_ts: result.event?.origin_server_ts ?? null,
+    });
+  }
+  return matrixErrorResponse(404, 'M_UNRECOGNIZED', 'Unrecognized or unsupported endpoint');
+}
+
+async function handleRoomTyping(request, env, roomId, userId) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const decodedRoomId = normalizePathRoomId(roomId);
+  const targetUserId = normalizePathUserId(userId, env);
+  if (!decodedRoomId || !targetUserId) {
+    return matrixErrorResponse(400, 'M_INVALID_PARAM', 'Invalid typing path');
+  }
+  const selfError = ensureSelfAccess(access, targetUserId);
+  if (selfError) {
+    return selfError;
+  }
+  const body = await readJsonObject(request);
+  if (body instanceof Response) {
+    return body;
+  }
+  if (body.typing === true && (!Number.isInteger(body.timeout ?? 30_000) || (body.timeout ?? 30_000) < 1)) {
+    return matrixErrorResponse(400, 'M_INVALID_PARAM', 'timeout must be a positive integer');
+  }
+  try {
+    const result = await getRoomDoStub(env, decodedRoomId).setTyping({
+      room_id: decodedRoomId,
+      user_id: targetUserId,
+      typing: body.typing === true,
+      timeout_ms: body.timeout ?? 30_000,
+    });
+    if (!result?.ok) {
+      return mapInternalErrorToResponse(result?.error);
+    }
+    return jsonResponse({});
+  } catch (error) {
+    if (error instanceof TypeError || error instanceof RangeError) {
+      return matrixErrorResponse(400, 'M_INVALID_PARAM', error.message);
+    }
+    throw error;
+  }
+}
+
+async function handleRoomReceipt(request, env, roomId, receiptType, eventId) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const decodedRoomId = normalizePathRoomId(roomId);
+  const decodedReceiptType = decodePathComponent(receiptType);
+  const decodedEventId = decodePathComponent(eventId);
+  if (!decodedRoomId || !decodedReceiptType || !decodedEventId) {
+    return matrixErrorResponse(400, 'M_INVALID_PARAM', 'Invalid receipt path');
+  }
+  const body = await readJsonObject(request);
+  if (body instanceof Response) {
+    return body;
+  }
+  const result = await getRoomDoStub(env, decodedRoomId).applyReceipt({
+    room_id: decodedRoomId,
+    user_id: access.session.user_id,
+    receipt_type: decodedReceiptType,
+    event_id: decodedEventId,
+    thread_id: typeof body.thread_id === 'string' ? body.thread_id : '',
+    receipt_ts: Number.isInteger(body.ts) ? body.ts : Date.now(),
+  });
+  if (!result?.ok) {
+    return mapInternalErrorToResponse(result?.error);
+  }
+  return jsonResponse({});
+}
+
 async function handleSync(request, env, url) {
   const access = await requireAccessSession(request, env);
   if (!access.ok) {
@@ -1931,6 +2607,185 @@ async function handleRequest(request, env) {
       kind: pushRuleMatch[1],
       ruleId: pushRuleMatch[2],
     });
+  }
+
+  if (pathname === '/_matrix/client/v3/createRoom' && method === 'POST') {
+    return handleCreateRoom(request, env);
+  }
+  const roomJoinByAliasMatch = /^\/_matrix\/client\/v3\/join\/([^/]+)$/.exec(pathname);
+  if (roomJoinByAliasMatch && method === 'POST') {
+    return handleRoomMembershipRequest(request, env, {
+      kind: 'join',
+      roomIdOrAlias: roomJoinByAliasMatch[1],
+    });
+  }
+  const roomJoinMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/join$/.exec(pathname);
+  if (roomJoinMatch && method === 'POST') {
+    return handleRoomMembershipRequest(request, env, {
+      kind: 'join',
+      roomId: roomJoinMatch[1],
+    });
+  }
+  const roomLeaveMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/leave$/.exec(pathname);
+  if (roomLeaveMatch && method === 'POST') {
+    return handleRoomMembershipRequest(request, env, {
+      kind: 'leave',
+      roomId: roomLeaveMatch[1],
+    });
+  }
+  const roomInviteMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/invite$/.exec(pathname);
+  if (roomInviteMatch && method === 'POST') {
+    return handleRoomMembershipRequest(request, env, {
+      kind: 'invite',
+      roomId: roomInviteMatch[1],
+    });
+  }
+  const roomBanMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/ban$/.exec(pathname);
+  if (roomBanMatch && method === 'POST') {
+    return handleRoomMembershipRequest(request, env, {
+      kind: 'ban',
+      roomId: roomBanMatch[1],
+    });
+  }
+  const roomUnbanMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/unban$/.exec(pathname);
+  if (roomUnbanMatch && method === 'POST') {
+    return handleRoomMembershipRequest(request, env, {
+      kind: 'unban',
+      roomId: roomUnbanMatch[1],
+    });
+  }
+  const roomKickMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/kick$/.exec(pathname);
+  if (roomKickMatch && method === 'POST') {
+    return handleRoomMembershipRequest(request, env, {
+      kind: 'kick',
+      roomId: roomKickMatch[1],
+    });
+  }
+  const roomKnockMatch = /^\/_matrix\/client\/v3\/knock\/([^/]+)$/.exec(pathname);
+  if (roomKnockMatch && method === 'POST') {
+    return handleRoomMembershipRequest(request, env, {
+      kind: 'knock',
+      roomIdOrAlias: roomKnockMatch[1],
+    });
+  }
+  const roomForgetMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/forget$/.exec(pathname);
+  if (roomForgetMatch && method === 'POST') {
+    return handleRoomMembershipRequest(request, env, {
+      kind: 'forget',
+      roomId: roomForgetMatch[1],
+    });
+  }
+  const roomSendMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/send\/([^/]+)\/([^/]+)$/.exec(pathname);
+  if (roomSendMatch && method === 'PUT') {
+    return handleRoomSendEvent(request, env, roomSendMatch[1], roomSendMatch[2], roomSendMatch[3]);
+  }
+  const roomStateWithKeyMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/state\/([^/]+)\/([^/]+)$/.exec(pathname);
+  if (roomStateWithKeyMatch && method === 'PUT') {
+    return handleRoomStateWrite(request, env, roomStateWithKeyMatch[1], roomStateWithKeyMatch[2], roomStateWithKeyMatch[3]);
+  }
+  const roomStateWithoutKeyWriteMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/state\/([^/]+)$/.exec(pathname);
+  if (roomStateWithoutKeyWriteMatch && method === 'PUT') {
+    return handleRoomStateWrite(request, env, roomStateWithoutKeyWriteMatch[1], roomStateWithoutKeyWriteMatch[2], '');
+  }
+  const roomRedactMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/redact\/([^/]+)\/([^/]+)$/.exec(pathname);
+  if (roomRedactMatch && method === 'PUT') {
+    return handleRoomRedaction(request, env, roomRedactMatch[1], roomRedactMatch[2], roomRedactMatch[3]);
+  }
+  const roomMessagesMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/messages$/.exec(pathname);
+  if (roomMessagesMatch && method === 'GET') {
+    return handleRoomQueryRequest(request, env, roomMessagesMatch[1], {
+      kind: 'timeline',
+    });
+  }
+  const roomContextMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/context\/([^/]+)$/.exec(pathname);
+  if (roomContextMatch && method === 'GET') {
+    return handleRoomQueryRequest(request, env, roomContextMatch[1], {
+      kind: 'context',
+      eventId: roomContextMatch[2],
+    });
+  }
+  const roomEventMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/event\/([^/]+)$/.exec(pathname);
+  if (roomEventMatch && method === 'GET') {
+    return handleRoomQueryRequest(request, env, roomEventMatch[1], {
+      kind: 'event',
+      eventId: roomEventMatch[2],
+    });
+  }
+  const roomStateAllMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/state$/.exec(pathname);
+  if (roomStateAllMatch && method === 'GET') {
+    return handleRoomQueryRequest(request, env, roomStateAllMatch[1], {
+      kind: 'state',
+    });
+  }
+  if (roomStateWithKeyMatch && method === 'GET') {
+    return handleRoomQueryRequest(request, env, roomStateWithKeyMatch[1], {
+      kind: 'state',
+      eventType: roomStateWithKeyMatch[2],
+      stateKey: roomStateWithKeyMatch[3],
+    });
+  }
+  if (roomStateWithoutKeyWriteMatch && method === 'GET') {
+    return handleRoomQueryRequest(request, env, roomStateWithoutKeyWriteMatch[1], {
+      kind: 'state',
+      eventType: roomStateWithoutKeyWriteMatch[2],
+      stateKey: '',
+    });
+  }
+  const roomMembersMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/members$/.exec(pathname);
+  if (roomMembersMatch && method === 'GET') {
+    return handleRoomQueryRequest(request, env, roomMembersMatch[1], {
+      kind: 'members',
+    });
+  }
+  const roomJoinedMembersMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/joined_members$/.exec(pathname);
+  if (roomJoinedMembersMatch && method === 'GET') {
+    return handleRoomQueryRequest(request, env, roomJoinedMembersMatch[1], {
+      kind: 'joined_members',
+    });
+  }
+  const roomRelationsFullMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/relations\/([^/]+)\/([^/]+)\/([^/]+)$/.exec(pathname);
+  if (roomRelationsFullMatch && method === 'GET') {
+    return handleRoomQueryRequest(request, env, roomRelationsFullMatch[1], {
+      kind: 'relations',
+      eventId: roomRelationsFullMatch[2],
+      relType: roomRelationsFullMatch[3],
+      relationEventType: roomRelationsFullMatch[4],
+    });
+  }
+  const roomRelationsTypedMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/relations\/([^/]+)\/([^/]+)$/.exec(pathname);
+  if (roomRelationsTypedMatch && method === 'GET') {
+    return handleRoomQueryRequest(request, env, roomRelationsTypedMatch[1], {
+      kind: 'relations',
+      eventId: roomRelationsTypedMatch[2],
+      relType: roomRelationsTypedMatch[3],
+    });
+  }
+  const roomRelationsMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/relations\/([^/]+)$/.exec(pathname);
+  if (roomRelationsMatch && method === 'GET') {
+    return handleRoomQueryRequest(request, env, roomRelationsMatch[1], {
+      kind: 'relations',
+      eventId: roomRelationsMatch[2],
+    });
+  }
+  const roomThreadsMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/threads$/.exec(pathname);
+  if (roomThreadsMatch && method === 'GET') {
+    return handleRoomQueryRequest(request, env, roomThreadsMatch[1], {
+      kind: 'threads',
+    });
+  }
+  const roomTimestampMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/timestamp_to_event$/.exec(pathname);
+  if (roomTimestampMatch && method === 'GET') {
+    return handleRoomQueryRequest(request, env, roomTimestampMatch[1], {
+      kind: 'timestamp_lookup',
+    });
+  }
+  const roomTypingMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/typing\/([^/]+)$/.exec(pathname);
+  if (roomTypingMatch && method === 'PUT') {
+    return handleRoomTyping(request, env, roomTypingMatch[1], roomTypingMatch[2]);
+  }
+  const roomReceiptMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/receipt\/([^/]+)\/([^/]+)$/.exec(pathname);
+  if (roomReceiptMatch && method === 'POST') {
+    return handleRoomReceipt(request, env, roomReceiptMatch[1], roomReceiptMatch[2], roomReceiptMatch[3]);
   }
 
   const sendToDeviceMatch = /^\/_matrix\/client\/v3\/sendToDevice\/([^/]+)\/([^/]+)$/.exec(pathname);

@@ -50,6 +50,20 @@ async function syncRequest(rig, accessToken, query = '') {
   return response.json();
 }
 
+function roomPath(roomId, suffix = '') {
+  return `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}${suffix}`;
+}
+
+async function postJson(rig, accessToken, pathname, json = {}) {
+  const response = await rig.gatewayFetch(pathname, {
+    method: 'POST',
+    headers: rig.authHeaders(accessToken),
+    json,
+  });
+  assert.equal(response.status, 200);
+  return response.json();
+}
+
 async function seedJoinedRoom(rig, {
   roomId = '!phase05:matrix.example.test',
   userId = '@alice:matrix.example.test',
@@ -441,6 +455,64 @@ test('Phase 05 profile, presence, and sync propagation are wired end-to-end', as
 
   const avatarFieldAfterDelete = await rig.gatewayFetch('/_matrix/client/v3/profile/@alice:matrix.example.test/avatar_url');
   await expectMatrixError(avatarFieldAfterDelete, 404, 'M_NOT_FOUND');
+});
+
+test('Phase 05 profile refreshes re-enter room admission and fan out to other joined users', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, {
+    username: 'phase05-profile-alice',
+    password: 'correct horse battery staple',
+    deviceId: 'ALICEPHONE',
+  });
+  const bob = await registerUser(rig, {
+    username: 'phase05-profile-bob',
+    password: 'correct horse battery staple',
+    deviceId: 'BOBPHONE',
+  });
+
+  const createResponse = await rig.gatewayFetch('/_matrix/client/v3/createRoom', {
+    method: 'POST',
+    headers: rig.authHeaders(alice.access_token),
+    json: {
+      invite: [bob.user_id],
+    },
+  });
+  assert.equal(createResponse.status, 200);
+  const { room_id: roomId } = await createResponse.json();
+  await postJson(rig, bob.access_token, roomPath(roomId, '/join'));
+
+  const bobBaselineSync = await syncRequest(rig, bob.access_token);
+  const setDisplayName = await rig.gatewayFetch(`/_matrix/client/v3/profile/${encodeURIComponent(alice.user_id)}/displayname`, {
+    method: 'PUT',
+    headers: rig.authHeaders(alice.access_token),
+    json: {
+      displayname: 'Alice Through Admission',
+    },
+  });
+  assert.equal(setDisplayName.status, 200);
+
+  const bobIncrementalSync = await syncRequest(rig, bob.access_token, `since=${encodeURIComponent(bobBaselineSync.next_batch)}`);
+  const bobRoomEntry = getJoinedRoomEntry(bobIncrementalSync, roomId);
+  assert.ok(bobRoomEntry);
+  const refreshedMemberEvent = getStateEvent(bobRoomEntry, {
+    type: 'm.room.member',
+    stateKey: alice.user_id,
+  });
+  assert.ok(refreshedMemberEvent);
+  assert.equal(refreshedMemberEvent.content.displayname, 'Alice Through Admission');
+
+  const roomDo = rig.getRoomDo(roomId);
+  const refreshedMetadata = roomDo.persistence.eventMetadata.list()
+    .filter((row) => row.event_type === 'm.room.member' && row.state_key_or_null === alice.user_id)
+    .sort((left, right) => left.room_pos - right.room_pos)
+    .at(-1);
+  const refreshedEvent = roomDo.loadRoomEventById(refreshedMetadata.event_id).event;
+  assert.equal(refreshedMetadata.record.request_kind, 'client');
+  assert.equal(refreshedMetadata.record.propagation_kind, 'profile_refresh');
+  assert.ok(Array.isArray(refreshedEvent.prev_events));
+  assert.ok(refreshedEvent.prev_events.length >= 1);
 });
 
 test('Phase 05 profile field read rejects malformed path encoding deterministically', async (t) => {
