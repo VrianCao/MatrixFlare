@@ -1,0 +1,51 @@
+{
+  "required_environments": [
+    "ci-integration",
+    "staging"
+  ],
+  "supporting_environments": [
+    "local",
+    "pre-release"
+  ],
+  "required_results": [
+    {
+      "environment_name": "ci-integration",
+      "status": "pass",
+      "exit_code": 0,
+      "duration_ms": 11905,
+      "command": "/usr/bin/node --test /root/Matrix/tests/integration/bootstrap.test.mjs /root/Matrix/tests/integration/l1-mandatory.test.mjs",
+      "log_artifact": "../../../common/_test-runs/20260331T130238Z/ci-integration.log",
+      "summary_artifact": "../../../common/_test-runs/20260331T130238Z/ci-integration.json"
+    },
+    {
+      "environment_name": "staging",
+      "status": "pass",
+      "exit_code": 0,
+      "duration_ms": 11288,
+      "command": "/usr/bin/node --test /root/Matrix/tests/staging/bootstrap.test.mjs /root/Matrix/tests/staging/l1-mandatory.test.mjs",
+      "log_artifact": "../../../common/_test-runs/20260331T130238Z/staging.log",
+      "summary_artifact": "../../../common/_test-runs/20260331T130238Z/staging.json"
+    }
+  ],
+  "supporting_results": [
+    {
+      "environment_name": "local",
+      "status": "pass",
+      "exit_code": 0,
+      "duration_ms": 11844,
+      "command": "/usr/bin/node --test /root/Matrix/tests/local/client-identity/phase-04.test.mjs /root/Matrix/tests/local/client-identity/phase-05.test.mjs /root/Matrix/tests/local/client-identity/phase-06.test.mjs /root/Matrix/tests/local/client-identity/phase-07.test.mjs /root/Matrix/tests/local/control-plane/control-plane.test.mjs /root/Matrix/tests/local/control-plane/phase-08-ops.test.mjs /root/Matrix/tests/local/runtime-foundations/canonical-json.test.mjs /root/Matrix/tests/local/runtime-foundations/config.test.mjs /root/Matrix/tests/local/runtime-foundations/data-plane-storage.test.mjs /root/Matrix/tests/local/runtime-foundations/errors.test.mjs /root/Matrix/tests/local/runtime-foundations/logging.test.mjs /root/Matrix/tests/local/runtime-foundations/phase-08-runtime-controls.test.mjs /root/Matrix/tests/local/runtime-foundations/runtime-skeleton.test.mjs /root/Matrix/tests/local/runtime-foundations/testing-harness.test.mjs /root/Matrix/tests/local/spec-tools/governance.test.mjs",
+      "log_artifact": "../../../common/_test-runs/20260331T130238Z/local.log",
+      "summary_artifact": "../../../common/_test-runs/20260331T130238Z/local.json"
+    },
+    {
+      "environment_name": "pre-release",
+      "status": "pass",
+      "exit_code": 0,
+      "duration_ms": 11953,
+      "command": "/usr/bin/node --test /root/Matrix/tests/pre-release/bootstrap.test.mjs /root/Matrix/tests/pre-release/l1-mandatory.test.mjs",
+      "log_artifact": "../../../common/_test-runs/20260331T130238Z/pre-release.log",
+      "summary_artifact": "../../../common/_test-runs/20260331T130238Z/pre-release.json"
+    }
+  ],
+  "shared_run_root": "../../../common/_test-runs/20260331T130238Z"
+}

@@ -1,0 +1,18 @@
+{
+  "environment_name": "staging",
+  "status": "pass",
+  "exit_code": 0,
+  "started_at": "2026-03-31T13:03:09.407Z",
+  "completed_at": "2026-03-31T13:03:20.695Z",
+  "duration_ms": 11288,
+  "command": "/usr/bin/node --test /root/Matrix/tests/staging/bootstrap.test.mjs /root/Matrix/tests/staging/l1-mandatory.test.mjs",
+  "test_directory": "tests/staging",
+  "test_file_count": 2,
+  "test_files": [
+    "tests/staging/bootstrap.test.mjs",
+    "tests/staging/l1-mandatory.test.mjs"
+  ],
+  "output_sha256": "a965262a8e9aac1409231d6c28ce01e61de4db4930c47d9d1e42b3ccfd2dfd54",
+  "error_message": null,
+  "log_artifact": "evidence/common/_test-runs/20260331T130238Z/staging.log"
+}

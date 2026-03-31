@@ -1,0 +1,18 @@
+{
+  "environment_name": "ci-integration",
+  "status": "pass",
+  "exit_code": 0,
+  "started_at": "2026-03-31T13:02:57.498Z",
+  "completed_at": "2026-03-31T13:03:09.403Z",
+  "duration_ms": 11905,
+  "command": "/usr/bin/node --test /root/Matrix/tests/integration/bootstrap.test.mjs /root/Matrix/tests/integration/l1-mandatory.test.mjs",
+  "test_directory": "tests/integration",
+  "test_file_count": 2,
+  "test_files": [
+    "tests/integration/bootstrap.test.mjs",
+    "tests/integration/l1-mandatory.test.mjs"
+  ],
+  "output_sha256": "0e64fefe87eb727f33c51807c62ac479aefde2d33b0962737dc78647b97a920f",
+  "error_message": null,
+  "log_artifact": "evidence/common/_test-runs/20260331T130238Z/ci-integration.log"
+}

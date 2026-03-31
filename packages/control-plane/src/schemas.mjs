@@ -214,6 +214,12 @@ export function normalizeOpsHealthResponse(value) {
       };
     })
     : [];
+  const deploymentComposition = Array.isArray(value.deployment_composition)
+    ? value.deployment_composition.map((entry, index) => {
+      assertObject(entry, `deployment_composition[${index}]`);
+      return structuredClone(entry);
+    })
+    : [];
   return {
     service: normalizeString(value.service, 'service'),
     status: normalizeEnum(value.status, 'status', ['ok', 'degraded', 'fail']),
@@ -222,6 +228,15 @@ export function normalizeOpsHealthResponse(value) {
     deployment_id: normalizeString(value.deployment_id, 'deployment_id'),
     compatibility_date: normalizeString(value.compatibility_date, 'compatibility_date'),
     release_profile: normalizeString(value.release_profile, 'release_profile'),
+    cpu_limit_class: normalizeString(value.cpu_limit_class, 'cpu_limit_class'),
+    startup_time_ms: normalizeInteger(value.startup_time_ms, 'startup_time_ms', { min: 0 }),
+    deployment_composition: deploymentComposition,
+    feature_gates: value.feature_gates == null
+      ? {}
+      : (assertObject(value.feature_gates, 'feature_gates'), structuredClone(value.feature_gates)),
+    secret_versions: value.secret_versions == null
+      ? {}
+      : (assertObject(value.secret_versions, 'secret_versions'), structuredClone(value.secret_versions)),
     dependencies,
   };
 }

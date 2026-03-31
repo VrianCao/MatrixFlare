@@ -15,6 +15,7 @@
     "test:staging": "node packages/testing/src/cli.mjs staging",
     "test:pre-release": "node packages/testing/src/cli.mjs pre-release",
     "test:all": "node packages/testing/src/cli.mjs all",
+    "evidence:l1": "node packages/testing/src/cli.mjs evidence-l1",
     "build": "node packages/spec-tools/src/cli.mjs build",
     "governance:scan": "node packages/spec-tools/src/cli.mjs scan-ids",
     "governance:check": "node packages/spec-tools/src/cli.mjs governance-check",

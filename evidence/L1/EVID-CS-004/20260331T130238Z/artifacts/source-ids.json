@@ -1,0 +1,47 @@
+{
+  "declared_source_ids": [
+    "MX-CS-003",
+    "MX-CS-005",
+    "MX-CS-012",
+    "MX-CS-016",
+    "MX-CS-018",
+    "MX-CS-020",
+    "MX-CS-021",
+    "MX-CS-022",
+    "MX-CS-023",
+    "MX-CS-025",
+    "MX-CS-027",
+    "MX-CS-028",
+    "MX-CS-029"
+  ],
+  "expanded_source_ids": [
+    "MX-CS-003",
+    "MX-CS-005",
+    "MX-CS-012",
+    "MX-CS-016",
+    "MX-CS-018",
+    "MX-CS-020",
+    "MX-CS-021",
+    "MX-CS-022",
+    "MX-CS-023",
+    "MX-CS-025",
+    "MX-CS-027",
+    "MX-CS-028",
+    "MX-CS-029"
+  ],
+  "applicable_source_ids": [
+    "MX-CS-003",
+    "MX-CS-005",
+    "MX-CS-012",
+    "MX-CS-016",
+    "MX-CS-018",
+    "MX-CS-020",
+    "MX-CS-021",
+    "MX-CS-022",
+    "MX-CS-023",
+    "MX-CS-025",
+    "MX-CS-027",
+    "MX-CS-028",
+    "MX-CS-029"
+  ]
+}

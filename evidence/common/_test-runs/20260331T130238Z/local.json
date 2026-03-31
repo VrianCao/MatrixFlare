@@ -1,0 +1,31 @@
+{
+  "environment_name": "local",
+  "status": "pass",
+  "exit_code": 0,
+  "started_at": "2026-03-31T13:02:45.641Z",
+  "completed_at": "2026-03-31T13:02:57.492Z",
+  "duration_ms": 11844,
+  "command": "/usr/bin/node --test /root/Matrix/tests/local/client-identity/phase-04.test.mjs /root/Matrix/tests/local/client-identity/phase-05.test.mjs /root/Matrix/tests/local/client-identity/phase-06.test.mjs /root/Matrix/tests/local/client-identity/phase-07.test.mjs /root/Matrix/tests/local/control-plane/control-plane.test.mjs /root/Matrix/tests/local/control-plane/phase-08-ops.test.mjs /root/Matrix/tests/local/runtime-foundations/canonical-json.test.mjs /root/Matrix/tests/local/runtime-foundations/config.test.mjs /root/Matrix/tests/local/runtime-foundations/data-plane-storage.test.mjs /root/Matrix/tests/local/runtime-foundations/errors.test.mjs /root/Matrix/tests/local/runtime-foundations/logging.test.mjs /root/Matrix/tests/local/runtime-foundations/phase-08-runtime-controls.test.mjs /root/Matrix/tests/local/runtime-foundations/runtime-skeleton.test.mjs /root/Matrix/tests/local/runtime-foundations/testing-harness.test.mjs /root/Matrix/tests/local/spec-tools/governance.test.mjs",
+  "test_directory": "tests/local",
+  "test_file_count": 15,
+  "test_files": [
+    "tests/local/client-identity/phase-04.test.mjs",
+    "tests/local/client-identity/phase-05.test.mjs",
+    "tests/local/client-identity/phase-06.test.mjs",
+    "tests/local/client-identity/phase-07.test.mjs",
+    "tests/local/control-plane/control-plane.test.mjs",
+    "tests/local/control-plane/phase-08-ops.test.mjs",
+    "tests/local/runtime-foundations/canonical-json.test.mjs",
+    "tests/local/runtime-foundations/config.test.mjs",
+    "tests/local/runtime-foundations/data-plane-storage.test.mjs",
+    "tests/local/runtime-foundations/errors.test.mjs",
+    "tests/local/runtime-foundations/logging.test.mjs",
+    "tests/local/runtime-foundations/phase-08-runtime-controls.test.mjs",
+    "tests/local/runtime-foundations/runtime-skeleton.test.mjs",
+    "tests/local/runtime-foundations/testing-harness.test.mjs",
+    "tests/local/spec-tools/governance.test.mjs"
+  ],
+  "output_sha256": "b6692b0ef02c0802ce1d5b8e031d66ab7bec87199bedb89e7146fd6daa267aaa",
+  "error_message": null,
+  "log_artifact": "evidence/common/_test-runs/20260331T130238Z/local.log"
+}

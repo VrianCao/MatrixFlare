@@ -1,0 +1,17 @@
+{
+  "declared_source_ids": [
+    "REQ-OPS-010",
+    "REQ-OPS-011",
+    "REQ-OPS-012"
+  ],
+  "expanded_source_ids": [
+    "REQ-OPS-010",
+    "REQ-OPS-011",
+    "REQ-OPS-012"
+  ],
+  "applicable_source_ids": [
+    "REQ-OPS-010",
+    "REQ-OPS-011",
+    "REQ-OPS-012"
+  ]
+}

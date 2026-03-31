@@ -1,9 +1,20 @@
 export {
+  classifyGatewayRequest,
+  createMatrixRateLimitResponse,
+  enforceGatewayAbuseGuard,
+  enforceSemanticQuota,
+  resolveAbusePolicy,
+} from './abuse-guard.mjs';
+export {
   canonicalJsonBytes,
   canonicalizeJsonText,
   canonicalizeJsonValue,
   parseJsonTextWithDuplicateKeyCheck,
 } from './canonical-json.mjs';
+export {
+  buildDeploymentRecord,
+  ensureDeploymentRecord,
+} from './deployment-records.mjs';
 export {
   BaseDurableObject,
   RemoteServerDO,
@@ -113,6 +124,18 @@ export {
   listWorkerNames,
   loadWorkerRuntimeConfig,
 } from './runtime-manifest.mjs';
+export {
+  incrementMetric,
+  instrumentEnvironmentBindings,
+  listDeploymentRecords,
+  observeMetric,
+  recordCostAttribution,
+  recordJobMetric,
+  recordMetric,
+  setGaugeMetric,
+  snapshotTelemetry,
+  startRequestMetrics,
+} from './telemetry.mjs';
 export {
   createAsyncTaskContext,
   createRequestContext,

@@ -27,7 +27,7 @@ import {
   startControlPlaneJob,
 } from './services.mjs';
 
-function buildHealthResponse(config, dependencies, status) {
+function buildHealthResponse(config, deploymentRecord, dependencies, status) {
   return {
     service: 'ops-worker',
     status,
@@ -36,6 +36,11 @@ function buildHealthResponse(config, dependencies, status) {
     deployment_id: config.text.DEPLOYMENT_ID,
     compatibility_date: config.compatibilityDate,
     release_profile: config.releaseProfile,
+    cpu_limit_class: deploymentRecord.cpu_limit_class,
+    startup_time_ms: deploymentRecord.startup_time_ms,
+    deployment_composition: deploymentRecord.deployment_composition,
+    feature_gates: deploymentRecord.feature_gates,
+    secret_versions: deploymentRecord.secret_versions,
     dependencies,
   };
 }
@@ -299,7 +304,12 @@ async function handleAppserviceItem(request, env, config, requestContext, persis
 
 export function createOpsWorkerFetchHandler() {
   return async function opsWorkerFetch(request, env) {
-    const { config, requestContext, persistence } = makeOpsContext('ops-worker', request, env, {
+    const {
+      config,
+      deploymentRecord,
+      requestContext,
+      persistence,
+    } = makeOpsContext('ops-worker', request, env, {
       routeFamily: 'ops-control-plane',
     });
 
@@ -340,7 +350,7 @@ export function createOpsWorkerFetchHandler() {
           : dependencies.some((entry) => entry.status === 'degraded')
             ? 'degraded'
             : 'ok';
-        return jsonResponse(buildHealthResponse(config, dependencies, status), status === 'fail' ? 503 : 200);
+        return jsonResponse(buildHealthResponse(config, deploymentRecord, dependencies, status), status === 'fail' ? 503 : 200);
       }
 
       if (info.kind === 'job-create') {

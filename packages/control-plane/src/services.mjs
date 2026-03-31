@@ -8,8 +8,10 @@ import {
   canonicalizeJsonValue,
   createRequestFingerprint,
   createRequestContext,
+  ensureDeploymentRecord,
   loadWorkerRuntimeConfig,
   makeId,
+  recordJobMetric,
 } from '../../runtime-core/src/index.mjs';
 import {
   canonicalHash,
@@ -1776,6 +1778,10 @@ export async function dispatchJobStart({
 
 export function makeOpsContext(workerName, request, env, { routeFamily }) {
   const config = loadWorkerRuntimeConfig(workerName, env);
+  const deploymentRecord = ensureDeploymentRecord(env, {
+    workerName,
+    config,
+  });
   const requestContext = createRequestContext({
     workerName,
     workerVersion: config.text.WORKER_VERSION_ID,
@@ -1784,6 +1790,7 @@ export function makeOpsContext(workerName, request, env, { routeFamily }) {
   });
   return {
     config,
+    deploymentRecord,
     requestContext,
     persistence: getControlPlanePersistence(env),
     now: getNow(env),
@@ -2235,6 +2242,12 @@ export async function startControlPlaneJob({
     }
   }
 
+  recordJobMetric(env, {
+    jobType,
+    jobId,
+    state: 'pending',
+  });
+
   try {
     if (jobType === 'restore') {
       await resolveRestoreCheckpointRefs({
@@ -2361,6 +2374,11 @@ export async function startControlPlaneJob({
       },
     };
     await persistence.updateJob(failedJob);
+    recordJobMetric(env, {
+      jobType,
+      jobId,
+      state: 'failed',
+    });
     const errorEnvelope = serializeEnvelope('error', failureStatus, failureBody);
     await finalizeReservedWrite({
       persistence,
@@ -2382,6 +2400,7 @@ export async function startControlPlaneJob({
 }
 
 export async function updateJobState({
+  env = null,
   persistence,
   job,
   newState,
@@ -2439,6 +2458,13 @@ export async function updateJobState({
     }
   } else {
     await persistence.updateJob(updated);
+  }
+  if (env) {
+    recordJobMetric(env, {
+      jobType: job.job_type,
+      jobId: job.job_id,
+      state: newState,
+    });
   }
   return updated;
 }

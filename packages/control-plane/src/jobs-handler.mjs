@@ -249,6 +249,7 @@ async function failJobForQueueMessage({
   queueName,
   message,
   asyncContext,
+  env,
   error,
 }) {
   const jobId = typeof message?.body?.job_id === 'string' ? message.body.job_id.trim() : '';
@@ -264,6 +265,7 @@ async function failJobForQueueMessage({
     schemaVersion: message?.body?.schema_version ?? null,
   });
   await updateJobState({
+    env,
     persistence,
     job,
     newState: 'failed',
@@ -285,6 +287,7 @@ async function failJobForQueueMessage({
 }
 
 async function stageQueuedPayloads({
+  env,
   persistence,
   job,
   kind,
@@ -309,6 +312,7 @@ async function stageQueuedPayloads({
       });
     }
     await updateJobState({
+      env,
       persistence: tx,
       job,
       newState: nextState,
@@ -459,6 +463,7 @@ async function fanOutJobTasks({ env, persistence, job, kind }) {
     })];
   }
   await stageQueuedPayloads({
+    env,
     persistence,
     job,
     kind,
@@ -671,6 +676,7 @@ async function processQueueMessage({
   }
   if (job.internal_state === 'cancel_requested') {
     await updateJobState({
+      env,
       persistence,
       job,
       newState: 'canceled',
@@ -737,6 +743,7 @@ async function processQueueMessage({
         });
       }
       await updateJobState({
+        env,
         persistence,
         job,
         newState: terminalState,
@@ -781,6 +788,7 @@ async function processQueueMessage({
   }
   if (job.internal_state !== runningState) {
     const runningJob = await updateJobState({
+      env,
       persistence,
       job,
       newState: runningState,
@@ -907,6 +915,7 @@ async function processQueueMessage({
     });
   }
   await updateJobState({
+    env,
     persistence,
     job,
     newState: isTerminal ? terminalState : 'checkpointed',
@@ -1064,6 +1073,7 @@ export function createJobsWorkerQueueHandler() {
         const retryable = error.retryable ?? !(error instanceof TypeError || error instanceof RangeError);
         if (!retryable) {
           await failJobForQueueMessage({
+            env,
             persistence,
             queueName: batch.queue,
             message,

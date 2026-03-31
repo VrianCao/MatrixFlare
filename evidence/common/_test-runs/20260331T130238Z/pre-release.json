@@ -1,0 +1,18 @@
+{
+  "environment_name": "pre-release",
+  "status": "pass",
+  "exit_code": 0,
+  "started_at": "2026-03-31T13:03:20.699Z",
+  "completed_at": "2026-03-31T13:03:32.653Z",
+  "duration_ms": 11953,
+  "command": "/usr/bin/node --test /root/Matrix/tests/pre-release/bootstrap.test.mjs /root/Matrix/tests/pre-release/l1-mandatory.test.mjs",
+  "test_directory": "tests/pre-release",
+  "test_file_count": 2,
+  "test_files": [
+    "tests/pre-release/bootstrap.test.mjs",
+    "tests/pre-release/l1-mandatory.test.mjs"
+  ],
+  "output_sha256": "78824e8f4431b0734202e7b65a28df59995e2d7cbd3137e79ad2d21533f28cae",
+  "error_message": null,
+  "log_artifact": "evidence/common/_test-runs/20260331T130238Z/pre-release.log"
+}

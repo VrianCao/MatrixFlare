@@ -1,0 +1,25 @@
+{
+  "evid_id": "EVID-COST-001",
+  "target_profile": "L1",
+  "generated_at": "2026-03-31T13:02:45.600Z",
+  "run_ts": "20260331T130238Z",
+  "repo_root": "/root/Matrix",
+  "code_version": {
+    "git_commit": "74a3ba7dbe2cc0199e210b812773ec4dfdbea480",
+    "worktree_dirty": true
+  },
+  "data_version": {
+    "analysis_sha256": "034f0133cec010cd40cd6631dc1a3f232ed1d1a51fb9a94256bcff093680fab8",
+    "requirement_register_sha256": "b6b25c4daffa1b2fc12da4d3bbd65fef4135d9261a8c7407e19d3e1458d8864a",
+    "traceability_matrix_sha256": "5a5cb8f997a55a45c42e55336397d1792cd84d0c85a978001b568fa6b8df8722",
+    "expanded_source_ids_sha256": "2502cfd5a15dba976fe5887a2d87abf2ed8aaf2144860b19a8ec99ae74285604",
+    "wildcard_route_expansion_sha256": "36a11aa9bc55e0800be48548c8c6beb38ee55c54981bf5e9c2b1c7940a4492ac"
+  },
+  "governance_valid": true,
+  "evidence_type": "cost",
+  "generation_method": "monthly dashboard snapshot + model comparison",
+  "pass_criteria": "Metrics and cost-attribution surfaces must produce stable pre-release evidence without budget-model drift signals.",
+  "test_ids": [
+    "TEST-COST-001"
+  ]
+}

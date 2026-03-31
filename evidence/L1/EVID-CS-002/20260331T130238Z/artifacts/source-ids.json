@@ -1,0 +1,23 @@
+{
+  "declared_source_ids": [
+    "MX-CS-004",
+    "MX-CS-006",
+    "MX-CS-007",
+    "MX-CS-010",
+    "MX-CS-015"
+  ],
+  "expanded_source_ids": [
+    "MX-CS-004",
+    "MX-CS-006",
+    "MX-CS-007",
+    "MX-CS-010",
+    "MX-CS-015"
+  ],
+  "applicable_source_ids": [
+    "MX-CS-004",
+    "MX-CS-006",
+    "MX-CS-007",
+    "MX-CS-010",
+    "MX-CS-015"
+  ]
+}

@@ -38,6 +38,7 @@
   * 每个 Worker 的显式 CPU limit 配置
   * `startup_time_ms` 或等价启动校验结果
   * enabled flags / feature gates
+  * secret rotation 的 active version 摘要（禁止记录 secret material）
 
 ## 3. Backward Compatibility Rules
 

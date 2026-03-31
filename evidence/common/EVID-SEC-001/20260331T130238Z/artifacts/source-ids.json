@@ -1,0 +1,50 @@
+{
+  "declared_source_ids": [
+    "REQ-SEC-*",
+    "MX-CS-002",
+    "MX-CS-003",
+    "MX-CS-005",
+    "MX-CS-016",
+    "MX-CS-024",
+    "MX-CS-025",
+    "MX-CS-026",
+    "MX-CS-028",
+    "MX-FED-002"
+  ],
+  "expanded_source_ids": [
+    "MX-CS-002",
+    "MX-CS-003",
+    "MX-CS-005",
+    "MX-CS-016",
+    "MX-CS-024",
+    "MX-CS-025",
+    "MX-CS-026",
+    "MX-CS-028",
+    "MX-FED-002",
+    "REQ-SEC-001",
+    "REQ-SEC-002",
+    "REQ-SEC-003",
+    "REQ-SEC-004",
+    "REQ-SEC-005",
+    "REQ-SEC-006",
+    "REQ-SEC-007",
+    "REQ-SEC-008"
+  ],
+  "applicable_source_ids": [
+    "MX-CS-002",
+    "MX-CS-003",
+    "MX-CS-005",
+    "MX-CS-016",
+    "MX-CS-024",
+    "MX-CS-025",
+    "MX-CS-026",
+    "MX-CS-028",
+    "REQ-SEC-001",
+    "REQ-SEC-002",
+    "REQ-SEC-003",
+    "REQ-SEC-004",
+    "REQ-SEC-006",
+    "REQ-SEC-007",
+    "REQ-SEC-008"
+  ]
+}

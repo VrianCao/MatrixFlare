@@ -29,8 +29,11 @@ const SHARED_TEXT_BINDINGS = Object.freeze({
   RELEASE_PROFILE: { type: 'enum', required: true, values: RELEASE_PROFILES },
   WORKER_VERSION_ID: { type: 'string', required: false, default: 'dev' },
   DEPLOYMENT_ID: { type: 'string', required: false, default: 'local-dev' },
+  ACTIVE_DEPLOYMENT_COMPOSITION: { type: 'string', required: false, default: '' },
   LOG_LEVEL: { type: 'enum', required: false, values: LOG_LEVELS, default: 'info' },
   CPU_LIMIT_CLASS: { type: 'enum', required: false, values: CPU_LIMIT_CLASSES, default: 'default' },
+  STARTUP_TIME_MS: { type: 'integer', required: false, default: 0, min: 0 },
+  ABUSE_GUARD_POLICY_JSON: { type: 'string', required: false, default: '' },
 });
 
 const WORKER_RUNTIME_MANIFEST = Object.freeze({
@@ -250,8 +253,9 @@ function parseTextBinding(env, envName, definition) {
     const parsed = typeof value === 'number'
       ? value
       : (/^[0-9]+$/.test(String(value).trim()) ? Number.parseInt(String(value).trim(), 10) : Number.NaN);
-    if (!Number.isInteger(parsed) || parsed <= 0) {
-      throw new TypeError(`${envName} must be a positive integer`);
+    const minimum = Number.isInteger(definition.min) ? definition.min : 1;
+    if (!Number.isInteger(parsed) || parsed < minimum) {
+      throw new TypeError(`${envName} must be an integer >= ${minimum}`);
     }
     return parsed;
   }

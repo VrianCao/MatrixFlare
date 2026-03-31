@@ -10,6 +10,7 @@ import {
   listTestEnvironmentNames,
   resolveTestEnvironmentName,
 } from './bootstrap.mjs';
+import { writeL1Evidence } from './evidence.mjs';
 
 async function runEnvironment(environmentName) {
   const repoRoot = process.cwd();
@@ -40,6 +41,22 @@ async function runEnvironment(environmentName) {
 
 async function main() {
   const requestedEnvironment = process.argv[2] ?? 'local';
+  if (requestedEnvironment === 'evidence-l1') {
+    const timestampFlagIndex = process.argv.indexOf('--timestamp');
+    const timestamp = timestampFlagIndex === -1 ? null : (process.argv[timestampFlagIndex + 1] ?? null);
+    const result = await writeL1Evidence(process.cwd(), {
+      timestamp,
+    });
+    console.log(`Wrote L1 evidence bundles for run ${result.run_timestamp}`);
+    console.log(`Shared test-run artifacts: ${path.relative(process.cwd(), result.shared_run_root)}`);
+    for (const bundle of result.bundles) {
+      console.log(`- ${bundle.evid_id}: ${bundle.status} (${path.relative(process.cwd(), bundle.evidence_root)})`);
+    }
+    if (!result.ok) {
+      process.exitCode = 1;
+    }
+    return;
+  }
   const environments = requestedEnvironment === 'all'
     ? listTestEnvironmentNames()
     : [resolveTestEnvironmentName(requestedEnvironment)];

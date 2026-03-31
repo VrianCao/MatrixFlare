@@ -2,6 +2,7 @@ import { createHmac } from 'node:crypto';
 
 import { createCanonicalFilterHash } from './fingerprints.mjs';
 import { normalizeInteger, normalizeString } from './persistence-common.mjs';
+import { observeMetric, setGaugeMetric } from './telemetry.mjs';
 import { parseSessionRootKeyRing } from './user-identity.mjs';
 
 const textEncoder = new TextEncoder();
@@ -865,6 +866,13 @@ export function ensureSyncWaiterHub(env) {
   return env.__matrix_sync_waiter_hub;
 }
 
+function updateSyncWaiterMetrics(env, hub) {
+  const activeWaiters = [...hub.waiters_by_user.values()].reduce((total, userWaiters) => total + userWaiters.size, 0);
+  setGaugeMetric(env, 'sync.waiter.active', activeWaiters, {
+    environment: typeof env?.ENVIRONMENT_NAME === 'string' ? env.ENVIRONMENT_NAME : 'unknown',
+  });
+}
+
 export function registerSyncWaiter(env, {
   user_id,
   session_id,
@@ -904,15 +912,24 @@ export function registerSyncWaiter(env, {
           hub.waiter_key_by_session.delete(sessionKey);
         }
         clearTimeout(waiter.timer);
+        if (payload?.reason === 'wake') {
+          observeMetric(env, 'sync.wake.latency_ms', Date.now() - waiter.created_at_ms, {
+            environment: typeof env?.ENVIRONMENT_NAME === 'string' ? env.ENVIRONMENT_NAME : 'unknown',
+            reason: payload.reason,
+          });
+        }
+        updateSyncWaiterMetrics(env, hub);
         resolve(payload);
       },
     };
+    waiter.created_at_ms = Date.now();
     waiterRef = waiter;
     waiter.timer = setTimeout(() => {
       waiter.resolve({ reason: 'timeout' });
     }, normalizedTimeoutMs);
     userWaiters.set(normalizedWaiterKey, waiter);
     hub.waiter_key_by_session.set(sessionKey, normalizedWaiterKey);
+    updateSyncWaiterMetrics(env, hub);
   });
   return Object.freeze({
     promise,
@@ -944,5 +961,6 @@ export function wakeSyncWaiters(env, {
     });
     wakeCount += 1;
   }
+  updateSyncWaiterMetrics(env, hub);
   return wakeCount;
 }

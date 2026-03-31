@@ -7,11 +7,19 @@ import {
   clearDerivedTarget,
   createThumbnailBodyInput,
   createDefaultThumbnailJob,
+  ensureDeploymentRecord,
+  incrementMetric,
   INTERNAL_RUNTIME_DERIVED_WORK_PATH,
+  instrumentEnvironmentBindings,
+  loadWorkerRuntimeConfig,
   normalizeDerivedWorkBatch,
+  observeMetric,
   parseLegacyUnauthFreezeAt,
+  recordCostAttribution,
   resolveThumbnailAnimationPreference,
   RUNTIME_JOB_SCHEMA_VERSION,
+  setGaugeMetric,
+  startRequestMetrics,
 } from '../../../packages/runtime-core/src/index.mjs';
 import { createSkeletonQueueHandler } from '../../../packages/runtime-core/src/index.mjs';
 import {
@@ -88,6 +96,13 @@ function resolveConfiguredMaxMediaBytes(env) {
     : Number.POSITIVE_INFINITY;
 }
 
+function resolveEnqueueLagMilliseconds(enqueuedAt) {
+  const parsed = typeof enqueuedAt === 'string' ? Date.parse(enqueuedAt) : Number.NaN;
+  return Number.isFinite(parsed)
+    ? Math.max(0, Date.now() - parsed)
+    : null;
+}
+
 async function handleRuntimeDerivedFetch(request, env) {
   let body;
   try {
@@ -98,6 +113,12 @@ async function handleRuntimeDerivedFetch(request, env) {
     }, 400);
   }
   for (const item of body.work_items) {
+    const lagMs = resolveEnqueueLagMilliseconds(item.enqueued_at);
+    if (lagMs != null) {
+      observeMetric(env, 'derived.work.lag_ms', lagMs, {
+        work_type: item.work_type,
+      });
+    }
     if (item.work_type === 'search_index') {
       await env.SEARCH_INDEX_QUEUE.send({
         schema_version: RUNTIME_JOB_SCHEMA_VERSION,
@@ -154,6 +175,12 @@ async function handleRuntimeDerivedFetch(request, env) {
 }
 
 async function processSearchIndexMessage(messageBody, env) {
+  const lagMs = resolveEnqueueLagMilliseconds(messageBody.enqueued_at);
+  if (lagMs != null) {
+    observeMetric(env, 'derived.work.lag_ms', lagMs, {
+      work_type: 'search_index',
+    });
+  }
   const roomDo = getRoomDoStub(env, messageBody.room_id);
   const projection = await roomDo.getDerivedEventProjection({
     event_id: messageBody.event_id,
@@ -182,6 +209,12 @@ async function processSearchIndexMessage(messageBody, env) {
 }
 
 async function processMediaThumbnailMessage(messageBody, env) {
+  const lagMs = resolveEnqueueLagMilliseconds(messageBody.enqueued_at);
+  if (lagMs != null) {
+    observeMetric(env, 'derived.work.lag_ms', lagMs, {
+      work_type: 'media_thumbnail',
+    });
+  }
   const source = await env.MATRIX_MEDIA_BUCKET.get(messageBody.r2_object_key);
   if (!source) {
     throw Object.assign(new Error(`Source media object ${messageBody.r2_object_key} is missing`), {
@@ -294,24 +327,121 @@ function createRuntimeQueueHandler() {
   };
 }
 
+function instrumentQueueBatch(batch, env) {
+  const queueName = batch.queue;
+  const messages = Array.isArray(batch.messages) ? batch.messages : [];
+  setGaugeMetric(env, 'queue.backlog.depth', messages.length, {
+    queue_name: queueName,
+  });
+  incrementMetric(env, 'queue.read.count', messages.length, {
+    queue_name: queueName,
+  });
+  recordCostAttribution(env, {
+    surface: 'queue.read',
+    quantity: messages.length,
+    dimensions: {
+      queue_name: queueName,
+    },
+  });
+  return {
+    ...batch,
+    messages: messages.map((message) => ({
+      ...message,
+      ack() {
+        incrementMetric(env, 'queue.delete.count', 1, {
+          queue_name: queueName,
+        });
+        recordCostAttribution(env, {
+          surface: 'queue.delete',
+          quantity: 1,
+          dimensions: {
+            queue_name: queueName,
+          },
+        });
+        return typeof message.ack === 'function'
+          ? message.ack.call(message)
+          : undefined;
+      },
+      retry() {
+        incrementMetric(env, 'queue.retry.count', 1, {
+          queue_name: queueName,
+        });
+        return typeof message.retry === 'function'
+          ? message.retry.call(message)
+          : undefined;
+      },
+    })),
+  };
+}
+
 const controlPlaneFetch = createJobsWorkerFetchHandler();
 const controlPlaneQueue = createJobsWorkerQueueHandler();
 const runtimeQueue = createRuntimeQueueHandler();
 const CONTROL_PLANE_QUEUES = new Set(Object.values(QUEUE_NAMES));
 
 const fetch = async (request, env) => {
+  instrumentEnvironmentBindings(env);
+  const config = loadWorkerRuntimeConfig('jobs-worker', env);
+  ensureDeploymentRecord(env, {
+    workerName: 'jobs-worker',
+    config,
+  });
   const pathname = new URL(request.url).pathname;
-  if (pathname === INTERNAL_RUNTIME_DERIVED_WORK_PATH) {
-    return handleRuntimeDerivedFetch(request, env);
+  const routeFamily = pathname === INTERNAL_RUNTIME_DERIVED_WORK_PATH
+    ? 'runtime-derived'
+    : 'jobs-control-plane';
+  const requestMetrics = startRequestMetrics(env, {
+    workerName: 'jobs-worker',
+    workerVersion: config.text.WORKER_VERSION_ID,
+    routeFamily,
+  });
+  try {
+    const response = pathname === INTERNAL_RUNTIME_DERIVED_WORK_PATH
+      ? await handleRuntimeDerivedFetch(request, env)
+      : await controlPlaneFetch(request, env);
+    requestMetrics.finish({
+      status: response.status,
+    });
+    return response;
+  } catch (error) {
+    requestMetrics.finish({
+      status: 500,
+      error,
+    });
+    throw error;
   }
-  return controlPlaneFetch(request, env);
 };
 
-const queue = async (batch, env) => (
-  CONTROL_PLANE_QUEUES.has(batch.queue)
-    ? controlPlaneQueue(batch, env)
-    : runtimeQueue(batch, env)
-);
+const queue = async (batch, env) => {
+  instrumentEnvironmentBindings(env);
+  const config = loadWorkerRuntimeConfig('jobs-worker', env);
+  ensureDeploymentRecord(env, {
+    workerName: 'jobs-worker',
+    config,
+  });
+  const routeFamily = `queue:${batch.queue}`;
+  const requestMetrics = startRequestMetrics(env, {
+    workerName: 'jobs-worker',
+    workerVersion: config.text.WORKER_VERSION_ID,
+    routeFamily,
+  });
+  const instrumentedBatch = instrumentQueueBatch(batch, env);
+  try {
+    const result = CONTROL_PLANE_QUEUES.has(batch.queue)
+      ? await controlPlaneQueue(instrumentedBatch, env)
+      : await runtimeQueue(instrumentedBatch, env);
+    requestMetrics.finish({
+      status: 200,
+    });
+    return result;
+  } catch (error) {
+    requestMetrics.finish({
+      status: 500,
+      error,
+    });
+    throw error;
+  }
+};
 
 export default {
   fetch,

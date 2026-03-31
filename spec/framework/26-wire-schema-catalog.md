@@ -218,6 +218,11 @@
 | `deployment_id` | string | 当前 deployment ID |
 | `compatibility_date` | string | 当前 compatibility date |
 | `release_profile` | string | `L1`,`L2`,`L3` 之一 |
+| `cpu_limit_class` | string | 当前 Worker 的显式 CPU limit class |
+| `startup_time_ms` | integer | 当前 Worker 的启动校验耗时；若未采样则必须返回 `0` |
+| `deployment_composition` | array | 当前 active deployment composition；每项至少包含 `worker_name`,`worker_version_id`,`deployment_id` |
+| `feature_gates` | object | 当前启用/禁用的 feature gate 布尔值快照 |
+| `secret_versions` | object | 仅允许返回 secret version 摘要；禁止返回 secret material，允许嵌套对象表达 signing/encryption active version |
 | `dependencies` | array | 每项至少包含 `name`,`kind`,`status`,`detail` |
 
 ### 5.3 `ExportJobRequest`

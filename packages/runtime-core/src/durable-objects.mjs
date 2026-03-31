@@ -20,7 +20,12 @@ import {
   resolveRequestedRoomVersion,
 } from './room-domain.mjs';
 import { createAsyncTaskContext, createRequestContext } from './structured-logging.mjs';
+import {
+  incrementMetric,
+  observeMetric,
+} from './telemetry.mjs';
 import { loadWorkerRuntimeConfig } from './runtime-manifest.mjs';
+import { enforceSemanticQuota } from './abuse-guard.mjs';
 import {
   DEFAULT_ACCESS_TOKEN_TTL_MS,
   DEFAULT_REFRESH_TOKEN_TTL_MS,
@@ -1523,6 +1528,34 @@ export class BaseDurableObject {
     }
     return sql;
   }
+
+  observeAuthorityMetric(name, value, dimensions = {}) {
+    return observeMetric(this.env, name, value, {
+      authority_kind: this.options.authorityKind,
+      class_name: this.options.className,
+      ...dimensions,
+    });
+  }
+
+  incrementAuthorityMetric(name, value = 1, dimensions = {}) {
+    return incrementMetric(this.env, name, value, {
+      authority_kind: this.options.authorityKind,
+      class_name: this.options.className,
+      ...dimensions,
+    });
+  }
+
+  enforceSemanticQuota(policyId, key, {
+    nowIso = new Date().toISOString(),
+    message = 'Rate limit exceeded',
+  } = {}) {
+    return enforceSemanticQuota(this, this.env, {
+      policy_id: policyId,
+      key,
+      now_iso: nowIso,
+      message,
+    });
+  }
 }
 
 export class UserDO extends BaseDurableObject {
@@ -1906,6 +1939,9 @@ export class UserDO extends BaseDurableObject {
         }),
       }));
     });
+    this.incrementAuthorityMetric('userdo.stream.append.count', 1, {
+      stream_kind: 'room_fanout',
+    });
     wakeSyncWaiters(this.env, {
       user_id: principal.user_id,
       user_stream_pos: wakePos,
@@ -1969,6 +2005,9 @@ export class UserDO extends BaseDurableObject {
         room_id: roomId,
         event,
       },
+    });
+    this.incrementAuthorityMetric('userdo.stream.append.count', 1, {
+      stream_kind: 'room_ephemeral',
     });
     wakeSyncWaiters(this.env, {
       user_id: userId,
@@ -3421,162 +3460,178 @@ export class UserDO extends BaseDurableObject {
   }
 
   async register() {
+    const startedAt = Date.now();
     await this.ensureCurrentness();
     await this.ensureSchema();
-    const [request = {}] = arguments;
-    const now = request?.now ?? new Date().toISOString();
-    let localpart;
     try {
-      localpart = normalizeLocalpart(request?.localpart);
-    } catch {
-      return createMatrixError(400, 'M_INVALID_USERNAME', 'The requested username is not valid');
-    }
-
-    const userId = buildLocalUserId(localpart, this.config.text.MATRIX_SERVER_NAME);
-    const requestFingerprint = request?.request_fingerprint ?? null;
-    const uiaNonce = request?.uia_nonce ?? null;
-    const password = request?.password;
-    if (typeof password !== 'string' || password.trim().length === 0) {
-      return createMatrixError(400, 'M_MISSING_PARAM', 'password must be present');
-    }
-
-    if (!this.persistence.getRuntimeState().user_id) {
-      this.persistence.setRuntimeIdentity({ user_id: userId, updated_at: now });
-    }
-
-    const sql = this.requireSqlStorage();
-    return withSqliteTransaction(sql, () => {
-      const principal = this.persistence.userPrincipal.get();
-      const phase04 = readPhase04Meta(principal);
-      const isIdempotentRetry = Boolean(
-        principal
-        && phase04.registration?.uia_nonce === uiaNonce
-        && phase04.registration?.request_fingerprint === requestFingerprint,
-      );
-
-      if (principal && !isIdempotentRetry) {
-        return createMatrixError(400, 'M_USER_IN_USE', 'The requested username is already in use');
+      const [request = {}] = arguments;
+      const now = request?.now ?? new Date().toISOString();
+      let localpart;
+      try {
+        localpart = normalizeLocalpart(request?.localpart);
+      } catch {
+        return createMatrixError(400, 'M_INVALID_USERNAME', 'The requested username is not valid');
+      }
+      const semanticQuota = this.enforceSemanticQuota('userdo_register', `register:${localpart}`, {
+        nowIso: now,
+        message: 'Registration rate limit exceeded',
+      });
+      if (!semanticQuota.ok) {
+        return createMatrixError(429, 'M_LIMIT_EXCEEDED', 'Registration rate limit exceeded', {
+          retry_after_ms: semanticQuota.retry_after_ms,
+        });
       }
 
-      if (principal && isIdempotentRetry) {
-        const existingRegistration = phase04.registration ?? null;
-        const existingSession = existingRegistration?.session_id
-          ? this.persistence.sessions.get(existingRegistration.session_id)
-          : null;
-        if (!existingSession || existingSession.revoked_at) {
-          return createMatrixError(409, 'M_CONFLICT', 'Registration was already completed for this UIA session');
+      const userId = buildLocalUserId(localpart, this.config.text.MATRIX_SERVER_NAME);
+      const requestFingerprint = request?.request_fingerprint ?? null;
+      const uiaNonce = request?.uia_nonce ?? null;
+      const password = request?.password;
+      if (typeof password !== 'string' || password.trim().length === 0) {
+        return createMatrixError(400, 'M_MISSING_PARAM', 'password must be present');
+      }
+
+      if (!this.persistence.getRuntimeState().user_id) {
+        this.persistence.setRuntimeIdentity({ user_id: userId, updated_at: now });
+      }
+
+      const sql = this.requireSqlStorage();
+      return withSqliteTransaction(sql, () => {
+        const principal = this.persistence.userPrincipal.get();
+        const phase04 = readPhase04Meta(principal);
+        const isIdempotentRetry = Boolean(
+          principal
+          && phase04.registration?.uia_nonce === uiaNonce
+          && phase04.registration?.request_fingerprint === requestFingerprint,
+        );
+
+        if (principal && !isIdempotentRetry) {
+          return createMatrixError(400, 'M_USER_IN_USE', 'The requested username is already in use');
         }
-        const tokenRevision = getSessionTokenRevision(existingSession);
-        const tokenRootKeyVersion = getSessionTokenRootKeyVersion(existingSession);
-        const { accessToken, refreshToken } = issueSessionTokens(this.env, {
-          userId,
-          sessionId: existingSession.session_id,
-          tokenRevision,
-          tokenRootKeyVersion,
-        });
-        return createSuccessResult({
-          response: makeTokenResponse({
-            userId,
-            deviceId: existingRegistration?.device_id ?? existingSession.device_id,
-            accessToken,
-            refreshToken,
-          }),
-        });
-      }
 
-      if (!principal) {
-        this.persistence.userPrincipal.put({
-          user_id: userId,
-          localpart,
-          user_type: 'human',
-          password_hash_or_null: hashPassword(password),
-          password_login_enabled: true,
+        if (principal && isIdempotentRetry) {
+          const existingRegistration = phase04.registration ?? null;
+          const existingSession = existingRegistration?.session_id
+            ? this.persistence.sessions.get(existingRegistration.session_id)
+            : null;
+          if (!existingSession || existingSession.revoked_at) {
+            return createMatrixError(409, 'M_CONFLICT', 'Registration was already completed for this UIA session');
+          }
+          const tokenRevision = getSessionTokenRevision(existingSession);
+          const tokenRootKeyVersion = getSessionTokenRootKeyVersion(existingSession);
+          const { accessToken, refreshToken } = issueSessionTokens(this.env, {
+            userId,
+            sessionId: existingSession.session_id,
+            tokenRevision,
+            tokenRootKeyVersion,
+          });
+          return createSuccessResult({
+            response: makeTokenResponse({
+              userId,
+              deviceId: existingRegistration?.device_id ?? existingSession.device_id,
+              accessToken,
+              refreshToken,
+            }),
+          });
+        }
+
+        if (!principal) {
+          this.persistence.userPrincipal.put({
+            user_id: userId,
+            localpart,
+            user_type: 'human',
+            password_hash_or_null: hashPassword(password),
+            password_login_enabled: true,
+            created_at: now,
+            deactivated_at_or_null: null,
+            erase_requested_flag: false,
+            auth_version: 1,
+            registration_source: 'self-service',
+            record: mergePhase04Meta(null, {
+              registration: {
+                uia_nonce: uiaNonce,
+                request_fingerprint: requestFingerprint,
+                completed_at: now,
+              },
+            }),
+          });
+        }
+
+        const currentPrincipal = this.persistence.userPrincipal.get();
+        const deviceId = typeof request?.device_id === 'string' && request.device_id.trim().length > 0
+          ? request.device_id.trim()
+          : generateDeviceId();
+        const existingDevice = this.persistence.devices.get(deviceId);
+        this.persistence.devices.put(deviceRowToPutRecord(existingDevice ?? {
+          device_id: deviceId,
+          display_name: request?.initial_device_display_name ?? null,
           created_at: now,
-          deactivated_at_or_null: null,
-          erase_requested_flag: false,
-          auth_version: 1,
-          registration_source: 'self-service',
-          record: mergePhase04Meta(null, {
+          updated_at: now,
+          last_seen_at: now,
+          last_seen_ip: null,
+          deleted_at: null,
+          record: {},
+        }, {
+          display_name: request?.initial_device_display_name ?? existingDevice?.display_name ?? null,
+          updated_at: now,
+          last_seen_at: now,
+          deleted_at: null,
+        }));
+
+        const sessionId = generateSessionId();
+        const tokenRevision = 0;
+        const { accessToken, refreshToken, tokenRootKeyVersion } = issueSessionTokens(this.env, {
+          userId,
+          sessionId,
+          tokenRevision,
+        });
+        const runtimeState = this.persistence.getRuntimeState();
+        const sessionRecord = {
+          session_id: sessionId,
+          access_token_hash: hashOpaqueToken(accessToken),
+          refresh_token_hash: hashOpaqueToken(refreshToken),
+          device_id: deviceId,
+          auth_version: currentPrincipal.auth_version,
+          session_epoch: runtimeState.session_epoch,
+          is_guest: false,
+          created_at: now,
+          updated_at: now,
+          expires_at: isoAfter(now, DEFAULT_ACCESS_TOKEN_TTL_MS),
+          refresh_expires_at: isoAfter(now, DEFAULT_REFRESH_TOKEN_TTL_MS),
+          revoked_at: null,
+          record: {
+            route: 'register',
+            token_revision: tokenRevision,
+            token_root_key_version: tokenRootKeyVersion,
+          },
+        };
+        this.persistence.sessions.put(sessionRowToPutRecord(sessionRecord));
+        this.persistence.userPrincipal.put(principalRowToPutRecord(currentPrincipal, {
+          record: mergePhase04Meta(currentPrincipal, {
             registration: {
               uia_nonce: uiaNonce,
               request_fingerprint: requestFingerprint,
               completed_at: now,
+              session_id: sessionId,
+              device_id: deviceId,
+              token_revision: tokenRevision,
+              token_root_key_version: tokenRootKeyVersion,
             },
           }),
+        }));
+        return createSuccessResult({
+          response: makeTokenResponse({
+            userId,
+            deviceId,
+            accessToken,
+            refreshToken,
+          }),
         });
-      }
-
-      const currentPrincipal = this.persistence.userPrincipal.get();
-      const deviceId = typeof request?.device_id === 'string' && request.device_id.trim().length > 0
-        ? request.device_id.trim()
-        : generateDeviceId();
-      const existingDevice = this.persistence.devices.get(deviceId);
-      this.persistence.devices.put(deviceRowToPutRecord(existingDevice ?? {
-        device_id: deviceId,
-        display_name: request?.initial_device_display_name ?? null,
-        created_at: now,
-        updated_at: now,
-        last_seen_at: now,
-        last_seen_ip: null,
-        deleted_at: null,
-        record: {},
-      }, {
-        display_name: request?.initial_device_display_name ?? existingDevice?.display_name ?? null,
-        updated_at: now,
-        last_seen_at: now,
-        deleted_at: null,
-      }));
-
-      const sessionId = generateSessionId();
-      const tokenRevision = 0;
-      const { accessToken, refreshToken, tokenRootKeyVersion } = issueSessionTokens(this.env, {
-        userId,
-        sessionId,
-        tokenRevision,
       });
-      const runtimeState = this.persistence.getRuntimeState();
-      const sessionRecord = {
-        session_id: sessionId,
-        access_token_hash: hashOpaqueToken(accessToken),
-        refresh_token_hash: hashOpaqueToken(refreshToken),
-        device_id: deviceId,
-        auth_version: currentPrincipal.auth_version,
-        session_epoch: runtimeState.session_epoch,
-        is_guest: false,
-        created_at: now,
-        updated_at: now,
-        expires_at: isoAfter(now, DEFAULT_ACCESS_TOKEN_TTL_MS),
-        refresh_expires_at: isoAfter(now, DEFAULT_REFRESH_TOKEN_TTL_MS),
-        revoked_at: null,
-        record: {
-          route: 'register',
-          token_revision: tokenRevision,
-          token_root_key_version: tokenRootKeyVersion,
-        },
-      };
-      this.persistence.sessions.put(sessionRowToPutRecord(sessionRecord));
-      this.persistence.userPrincipal.put(principalRowToPutRecord(currentPrincipal, {
-        record: mergePhase04Meta(currentPrincipal, {
-          registration: {
-            uia_nonce: uiaNonce,
-            request_fingerprint: requestFingerprint,
-            completed_at: now,
-            session_id: sessionId,
-            device_id: deviceId,
-            token_revision: tokenRevision,
-            token_root_key_version: tokenRootKeyVersion,
-          },
-        }),
-      }));
-      return createSuccessResult({
-        response: makeTokenResponse({
-          userId,
-          deviceId,
-          accessToken,
-          refreshToken,
-        }),
+    } finally {
+      this.observeAuthorityMetric('userdo.operation.latency_ms', Date.now() - startedAt, {
+        operation: 'register',
       });
-    });
+    }
   }
 
   async verifyPasswordAuth() {
@@ -3602,91 +3657,108 @@ export class UserDO extends BaseDurableObject {
   }
 
   async login() {
+    const startedAt = Date.now();
     await this.ensureCurrentness();
     await this.ensureSchema();
-    const [request = {}] = arguments;
-    const now = request?.now ?? new Date().toISOString();
-    let localpart;
     try {
-      localpart = normalizeLocalpart(request?.localpart);
-    } catch {
-      return createMatrixError(403, 'M_FORBIDDEN', 'Invalid username or password');
-    }
-    const passwordResult = await this.verifyPasswordAuth({
-      localpart,
-      password: request?.password ?? '',
-    });
-    if (!passwordResult.ok) {
-      return passwordResult;
-    }
-
-    const userId = passwordResult.user_id;
-    if (!this.persistence.getRuntimeState().user_id) {
-      this.persistence.setRuntimeIdentity({ user_id: userId, updated_at: now });
-    }
-
-    const sql = this.requireSqlStorage();
-    return withSqliteTransaction(sql, () => {
-      const principal = this.persistence.userPrincipal.get();
-      const deviceId = typeof request?.device_id === 'string' && request.device_id.trim().length > 0
-        ? request.device_id.trim()
-        : generateDeviceId();
-      const existingDevice = this.persistence.devices.get(deviceId);
-      this.persistence.devices.put(deviceRowToPutRecord(existingDevice ?? {
-        device_id: deviceId,
-        display_name: request?.initial_device_display_name ?? null,
-        created_at: now,
-        updated_at: now,
-        last_seen_at: now,
-        last_seen_ip: null,
-        deleted_at: null,
-        record: {},
-      }, {
-        display_name: request?.initial_device_display_name ?? existingDevice?.display_name ?? null,
-        updated_at: now,
-        last_seen_at: now,
-        deleted_at: null,
-      }));
-
-      const sessionId = generateSessionId();
-      const tokenRevision = 0;
-      const { accessToken, refreshToken, tokenRootKeyVersion } = issueSessionTokens(this.env, {
-        userId,
-        sessionId,
-        tokenRevision,
+      const [request = {}] = arguments;
+      const now = request?.now ?? new Date().toISOString();
+      let localpart;
+      try {
+        localpart = normalizeLocalpart(request?.localpart);
+      } catch {
+        return createMatrixError(403, 'M_FORBIDDEN', 'Invalid username or password');
+      }
+      const semanticQuota = this.enforceSemanticQuota('userdo_login', `login:${localpart}`, {
+        nowIso: now,
+        message: 'Login rate limit exceeded',
       });
-      const runtimeState = this.persistence.getRuntimeState();
-      this.persistence.sessions.put(sessionRowToPutRecord({
-        session_id: sessionId,
-        access_token_hash: hashOpaqueToken(accessToken),
-        refresh_token_hash: hashOpaqueToken(refreshToken),
-        device_id: deviceId,
-        auth_version: principal.auth_version,
-        session_epoch: runtimeState.session_epoch,
-        is_guest: false,
-        created_at: now,
-        updated_at: now,
-        expires_at: isoAfter(now, DEFAULT_ACCESS_TOKEN_TTL_MS),
-        refresh_expires_at: isoAfter(now, DEFAULT_REFRESH_TOKEN_TTL_MS),
-        revoked_at: null,
-        record: {
-          route: 'login',
-          token_revision: tokenRevision,
-          token_root_key_version: tokenRootKeyVersion,
-        },
-      }));
-      return createSuccessResult({
-        response: makeTokenResponse({
+      if (!semanticQuota.ok) {
+        return createMatrixError(429, 'M_LIMIT_EXCEEDED', 'Login rate limit exceeded', {
+          retry_after_ms: semanticQuota.retry_after_ms,
+        });
+      }
+      const passwordResult = await this.verifyPasswordAuth({
+        localpart,
+        password: request?.password ?? '',
+      });
+      if (!passwordResult.ok) {
+        return passwordResult;
+      }
+
+      const userId = passwordResult.user_id;
+      if (!this.persistence.getRuntimeState().user_id) {
+        this.persistence.setRuntimeIdentity({ user_id: userId, updated_at: now });
+      }
+
+      const sql = this.requireSqlStorage();
+      return withSqliteTransaction(sql, () => {
+        const principal = this.persistence.userPrincipal.get();
+        const deviceId = typeof request?.device_id === 'string' && request.device_id.trim().length > 0
+          ? request.device_id.trim()
+          : generateDeviceId();
+        const existingDevice = this.persistence.devices.get(deviceId);
+        this.persistence.devices.put(deviceRowToPutRecord(existingDevice ?? {
+          device_id: deviceId,
+          display_name: request?.initial_device_display_name ?? null,
+          created_at: now,
+          updated_at: now,
+          last_seen_at: now,
+          last_seen_ip: null,
+          deleted_at: null,
+          record: {},
+        }, {
+          display_name: request?.initial_device_display_name ?? existingDevice?.display_name ?? null,
+          updated_at: now,
+          last_seen_at: now,
+          deleted_at: null,
+        }));
+
+        const sessionId = generateSessionId();
+        const tokenRevision = 0;
+        const { accessToken, refreshToken, tokenRootKeyVersion } = issueSessionTokens(this.env, {
           userId,
-          deviceId,
-          accessToken,
-          refreshToken,
-        }),
+          sessionId,
+          tokenRevision,
+        });
+        const runtimeState = this.persistence.getRuntimeState();
+        this.persistence.sessions.put(sessionRowToPutRecord({
+          session_id: sessionId,
+          access_token_hash: hashOpaqueToken(accessToken),
+          refresh_token_hash: hashOpaqueToken(refreshToken),
+          device_id: deviceId,
+          auth_version: principal.auth_version,
+          session_epoch: runtimeState.session_epoch,
+          is_guest: false,
+          created_at: now,
+          updated_at: now,
+          expires_at: isoAfter(now, DEFAULT_ACCESS_TOKEN_TTL_MS),
+          refresh_expires_at: isoAfter(now, DEFAULT_REFRESH_TOKEN_TTL_MS),
+          revoked_at: null,
+          record: {
+            route: 'login',
+            token_revision: tokenRevision,
+            token_root_key_version: tokenRootKeyVersion,
+          },
+        }));
+        return createSuccessResult({
+          response: makeTokenResponse({
+            userId,
+            deviceId,
+            accessToken,
+            refreshToken,
+          }),
+        });
       });
-    });
+    } finally {
+      this.observeAuthorityMetric('userdo.operation.latency_ms', Date.now() - startedAt, {
+        operation: 'login',
+      });
+    }
   }
 
   async refreshSession() {
+    const startedAt = Date.now();
     await this.ensureCurrentness();
     await this.ensureSchema();
     const [request = {}] = arguments;
@@ -3725,7 +3797,17 @@ export class UserDO extends BaseDurableObject {
     }
 
     const sql = this.requireSqlStorage();
-    return withSqliteTransaction(sql, () => {
+    try {
+      const semanticQuota = this.enforceSemanticQuota('userdo_refresh', `refresh:${session.session_id}`, {
+        nowIso: now,
+        message: 'Refresh rate limit exceeded',
+      });
+      if (!semanticQuota.ok) {
+        return createMatrixError(429, 'M_LIMIT_EXCEEDED', 'Refresh rate limit exceeded', {
+          retry_after_ms: semanticQuota.retry_after_ms,
+        });
+      }
+      return withSqliteTransaction(sql, () => {
       const nextTokenRevision = getSessionTokenRevision(session) + 1;
       const { accessToken: nextAccessToken, refreshToken: nextRefreshToken, tokenRootKeyVersion } = issueSessionTokens(this.env, {
         userId: principal.user_id,
@@ -3752,7 +3834,12 @@ export class UserDO extends BaseDurableObject {
           refresh_token: nextRefreshToken,
         },
       });
-    });
+      });
+    } finally {
+      this.observeAuthorityMetric('userdo.operation.latency_ms', Date.now() - startedAt, {
+        operation: 'refreshSession',
+      });
+    }
   }
 
   async logoutSession() {
@@ -3986,120 +4073,144 @@ export class UserDO extends BaseDurableObject {
   }
 
   async beginMediaUpload() {
+    const startedAt = Date.now();
     await this.ensureCurrentness();
     await this.ensureSchema();
-    const [request = {}] = arguments;
-    const principal = this.persistence.userPrincipal.get();
-    const userId = normalizeString(request?.user_id ?? principal?.user_id, 'request.user_id');
-    if (!principal || principal.user_id !== userId || principal.deactivated_at_or_null) {
-      return {
-        ok: false,
-        error: createInternalErrorEnvelope({
-          code: 'target_not_local',
-          message: 'Target user does not exist on this homeserver',
-          retryable: false,
-        }),
-      };
-    }
-    const declaredSize = normalizeInteger(request?.declared_size ?? 0, 'request.declared_size', { min: 0 });
-    const maxBytes = normalizeInteger(
-      request?.max_bytes ?? this.config.text.MATRIX_MEDIA_MAX_UPLOAD_BYTES,
-      'request.max_bytes',
-      { min: 1 },
-    );
-    if (declaredSize > maxBytes) {
-      return {
-        ok: false,
-        error: createInternalErrorEnvelope({
-          code: 'content_too_large',
-          message: `Media upload exceeds the ${maxBytes} byte limit`,
-          retryable: false,
-        }),
-      };
-    }
-    const contentType = normalizeString(request?.content_type ?? 'application/octet-stream', 'request.content_type');
-    const now = request?.now ?? new Date().toISOString();
-    let sweepResult = {
-      orphan_cleanup: [],
-      next_alarm_at: null,
-    };
-    let grant = null;
-    const sql = this.requireSqlStorage();
-    withSqliteTransaction(sql, () => {
-      sweepResult = sweepPendingUploadGrants(this, now, { applyChanges: true });
-      const mediaId = request?.media_id == null
-        ? makeId('media')
-        : normalizeString(request.media_id, 'request.media_id');
-      const pendingUploadId = buildPendingUploadId(mediaId);
-      const existingGrant = this.persistence.pendingUploadGrants.get({ pending_upload_id: pendingUploadId });
-      if (existingGrant && normalizePendingUploadState(existingGrant.state) === 'pending') {
-        const effectiveMaxBytes = Math.min(
-          normalizeInteger(existingGrant.max_bytes, 'existingGrant.max_bytes', { min: 1 }),
-          maxBytes,
-        );
-        if (declaredSize > effectiveMaxBytes) {
-          throw createInternalErrorEnvelope({
+    try {
+      const [request = {}] = arguments;
+      const principal = this.persistence.userPrincipal.get();
+      const userId = normalizeString(request?.user_id ?? principal?.user_id, 'request.user_id');
+      if (!principal || principal.user_id !== userId || principal.deactivated_at_or_null) {
+        return {
+          ok: false,
+          error: createInternalErrorEnvelope({
+            code: 'target_not_local',
+            message: 'Target user does not exist on this homeserver',
+            retryable: false,
+          }),
+        };
+      }
+      const semanticQuota = this.enforceSemanticQuota('userdo_media', `media:${userId}`, {
+        nowIso: request?.now ?? new Date().toISOString(),
+        message: 'Media upload rate limit exceeded',
+      });
+      if (!semanticQuota.ok) {
+        return {
+          ok: false,
+          error: createInternalErrorEnvelope({
+            code: 'quota_exceeded',
+            message: 'Media upload rate limit exceeded',
+            retryable: true,
+            details: {
+              retry_after_ms: semanticQuota.retry_after_ms,
+            },
+          }),
+        };
+      }
+      const declaredSize = normalizeInteger(request?.declared_size ?? 0, 'request.declared_size', { min: 0 });
+      const maxBytes = normalizeInteger(
+        request?.max_bytes ?? this.config.text.MATRIX_MEDIA_MAX_UPLOAD_BYTES,
+        'request.max_bytes',
+        { min: 1 },
+      );
+      if (declaredSize > maxBytes) {
+        return {
+          ok: false,
+          error: createInternalErrorEnvelope({
             code: 'content_too_large',
-            message: `Media upload exceeds the ${effectiveMaxBytes} byte limit`,
+            message: `Media upload exceeds the ${maxBytes} byte limit`,
+            retryable: false,
+          }),
+        };
+      }
+      const contentType = normalizeString(request?.content_type ?? 'application/octet-stream', 'request.content_type');
+      const now = request?.now ?? new Date().toISOString();
+      let sweepResult = {
+        orphan_cleanup: [],
+        next_alarm_at: null,
+      };
+      let grant = null;
+      const sql = this.requireSqlStorage();
+      withSqliteTransaction(sql, () => {
+        sweepResult = sweepPendingUploadGrants(this, now, { applyChanges: true });
+        const mediaId = request?.media_id == null
+          ? makeId('media')
+          : normalizeString(request.media_id, 'request.media_id');
+        const pendingUploadId = buildPendingUploadId(mediaId);
+        const existingGrant = this.persistence.pendingUploadGrants.get({ pending_upload_id: pendingUploadId });
+        if (existingGrant && normalizePendingUploadState(existingGrant.state) === 'pending') {
+          const effectiveMaxBytes = Math.min(
+            normalizeInteger(existingGrant.max_bytes, 'existingGrant.max_bytes', { min: 1 }),
+            maxBytes,
+          );
+          if (declaredSize > effectiveMaxBytes) {
+            throw createInternalErrorEnvelope({
+              code: 'content_too_large',
+              message: `Media upload exceeds the ${effectiveMaxBytes} byte limit`,
+              retryable: false,
+            });
+          }
+          grant = {
+            ...buildPendingUploadGrantView(existingGrant, this.env.MATRIX_SERVER_NAME),
+            max_bytes: effectiveMaxBytes,
+          };
+          return;
+        }
+        if (request?.require_existing === true) {
+          throw createInternalErrorEnvelope({
+            code: 'upload_not_found',
+            message: `Pending upload ${pendingUploadId} does not exist`,
             retryable: false,
           });
         }
-        grant = {
-          ...buildPendingUploadGrantView(existingGrant, this.env.MATRIX_SERVER_NAME),
-          max_bytes: effectiveMaxBytes,
+        const activePendingCount = this.persistence.pendingUploadGrants.list()
+          .filter((row) => normalizePendingUploadState(row.state) === 'pending')
+          .length;
+        if (activePendingCount >= 8) {
+          throw createInternalErrorEnvelope({
+            code: 'quota_exceeded',
+            message: 'Too many concurrent pending uploads',
+            retryable: true,
+          });
+        }
+        const expiresAt = isoAfter(now, DEFAULT_MEDIA_PENDING_UPLOAD_TTL_MS);
+        const row = this.persistence.pendingUploadGrants.put({
+          pending_upload_id: pendingUploadId,
+          media_id: mediaId,
+          content_type: contentType,
+          max_bytes: maxBytes,
+          state: 'pending',
+          granted_at: now,
+          expires_at: expiresAt,
+          finalized_at: null,
+          record_json: {
+            allowed_content_types: [contentType],
+            device_id: request?.device_id ?? null,
+            filename: request?.filename ?? null,
+            request_fingerprint: request?.request_fingerprint ?? null,
+            reservation_only: request?.reservation_only === true,
+            sha256: request?.sha256 ?? null,
+          },
+        });
+        grant = buildPendingUploadGrantView(row, this.env.MATRIX_SERVER_NAME);
+        const alarmAt = sweepResult.next_alarm_at == null
+          ? expiresAt
+          : (Date.parse(sweepResult.next_alarm_at) < Date.parse(expiresAt) ? sweepResult.next_alarm_at : expiresAt);
+        sweepResult = {
+          ...sweepResult,
+          next_alarm_at: alarmAt,
         };
-        return;
-      }
-      if (request?.require_existing === true) {
-        throw createInternalErrorEnvelope({
-          code: 'upload_not_found',
-          message: `Pending upload ${pendingUploadId} does not exist`,
-          retryable: false,
-        });
-      }
-      const activePendingCount = this.persistence.pendingUploadGrants.list()
-        .filter((row) => normalizePendingUploadState(row.state) === 'pending')
-        .length;
-      if (activePendingCount >= 8) {
-        throw createInternalErrorEnvelope({
-          code: 'quota_exceeded',
-          message: 'Too many concurrent pending uploads',
-          retryable: true,
-        });
-      }
-      const expiresAt = isoAfter(now, DEFAULT_MEDIA_PENDING_UPLOAD_TTL_MS);
-      const row = this.persistence.pendingUploadGrants.put({
-        pending_upload_id: pendingUploadId,
-        media_id: mediaId,
-        content_type: contentType,
-        max_bytes: maxBytes,
-        state: 'pending',
-        granted_at: now,
-        expires_at: expiresAt,
-        finalized_at: null,
-        record_json: {
-          allowed_content_types: [contentType],
-          device_id: request?.device_id ?? null,
-          filename: request?.filename ?? null,
-          request_fingerprint: request?.request_fingerprint ?? null,
-          reservation_only: request?.reservation_only === true,
-          sha256: request?.sha256 ?? null,
-        },
       });
-      grant = buildPendingUploadGrantView(row, this.env.MATRIX_SERVER_NAME);
-      const alarmAt = sweepResult.next_alarm_at == null
-        ? expiresAt
-        : (Date.parse(sweepResult.next_alarm_at) < Date.parse(expiresAt) ? sweepResult.next_alarm_at : expiresAt);
-      sweepResult = {
-        ...sweepResult,
-        next_alarm_at: alarmAt,
-      };
-    });
-    await this.cleanupOrphanedMediaObjects(sweepResult.orphan_cleanup, { now });
-    await this.scheduleMediaLifecycleAlarm(getUserMediaLifecycleNextAlarm(this, now));
-    return createSuccessResult({
-      grant,
-    });
+      await this.cleanupOrphanedMediaObjects(sweepResult.orphan_cleanup, { now });
+      await this.scheduleMediaLifecycleAlarm(getUserMediaLifecycleNextAlarm(this, now));
+      return createSuccessResult({
+        grant,
+      });
+    } finally {
+      this.observeAuthorityMetric('userdo.operation.latency_ms', Date.now() - startedAt, {
+        operation: 'beginMediaUpload',
+      });
+    }
   }
 
   async finalizeMediaUpload() {
@@ -4743,6 +4854,7 @@ export class RoomDO extends BaseDurableObject {
   }
 
   async admitEvent() {
+    const startedAt = Date.now();
     await this.ensureCurrentness();
     await this.ensureSchema();
     const [request = {}] = arguments;
@@ -4776,6 +4888,26 @@ export class RoomDO extends BaseDurableObject {
           ?? runtimeState?.room_id,
         'request.room_id',
       );
+      if (profileRefresh == null) {
+        const semanticQuota = this.enforceSemanticQuota(
+          eventType === 'm.room.member' ? 'roomdo_membership' : 'roomdo_send',
+          `${roomId}|${sender}`,
+          {
+            nowIso: request?.now ?? new Date().toISOString(),
+            message: eventType === 'm.room.member' ? 'Membership rate limit exceeded' : 'Room send rate limit exceeded',
+          },
+        );
+        if (!semanticQuota.ok) {
+          return createMatrixError(
+            429,
+            'M_LIMIT_EXCEEDED',
+            eventType === 'm.room.member' ? 'Membership rate limit exceeded' : 'Room send rate limit exceeded',
+            {
+              retry_after_ms: semanticQuota.retry_after_ms,
+            },
+          );
+        }
+      }
       if (!isCreateEvent && runtimeState?.room_id == null) {
         throw createRoomInternalError('room_not_found', `Room ${roomId} does not exist`);
       }
@@ -5184,6 +5316,10 @@ export class RoomDO extends BaseDurableObject {
         ok: false,
         error: error?.matrix_error ? error.matrix_error : error,
       };
+    } finally {
+      this.observeAuthorityMetric('roomdo.admission.latency_ms', Date.now() - startedAt, {
+        operation: 'admitEvent',
+      });
     }
   }
 
@@ -5766,93 +5902,107 @@ export class RoomDO extends BaseDurableObject {
   }
 
   async setTyping() {
+    const startedAt = Date.now();
     await this.ensureCurrentness();
     await this.ensureSchema();
-    const [request = {}] = arguments;
-    const userId = normalizeString(request?.user_id, 'request.user_id');
-    const membership = this.persistence.membershipProjection.get({ user_id: userId });
-    if (!membership || membership.membership !== 'join') {
-      return {
-        ok: false,
-        error: createRoomInternalError('room_forbidden', 'Typing is only allowed for joined users'),
-      };
-    }
-    const now = request?.now ?? new Date().toISOString();
-    if (request?.typing === true) {
-      const timeoutMs = normalizeInteger(request?.timeout_ms ?? 30_000, 'request.timeout_ms', { min: 1 });
-      this.persistence.typing.put({
-        user_id: userId,
-        typing: true,
-        expires_at: new Date(Date.parse(now) + timeoutMs).toISOString(),
-        updated_at: now,
-        record_json: {},
+    try {
+      const [request = {}] = arguments;
+      const userId = normalizeString(request?.user_id, 'request.user_id');
+      const membership = this.persistence.membershipProjection.get({ user_id: userId });
+      if (!membership || membership.membership !== 'join') {
+        return {
+          ok: false,
+          error: createRoomInternalError('room_forbidden', 'Typing is only allowed for joined users'),
+        };
+      }
+      const now = request?.now ?? new Date().toISOString();
+      if (request?.typing === true) {
+        const timeoutMs = normalizeInteger(request?.timeout_ms ?? 30_000, 'request.timeout_ms', { min: 1 });
+        this.persistence.typing.put({
+          user_id: userId,
+          typing: true,
+          expires_at: new Date(Date.parse(now) + timeoutMs).toISOString(),
+          updated_at: now,
+          record_json: {},
+        });
+      } else {
+        this.persistence.typing.delete({ user_id: userId });
+      }
+      await this.syncTypingAlarm(now);
+      const currentTyping = this.persistence.typing.list()
+        .filter((row) => Date.parse(row.expires_at) > Date.parse(now));
+      await this.emitEphemeralToJoinedMembers(
+        buildTypingEphemeralEvent(this.persistence.getRuntimeState()?.room_id, currentTyping),
+        {
+          now,
+          dedupeSeed: `typing|${userId}|${now}`,
+        },
+      );
+      return createSuccessResult({
+        response: {},
       });
-    } else {
-      this.persistence.typing.delete({ user_id: userId });
+    } finally {
+      this.observeAuthorityMetric('roomdo.operation.latency_ms', Date.now() - startedAt, {
+        operation: 'setTyping',
+      });
     }
-    await this.syncTypingAlarm(now);
-    const currentTyping = this.persistence.typing.list()
-      .filter((row) => Date.parse(row.expires_at) > Date.parse(now));
-    await this.emitEphemeralToJoinedMembers(
-      buildTypingEphemeralEvent(this.persistence.getRuntimeState()?.room_id, currentTyping),
-      {
-        now,
-        dedupeSeed: `typing|${userId}|${now}`,
-      },
-    );
-    return createSuccessResult({
-      response: {},
-    });
   }
 
   async applyReceipt() {
+    const startedAt = Date.now();
     await this.ensureCurrentness();
     await this.ensureSchema();
-    const [request = {}] = arguments;
-    const userId = normalizeString(request?.user_id, 'request.user_id');
-    const membership = this.persistence.membershipProjection.get({ user_id: userId });
-    if (!membership || membership.membership !== 'join') {
-      return {
-        ok: false,
-        error: createRoomInternalError('room_forbidden', 'Receipts are only allowed for joined users'),
-      };
+    try {
+      const [request = {}] = arguments;
+      const userId = normalizeString(request?.user_id, 'request.user_id');
+      const membership = this.persistence.membershipProjection.get({ user_id: userId });
+      if (!membership || membership.membership !== 'join') {
+        return {
+          ok: false,
+          error: createRoomInternalError('room_forbidden', 'Receipts are only allowed for joined users'),
+        };
+      }
+      const eventId = normalizeString(request?.event_id, 'request.event_id');
+      const metadata = this.persistence.eventMetadata.get({ event_id: eventId });
+      if (!metadata) {
+        return {
+          ok: false,
+          error: createRoomInternalError('event_not_found', `Event ${eventId} does not exist`),
+        };
+      }
+      const now = request?.now ?? new Date().toISOString();
+      const receiptType = normalizeString(request?.receipt_type, 'request.receipt_type');
+      const threadId = typeof request?.thread_id === 'string' ? request.thread_id : '';
+      this.persistence.receipts.put({
+        receipt_type: receiptType,
+        user_id: userId,
+        thread_id: threadId,
+        event_id: eventId,
+        room_pos: metadata.room_pos,
+        receipt_ts: Number.isInteger(request?.receipt_ts) ? request.receipt_ts : Date.now(),
+        updated_at: now,
+        record_json: {},
+      });
+      const receiptRow = this.persistence.receipts.get({
+        receipt_type: receiptType,
+        user_id: userId,
+        thread_id: threadId,
+      });
+      await this.emitEphemeralToJoinedMembers(
+        buildReceiptEphemeralEvent(this.persistence.getRuntimeState()?.room_id, receiptRow),
+        {
+          now,
+          dedupeSeed: `receipt|${receiptType}|${eventId}|${userId}|${threadId}|${now}`,
+        },
+      );
+      return createSuccessResult({
+        response: {},
+      });
+    } finally {
+      this.observeAuthorityMetric('roomdo.operation.latency_ms', Date.now() - startedAt, {
+        operation: 'applyReceipt',
+      });
     }
-    const eventId = normalizeString(request?.event_id, 'request.event_id');
-    const metadata = this.persistence.eventMetadata.get({ event_id: eventId });
-    if (!metadata) {
-      return {
-        ok: false,
-        error: createRoomInternalError('event_not_found', `Event ${eventId} does not exist`),
-      };
-    }
-    const now = request?.now ?? new Date().toISOString();
-    const receiptType = normalizeString(request?.receipt_type, 'request.receipt_type');
-    const threadId = typeof request?.thread_id === 'string' ? request.thread_id : '';
-    this.persistence.receipts.put({
-      receipt_type: receiptType,
-      user_id: userId,
-      thread_id: threadId,
-      event_id: eventId,
-      room_pos: metadata.room_pos,
-      receipt_ts: Number.isInteger(request?.receipt_ts) ? request.receipt_ts : Date.now(),
-      updated_at: now,
-      record_json: {},
-    });
-    const receiptRow = this.persistence.receipts.get({
-      receipt_type: receiptType,
-      user_id: userId,
-      thread_id: threadId,
-    });
-    await this.emitEphemeralToJoinedMembers(
-      buildReceiptEphemeralEvent(this.persistence.getRuntimeState()?.room_id, receiptRow),
-      {
-        now,
-        dedupeSeed: `receipt|${receiptType}|${eventId}|${userId}|${threadId}|${now}`,
-      },
-    );
-    return createSuccessResult({
-      response: {},
-    });
   }
 
   async expireTypingAlarm() {

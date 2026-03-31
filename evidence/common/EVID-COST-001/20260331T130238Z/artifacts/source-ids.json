@@ -1,0 +1,47 @@
+{
+  "declared_source_ids": [
+    "REQ-OPS-003",
+    "CF-WKR-015",
+    "CF-WKR-016",
+    "CF-WKR-017",
+    "CF-WKR-018",
+    "CF-WKR-019",
+    "CF-DO-011",
+    "CF-DO-012",
+    "CF-DO-013",
+    "CF-D1-006",
+    "CF-KV-003",
+    "CF-R2-005",
+    "CF-QUE-001"
+  ],
+  "expanded_source_ids": [
+    "CF-D1-006",
+    "CF-DO-011",
+    "CF-DO-012",
+    "CF-DO-013",
+    "CF-KV-003",
+    "CF-QUE-001",
+    "CF-R2-005",
+    "CF-WKR-015",
+    "CF-WKR-016",
+    "CF-WKR-017",
+    "CF-WKR-018",
+    "CF-WKR-019",
+    "REQ-OPS-003"
+  ],
+  "applicable_source_ids": [
+    "CF-D1-006",
+    "CF-DO-011",
+    "CF-DO-012",
+    "CF-DO-013",
+    "CF-KV-003",
+    "CF-QUE-001",
+    "CF-R2-005",
+    "CF-WKR-015",
+    "CF-WKR-016",
+    "CF-WKR-017",
+    "CF-WKR-018",
+    "CF-WKR-019",
+    "REQ-OPS-003"
+  ]
+}

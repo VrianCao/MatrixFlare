@@ -18,11 +18,14 @@ import {
   createThumbnailBodyInput,
   createRequestFingerprint,
   createRequestContext,
+  ensureDeploymentRecord,
   ensureDerivedSchema,
   enqueueDerivedWork,
+  enforceGatewayAbuseGuard,
   extractPublicRoomsQuery,
   getDerivedPersistence,
   getWellKnownCacheEntry,
+  instrumentEnvironmentBindings,
   loadWorkerRuntimeConfig,
   normalizeDownloadOptions,
   normalizeLocalMediaObjectMetadata,
@@ -33,7 +36,9 @@ import {
   readBodyWithDigest,
   putWellKnownCacheEntry,
   resolveThumbnailAnimationPreference,
+  startRequestMetrics,
   teeBodyStreamWithDigest,
+  classifyGatewayRequest,
 } from '../../../packages/runtime-core/src/index.mjs';
 import {
   buildProfileCapabilities,
@@ -747,6 +752,24 @@ function expectSingleProperty(body, propertyName) {
 function mapInternalErrorToResponse(error) {
   if (!error || typeof error !== 'object') {
     return matrixErrorResponse(500, 'M_UNKNOWN', 'Internal error');
+  }
+  if (Number.isInteger(error.status) && error.body && typeof error.body === 'object') {
+    const extra = {
+      ...error.body,
+    };
+    delete extra.errcode;
+    delete extra.error;
+    const headers = {};
+    if (Number.isInteger(error.body.retry_after_ms) && error.body.retry_after_ms > 0) {
+      headers['retry-after'] = String(Math.max(1, Math.ceil(error.body.retry_after_ms / 1000)));
+    }
+    return matrixErrorResponse(
+      error.status,
+      error.body.errcode ?? 'M_UNKNOWN',
+      error.body.error ?? 'Internal error',
+      Object.keys(extra).length > 0 ? extra : null,
+      headers,
+    );
   }
   if (error.code === 'idempotency_conflict') {
     return matrixErrorResponse(409, 'M_CONFLICT', error.message ?? 'Idempotency conflict');
@@ -2951,6 +2974,16 @@ async function admitRoomClientEvent(roomDo, {
     candidate_event: candidateEvent,
   });
   if (!result?.ok) {
+    if (result?.matrix_error?.body && Number.isInteger(result?.matrix_error?.status)) {
+      const headers = {};
+      if (Number.isInteger(result.matrix_error.body.retry_after_ms) && result.matrix_error.body.retry_after_ms > 0) {
+        headers['retry-after'] = String(Math.max(1, Math.ceil(result.matrix_error.body.retry_after_ms / 1000)));
+      }
+      return {
+        ok: false,
+        response: jsonResponse(result.matrix_error.body, result.matrix_error.status, headers),
+      };
+    }
     return {
       ok: false,
       response: mapInternalErrorToResponse(result?.error),
@@ -3767,432 +3800,487 @@ async function handleSync(request, env, url) {
 }
 
 async function handleRequest(request, env) {
+  instrumentEnvironmentBindings(env);
   const config = loadWorkerRuntimeConfig('gateway-worker', env);
+  ensureDeploymentRecord(env, {
+    workerName: 'gateway-worker',
+    config,
+  });
+  const url = new URL(request.url);
+  const { pathname } = url;
+  const method = request.method.toUpperCase();
+  const classification = classifyGatewayRequest(method, pathname);
   const requestContext = createRequestContext({
     workerName: 'gateway-worker',
     workerVersion: config.text.WORKER_VERSION_ID,
     request,
-    routeFamily: 'public-edge',
+    routeFamily: classification.route_family,
   });
-
-  const url = new URL(request.url);
-  const { pathname } = url;
-  const method = request.method.toUpperCase();
+  const requestMetrics = startRequestMetrics(env, {
+    workerName: 'gateway-worker',
+    workerVersion: config.text.WORKER_VERSION_ID,
+    routeFamily: classification.route_family,
+  });
+  const finalizeResponse = (response, {
+    outcome = response.status >= 500 ? 'error' : (response.status >= 400 ? 'rejected' : 'ok'),
+    errorClass = null,
+  } = {}) => {
+    const completed = requestMetrics.finish({
+      status: response.status,
+    });
+    const logMethod = response.status >= 500 ? 'error' : (response.status >= 400 ? 'warn' : 'info');
+    requestContext.logger[logMethod]('gateway.request.complete', {
+      method,
+      path: pathname,
+      status: response.status,
+      outcome,
+      latency_ms: Math.round(completed.wall_ms),
+      cpu_ms: Math.round(completed.cpu_ms),
+      ...(errorClass == null ? {} : { error_class: errorClass }),
+    });
+    return response;
+  };
 
   requestContext.logger.info('gateway.request.start', {
     method,
     path: pathname,
   });
+  try {
+    const abuseResponse = enforceGatewayAbuseGuard(request, env, classification);
+    const response = await (async () => {
+      if (abuseResponse) {
+        return abuseResponse;
+      }
+      if (pathname === '/.well-known/matrix/client' && method === 'GET') {
+        return handleWellKnownClient(url, env);
+      }
+      if (pathname === '/.well-known/matrix/server' && method === 'GET') {
+        return handleWellKnownServer(env);
+      }
 
-  if (pathname === '/.well-known/matrix/client' && method === 'GET') {
-    return handleWellKnownClient(url, env);
-  }
-  if (pathname === '/.well-known/matrix/server' && method === 'GET') {
-    return handleWellKnownServer(env);
-  }
+      if (isStubbedClientRoute(method, pathname)) {
+        return stubRouteResponse();
+      }
 
-  if (isStubbedClientRoute(method, pathname)) {
-    return stubRouteResponse();
-  }
+      if (pathname === '/_matrix/client/versions' && method === 'GET') {
+        return jsonResponse({
+          versions: ['v1.17'],
+          unstable_features: {},
+        });
+      }
+      if (pathname === '/_matrix/client/v3/login' && method === 'GET') {
+        return jsonResponse({
+          flows: [
+            { type: 'm.login.password' },
+          ],
+        }, 200, {
+          'cache-control': 'public, max-age=60',
+        });
+      }
+      if (pathname === '/_matrix/client/v3/register/available' && method === 'GET') {
+        return handleRegisterAvailable(url, env);
+      }
+      if (pathname === '/_matrix/client/v1/register/m.login.registration_token/validity' && method === 'GET') {
+        return handleRegistrationTokenValidity(url, env);
+      }
+      if (pathname === '/_matrix/client/v3/login' && method === 'POST') {
+        return handleLogin(request, env);
+      }
+      if (pathname === '/_matrix/client/v3/register' && method === 'POST') {
+        return handleRegister(request, env);
+      }
+      if (pathname === '/_matrix/client/v3/refresh' && method === 'POST') {
+        return handleRefresh(request, env);
+      }
+      if (pathname === '/_matrix/client/v3/logout' && method === 'POST') {
+        return handleLogout(request, env, { all: false });
+      }
+      if (pathname === '/_matrix/client/v3/logout/all' && method === 'POST') {
+        return handleLogout(request, env, { all: true });
+      }
+      if (pathname === '/_matrix/client/v3/account/whoami' && method === 'GET') {
+        return handleWhoAmI(request, env);
+      }
+      if (pathname === '/_matrix/client/v3/capabilities' && method === 'GET') {
+        const access = await requireAccessSession(request, env);
+        if (!access.ok) {
+          return access.response;
+        }
+        return jsonResponse(buildCapabilitiesResponse());
+      }
+      if (pathname === '/_matrix/client/v3/account/password' && method === 'POST') {
+        return handlePasswordChange(request, env);
+      }
+      if (pathname === '/_matrix/client/v3/account/deactivate' && method === 'POST') {
+        return handleDeactivateAccount(request, env);
+      }
 
-  if (pathname === '/_matrix/client/versions' && method === 'GET') {
-    return jsonResponse({
-      versions: ['v1.17'],
-      unstable_features: {},
-    });
-  }
-  if (pathname === '/_matrix/client/v3/login' && method === 'GET') {
-    return jsonResponse({
-      flows: [
-        { type: 'm.login.password' },
-      ],
-    }, 200, {
-      'cache-control': 'public, max-age=60',
-    });
-  }
-  if (pathname === '/_matrix/client/v3/register/available' && method === 'GET') {
-    return handleRegisterAvailable(url, env);
-  }
-  if (pathname === '/_matrix/client/v1/register/m.login.registration_token/validity' && method === 'GET') {
-    return handleRegistrationTokenValidity(url, env);
-  }
-  if (pathname === '/_matrix/client/v3/login' && method === 'POST') {
-    return handleLogin(request, env);
-  }
-  if (pathname === '/_matrix/client/v3/register' && method === 'POST') {
-    return handleRegister(request, env);
-  }
-  if (pathname === '/_matrix/client/v3/refresh' && method === 'POST') {
-    return handleRefresh(request, env);
-  }
-  if (pathname === '/_matrix/client/v3/logout' && method === 'POST') {
-    return handleLogout(request, env, { all: false });
-  }
-  if (pathname === '/_matrix/client/v3/logout/all' && method === 'POST') {
-    return handleLogout(request, env, { all: true });
-  }
-  if (pathname === '/_matrix/client/v3/account/whoami' && method === 'GET') {
-    return handleWhoAmI(request, env);
-  }
-  if (pathname === '/_matrix/client/v3/capabilities' && method === 'GET') {
-    const access = await requireAccessSession(request, env);
-    if (!access.ok) {
-      return access.response;
-    }
-    return jsonResponse(buildCapabilitiesResponse());
-  }
-  if (pathname === '/_matrix/client/v3/account/password' && method === 'POST') {
-    return handlePasswordChange(request, env);
-  }
-  if (pathname === '/_matrix/client/v3/account/deactivate' && method === 'POST') {
-    return handleDeactivateAccount(request, env);
-  }
+      const profileDocumentMatch = /^\/_matrix\/client\/v3\/profile\/([^/]+)$/.exec(pathname);
+      if (profileDocumentMatch && method === 'GET') {
+        return handleProfileDocumentRead(env, profileDocumentMatch[1], null);
+      }
+      const profileFieldMatch = /^\/_matrix\/client\/v3\/profile\/([^/]+)\/([^/]+)$/.exec(pathname);
+      if (profileFieldMatch && method === 'GET') {
+        return handleProfileDocumentRead(env, profileFieldMatch[1], profileFieldMatch[2]);
+      }
+      if (profileFieldMatch && ['PUT', 'DELETE'].includes(method)) {
+        return handleProfileFieldWrite(request, env, profileFieldMatch[1], profileFieldMatch[2], { method });
+      }
 
-  const profileDocumentMatch = /^\/_matrix\/client\/v3\/profile\/([^/]+)$/.exec(pathname);
-  if (profileDocumentMatch && method === 'GET') {
-    return handleProfileDocumentRead(env, profileDocumentMatch[1], null);
-  }
-  const profileFieldMatch = /^\/_matrix\/client\/v3\/profile\/([^/]+)\/([^/]+)$/.exec(pathname);
-  if (profileFieldMatch && method === 'GET') {
-    return handleProfileDocumentRead(env, profileFieldMatch[1], profileFieldMatch[2]);
-  }
-  if (profileFieldMatch && ['PUT', 'DELETE'].includes(method)) {
-    return handleProfileFieldWrite(request, env, profileFieldMatch[1], profileFieldMatch[2], { method });
-  }
+      const globalAccountDataMatch = /^\/_matrix\/client\/v3\/user\/([^/]+)\/account_data\/([^/]+)$/.exec(pathname);
+      if (globalAccountDataMatch && ['GET', 'PUT'].includes(method)) {
+        return handleGlobalAccountDataRequest(request, env, globalAccountDataMatch[1], globalAccountDataMatch[2], { method });
+      }
+      const roomAccountDataMatch = /^\/_matrix\/client\/v3\/user\/([^/]+)\/rooms\/([^/]+)\/account_data\/([^/]+)$/.exec(pathname);
+      if (roomAccountDataMatch && ['GET', 'PUT'].includes(method)) {
+        return handleRoomAccountDataRequest(
+          request,
+          env,
+          roomAccountDataMatch[1],
+          roomAccountDataMatch[2],
+          roomAccountDataMatch[3],
+          { method },
+        );
+      }
+      const tagsMatch = /^\/_matrix\/client\/v3\/user\/([^/]+)\/rooms\/([^/]+)\/tags\/?$/.exec(pathname);
+      if (tagsMatch && method === 'GET') {
+        return handleTagsRequest(request, env, tagsMatch[1], tagsMatch[2], null, { method });
+      }
+      const tagMatch = /^\/_matrix\/client\/v3\/user\/([^/]+)\/rooms\/([^/]+)\/tags\/([^/]+)$/.exec(pathname);
+      if (tagMatch && ['PUT', 'DELETE'].includes(method)) {
+        return handleTagsRequest(request, env, tagMatch[1], tagMatch[2], tagMatch[3], { method });
+      }
+      const readMarkersMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/read_markers$/.exec(pathname);
+      if (readMarkersMatch && method === 'POST') {
+        return handleReadMarkersRequest(request, env, readMarkersMatch[1]);
+      }
 
-  const globalAccountDataMatch = /^\/_matrix\/client\/v3\/user\/([^/]+)\/account_data\/([^/]+)$/.exec(pathname);
-  if (globalAccountDataMatch && ['GET', 'PUT'].includes(method)) {
-    return handleGlobalAccountDataRequest(request, env, globalAccountDataMatch[1], globalAccountDataMatch[2], { method });
-  }
-  const roomAccountDataMatch = /^\/_matrix\/client\/v3\/user\/([^/]+)\/rooms\/([^/]+)\/account_data\/([^/]+)$/.exec(pathname);
-  if (roomAccountDataMatch && ['GET', 'PUT'].includes(method)) {
-    return handleRoomAccountDataRequest(
-      request,
-      env,
-      roomAccountDataMatch[1],
-      roomAccountDataMatch[2],
-      roomAccountDataMatch[3],
-      { method },
-    );
-  }
-  const tagsMatch = /^\/_matrix\/client\/v3\/user\/([^/]+)\/rooms\/([^/]+)\/tags\/?$/.exec(pathname);
-  if (tagsMatch && method === 'GET') {
-    return handleTagsRequest(request, env, tagsMatch[1], tagsMatch[2], null, { method });
-  }
-  const tagMatch = /^\/_matrix\/client\/v3\/user\/([^/]+)\/rooms\/([^/]+)\/tags\/([^/]+)$/.exec(pathname);
-  if (tagMatch && ['PUT', 'DELETE'].includes(method)) {
-    return handleTagsRequest(request, env, tagMatch[1], tagMatch[2], tagMatch[3], { method });
-  }
-  const readMarkersMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/read_markers$/.exec(pathname);
-  if (readMarkersMatch && method === 'POST') {
-    return handleReadMarkersRequest(request, env, readMarkersMatch[1]);
-  }
+      const presenceMatch = /^\/_matrix\/client\/v3\/presence\/([^/]+)\/status$/.exec(pathname);
+      if (presenceMatch && ['GET', 'PUT'].includes(method)) {
+        return handlePresenceRequest(request, env, presenceMatch[1], { method });
+      }
 
-  const presenceMatch = /^\/_matrix\/client\/v3\/presence\/([^/]+)\/status$/.exec(pathname);
-  if (presenceMatch && ['GET', 'PUT'].includes(method)) {
-    return handlePresenceRequest(request, env, presenceMatch[1], { method });
-  }
+      const filterCreateMatch = /^\/_matrix\/client\/v3\/user\/([^/]+)\/filter$/.exec(pathname);
+      if (filterCreateMatch && method === 'POST') {
+        return handleFilterRequest(request, env, filterCreateMatch[1], null, { method });
+      }
+      const filterGetMatch = /^\/_matrix\/client\/v3\/user\/([^/]+)\/filter\/([^/]+)$/.exec(pathname);
+      if (filterGetMatch && method === 'GET') {
+        return handleFilterRequest(request, env, filterGetMatch[1], filterGetMatch[2], { method });
+      }
 
-  const filterCreateMatch = /^\/_matrix\/client\/v3\/user\/([^/]+)\/filter$/.exec(pathname);
-  if (filterCreateMatch && method === 'POST') {
-    return handleFilterRequest(request, env, filterCreateMatch[1], null, { method });
-  }
-  const filterGetMatch = /^\/_matrix\/client\/v3\/user\/([^/]+)\/filter\/([^/]+)$/.exec(pathname);
-  if (filterGetMatch && method === 'GET') {
-    return handleFilterRequest(request, env, filterGetMatch[1], filterGetMatch[2], { method });
-  }
+      if ((pathname === '/_matrix/client/v3/pushrules' || pathname === '/_matrix/client/v3/pushrules/') && method === 'GET') {
+        return handlePushRulesRequest(request, env);
+      }
+      if ((pathname === '/_matrix/client/v3/pushrules/global' || pathname === '/_matrix/client/v3/pushrules/global/') && method === 'GET') {
+        return handlePushRulesRequest(request, env, { subresource: 'global' });
+      }
+      const pushRuleActionsMatch = /^\/_matrix\/client\/v3\/pushrules\/global\/([^/]+)\/([^/]+)\/(actions|enabled)$/.exec(pathname);
+      if (pushRuleActionsMatch && ['GET', 'PUT'].includes(method)) {
+        return handlePushRulesRequest(request, env, {
+          kind: pushRuleActionsMatch[1],
+          ruleId: pushRuleActionsMatch[2],
+          subresource: pushRuleActionsMatch[3],
+        });
+      }
+      const pushRuleMatch = /^\/_matrix\/client\/v3\/pushrules\/global\/([^/]+)\/([^/]+)$/.exec(pathname);
+      if (pushRuleMatch && ['GET', 'PUT', 'DELETE'].includes(method)) {
+        return handlePushRulesRequest(request, env, {
+          kind: pushRuleMatch[1],
+          ruleId: pushRuleMatch[2],
+        });
+      }
 
-  if ((pathname === '/_matrix/client/v3/pushrules' || pathname === '/_matrix/client/v3/pushrules/') && method === 'GET') {
-    return handlePushRulesRequest(request, env);
-  }
-  if ((pathname === '/_matrix/client/v3/pushrules/global' || pathname === '/_matrix/client/v3/pushrules/global/') && method === 'GET') {
-    return handlePushRulesRequest(request, env, { subresource: 'global' });
-  }
-  const pushRuleActionsMatch = /^\/_matrix\/client\/v3\/pushrules\/global\/([^/]+)\/([^/]+)\/(actions|enabled)$/.exec(pathname);
-  if (pushRuleActionsMatch && ['GET', 'PUT'].includes(method)) {
-    return handlePushRulesRequest(request, env, {
-      kind: pushRuleActionsMatch[1],
-      ruleId: pushRuleActionsMatch[2],
-      subresource: pushRuleActionsMatch[3],
-    });
-  }
-  const pushRuleMatch = /^\/_matrix\/client\/v3\/pushrules\/global\/([^/]+)\/([^/]+)$/.exec(pathname);
-  if (pushRuleMatch && ['GET', 'PUT', 'DELETE'].includes(method)) {
-    return handlePushRulesRequest(request, env, {
-      kind: pushRuleMatch[1],
-      ruleId: pushRuleMatch[2],
-    });
-  }
+      if (pathname === '/_matrix/client/v1/media/config' && method === 'GET') {
+        return handleMediaConfigRequest(request, env);
+      }
+      const currentMediaDownloadMatch = /^\/_matrix\/client\/v1\/media\/download\/([^/]+)\/([^/]+)(?:\/([^/]+))?$/.exec(pathname);
+      if (currentMediaDownloadMatch && method === 'GET') {
+        return handleMediaDownloadRequest(request, env, {
+          serverName: decodePathComponent(currentMediaDownloadMatch[1]),
+          mediaId: decodePathComponent(currentMediaDownloadMatch[2]),
+          fileName: currentMediaDownloadMatch[3] == null ? null : decodePathComponent(currentMediaDownloadMatch[3]),
+          legacyCompatibility: false,
+        });
+      }
+      const currentMediaThumbnailMatch = /^\/_matrix\/client\/v1\/media\/thumbnail\/([^/]+)\/([^/]+)$/.exec(pathname);
+      if (currentMediaThumbnailMatch && method === 'GET') {
+        return handleMediaThumbnailRequest(request, env, {
+          serverName: decodePathComponent(currentMediaThumbnailMatch[1]),
+          mediaId: decodePathComponent(currentMediaThumbnailMatch[2]),
+          legacyCompatibility: false,
+        });
+      }
+      if (/^\/_matrix\/media\/[^/]+\/config$/.test(pathname) && method === 'GET') {
+        return handleMediaConfigRequest(request, env);
+      }
+      if (/^\/_matrix\/media\/[^/]+\/create$/.test(pathname) && method === 'POST') {
+        return handleMediaCreateRequest(request, env);
+      }
+      if (/^\/_matrix\/media\/[^/]+\/upload$/.test(pathname) && method === 'POST') {
+        return handleMediaUploadRequest(request, env);
+      }
+      const uploadByIdMatch = /^\/_matrix\/media\/[^/]+\/upload\/([^/]+)\/([^/]+)$/.exec(pathname);
+      if (uploadByIdMatch && method === 'PUT') {
+        const serverName = decodePathComponent(uploadByIdMatch[1]);
+        const mediaId = decodePathComponent(uploadByIdMatch[2]);
+        if (serverName !== env.MATRIX_SERVER_NAME) {
+          return matrixErrorResponse(404, 'M_NOT_FOUND', 'Only locally reserved MXC URIs are supported');
+        }
+        return handleMediaUploadRequest(request, env, {
+          mediaId,
+          requireExisting: true,
+        });
+      }
+      const compatMediaDownloadMatch = /^\/_matrix\/media\/[^/]+\/download\/([^/]+)\/([^/]+)(?:\/([^/]+))?$/.exec(pathname);
+      if (compatMediaDownloadMatch && method === 'GET') {
+        return handleMediaDownloadRequest(request, env, {
+          serverName: decodePathComponent(compatMediaDownloadMatch[1]),
+          mediaId: decodePathComponent(compatMediaDownloadMatch[2]),
+          fileName: compatMediaDownloadMatch[3] == null ? null : decodePathComponent(compatMediaDownloadMatch[3]),
+          legacyCompatibility: true,
+        });
+      }
+      const compatMediaThumbnailMatch = /^\/_matrix\/media\/[^/]+\/thumbnail\/([^/]+)\/([^/]+)$/.exec(pathname);
+      if (compatMediaThumbnailMatch && method === 'GET') {
+        return handleMediaThumbnailRequest(request, env, {
+          serverName: decodePathComponent(compatMediaThumbnailMatch[1]),
+          mediaId: decodePathComponent(compatMediaThumbnailMatch[2]),
+          legacyCompatibility: true,
+        });
+      }
 
-  if (pathname === '/_matrix/client/v1/media/config' && method === 'GET') {
-    return handleMediaConfigRequest(request, env);
-  }
-  const currentMediaDownloadMatch = /^\/_matrix\/client\/v1\/media\/download\/([^/]+)\/([^/]+)(?:\/([^/]+))?$/.exec(pathname);
-  if (currentMediaDownloadMatch && method === 'GET') {
-    return handleMediaDownloadRequest(request, env, {
-      serverName: decodePathComponent(currentMediaDownloadMatch[1]),
-      mediaId: decodePathComponent(currentMediaDownloadMatch[2]),
-      fileName: currentMediaDownloadMatch[3] == null ? null : decodePathComponent(currentMediaDownloadMatch[3]),
-      legacyCompatibility: false,
-    });
-  }
-  const currentMediaThumbnailMatch = /^\/_matrix\/client\/v1\/media\/thumbnail\/([^/]+)\/([^/]+)$/.exec(pathname);
-  if (currentMediaThumbnailMatch && method === 'GET') {
-    return handleMediaThumbnailRequest(request, env, {
-      serverName: decodePathComponent(currentMediaThumbnailMatch[1]),
-      mediaId: decodePathComponent(currentMediaThumbnailMatch[2]),
-      legacyCompatibility: false,
-    });
-  }
-  if (/^\/_matrix\/media\/[^/]+\/config$/.test(pathname) && method === 'GET') {
-    return handleMediaConfigRequest(request, env);
-  }
-  if (/^\/_matrix\/media\/[^/]+\/create$/.test(pathname) && method === 'POST') {
-    return handleMediaCreateRequest(request, env);
-  }
-  if (/^\/_matrix\/media\/[^/]+\/upload$/.test(pathname) && method === 'POST') {
-    return handleMediaUploadRequest(request, env);
-  }
-  const uploadByIdMatch = /^\/_matrix\/media\/[^/]+\/upload\/([^/]+)\/([^/]+)$/.exec(pathname);
-  if (uploadByIdMatch && method === 'PUT') {
-    const serverName = decodePathComponent(uploadByIdMatch[1]);
-    const mediaId = decodePathComponent(uploadByIdMatch[2]);
-    if (serverName !== env.MATRIX_SERVER_NAME) {
-      return matrixErrorResponse(404, 'M_NOT_FOUND', 'Only locally reserved MXC URIs are supported');
-    }
-    return handleMediaUploadRequest(request, env, {
-      mediaId,
-      requireExisting: true,
-    });
-  }
-  const compatMediaDownloadMatch = /^\/_matrix\/media\/[^/]+\/download\/([^/]+)\/([^/]+)(?:\/([^/]+))?$/.exec(pathname);
-  if (compatMediaDownloadMatch && method === 'GET') {
-    return handleMediaDownloadRequest(request, env, {
-      serverName: decodePathComponent(compatMediaDownloadMatch[1]),
-      mediaId: decodePathComponent(compatMediaDownloadMatch[2]),
-      fileName: compatMediaDownloadMatch[3] == null ? null : decodePathComponent(compatMediaDownloadMatch[3]),
-      legacyCompatibility: true,
-    });
-  }
-  const compatMediaThumbnailMatch = /^\/_matrix\/media\/[^/]+\/thumbnail\/([^/]+)\/([^/]+)$/.exec(pathname);
-  if (compatMediaThumbnailMatch && method === 'GET') {
-    return handleMediaThumbnailRequest(request, env, {
-      serverName: decodePathComponent(compatMediaThumbnailMatch[1]),
-      mediaId: decodePathComponent(compatMediaThumbnailMatch[2]),
-      legacyCompatibility: true,
-    });
-  }
+      if (pathname === '/_matrix/client/v3/search' && method === 'POST') {
+        return handleSearchRequest(request, env);
+      }
+      if (pathname === '/_matrix/client/v3/user_directory/search' && method === 'POST') {
+        return handleUserDirectorySearchRequest(request, env);
+      }
+      if (pathname === '/_matrix/client/v3/publicRooms' && method === 'GET') {
+        return handlePublicRoomsRequest(request, env, { method });
+      }
+      if (pathname === '/_matrix/client/v3/publicRooms' && method === 'POST') {
+        return handlePublicRoomsRequest(request, env, { method });
+      }
 
-  if (pathname === '/_matrix/client/v3/search' && method === 'POST') {
-    return handleSearchRequest(request, env);
-  }
-  if (pathname === '/_matrix/client/v3/user_directory/search' && method === 'POST') {
-    return handleUserDirectorySearchRequest(request, env);
-  }
-  if (pathname === '/_matrix/client/v3/publicRooms' && method === 'GET') {
-    return handlePublicRoomsRequest(request, env, { method });
-  }
-  if (pathname === '/_matrix/client/v3/publicRooms' && method === 'POST') {
-    return handlePublicRoomsRequest(request, env, { method });
-  }
+      if (pathname === '/_matrix/client/v3/createRoom' && method === 'POST') {
+        return handleCreateRoom(request, env);
+      }
+      const roomJoinByAliasMatch = /^\/_matrix\/client\/v3\/join\/([^/]+)$/.exec(pathname);
+      if (roomJoinByAliasMatch && method === 'POST') {
+        return handleRoomMembershipRequest(request, env, {
+          kind: 'join',
+          roomIdOrAlias: roomJoinByAliasMatch[1],
+        });
+      }
+      const roomJoinMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/join$/.exec(pathname);
+      if (roomJoinMatch && method === 'POST') {
+        return handleRoomMembershipRequest(request, env, {
+          kind: 'join',
+          roomId: roomJoinMatch[1],
+        });
+      }
+      const roomLeaveMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/leave$/.exec(pathname);
+      if (roomLeaveMatch && method === 'POST') {
+        return handleRoomMembershipRequest(request, env, {
+          kind: 'leave',
+          roomId: roomLeaveMatch[1],
+        });
+      }
+      const roomInviteMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/invite$/.exec(pathname);
+      if (roomInviteMatch && method === 'POST') {
+        return handleRoomMembershipRequest(request, env, {
+          kind: 'invite',
+          roomId: roomInviteMatch[1],
+        });
+      }
+      const roomBanMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/ban$/.exec(pathname);
+      if (roomBanMatch && method === 'POST') {
+        return handleRoomMembershipRequest(request, env, {
+          kind: 'ban',
+          roomId: roomBanMatch[1],
+        });
+      }
+      const roomUnbanMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/unban$/.exec(pathname);
+      if (roomUnbanMatch && method === 'POST') {
+        return handleRoomMembershipRequest(request, env, {
+          kind: 'unban',
+          roomId: roomUnbanMatch[1],
+        });
+      }
+      const roomKickMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/kick$/.exec(pathname);
+      if (roomKickMatch && method === 'POST') {
+        return handleRoomMembershipRequest(request, env, {
+          kind: 'kick',
+          roomId: roomKickMatch[1],
+        });
+      }
+      const roomKnockMatch = /^\/_matrix\/client\/v3\/knock\/([^/]+)$/.exec(pathname);
+      if (roomKnockMatch && method === 'POST') {
+        return handleRoomMembershipRequest(request, env, {
+          kind: 'knock',
+          roomIdOrAlias: roomKnockMatch[1],
+        });
+      }
+      const roomForgetMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/forget$/.exec(pathname);
+      if (roomForgetMatch && method === 'POST') {
+        return handleRoomMembershipRequest(request, env, {
+          kind: 'forget',
+          roomId: roomForgetMatch[1],
+        });
+      }
+      const roomSendMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/send\/([^/]+)\/([^/]+)$/.exec(pathname);
+      if (roomSendMatch && method === 'PUT') {
+        return handleRoomSendEvent(request, env, roomSendMatch[1], roomSendMatch[2], roomSendMatch[3]);
+      }
+      const roomStateWithKeyMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/state\/([^/]+)\/([^/]+)$/.exec(pathname);
+      if (roomStateWithKeyMatch && method === 'PUT') {
+        return handleRoomStateWrite(request, env, roomStateWithKeyMatch[1], roomStateWithKeyMatch[2], roomStateWithKeyMatch[3]);
+      }
+      const roomStateWithoutKeyWriteMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/state\/([^/]+)$/.exec(pathname);
+      if (roomStateWithoutKeyWriteMatch && method === 'PUT') {
+        return handleRoomStateWrite(request, env, roomStateWithoutKeyWriteMatch[1], roomStateWithoutKeyWriteMatch[2], '');
+      }
+      const roomRedactMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/redact\/([^/]+)\/([^/]+)$/.exec(pathname);
+      if (roomRedactMatch && method === 'PUT') {
+        return handleRoomRedaction(request, env, roomRedactMatch[1], roomRedactMatch[2], roomRedactMatch[3]);
+      }
+      const roomMessagesMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/messages$/.exec(pathname);
+      if (roomMessagesMatch && method === 'GET') {
+        return handleRoomQueryRequest(request, env, roomMessagesMatch[1], {
+          kind: 'timeline',
+        });
+      }
+      const roomContextMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/context\/([^/]+)$/.exec(pathname);
+      if (roomContextMatch && method === 'GET') {
+        return handleRoomQueryRequest(request, env, roomContextMatch[1], {
+          kind: 'context',
+          eventId: roomContextMatch[2],
+        });
+      }
+      const roomEventMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/event\/([^/]+)$/.exec(pathname);
+      if (roomEventMatch && method === 'GET') {
+        return handleRoomQueryRequest(request, env, roomEventMatch[1], {
+          kind: 'event',
+          eventId: roomEventMatch[2],
+        });
+      }
+      const roomStateAllMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/state$/.exec(pathname);
+      if (roomStateAllMatch && method === 'GET') {
+        return handleRoomQueryRequest(request, env, roomStateAllMatch[1], {
+          kind: 'state',
+        });
+      }
+      if (roomStateWithKeyMatch && method === 'GET') {
+        return handleRoomQueryRequest(request, env, roomStateWithKeyMatch[1], {
+          kind: 'state',
+          eventType: roomStateWithKeyMatch[2],
+          stateKey: roomStateWithKeyMatch[3],
+        });
+      }
+      if (roomStateWithoutKeyWriteMatch && method === 'GET') {
+        return handleRoomQueryRequest(request, env, roomStateWithoutKeyWriteMatch[1], {
+          kind: 'state',
+          eventType: roomStateWithoutKeyWriteMatch[2],
+          stateKey: '',
+        });
+      }
+      const roomMembersMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/members$/.exec(pathname);
+      if (roomMembersMatch && method === 'GET') {
+        return handleRoomQueryRequest(request, env, roomMembersMatch[1], {
+          kind: 'members',
+        });
+      }
+      const roomJoinedMembersMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/joined_members$/.exec(pathname);
+      if (roomJoinedMembersMatch && method === 'GET') {
+        return handleRoomQueryRequest(request, env, roomJoinedMembersMatch[1], {
+          kind: 'joined_members',
+        });
+      }
+      const roomRelationsFullMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/relations\/([^/]+)\/([^/]+)\/([^/]+)$/.exec(pathname);
+      if (roomRelationsFullMatch && method === 'GET') {
+        return handleRoomQueryRequest(request, env, roomRelationsFullMatch[1], {
+          kind: 'relations',
+          eventId: roomRelationsFullMatch[2],
+          relType: roomRelationsFullMatch[3],
+          relationEventType: roomRelationsFullMatch[4],
+        });
+      }
+      const roomRelationsTypedMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/relations\/([^/]+)\/([^/]+)$/.exec(pathname);
+      if (roomRelationsTypedMatch && method === 'GET') {
+        return handleRoomQueryRequest(request, env, roomRelationsTypedMatch[1], {
+          kind: 'relations',
+          eventId: roomRelationsTypedMatch[2],
+          relType: roomRelationsTypedMatch[3],
+        });
+      }
+      const roomRelationsMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/relations\/([^/]+)$/.exec(pathname);
+      if (roomRelationsMatch && method === 'GET') {
+        return handleRoomQueryRequest(request, env, roomRelationsMatch[1], {
+          kind: 'relations',
+          eventId: roomRelationsMatch[2],
+        });
+      }
+      const roomThreadsMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/threads$/.exec(pathname);
+      if (roomThreadsMatch && method === 'GET') {
+        return handleRoomQueryRequest(request, env, roomThreadsMatch[1], {
+          kind: 'threads',
+        });
+      }
+      const roomTimestampMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/timestamp_to_event$/.exec(pathname);
+      if (roomTimestampMatch && method === 'GET') {
+        return handleRoomQueryRequest(request, env, roomTimestampMatch[1], {
+          kind: 'timestamp_lookup',
+        });
+      }
+      const roomHierarchyMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/hierarchy$/.exec(pathname);
+      if (roomHierarchyMatch && method === 'GET') {
+        return handleRoomHierarchyRequest(request, env, roomHierarchyMatch[1]);
+      }
+      const roomTypingMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/typing\/([^/]+)$/.exec(pathname);
+      if (roomTypingMatch && method === 'PUT') {
+        return handleRoomTyping(request, env, roomTypingMatch[1], roomTypingMatch[2]);
+      }
+      const roomReceiptMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/receipt\/([^/]+)\/([^/]+)$/.exec(pathname);
+      if (roomReceiptMatch && method === 'POST') {
+        return handleRoomReceipt(request, env, roomReceiptMatch[1], roomReceiptMatch[2], roomReceiptMatch[3]);
+      }
 
-  if (pathname === '/_matrix/client/v3/createRoom' && method === 'POST') {
-    return handleCreateRoom(request, env);
-  }
-  const roomJoinByAliasMatch = /^\/_matrix\/client\/v3\/join\/([^/]+)$/.exec(pathname);
-  if (roomJoinByAliasMatch && method === 'POST') {
-    return handleRoomMembershipRequest(request, env, {
-      kind: 'join',
-      roomIdOrAlias: roomJoinByAliasMatch[1],
-    });
-  }
-  const roomJoinMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/join$/.exec(pathname);
-  if (roomJoinMatch && method === 'POST') {
-    return handleRoomMembershipRequest(request, env, {
-      kind: 'join',
-      roomId: roomJoinMatch[1],
-    });
-  }
-  const roomLeaveMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/leave$/.exec(pathname);
-  if (roomLeaveMatch && method === 'POST') {
-    return handleRoomMembershipRequest(request, env, {
-      kind: 'leave',
-      roomId: roomLeaveMatch[1],
-    });
-  }
-  const roomInviteMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/invite$/.exec(pathname);
-  if (roomInviteMatch && method === 'POST') {
-    return handleRoomMembershipRequest(request, env, {
-      kind: 'invite',
-      roomId: roomInviteMatch[1],
-    });
-  }
-  const roomBanMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/ban$/.exec(pathname);
-  if (roomBanMatch && method === 'POST') {
-    return handleRoomMembershipRequest(request, env, {
-      kind: 'ban',
-      roomId: roomBanMatch[1],
-    });
-  }
-  const roomUnbanMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/unban$/.exec(pathname);
-  if (roomUnbanMatch && method === 'POST') {
-    return handleRoomMembershipRequest(request, env, {
-      kind: 'unban',
-      roomId: roomUnbanMatch[1],
-    });
-  }
-  const roomKickMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/kick$/.exec(pathname);
-  if (roomKickMatch && method === 'POST') {
-    return handleRoomMembershipRequest(request, env, {
-      kind: 'kick',
-      roomId: roomKickMatch[1],
-    });
-  }
-  const roomKnockMatch = /^\/_matrix\/client\/v3\/knock\/([^/]+)$/.exec(pathname);
-  if (roomKnockMatch && method === 'POST') {
-    return handleRoomMembershipRequest(request, env, {
-      kind: 'knock',
-      roomIdOrAlias: roomKnockMatch[1],
-    });
-  }
-  const roomForgetMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/forget$/.exec(pathname);
-  if (roomForgetMatch && method === 'POST') {
-    return handleRoomMembershipRequest(request, env, {
-      kind: 'forget',
-      roomId: roomForgetMatch[1],
-    });
-  }
-  const roomSendMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/send\/([^/]+)\/([^/]+)$/.exec(pathname);
-  if (roomSendMatch && method === 'PUT') {
-    return handleRoomSendEvent(request, env, roomSendMatch[1], roomSendMatch[2], roomSendMatch[3]);
-  }
-  const roomStateWithKeyMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/state\/([^/]+)\/([^/]+)$/.exec(pathname);
-  if (roomStateWithKeyMatch && method === 'PUT') {
-    return handleRoomStateWrite(request, env, roomStateWithKeyMatch[1], roomStateWithKeyMatch[2], roomStateWithKeyMatch[3]);
-  }
-  const roomStateWithoutKeyWriteMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/state\/([^/]+)$/.exec(pathname);
-  if (roomStateWithoutKeyWriteMatch && method === 'PUT') {
-    return handleRoomStateWrite(request, env, roomStateWithoutKeyWriteMatch[1], roomStateWithoutKeyWriteMatch[2], '');
-  }
-  const roomRedactMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/redact\/([^/]+)\/([^/]+)$/.exec(pathname);
-  if (roomRedactMatch && method === 'PUT') {
-    return handleRoomRedaction(request, env, roomRedactMatch[1], roomRedactMatch[2], roomRedactMatch[3]);
-  }
-  const roomMessagesMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/messages$/.exec(pathname);
-  if (roomMessagesMatch && method === 'GET') {
-    return handleRoomQueryRequest(request, env, roomMessagesMatch[1], {
-      kind: 'timeline',
-    });
-  }
-  const roomContextMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/context\/([^/]+)$/.exec(pathname);
-  if (roomContextMatch && method === 'GET') {
-    return handleRoomQueryRequest(request, env, roomContextMatch[1], {
-      kind: 'context',
-      eventId: roomContextMatch[2],
-    });
-  }
-  const roomEventMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/event\/([^/]+)$/.exec(pathname);
-  if (roomEventMatch && method === 'GET') {
-    return handleRoomQueryRequest(request, env, roomEventMatch[1], {
-      kind: 'event',
-      eventId: roomEventMatch[2],
-    });
-  }
-  const roomStateAllMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/state$/.exec(pathname);
-  if (roomStateAllMatch && method === 'GET') {
-    return handleRoomQueryRequest(request, env, roomStateAllMatch[1], {
-      kind: 'state',
-    });
-  }
-  if (roomStateWithKeyMatch && method === 'GET') {
-    return handleRoomQueryRequest(request, env, roomStateWithKeyMatch[1], {
-      kind: 'state',
-      eventType: roomStateWithKeyMatch[2],
-      stateKey: roomStateWithKeyMatch[3],
-    });
-  }
-  if (roomStateWithoutKeyWriteMatch && method === 'GET') {
-    return handleRoomQueryRequest(request, env, roomStateWithoutKeyWriteMatch[1], {
-      kind: 'state',
-      eventType: roomStateWithoutKeyWriteMatch[2],
-      stateKey: '',
-    });
-  }
-  const roomMembersMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/members$/.exec(pathname);
-  if (roomMembersMatch && method === 'GET') {
-    return handleRoomQueryRequest(request, env, roomMembersMatch[1], {
-      kind: 'members',
-    });
-  }
-  const roomJoinedMembersMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/joined_members$/.exec(pathname);
-  if (roomJoinedMembersMatch && method === 'GET') {
-    return handleRoomQueryRequest(request, env, roomJoinedMembersMatch[1], {
-      kind: 'joined_members',
-    });
-  }
-  const roomRelationsFullMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/relations\/([^/]+)\/([^/]+)\/([^/]+)$/.exec(pathname);
-  if (roomRelationsFullMatch && method === 'GET') {
-    return handleRoomQueryRequest(request, env, roomRelationsFullMatch[1], {
-      kind: 'relations',
-      eventId: roomRelationsFullMatch[2],
-      relType: roomRelationsFullMatch[3],
-      relationEventType: roomRelationsFullMatch[4],
-    });
-  }
-  const roomRelationsTypedMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/relations\/([^/]+)\/([^/]+)$/.exec(pathname);
-  if (roomRelationsTypedMatch && method === 'GET') {
-    return handleRoomQueryRequest(request, env, roomRelationsTypedMatch[1], {
-      kind: 'relations',
-      eventId: roomRelationsTypedMatch[2],
-      relType: roomRelationsTypedMatch[3],
-    });
-  }
-  const roomRelationsMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/relations\/([^/]+)$/.exec(pathname);
-  if (roomRelationsMatch && method === 'GET') {
-    return handleRoomQueryRequest(request, env, roomRelationsMatch[1], {
-      kind: 'relations',
-      eventId: roomRelationsMatch[2],
-    });
-  }
-  const roomThreadsMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/threads$/.exec(pathname);
-  if (roomThreadsMatch && method === 'GET') {
-    return handleRoomQueryRequest(request, env, roomThreadsMatch[1], {
-      kind: 'threads',
-    });
-  }
-  const roomTimestampMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/timestamp_to_event$/.exec(pathname);
-  if (roomTimestampMatch && method === 'GET') {
-    return handleRoomQueryRequest(request, env, roomTimestampMatch[1], {
-      kind: 'timestamp_lookup',
-    });
-  }
-  const roomHierarchyMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/hierarchy$/.exec(pathname);
-  if (roomHierarchyMatch && method === 'GET') {
-    return handleRoomHierarchyRequest(request, env, roomHierarchyMatch[1]);
-  }
-  const roomTypingMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/typing\/([^/]+)$/.exec(pathname);
-  if (roomTypingMatch && method === 'PUT') {
-    return handleRoomTyping(request, env, roomTypingMatch[1], roomTypingMatch[2]);
-  }
-  const roomReceiptMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/receipt\/([^/]+)\/([^/]+)$/.exec(pathname);
-  if (roomReceiptMatch && method === 'POST') {
-    return handleRoomReceipt(request, env, roomReceiptMatch[1], roomReceiptMatch[2], roomReceiptMatch[3]);
-  }
+      const sendToDeviceMatch = /^\/_matrix\/client\/v3\/sendToDevice\/([^/]+)\/([^/]+)$/.exec(pathname);
+      if (sendToDeviceMatch && method === 'PUT') {
+        return handleSendToDevice(request, env, sendToDeviceMatch[1], sendToDeviceMatch[2]);
+      }
 
-  const sendToDeviceMatch = /^\/_matrix\/client\/v3\/sendToDevice\/([^/]+)\/([^/]+)$/.exec(pathname);
-  if (sendToDeviceMatch && method === 'PUT') {
-    return handleSendToDevice(request, env, sendToDeviceMatch[1], sendToDeviceMatch[2]);
-  }
+      if (pathname === '/_matrix/client/v3/sync' && method === 'GET') {
+        return handleSync(request, env, url);
+      }
 
-  if (pathname === '/_matrix/client/v3/sync' && method === 'GET') {
-    return handleSync(request, env, url);
-  }
+      if (pathname.startsWith('/_matrix/')) {
+        return stubRouteResponse();
+      }
 
-  if (pathname.startsWith('/_matrix/')) {
-    return stubRouteResponse();
+      return new Response('Not found', { status: 404 });
+    })();
+    return finalizeResponse(response, {
+      outcome: abuseResponse ? 'rate_limited' : undefined,
+      errorClass: abuseResponse ? 'abuse_guard' : null,
+    });
+  } catch (error) {
+    const completed = requestMetrics.finish({
+      status: 500,
+      error,
+    });
+    requestContext.logger.error('gateway.request.failed', {
+      method,
+      path: pathname,
+      outcome: 'error',
+      error_class: error?.code ?? error?.name ?? 'internal',
+      error_message: error?.message ?? 'Unknown gateway failure',
+      latency_ms: Math.round(completed.wall_ms),
+      cpu_ms: Math.round(completed.cpu_ms),
+    });
+    throw error;
   }
-
-  return new Response('Not found', { status: 404 });
 }
 
 const fetch = async (request, env) => handleRequest(request, env);

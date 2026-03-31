@@ -201,3 +201,113 @@ export function createGatewayPhase04Rig(overrides = {}) {
     },
   };
 }
+
+export function createGatewayVersionSkewRig({
+  workerEnvOverrides = {},
+  authorityEnvOverrides = {},
+  jobsEnvOverrides = {},
+} = {}) {
+  const sharedD1 = createFakeD1Database();
+  const sharedMediaBucket = new FakeR2Bucket();
+  const sharedArchiveBucket = new FakeR2Bucket();
+  const sharedEdgeCache = new FakeKvNamespace();
+  const sharedQueues = {
+    search: new FakeQueueBinding('matrix-search-index-job'),
+    media: new FakeQueueBinding('matrix-media-thumbnail-job'),
+    appservice: new FakeQueueBinding('matrix-appservice-txn-job'),
+    rebuild: new FakeQueueBinding('matrix-rebuild-shard-job'),
+    export: new FakeQueueBinding('matrix-export-shard-job'),
+    restore: new FakeQueueBinding('matrix-restore-shard-job'),
+    repair: new FakeQueueBinding('matrix-repair-shard-job'),
+  };
+  const sharedTelemetry = {
+    metrics: new Map(),
+    deployment_records: new Map(),
+    cost_totals: new Map(),
+    events: [],
+  };
+  const sharedBindings = {
+    MATRIX_CONTROL_D1: sharedD1,
+    MATRIX_MEDIA_BUCKET: sharedMediaBucket,
+    MATRIX_ARCHIVE_BUCKET: sharedArchiveBucket,
+    MATRIX_EDGE_CACHE: sharedEdgeCache,
+    SEARCH_INDEX_QUEUE: sharedQueues.search,
+    MEDIA_THUMBNAIL_QUEUE: sharedQueues.media,
+    APPSERVICE_TXN_QUEUE: sharedQueues.appservice,
+    REBUILD_SHARD_QUEUE: sharedQueues.rebuild,
+    EXPORT_SHARD_QUEUE: sharedQueues.export,
+    RESTORE_SHARD_QUEUE: sharedQueues.restore,
+    REPAIR_SHARD_QUEUE: sharedQueues.repair,
+    __MATRIX_RUNTIME_TELEMETRY__: sharedTelemetry,
+  };
+  const workerEnv = createDefaultEnv({
+    ...sharedBindings,
+    ...workerEnvOverrides,
+  });
+  const authorityEnv = createDefaultEnv({
+    ...sharedBindings,
+    ...authorityEnvOverrides,
+  });
+  const jobsEnv = createDefaultEnv({
+    ...sharedBindings,
+    ...jobsEnvOverrides,
+  });
+  const userNamespace = new FakeDurableObjectNamespace(UserDO, authorityEnv);
+  const roomNamespace = new FakeDurableObjectNamespace(RoomDO, authorityEnv);
+  workerEnv.USER_DO = userNamespace;
+  workerEnv.ROOM_DO = roomNamespace;
+  jobsEnv.USER_DO = userNamespace;
+  jobsEnv.ROOM_DO = roomNamespace;
+  workerEnv.JOBS_WORKER = {
+    fetch(request) {
+      return jobsWorkerModule.fetch(request, jobsEnv);
+    },
+  };
+
+  async function gatewayFetch(pathname, {
+    method = 'GET',
+    headers = {},
+    json = null,
+    body = null,
+  } = {}) {
+    const requestHeaders = new Headers(headers);
+    if (json != null && !requestHeaders.has('content-type')) {
+      requestHeaders.set('content-type', 'application/json; charset=utf-8');
+    }
+    if (body != null && json != null) {
+      throw new TypeError('body and json are mutually exclusive');
+    }
+    const request = new Request(`https://matrix.example.test${pathname}`, {
+      method,
+      headers: requestHeaders,
+      body: json == null ? body : JSON.stringify(json),
+    });
+    return gatewayWorkerModule.fetch(request, workerEnv);
+  }
+
+  return {
+    env: workerEnv,
+    authorityEnv,
+    jobsEnv,
+    gatewayFetch,
+    authHeaders(accessToken) {
+      return {
+        authorization: `Bearer ${accessToken}`,
+      };
+    },
+    getUserDo(localpartOrUserId) {
+      const userId = String(localpartOrUserId).startsWith('@')
+        ? String(localpartOrUserId)
+        : buildLocalUserId(localpartOrUserId, workerEnv.MATRIX_SERVER_NAME);
+      return userNamespace.get(userNamespace.idFromName(userId));
+    },
+    getRoomDo(roomId) {
+      return roomNamespace.get(roomNamespace.idFromName(roomId));
+    },
+    close() {
+      sharedD1.close?.();
+      userNamespace.close();
+      roomNamespace.close();
+    },
+  };
+}

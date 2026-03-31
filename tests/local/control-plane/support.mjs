@@ -176,6 +176,7 @@ export async function createControlPlaneRig({
   audience = 'aud-ops',
   policies = [],
   jwkSequence = null,
+  envOverrides = {},
 } = {}) {
   const accessKeyPair = generateKeyPairSync('rsa', { modulusLength: 2048 });
   const accessPrivatePem = accessKeyPair.privateKey.export({ format: 'pem', type: 'pkcs8' });
@@ -255,6 +256,7 @@ export async function createControlPlaneRig({
     UIA_ROOT_KEY_RING: 'uia-root-key-ring',
     APPSERVICE_TOKEN_SET: 'appservice-token-set',
     __ACCESS_FETCH__: accessFetch,
+    ...envOverrides,
   };
 
   const jobsEnv = {

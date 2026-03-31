@@ -1,0 +1,50 @@
+req_id,owning_spec,title,normative_statement,source_file,source_line,status
+REQ-ARCH-001,20,主权状态机优先,房间、用户、远端服务器三类权威状态必须各自拥有唯一串行裁决者。,spec/framework/20-system-context-and-principles.md,73,active
+REQ-ARCH-002,20,单一真相面,任一业务事实只能有一个权威写入位置。,spec/framework/20-system-context-and-principles.md,74,active
+REQ-ARCH-003,20,协议入口统一,同一类 Matrix 语义无论来自本地客户端、联邦还是 AS，都必须进入同一语义裁决管道。,spec/framework/20-system-context-and-principles.md,75,active
+REQ-ARCH-004,20,提交前不等待外部 I/O,权威写路径在提交前不得依赖远端网络、D1、KV、Queues 或 R2 的成功。,spec/framework/20-system-context-and-principles.md,76,active
+REQ-ARCH-005,20,可恢复优先,任何衍生副作用失败都必须可通过重放、重建或补偿修复。,spec/framework/20-system-context-and-principles.md,77,active
+REQ-ARCH-006,20,DO SQLite 承载真相,需要强一致、串行裁决的数据必须优先放在 DO SQLite。,spec/framework/20-system-context-and-principles.md,90,active
+REQ-ARCH-007,20,D1 不承载数据面业务真相,D1 可以承载可重建衍生面与少量权威控制面元数据，但不得承载房间当前状态、设备会话真相、联邦幂等真相或任何需要由数据面主权对象串行裁决的业务事实。,spec/framework/20-system-context-and-principles.md,91,active
+REQ-ARCH-008,20,KV 仅作缓存,KV 不得被视为即时一致或权威来源。,spec/framework/20-system-context-and-principles.md,92,active
+REQ-ARCH-009,20,R2 承载对象与冷历史,大对象、冷数据、归档必须移出 DO 热路径。,spec/framework/20-system-context-and-principles.md,93,active
+REQ-ARCH-010,20,每房间串行,同一 `room_id` 的事件接纳与状态推进必须在同一 `RoomDO` 内串行完成。,spec/framework/20-system-context-and-principles.md,99,active
+REQ-ARCH-011,20,每用户串行,同一 `user_id` 的 session、device、to-device、sync stream 必须在同一 `UserDO` 内线性化。,spec/framework/20-system-context-and-principles.md,100,active
+REQ-ARCH-012,20,每远端服务器串行出站,同一 `server_name` 的出站事务排序、重试和去重必须由同一 `RemoteServerDO` 裁决。,spec/framework/20-system-context-and-principles.md,101,active
+REQ-ARCH-013,20,派生最终一致,搜索、目录、统计、媒体目录、导出索引可以滞后，但必须可重建。,spec/framework/20-system-context-and-principles.md,102,active
+REQ-ARCH-014,20,成本与语义解耦,不能通过把权威语义塞进更便宜但不一致的存储来降低成本。,spec/framework/20-system-context-and-principles.md,108,active
+REQ-ARCH-015,20,长等待在 Worker，不在 DO,长轮询和稀疏等待应尽量停留在 Worker 或 hibernating DO 连接上。,spec/framework/20-system-context-and-principles.md,109,active
+REQ-ARCH-016,20,以分片替代纵向堆高,扩容优先通过更多主权对象，而不是更重单体实例。,spec/framework/20-system-context-and-principles.md,110,active
+REQ-ARCH-017,20,版本偏斜容忍,Worker 与 DO 接口必须前后兼容，以适应 Cloudflare 渐进和最终一致发布。,spec/framework/20-system-context-and-principles.md,116,active
+REQ-ARCH-018,20,房间版本隔离,房间版本差异必须通过策略层隔离，不得散落在业务代码中。,spec/framework/20-system-context-and-principles.md,117,active
+REQ-ARCH-019,20,协议与平台事实分离,Matrix 语义与 Cloudflare 平台限制必须分开建模，然后在责任分册中组合。,spec/framework/20-system-context-and-principles.md,118,active
+REQ-GOV-001,10,Single-homeserver deployment,一个部署环境只服务一个 homeserver 域名。,spec/framework/10-governance-and-references.md,72,active
+REQ-GOV-002,10,Single-tenant state plane,首版不支持同一部署内多租户混用同一状态平面。,spec/framework/10-governance-and-references.md,73,active
+REQ-GOV-003,10,Workers Paid baseline,所有成本、容量和运行时判断都基于 Workers Paid。,spec/framework/10-governance-and-references.md,74,active
+REQ-GOV-004,10,Explicit compatibility control,所有 Worker 都必须设置显式 `compatibility_date` 并在验证后推进。,spec/framework/10-governance-and-references.md,75,active
+REQ-GOV-005,10,Staging required,生产前必须存在独立 staging 环境。,spec/framework/10-governance-and-references.md,76,active
+REQ-GOV-006,10,R2 export required,生产必须具备到 R2 的导出与恢复演练能力。,spec/framework/10-governance-and-references.md,77,active
+REQ-OPS-001,41,Structured logs,所有生产 Worker 必须输出结构化 JSON 日志。,spec/framework/41-observability-performance-and-cost.md,24,active
+REQ-OPS-002,41,Correlation IDs,每个请求、异步任务、联邦事务和运维作业都必须能关联到稳定 ID。,spec/framework/41-observability-performance-and-cost.md,25,active
+REQ-OPS-003,41,Cost attribution,每个主要成本面都必须有可观测指标与月度归因面板。,spec/framework/41-observability-performance-and-cost.md,26,active
+REQ-OPS-004,41,Truth-path visibility,`UserDO`、`RoomDO`、`RemoteServerDO` 的核心提交路径必须有独立指标。,spec/framework/41-observability-performance-and-cost.md,27,active
+REQ-OPS-005,41,Derived-lag visibility,D1/Queue/R2 派生滞后必须可测。,spec/framework/41-observability-performance-and-cost.md,28,active
+REQ-OPS-010,42,Versioned deployments,生产发布必须使用 Worker versions/deployments 模型。,spec/framework/42-deployment-migration-and-recovery.md,24,active
+REQ-OPS-011,42,Compatibility before rollout,任何破坏性行为切换前必须先发布兼容代码。,spec/framework/42-deployment-migration-and-recovery.md,25,active
+REQ-OPS-012,42,Migrations isolated,DO migration 必须与普通代码发布解耦。,spec/framework/42-deployment-migration-and-recovery.md,26,active
+REQ-OPS-013,42,Recovery path before cleanup,删除旧 schema、旧索引、旧对象前必须确认已有恢复入口。,spec/framework/42-deployment-migration-and-recovery.md,27,active
+REQ-ROOM-001,31,Unified admission,所有房间事件写入，包括本地客户端、Application Service、联邦恢复与 repair/backfill 重放，都必须进入 `RoomDO` 串行的统一 `IF-INT-ROOM-001 admitEvent()` 管道，并按同一 `FLOW-ROOM-EVENT-ADMISSION` / `STATE-ROOM-EVENT-ADMISSION` 裁决终态。,spec/framework/31-room-processing-and-room-versions.md,25,active
+REQ-ROOM-002,31,Membership as events,create/join/invite/leave/ban/unban/kick/knock 以及 profile refresh 都必须表现为受房间版本规则约束的 membership 事件；提交成功后 `DATA-ROOM-007` 当前视图必须与事件真相原子同步。,spec/framework/31-room-processing-and-room-versions.md,26,active
+REQ-ROOM-003,31,Client room-write idempotency,客户端 create/membership/send/state/redact 写路径必须通过 `DATA-ROOM-012` 持久化幂等裁决；同一 dedupe key + 同一 request hash 必须返回同一终态，不同 hash 必须 deterministic conflict。,spec/framework/31-room-processing-and-room-versions.md,27,active
+REQ-ROOM-004,31,Query truth via RoomDO,`/messages`、`/context`、`/event`、`/state`、`/members`、`/joined_members`、`/relations`、`/threads`、`/timestamp_to_event` 与 `/sync` 房间投影都必须以 `RoomDO` 的权威 metadata、visibility、redaction 与 membership 边界裁决为准，不得直接从 D1、KV 或 R2 绕过真相面。,spec/framework/31-room-processing-and-room-versions.md,28,active
+REQ-ROOM-005,31,Durable local fanout,房间提交成功后的本地用户可见变化必须先 durable 写入 `DATA-ROOM-011` outbox，再通过 `IF-INT-USER-003` 追加到 `DATA-USER-010`；若任何一侧缺失，repair 流程必须可重驱或补记，且 `/sync` 可见性不得依赖易失内存。,spec/framework/31-room-processing-and-room-versions.md,29,active
+REQ-ROOM-006,31,Room-version strategy,新建房间默认 room version 必须为 `12`，且必须允许显式请求 `11`；`11/12` 的 event shape、auth、redaction、room id 与 state resolution 差异都必须封装在 strategy 层，不得散落到 `RoomDO` 业务逻辑。,spec/framework/31-room-processing-and-room-versions.md,30,active
+REQ-ROOM-007,31,Ephemeral room-state isolation,receipts / typing 只更新 `DATA-ROOM-009` / `DATA-ROOM-010` 等 ephemeral 真相，不得污染 timeline 或 current state；typing 必须通过 `IF-ALARM-002` 过期，ephemeral 写入失败也不得回滚已提交的房间事件真相。,spec/framework/31-room-processing-and-room-versions.md,31,active
+REQ-SEC-001,40,Token truth,access token 与 refresh token 的有效性只以 `UserDO` 真相为准。,spec/framework/40-security-and-abuse-resistance.md,24,active
+REQ-SEC-002,40,Secret storage,所有敏感密钥、bearer token 本体与可离线重放的凭据都必须存放于 Workers secrets 或 Secrets Store；不适用于仅以 hash 形式存于 `UserDO` 真相中的 access/refresh token。,spec/framework/40-security-and-abuse-resistance.md,25,active
+REQ-SEC-003,40,No plaintext secrets,严禁把敏感信息存入 Wrangler `vars`、D1、KV、Git 或日志。,spec/framework/40-security-and-abuse-resistance.md,26,active
+REQ-SEC-004,40,Room authorization,房间级授权最终只由 `RoomDO` + room version auth rules 裁决。,spec/framework/40-security-and-abuse-resistance.md,27,active
+REQ-SEC-005,40,Federation auth,除显式登记为 deterministic disabled stub 的联邦路由外，联邦请求只以 `X-Matrix` 签名和 Matrix 规则验证，不以 IP allowlist 替代。,spec/framework/40-security-and-abuse-resistance.md,28,active
+REQ-SEC-006,40,Abuse controls,注册、登录、媒体、房间发送、联邦入口、搜索等都必须具备限流或配额控制。,spec/framework/40-security-and-abuse-resistance.md,29,active
+REQ-SEC-007,40,Auditability,所有高权限操作都必须有审计记录与因果链。,spec/framework/40-security-and-abuse-resistance.md,30,active
+REQ-SEC-008,40,Single-tenant isolation,首版隔离边界是“每个 homeserver 域名独立部署单元”。,spec/framework/40-security-and-abuse-resistance.md,31,active

@@ -649,48 +649,58 @@
 
 ### 08.01 实现 baseline abuse guard
 
-- [ ] 为注册、登录、媒体、房间发送、搜索、本地公开入口接入限流/配额。
+- [x] 为注册、登录、媒体、房间发送、搜索、本地公开入口接入限流/配额。
   Spec refs: `40` 6, 6.1, `REQ-SEC-006`
   产出:
   粗粒度入口限流、主权对象内语义配额。
   完成标准:
   平台防护只是附加层，业务语义配额在应用层可见。
+  当前状态:
+  `packages/runtime-core/src/abuse-guard.mjs`、`apps/gateway-worker/src/index.mjs` 与 `packages/runtime-core/src/durable-objects.mjs` 已接通 gateway 入口限流与 `UserDO` / `RoomDO` 语义配额；覆盖注册、登录、媒体、搜索、本地公开入口，以及 room write / membership mutation（含 `join`、`knock`、`forget`）。`tests/local/runtime-foundations/phase-08-runtime-controls.test.mjs` 已验证 gateway `429 M_LIMIT_EXCEEDED` 与应用层可见配额拒绝。
 
 ### 08.02 接入核心 metrics / logs / cost attribution
 
-- [ ] 为 Worker、DO、D1、R2、Queue、控制面作业接入核心指标。
+- [x] 为 Worker、DO、D1、R2、Queue、控制面作业接入核心指标。
   Spec refs: `41` 2-9
   产出:
   指标埋点、结构化日志、最小成本面板字段。
   完成标准:
   `REQ-OPS-001`~`REQ-OPS-005` 有真实代码落位。
+  当前状态:
+  `packages/runtime-core/src/telemetry.mjs` 与三类 Worker 入口现已记录 request metrics、结构化日志、deployment record、D1/R2/KV/Queue 指标与成本归因；`UserDO` / `RoomDO` 关键操作与 control-plane job 状态也已落真实指标。Phase 08 本地测试已验证 deployment/binding/derived-lag/cost attribution 信号存在。
 
 ### 08.03 实现部署兼容与版本记录
 
-- [ ] 建立 Worker version、deployment composition、compatibility date、CPU limit、startup_time 记录。
+- [x] 建立 Worker version、deployment composition、compatibility date、CPU limit、startup_time 记录。
   Spec refs: `42` 2-8, `13` `CF-WKR-012`,`CF-WKR-025`
   产出:
   发布记录格式、版本兼容校验、secret rotation 记录。
   完成标准:
   `new Worker -> old DO` / `old Worker -> new DO` 兼容路径有实现基础。
+  当前状态:
+  `packages/runtime-core/src/deployment-records.mjs`、runtime manifest 与 worker env 已记录 `worker_version_id`、`deployment_id`、`compatibility_date`、`cpu_limit_class`、`startup_time_ms`、`deployment_composition`、`feature_gates` 与 `secret_versions`；`ops-worker` health 响应与 `spec/framework/26-wire-schema-catalog.md` 已同步扩展。Phase 08 版本偏斜测试已验证 `new Worker -> old DO` / `old Worker -> new DO` 的基础兼容路径。
 
 ### 08.04 完成 L1 测试
 
-- [ ] 落地 `TEST-CS-001`,`TEST-CS-002`,`TEST-CS-003`,`TEST-CS-004`,`TEST-ROOM-001`,`TEST-ROOM-002`,`TEST-MEDIA-001`,`TEST-DER-001`,`TEST-SEC-001`,`TEST-OPS-001`,`TEST-COST-001`。
+- [x] 落地 `TEST-CS-001`,`TEST-CS-002`,`TEST-CS-003`,`TEST-CS-004`,`TEST-ROOM-001`,`TEST-ROOM-002`,`TEST-MEDIA-001`,`TEST-DER-001`,`TEST-SEC-001`,`TEST-OPS-001`,`TEST-COST-001`。
   Spec refs: `43` 3, 9
   产出:
   local / CI / staging 测试套件。
   完成标准:
   `L1` mandatory tests 全部可运行。
+  当前状态:
+  `tests/shared/l1-mandatory-suite.mjs` 已汇总 L1 mandatory suites，`tests/integration/`、`tests/staging/`、`tests/pre-release/` 均已落环境入口；新增 Phase 08 runtime/ops 测试与版本偏斜 rig。最终验证已通过 `npm run test:all`（local + `ci-integration` + `staging` + `pre-release` 全部 exit `0`）。
 
 ### 08.05 完成 L1 证据
 
-- [ ] 生成 `EVID-CS-001`,`EVID-CS-002`,`EVID-CS-003`,`EVID-CS-004`,`EVID-ROOM-001`,`EVID-ROOM-002`,`EVID-MEDIA-001`,`EVID-DER-001`,`EVID-SEC-001`,`EVID-OPS-001`,`EVID-COST-001`。
+- [x] 生成 `EVID-CS-001`,`EVID-CS-002`,`EVID-CS-003`,`EVID-CS-004`,`EVID-ROOM-001`,`EVID-ROOM-002`,`EVID-MEDIA-001`,`EVID-DER-001`,`EVID-SEC-001`,`EVID-OPS-001`,`EVID-COST-001`。
   Spec refs: `44` 3, 4
   产出:
   对应 `evidence/L1/` 与 `evidence/common/` 证据包。
   完成标准:
   可以诚实声称达到 `L1 Local-Core`。
+  当前状态:
+  `npm run governance:evidence` 已生成 `evidence/common/EVID-GOV-001/20260331T130238Z/summary.md`；`npm run evidence:l1 -- --timestamp 20260331T130238Z` 已生成全部 `L1/common` Phase 08 证据包，shared run artifacts 位于 `evidence/common/_test-runs/20260331T130238Z/`。11 个目标 `EVID-*` bundle 均为 `pass`，且每个 bundle 都包含 `summary.md` 与 `artifacts/{context,source-ids,environment-results}.json`。
 
 ## Phase 09: Federation Core And L2 Gate
 
