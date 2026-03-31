@@ -3,13 +3,14 @@ import {
   applyPublicRoomDirectoryProjection,
   applySearchIndexProjection,
   applyUserDirectoryProjection,
-  buildThumbnailBody,
   buildThumbnailDescriptor,
   clearDerivedTarget,
+  createThumbnailBodyInput,
   createDefaultThumbnailJob,
   INTERNAL_RUNTIME_DERIVED_WORK_PATH,
   normalizeDerivedWorkBatch,
   parseLegacyUnauthFreezeAt,
+  resolveThumbnailAnimationPreference,
   RUNTIME_JOB_SCHEMA_VERSION,
 } from '../../../packages/runtime-core/src/index.mjs';
 import { createSkeletonQueueHandler } from '../../../packages/runtime-core/src/index.mjs';
@@ -78,6 +79,13 @@ async function withMediaKeyBackoff(env, objectKey, operation) {
     code: 'quota_exceeded',
     retryable: true,
   });
+}
+
+function resolveConfiguredMaxMediaBytes(env) {
+  const configured = Number.parseInt(env.MATRIX_MEDIA_MAX_UPLOAD_BYTES, 10);
+  return Number.isInteger(configured) && configured >= 1
+    ? configured
+    : Number.POSITIVE_INFINITY;
 }
 
 async function handleRuntimeDerivedFetch(request, env) {
@@ -180,14 +188,17 @@ async function processMediaThumbnailMessage(messageBody, env) {
       retryable: true,
     });
   }
-  const sourceBytes = typeof source.arrayBuffer === 'function'
-    ? Buffer.from(await source.arrayBuffer())
-    : Buffer.from(await source.text(), 'utf8');
   const sourceMetadata = source.customMetadata ?? {};
   const freezeAt = parseLegacyUnauthFreezeAt(env.MATRIX_MEDIA_LEGACY_UNAUTH_FREEZE_AT);
   const { server_name: originServerName, media_id: mediaId } = parseMxcUri(messageBody.mxc_uri);
   const legacyFlag = sourceMetadata.legacy_unauth_access_flag === 'true';
-  for (const variant of messageBody.variants ?? []) {
+  const sourceHasStreamBody = source?.body && typeof source.body.getReader === 'function';
+  for (let variantIndex = 0; variantIndex < (messageBody.variants ?? []).length; variantIndex += 1) {
+    const variant = messageBody.variants[variantIndex];
+    const effectiveAnimated = resolveThumbnailAnimationPreference(
+      variant.animated === true,
+      sourceMetadata.content_type ?? messageBody.content_type,
+    );
     const descriptor = buildThumbnailDescriptor({
       sourceKind: messageBody.source_kind === 'remote_cache' ? 'remote' : 'local',
       originServerName: messageBody.source_kind === 'remote_cache' ? originServerName : null,
@@ -195,9 +206,22 @@ async function processMediaThumbnailMessage(messageBody, env) {
       width: variant.width,
       height: variant.height,
       method: variant.method,
-      animated: variant.animated === true,
+      animated: effectiveAnimated,
     });
-    const thumbnailBody = buildThumbnailBody(sourceBytes, variant);
+    const variantSource = sourceHasStreamBody && variantIndex > 0
+      ? await env.MATRIX_MEDIA_BUCKET.get(messageBody.r2_object_key)
+      : source;
+    if (!variantSource) {
+      throw Object.assign(new Error(`Source media object ${messageBody.r2_object_key} disappeared while generating thumbnails`), {
+        retryable: true,
+      });
+    }
+    const thumbnailBody = await createThumbnailBodyInput(variantSource, {
+      ...variant,
+      animated: effectiveAnimated,
+    }, {
+      maxBytes: resolveConfiguredMaxMediaBytes(env),
+    });
     await withMediaKeyBackoff(env, descriptor.key, () => env.MATRIX_MEDIA_BUCKET.put(descriptor.key, thumbnailBody, {
       customMetadata: {
         ...descriptor.metadata,
@@ -218,7 +242,7 @@ async function processMediaThumbnailMessage(messageBody, env) {
     byte_size: Number.parseInt(
       messageBody.byte_size
         ?? sourceMetadata.byte_size
-        ?? String(sourceBytes.byteLength),
+        ?? String(source.size ?? 0),
       10,
     ),
     content_hash: typeof messageBody.content_hash === 'string'

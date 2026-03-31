@@ -629,12 +629,19 @@
 
 ### 07.06 实现 rebuild 能力
 
-- [x] 支持从 truth + archive 重建 search/user_directory/public_rooms。
+- [ ] 支持从 truth + archive 重建 search/user_directory/public_rooms。
   Spec refs: `34` 3.4, `42` 10, `25` `FLOW-REPLAY-REBUILD`
   产出:
   rebuild job、checkpoint、重放逻辑。
   完成标准:
   D1 派生表可完全从数据面真相重建。
+
+- [ ] 为 `RoomDO` 的大 shard rebuild 实现 checkpointed 分批重放，跨多次 queue invocation 满足 D1 单 invocation 预算。
+  Spec refs: `34` 3.4, `42` 10, `25` `STATE-REBUILD-JOB`
+  产出:
+  per-shard chunk cursor、幂等 clear/apply 语义、跨 invocation checkpoint 进度推进。
+  完成标准:
+  单 shard `search_index_rows` 超过单 invocation D1 budget 时仍可完成 rebuild，且不违反 `CF-D1-007` 到 `CF-D1-011`。
 
 ## Phase 08: L1 Security, Observability, Compatibility, And Release Gate
 

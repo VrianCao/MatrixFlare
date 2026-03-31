@@ -7,11 +7,56 @@ function encodeCursor(payload) {
   return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
 }
 
-function decodeCursor(value) {
+function createInvalidQueryParamError(message) {
+  return Object.assign(new TypeError(message), {
+    code: 'invalid_query_param',
+  });
+}
+
+function normalizeDerivedLimit(value) {
+  try {
+    return normalizeInteger(value, 'limit', { min: 1 });
+  } catch {
+    throw createInvalidQueryParamError('limit must be an integer >= 1');
+  }
+}
+
+function normalizeDerivedOffset(value, label) {
+  try {
+    return normalizeInteger(value, label, { min: 0 });
+  } catch {
+    throw createInvalidQueryParamError(`${label} must be an integer >= 0`);
+  }
+}
+
+function normalizeSearchRoomIds(roomIds) {
+  if (roomIds == null) {
+    return null;
+  }
+  if (!Array.isArray(roomIds)) {
+    throw createInvalidQueryParamError('filter.rooms must be an array of room IDs');
+  }
+  try {
+    return new Set(roomIds.map((roomId, index) => normalizeString(roomId, `roomIds[${index}]`)));
+  } catch {
+    throw createInvalidQueryParamError('filter.rooms entries must be strings');
+  }
+}
+
+function decodeCursor(value, label = 'cursor') {
   if (value == null || value === '') {
     return null;
   }
-  return JSON.parse(Buffer.from(normalizeString(value, 'cursor'), 'base64url').toString('utf8'));
+  try {
+    const decoded = Buffer.from(normalizeString(value, label), 'base64url').toString('utf8');
+    const parsed = JSON.parse(decoded);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new TypeError(`${label} must decode to an object`);
+    }
+    return parsed;
+  } catch {
+    throw createInvalidQueryParamError(`${label} must be a valid pagination token`);
+  }
 }
 
 export function getDerivedPersistence(env) {
@@ -113,13 +158,13 @@ export async function queryUserDirectory(env, {
   ignoredUserIds = null,
 } = {}) {
   const derived = await ensureDerivedSchema(env);
-  const normalizedLimit = normalizeInteger(limit, 'limit', { min: 1 });
+  const normalizedLimit = normalizeDerivedLimit(limit);
   const normalizedSearchTerm = normalizeString(searchTerm ?? '', 'searchTerm');
   const lowered = normalizedSearchTerm.toLowerCase();
   const ignoredUserIdSet = ignoredUserIds == null
     ? null
     : new Set([...ignoredUserIds].map((userId) => normalizeString(userId, 'ignoredUserId')));
-  const results = (await derived.userDirectory.list())
+  const matchedRows = (await derived.userDirectory.list())
     .filter((row) => row.directory_visibility !== 'hidden')
     .filter((row) => ignoredUserIdSet == null || !ignoredUserIdSet.has(row.user_id))
     .filter((row) => (
@@ -130,7 +175,8 @@ export async function queryUserDirectory(env, {
     .sort((left, right) => (
       (left.displayname ?? left.user_id).localeCompare(right.displayname ?? right.user_id)
       || left.user_id.localeCompare(right.user_id)
-    ))
+    ));
+  const results = matchedRows
     .slice(0, normalizedLimit)
     .map((row) => ({
       user_id: row.user_id,
@@ -139,7 +185,7 @@ export async function queryUserDirectory(env, {
     }));
   return {
     results,
-    limited: results.length >= normalizedLimit,
+    limited: matchedRows.length > normalizedLimit,
   };
 }
 
@@ -150,20 +196,19 @@ export async function querySearchIndex(env, {
   nextBatch = null,
 } = {}) {
   const derived = await ensureDerivedSchema(env);
-  const normalizedLimit = normalizeInteger(limit, 'limit', { min: 1 });
+  const normalizedLimit = normalizeDerivedLimit(limit);
   const lowered = normalizeString(searchTerm, 'searchTerm').toLowerCase();
-  const cursor = decodeCursor(nextBatch);
-  const offset = cursor?.offset == null ? 0 : normalizeInteger(cursor.offset, 'cursor.offset', { min: 0 });
-  const roomIdSet = roomIds == null ? null : new Set(roomIds.map((roomId) => normalizeString(roomId, 'roomId')));
+  const cursor = decodeCursor(nextBatch, 'next_batch');
+  const offset = cursor?.offset == null ? 0 : normalizeDerivedOffset(cursor.offset, 'next_batch.offset');
+  const roomIdSet = normalizeSearchRoomIds(roomIds);
   const rows = (await derived.searchIndex.list())
     .filter((row) => lowered.length === 0 || row.search_vector_text.toLowerCase().includes(lowered))
     .filter((row) => roomIdSet == null || roomIdSet.has(row.room_id))
     .sort((left, right) => right.origin_server_ts - left.origin_server_ts || right.event_id.localeCompare(left.event_id));
-  const page = rows.slice(offset, offset + normalizedLimit);
   return {
-    rows: page,
-    next_batch: offset + normalizedLimit < rows.length ? encodeCursor({ offset: offset + normalizedLimit }) : null,
-    count: rows.length,
+    rows: rows.slice(offset),
+    offset,
+    limit: normalizedLimit,
   };
 }
 
@@ -173,9 +218,9 @@ export async function queryPublicRooms(env, {
   searchTerm = null,
 } = {}) {
   const derived = await ensureDerivedSchema(env);
-  const normalizedLimit = normalizeInteger(limit, 'limit', { min: 1 });
-  const cursor = decodeCursor(since);
-  const offset = cursor?.offset == null ? 0 : normalizeInteger(cursor.offset, 'cursor.offset', { min: 0 });
+  const normalizedLimit = normalizeDerivedLimit(limit);
+  const cursor = decodeCursor(since, 'since');
+  const offset = cursor?.offset == null ? 0 : normalizeDerivedOffset(cursor.offset, 'since.offset');
   const loweredSearchTerm = searchTerm == null ? '' : normalizeString(searchTerm, 'searchTerm').toLowerCase();
   const rows = (await derived.publicRoomDirectory.list())
     .filter((row) => row.is_public === true)

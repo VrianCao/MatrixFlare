@@ -4033,7 +4033,21 @@ export class UserDO extends BaseDurableObject {
       const pendingUploadId = buildPendingUploadId(mediaId);
       const existingGrant = this.persistence.pendingUploadGrants.get({ pending_upload_id: pendingUploadId });
       if (existingGrant && normalizePendingUploadState(existingGrant.state) === 'pending') {
-        grant = buildPendingUploadGrantView(existingGrant, this.env.MATRIX_SERVER_NAME);
+        const effectiveMaxBytes = Math.min(
+          normalizeInteger(existingGrant.max_bytes, 'existingGrant.max_bytes', { min: 1 }),
+          maxBytes,
+        );
+        if (declaredSize > effectiveMaxBytes) {
+          throw createInternalErrorEnvelope({
+            code: 'content_too_large',
+            message: `Media upload exceeds the ${effectiveMaxBytes} byte limit`,
+            retryable: false,
+          });
+        }
+        grant = {
+          ...buildPendingUploadGrantView(existingGrant, this.env.MATRIX_SERVER_NAME),
+          max_bytes: effectiveMaxBytes,
+        };
         return;
       }
       if (request?.require_existing === true) {

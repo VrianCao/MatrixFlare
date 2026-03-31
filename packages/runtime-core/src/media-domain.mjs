@@ -7,9 +7,19 @@ export const DEFAULT_MEDIA_PENDING_UPLOAD_TTL_MS = 15 * 60 * 1000;
 export const DEFAULT_MEDIA_ORPHAN_RETENTION_MS = 60 * 60 * 1000;
 export const DEFAULT_MEDIA_FETCH_TIMEOUT_MS = 20_000;
 export const MAX_MEDIA_FETCH_TIMEOUT_MS = 60_000;
+const ANIMATABLE_MEDIA_CONTENT_TYPES = new Set([
+  'image/gif',
+]);
 export const DEFAULT_MEDIA_THUMBNAIL_VARIANTS = Object.freeze([
   Object.freeze({ width: 96, height: 96, method: 'scale', animated: false }),
 ]);
+
+function normalizeMediaContentType(contentType) {
+  return normalizeString(contentType ?? 'application/octet-stream', 'contentType')
+    .split(';', 1)[0]
+    .trim()
+    .toLowerCase();
+}
 
 export function buildMxcUri(serverName, mediaId) {
   return `mxc://${normalizeString(serverName, 'serverName')}/${normalizeString(mediaId, 'mediaId')}`;
@@ -46,6 +56,25 @@ export function buildMediaConfig(maxUploadBytes) {
   return {
     'm.upload.size': normalizeInteger(maxUploadBytes, 'maxUploadBytes', { min: 1 }),
   };
+}
+
+export function isAnimatableMediaContentType(contentType) {
+  if (contentType == null) {
+    return false;
+  }
+  return ANIMATABLE_MEDIA_CONTENT_TYPES.has(normalizeMediaContentType(contentType));
+}
+
+export function resolveThumbnailAnimationPreference(animated, contentType) {
+  return animated === true && isAnimatableMediaContentType(contentType);
+}
+
+function buildThumbnailPrefix(variant) {
+  const normalizedVariant = normalizeMediaThumbnailJobVariant(variant, 0);
+  return Buffer.from(
+    `thumbnail:${normalizedVariant.width}x${normalizedVariant.height}:${normalizedVariant.method}:${normalizedVariant.animated ? 'animated' : 'static'}\n`,
+    'utf8',
+  );
 }
 
 export function normalizeDownloadOptions(url, {
@@ -254,6 +283,88 @@ function createContentTooLargeError(maxBytes) {
   });
 }
 
+function prependReadableStream(prefix, stream, {
+  maxBytes,
+} = {}) {
+  const reader = stream.getReader();
+  let prefixSent = false;
+  let sourceBytesRead = 0;
+  return new ReadableStream({
+    async pull(controller) {
+      if (!prefixSent) {
+        prefixSent = true;
+        controller.enqueue(prefix);
+        return;
+      }
+      try {
+        const { done, value } = await reader.read();
+        if (done) {
+          controller.close();
+          return;
+        }
+        const chunk = Buffer.from(value);
+        sourceBytesRead += chunk.byteLength;
+        if (Number.isInteger(maxBytes) && sourceBytesRead > maxBytes) {
+          const error = createContentTooLargeError(maxBytes);
+          await reader.cancel(error).catch(() => {});
+          controller.error(error);
+          return;
+        }
+        controller.enqueue(chunk);
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+    async cancel(reason) {
+      try {
+        await reader.cancel(reason);
+      } catch {
+        // Ignore cancellation failures while unwinding prefixed stream readers.
+      }
+    },
+  });
+}
+
+export async function createThumbnailBodyInput(source, variant, {
+  maxBytes,
+} = {}) {
+  const prefix = buildThumbnailPrefix(variant);
+  const sourceStream = source?.body && typeof source.body.getReader === 'function'
+    ? source.body
+    : null;
+  const sourceSize = Number.isInteger(source?.size)
+    ? source.size
+    : (Buffer.isBuffer(source?.body) ? source.body.byteLength : null);
+  if (Number.isInteger(maxBytes) && Number.isInteger(sourceSize) && sourceSize > maxBytes) {
+    await sourceStream?.cancel?.(createContentTooLargeError(maxBytes)).catch(() => {});
+    throw createContentTooLargeError(maxBytes);
+  }
+  if (sourceStream) {
+    return prependReadableStream(prefix, sourceStream, { maxBytes });
+  }
+  if (Buffer.isBuffer(source?.body)) {
+    if (Number.isInteger(maxBytes) && source.body.byteLength > maxBytes) {
+      throw createContentTooLargeError(maxBytes);
+    }
+    return Buffer.concat([prefix, source.body]);
+  }
+  if (typeof source?.arrayBuffer === 'function') {
+    const buffer = Buffer.from(await source.arrayBuffer());
+    if (Number.isInteger(maxBytes) && buffer.byteLength > maxBytes) {
+      throw createContentTooLargeError(maxBytes);
+    }
+    return Buffer.concat([prefix, buffer]);
+  }
+  if (typeof source?.text === 'function') {
+    const buffer = Buffer.from(await source.text(), 'utf8');
+    if (Number.isInteger(maxBytes) && buffer.byteLength > maxBytes) {
+      throw createContentTooLargeError(maxBytes);
+    }
+    return Buffer.concat([prefix, buffer]);
+  }
+  return prefix;
+}
+
 export function normalizeMediaThumbnailJobVariant(value, index) {
   const normalized = assertPlainObject(value, `variants[${index}]`);
   const method = normalizeString(normalized.method, `variants[${index}].method`);
@@ -269,11 +380,7 @@ export function normalizeMediaThumbnailJobVariant(value, index) {
 }
 
 export function buildThumbnailBody(sourceBytes, variant) {
-  const normalizedVariant = normalizeMediaThumbnailJobVariant(variant, 0);
-  const prefix = Buffer.from(
-    `thumbnail:${normalizedVariant.width}x${normalizedVariant.height}:${normalizedVariant.method}:${normalizedVariant.animated ? 'animated' : 'static'}\n`,
-    'utf8',
-  );
+  const prefix = buildThumbnailPrefix(variant);
   return Buffer.concat([
     prefix,
     Buffer.isBuffer(sourceBytes) ? sourceBytes : Buffer.from(sourceBytes),

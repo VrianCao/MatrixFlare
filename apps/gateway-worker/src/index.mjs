@@ -12,10 +12,10 @@ import {
   buildMediaConfig,
   buildMxcUri,
   buildRemoteMediaObjectKey,
-  buildThumbnailBody,
   buildThumbnailDescriptor,
   computeLegacyUnauthAccessFlag,
   createCanonicalFilterHash,
+  createThumbnailBodyInput,
   createRequestFingerprint,
   createRequestContext,
   ensureDerivedSchema,
@@ -32,6 +32,7 @@ import {
   queryUserDirectory,
   readBodyWithDigest,
   putWellKnownCacheEntry,
+  resolveThumbnailAnimationPreference,
   teeBodyStreamWithDigest,
 } from '../../../packages/runtime-core/src/index.mjs';
 import {
@@ -186,11 +187,76 @@ function encodePublicRoomsCursor(payload) {
   return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
 }
 
+function encodeSearchCursor(payload) {
+  return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+}
+
+function createInvalidQueryParamError(message) {
+  return Object.assign(new TypeError(message), {
+    code: 'invalid_query_param',
+  });
+}
+
+function normalizeOptionalPositiveIntegerQueryParam(value, label, {
+  defaultValue,
+  min = 1,
+} = {}) {
+  if (value == null) {
+    return defaultValue;
+  }
+  if (!Number.isInteger(value) || value < min) {
+    throw createInvalidQueryParamError(`${label} must be an integer >= ${min}`);
+  }
+  return value;
+}
+
+function normalizeOptionalStringArrayQueryParam(value, label) {
+  if (value == null) {
+    return null;
+  }
+  if (!Array.isArray(value)) {
+    throw createInvalidQueryParamError(`${label} must be an array of strings`);
+  }
+  if (value.some((entry) => typeof entry !== 'string')) {
+    throw createInvalidQueryParamError(`${label} entries must be strings`);
+  }
+  return value;
+}
+
+function normalizeSearchQueryFilter(value) {
+  if (value == null) {
+    return {
+      rooms: null,
+      limit: 10,
+    };
+  }
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    throw createInvalidQueryParamError('search_categories.room_events.filter must be an object');
+  }
+  return {
+    rooms: normalizeOptionalStringArrayQueryParam(value.rooms, 'search_categories.room_events.filter.rooms'),
+    limit: normalizeOptionalPositiveIntegerQueryParam(
+      value.limit,
+      'search_categories.room_events.filter.limit',
+      { defaultValue: 10 },
+    ),
+  };
+}
+
 function decodePublicRoomsCursor(value) {
   if (value == null || value === '') {
     return null;
   }
-  return JSON.parse(Buffer.from(String(value), 'base64url').toString('utf8'));
+  try {
+    const decoded = Buffer.from(String(value), 'base64url').toString('utf8');
+    const parsed = JSON.parse(decoded);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new TypeError('since must decode to an object');
+    }
+    return parsed;
+  } catch {
+    throw createInvalidQueryParamError('since must be a valid pagination token');
+  }
 }
 
 function isPublicDirectoryRowComplete(row) {
@@ -257,9 +323,21 @@ function applyPublicRoomsQuery(rows, {
   since = null,
   searchTerm = null,
 } = {}) {
-  const normalizedLimit = Number.isInteger(limit) ? limit : 10;
+  const normalizedLimit = Number.isInteger(limit) && limit >= 1
+    ? limit
+    : (() => {
+      throw createInvalidQueryParamError('limit must be an integer >= 1');
+    })();
   const cursor = decodePublicRoomsCursor(since);
-  const offset = cursor?.offset == null ? 0 : Number.parseInt(cursor.offset, 10);
+  const offset = cursor?.offset == null
+    ? 0
+    : (() => {
+      const parsedOffset = Number.parseInt(cursor.offset, 10);
+      if (!Number.isInteger(parsedOffset) || parsedOffset < 0) {
+        throw createInvalidQueryParamError('since.offset must be an integer >= 0');
+      }
+      return parsedOffset;
+    })();
   const loweredSearchTerm = typeof searchTerm === 'string' ? searchTerm.toLowerCase() : '';
   const filteredRows = rows
     .filter((row) => row.is_public === true)
@@ -363,6 +441,18 @@ async function deleteMediaObjectBestEffort(env, objectKey) {
   }
   try {
     await env.MATRIX_MEDIA_BUCKET.delete(objectKey);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function cancelBodyBestEffort(body, reason = 'cancelled') {
+  if (!body || typeof body.cancel !== 'function') {
+    return false;
+  }
+  try {
+    await body.cancel(reason);
     return true;
   } catch {
     return false;
@@ -684,6 +774,9 @@ function mapInternalErrorToResponse(error) {
   }
   if (error.code === 'invalid_cursor' || error.code === 'filter_mismatch' || error.code === 'cursor_from_future') {
     return matrixErrorResponse(400, 'M_INVALID_PARAM', error.message ?? 'Invalid sync token');
+  }
+  if (error.code === 'invalid_query_param') {
+    return matrixErrorResponse(400, 'M_INVALID_PARAM', error.message ?? 'Invalid query parameter');
   }
   if (error.code === 'content_too_large') {
     return matrixErrorResponse(413, 'M_TOO_LARGE', error.message ?? 'Media body exceeds the configured limit');
@@ -2230,6 +2323,7 @@ async function handleMediaCreateRequest(request, env) {
     device_id: access.session.device_id,
     content_type: 'application/octet-stream',
     declared_size: 0,
+    max_bytes: resolveConfiguredMaxUploadBytes(env),
     reservation_only: true,
   });
   if (!grantResult?.ok) {
@@ -2291,11 +2385,20 @@ async function fetchRemoteMediaIntoCache(env, {
         source_kind: 'remote_cache',
       };
     }
-    const response = await fetchImpl(remoteUrl, {
-      redirect: 'follow',
-      signal: AbortSignal.timeout(timeoutMs),
-    });
+    let response;
+    try {
+      response = await fetchImpl(remoteUrl, {
+        redirect: 'follow',
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+    } catch (error) {
+      throw normalizeRemoteMediaFetchError(error, {
+        serverName: normalizedServerName,
+        mediaId,
+      });
+    }
     if (!response.ok) {
+      await cancelBodyBestEffort(response.body, `remote-fetch:${response.status}`);
       if (response.status === 404) {
         return null;
       }
@@ -2495,6 +2598,10 @@ async function handleMediaThumbnailRequest(request, env, {
   if (!source?.object) {
     return matrixErrorResponse(404, 'M_NOT_FOUND', 'Media does not exist');
   }
+  const effectiveAnimated = resolveThumbnailAnimationPreference(
+    options.animated === true,
+    source.metadata.content_type,
+  );
   const descriptor = buildThumbnailDescriptor({
     sourceKind: source.source_kind === 'remote_cache' ? 'remote' : 'local',
     originServerName: source.source_kind === 'remote_cache' ? serverName : null,
@@ -2502,19 +2609,18 @@ async function handleMediaThumbnailRequest(request, env, {
     width: options.width,
     height: options.height,
     method: options.method,
-    animated: options.animated === true,
+    animated: effectiveAnimated,
   });
   let thumbnail = await env.MATRIX_MEDIA_BUCKET.get(descriptor.key);
   if (!thumbnail) {
     try {
-      const sourceBytes = typeof source.object.arrayBuffer === 'function'
-        ? Buffer.from(await source.object.arrayBuffer())
-        : Buffer.from(await source.object.text(), 'utf8');
-      const thumbnailBody = buildThumbnailBody(sourceBytes, {
+      const thumbnailBody = await createThumbnailBodyInput(source.object, {
         width: options.width,
         height: options.height,
         method: options.method,
-        animated: options.animated === true,
+        animated: effectiveAnimated,
+      }, {
+        maxBytes: resolveConfiguredMaxUploadBytes(env),
       });
       await withMediaKeyBackoff(env, descriptor.key, () => env.MATRIX_MEDIA_BUCKET.put(descriptor.key, thumbnailBody, {
         customMetadata: {
@@ -2576,15 +2682,28 @@ async function handleSearchRequest(request, env) {
   if (searchTerm.length === 0) {
     return matrixErrorResponse(400, 'M_MISSING_PARAM', 'search_term is required');
   }
-  const rows = await querySearchIndex(env, {
-    searchTerm,
-    roomIds: Array.isArray(roomEvents.filter?.rooms) ? roomEvents.filter.rooms : null,
-    limit: Number.isInteger(roomEvents.filter?.limit) ? roomEvents.filter.limit : 10,
-    nextBatch: roomEvents.next_batch ?? null,
-  });
+  let filter;
+  try {
+    filter = normalizeSearchQueryFilter(roomEvents.filter);
+  } catch (error) {
+    return mapInternalErrorToResponse(error);
+  }
+  let rows;
+  try {
+    rows = await querySearchIndex(env, {
+      searchTerm,
+      roomIds: filter.rooms,
+      limit: filter.limit,
+      nextBatch: roomEvents.next_batch ?? null,
+    });
+  } catch (error) {
+    return mapInternalErrorToResponse(error);
+  }
   const results = [];
   const state = {};
-  for (const row of rows.rows) {
+  let nextBatch = null;
+  for (let index = 0; index < rows.rows.length; index += 1) {
+    const row = rows.rows[index];
     const roomDo = getRoomDoStub(env, row.room_id);
     const eventResult = await roomDo.queryRoom({
       kind: 'event',
@@ -2602,6 +2721,12 @@ async function handleSearchRequest(request, env) {
     }
     if (!event) {
       continue;
+    }
+    if (results.length >= rows.limit) {
+      nextBatch = encodeSearchCursor({
+        offset: rows.offset + index,
+      });
+      break;
     }
     results.push({
       rank: row.origin_server_ts,
@@ -2630,7 +2755,7 @@ async function handleSearchRequest(request, env) {
           },
         },
         highlights: [searchTerm],
-        next_batch: rows.next_batch ?? undefined,
+        next_batch: nextBatch ?? undefined,
       },
     },
   });
@@ -2649,12 +2774,23 @@ async function handleUserDirectorySearchRequest(request, env) {
   if (searchTerm.length === 0) {
     return matrixErrorResponse(400, 'M_MISSING_PARAM', 'search_term is required');
   }
+  let limit;
+  try {
+    limit = normalizeOptionalPositiveIntegerQueryParam(body.limit, 'limit', { defaultValue: 10 });
+  } catch (error) {
+    return mapInternalErrorToResponse(error);
+  }
   const ignoredUserIds = await loadIgnoredUserIds(access.user_do);
-  const result = await queryUserDirectory(env, {
-    searchTerm,
-    limit: Number.isInteger(body.limit) ? body.limit : 10,
-    ignoredUserIds,
-  });
+  let result;
+  try {
+    result = await queryUserDirectory(env, {
+      searchTerm,
+      limit,
+      ignoredUserIds,
+    });
+  } catch (error) {
+    return mapInternalErrorToResponse(error);
+  }
   return jsonResponse(result);
 }
 
@@ -2669,8 +2805,17 @@ async function handlePublicRoomsRequest(request, env, { method }) {
   try {
     if (method === 'GET') {
       const url = new URL(request.url);
+      const rawLimit = url.searchParams.get('limit');
+      const parsedLimit = rawLimit == null
+        ? 10
+        : (() => {
+          if (!/^[0-9]+$/.test(rawLimit)) {
+            throw new TypeError('limit must be an integer >= 1');
+          }
+          return Number.parseInt(rawLimit, 10);
+        })();
       queryInput = extractPublicRoomsQuery({
-        limit: url.searchParams.get('limit') == null ? 10 : Number.parseInt(url.searchParams.get('limit'), 10),
+        limit: parsedLimit,
         since: url.searchParams.get('since') ?? null,
         filter: {
           generic_search_term: url.searchParams.get('search_term') ?? null,
@@ -2686,7 +2831,12 @@ async function handlePublicRoomsRequest(request, env, { method }) {
   } catch (error) {
     return matrixErrorResponse(400, 'M_INVALID_PARAM', error.message);
   }
-  const result = await queryPublicRoomsWithTruthFallback(env, queryInput);
+  let result;
+  try {
+    result = await queryPublicRoomsWithTruthFallback(env, queryInput);
+  } catch (error) {
+    return mapInternalErrorToResponse(error);
+  }
   return jsonResponse(result);
 }
 

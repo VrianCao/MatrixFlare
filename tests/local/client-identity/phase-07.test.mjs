@@ -228,6 +228,11 @@ test('Phase 07 covers local media upload/download, compatibility routes, thumbna
   const legacyConfig = await getJson(rig, alice.access_token, '/_matrix/media/v3/config');
   assert.deepEqual(currentConfig, legacyConfig);
   await expectMatrixError(
+    await rig.gatewayFetch('/_matrix/client/v1/media/config'),
+    401,
+    'M_MISSING_TOKEN',
+  );
+  await expectMatrixError(
     await rig.gatewayFetch('/_matrix/media/v3/config'),
     401,
     'M_MISSING_TOKEN',
@@ -237,9 +242,9 @@ test('Phase 07 covers local media upload/download, compatibility routes, thumbna
     method: 'POST',
     headers: {
       ...rig.authHeaders(alice.access_token),
-      'content-type': 'text/plain; charset=utf-8',
+      'content-type': 'image/gif',
     },
-    body: 'phase07-local-media',
+    body: 'GIF89a-phase07-local-media',
   });
   assert.equal(uploadResponse.status, 200);
   const uploadBody = await uploadResponse.json();
@@ -263,20 +268,28 @@ test('Phase 07 covers local media upload/download, compatibility routes, thumbna
     },
   );
   assert.equal(currentDownload.status, 200);
-  assert.equal(await readResponseText(currentDownload), 'phase07-local-media');
+  assert.equal(await readResponseText(currentDownload), 'GIF89a-phase07-local-media');
   assert.match(currentDownload.headers.get('content-disposition') ?? '', /phase07\.txt/);
 
   const legacyDownload = await rig.gatewayFetch(
     `/_matrix/media/v3/download/${encodeURIComponent(uploaded.serverName)}/${encodeURIComponent(uploaded.mediaId)}/phase07.txt`,
   );
   assert.equal(legacyDownload.status, 200);
-  assert.equal(await readResponseText(legacyDownload), 'phase07-local-media');
+  assert.equal(await readResponseText(legacyDownload), 'GIF89a-phase07-local-media');
 
   await rig.drainJobsQueues();
   const catalogRow = await derived.mediaCatalog.get({ mxc_uri: uploadBody.content_uri });
   assert.ok(catalogRow);
   assert.equal(catalogRow.origin_kind, 'local');
   assert.equal(catalogRow.legacy_unauth_access_flag, true);
+
+  await expectMatrixError(
+    await rig.gatewayFetch(
+      `/_matrix/client/v1/media/thumbnail/${encodeURIComponent(uploaded.serverName)}/${encodeURIComponent(uploaded.mediaId)}?width=64&height=64&method=scale&animated=false`,
+    ),
+    401,
+    'M_MISSING_TOKEN',
+  );
 
   const staticThumbnail = await rig.gatewayFetch(
     `/_matrix/client/v1/media/thumbnail/${encodeURIComponent(uploaded.serverName)}/${encodeURIComponent(uploaded.mediaId)}?width=64&height=64&method=scale&animated=false`,
@@ -623,6 +636,82 @@ test('Phase 07 remote-media fetch failures are deterministic and do not leave ca
   await expectMatrixError(failedThumbnail, 503, 'M_UNKNOWN');
   assert.equal(
     await rig.buckets.media.get(buildRemoteMediaObjectKey('remote.example', 'upstream-500-thumb')),
+    null,
+  );
+});
+
+test('Phase 07 remote-media fetch cancels unused upstream bodies and normalizes timeout failures', async (t) => {
+  const rig = createGatewayPhase04Rig({
+    FF_MEDIA_REMOTE_FETCH: 'true',
+  });
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, { username: 'phase07-remote-cancel-alice' });
+  let notFoundCancelled = false;
+  let upstreamCancelled = false;
+
+  rig.env.__REMOTE_MEDIA_FETCH__ = async () => ({
+    ok: false,
+    status: 404,
+    body: {
+      async cancel() {
+        notFoundCancelled = true;
+      },
+    },
+  });
+
+  await expectMatrixError(
+    await rig.gatewayFetch('/_matrix/client/v1/media/download/remote.example/upstream-404', {
+      headers: rig.authHeaders(alice.access_token),
+    }),
+    404,
+    'M_NOT_FOUND',
+  );
+  assert.equal(notFoundCancelled, true);
+  assert.equal(
+    await rig.buckets.media.get(buildRemoteMediaObjectKey('remote.example', 'upstream-404')),
+    null,
+  );
+
+  rig.env.__REMOTE_MEDIA_FETCH__ = async () => ({
+    ok: false,
+    status: 500,
+    body: {
+      async cancel() {
+        upstreamCancelled = true;
+      },
+    },
+  });
+
+  await expectMatrixError(
+    await rig.gatewayFetch('/_matrix/client/v1/media/download/remote.example/upstream-500-cancel', {
+      headers: rig.authHeaders(alice.access_token),
+    }),
+    503,
+    'M_UNKNOWN',
+  );
+  assert.equal(upstreamCancelled, true);
+  assert.equal(
+    await rig.buckets.media.get(buildRemoteMediaObjectKey('remote.example', 'upstream-500-cancel')),
+    null,
+  );
+
+  rig.env.__REMOTE_MEDIA_FETCH__ = async () => {
+    const error = new Error('synthetic timeout');
+    error.name = 'TimeoutError';
+    throw error;
+  };
+
+  const timedOutDownload = await rig.gatewayFetch(
+    '/_matrix/client/v1/media/download/remote.example/upstream-timeout',
+    {
+      headers: rig.authHeaders(alice.access_token),
+    },
+  );
+  const timeoutBody = await expectMatrixError(timedOutDownload, 503, 'M_UNKNOWN');
+  assert.match(timeoutBody.error, /timed out/i);
+  assert.equal(
+    await rig.buckets.media.get(buildRemoteMediaObjectKey('remote.example', 'upstream-timeout')),
     null,
   );
 });
@@ -1147,6 +1236,276 @@ test('Phase 07 rebuild fails closed when a shard snapshot exceeds the single-inv
   assert.match(failedJob.last_error.message, /single-invocation D1 budget/i);
 });
 
+test('Phase 07 maps derived query validation failures to deterministic Matrix invalid-param errors', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, { username: 'phase07-invalid-query-alice' });
+
+  await expectMatrixError(
+    await rig.gatewayFetch('/_matrix/client/v3/user_directory/search', {
+      method: 'POST',
+      headers: rig.authHeaders(alice.access_token),
+      json: {
+        search_term: 'needle',
+        limit: -1,
+      },
+    }),
+    400,
+    'M_INVALID_PARAM',
+  );
+
+  await expectMatrixError(
+    await rig.gatewayFetch('/_matrix/client/v3/user_directory/search', {
+      method: 'POST',
+      headers: rig.authHeaders(alice.access_token),
+      json: {
+        search_term: 'needle',
+        limit: '2',
+      },
+    }),
+    400,
+    'M_INVALID_PARAM',
+  );
+
+  await expectMatrixError(
+    await rig.gatewayFetch('/_matrix/client/v3/search', {
+      method: 'POST',
+      headers: rig.authHeaders(alice.access_token),
+      json: {
+        search_categories: {
+          room_events: {
+            search_term: 'needle',
+            filter: {
+              limit: -1,
+            },
+          },
+        },
+      },
+    }),
+    400,
+    'M_INVALID_PARAM',
+  );
+
+  await expectMatrixError(
+    await rig.gatewayFetch('/_matrix/client/v3/search', {
+      method: 'POST',
+      headers: rig.authHeaders(alice.access_token),
+      json: {
+        search_categories: {
+          room_events: {
+            search_term: 'needle',
+            filter: {
+              limit: '2',
+            },
+          },
+        },
+      },
+    }),
+    400,
+    'M_INVALID_PARAM',
+  );
+
+  await expectMatrixError(
+    await rig.gatewayFetch('/_matrix/client/v3/search', {
+      method: 'POST',
+      headers: rig.authHeaders(alice.access_token),
+      json: {
+        search_categories: {
+          room_events: {
+            search_term: 'needle',
+            filter: {
+              rooms: [123],
+              limit: 1,
+            },
+          },
+        },
+      },
+    }),
+    400,
+    'M_INVALID_PARAM',
+  );
+
+  await expectMatrixError(
+    await rig.gatewayFetch('/_matrix/client/v3/search', {
+      method: 'POST',
+      headers: rig.authHeaders(alice.access_token),
+      json: {
+        search_categories: {
+          room_events: {
+            search_term: 'needle',
+            filter: {
+              rooms: 'not-an-array',
+              limit: 1,
+            },
+          },
+        },
+      },
+    }),
+    400,
+    'M_INVALID_PARAM',
+  );
+
+  await expectMatrixError(
+    await rig.gatewayFetch('/_matrix/client/v3/search', {
+      method: 'POST',
+      headers: rig.authHeaders(alice.access_token),
+      json: {
+        search_categories: {
+          room_events: {
+            search_term: 'needle',
+            next_batch: 'not-a-valid-token',
+          },
+        },
+      },
+    }),
+    400,
+    'M_INVALID_PARAM',
+  );
+
+  await expectMatrixError(
+    await rig.gatewayFetch('/_matrix/client/v3/publicRooms?since=not-a-valid-token'),
+    400,
+    'M_INVALID_PARAM',
+  );
+
+  await expectMatrixError(
+    await rig.gatewayFetch('/_matrix/client/v3/publicRooms?limit=10foo'),
+    400,
+    'M_INVALID_PARAM',
+  );
+});
+
+test('Phase 07 search paginates only visible hits and does not leak hidden-result cursors', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, { username: 'phase07-search-visible-alice' });
+  const bob = await registerUser(rig, { username: 'phase07-search-visible-bob' });
+
+  const publicRoom = await postJson(rig, alice.access_token, '/_matrix/client/v3/createRoom', {
+    visibility: 'public',
+    preset: 'public_chat',
+    room_alias_name: 'phase07-search-visible-room',
+    name: 'Phase 07 Search Visible Room',
+  });
+  const publicRoomId = publicRoom.room_id;
+  const joinVisible = await rig.gatewayFetch(
+    `/_matrix/client/v3/join/${encodeURIComponent(`#phase07-search-visible-room:${rig.env.MATRIX_SERVER_NAME}`)}`,
+    {
+      method: 'POST',
+      headers: rig.authHeaders(bob.access_token),
+      json: {},
+    },
+  );
+  assert.equal(joinVisible.status, 200);
+
+  const visibleOne = await rig.gatewayFetch(
+    `/_matrix/client/v3/rooms/${encodeURIComponent(publicRoomId)}/send/m.room.message/phase07-visible-1`,
+    {
+      method: 'PUT',
+      headers: rig.authHeaders(alice.access_token),
+      json: {
+        msgtype: 'm.text',
+        body: 'phase07 visible needle one',
+      },
+    },
+  );
+  assert.equal(visibleOne.status, 200);
+  const visibleOneBody = await visibleOne.json();
+  const visibleTwo = await rig.gatewayFetch(
+    `/_matrix/client/v3/rooms/${encodeURIComponent(publicRoomId)}/send/m.room.message/phase07-visible-2`,
+    {
+      method: 'PUT',
+      headers: rig.authHeaders(alice.access_token),
+      json: {
+        msgtype: 'm.text',
+        body: 'phase07 visible needle two',
+      },
+    },
+  );
+  assert.equal(visibleTwo.status, 200);
+  const visibleTwoBody = await visibleTwo.json();
+
+  const privateRoom = await postJson(rig, alice.access_token, '/_matrix/client/v3/createRoom', {
+    visibility: 'private',
+    name: 'Phase 07 Search Hidden Room',
+  });
+  const privateRoomId = privateRoom.room_id;
+  const hiddenOne = await rig.gatewayFetch(
+    `/_matrix/client/v3/rooms/${encodeURIComponent(privateRoomId)}/send/m.room.message/phase07-hidden-1`,
+    {
+      method: 'PUT',
+      headers: rig.authHeaders(alice.access_token),
+      json: {
+        msgtype: 'm.text',
+        body: 'phase07 hidden needle one',
+      },
+    },
+  );
+  assert.equal(hiddenOne.status, 200);
+  const hiddenTwo = await rig.gatewayFetch(
+    `/_matrix/client/v3/rooms/${encodeURIComponent(privateRoomId)}/send/m.room.message/phase07-hidden-2`,
+    {
+      method: 'PUT',
+      headers: rig.authHeaders(alice.access_token),
+      json: {
+        msgtype: 'm.text',
+        body: 'phase07 hidden needle two',
+      },
+    },
+  );
+  assert.equal(hiddenTwo.status, 200);
+
+  await rig.drainJobsQueues();
+
+  const firstPage = await postJson(rig, bob.access_token, '/_matrix/client/v3/search', {
+    search_categories: {
+      room_events: {
+        search_term: 'needle',
+        filter: {
+          rooms: [publicRoomId],
+          limit: 1,
+        },
+      },
+    },
+  });
+  assert.equal(firstPage.search_categories.room_events.results.length, 1);
+  assert.equal(firstPage.search_categories.room_events.results[0].result.event_id, visibleTwoBody.event_id);
+  assert.ok(typeof firstPage.search_categories.room_events.next_batch === 'string');
+
+  const secondPage = await postJson(rig, bob.access_token, '/_matrix/client/v3/search', {
+    search_categories: {
+      room_events: {
+        search_term: 'needle',
+        next_batch: firstPage.search_categories.room_events.next_batch,
+        filter: {
+          rooms: [publicRoomId],
+          limit: 1,
+        },
+      },
+    },
+  });
+  assert.equal(secondPage.search_categories.room_events.results.length, 1);
+  assert.equal(secondPage.search_categories.room_events.results[0].result.event_id, visibleOneBody.event_id);
+  assert.ok(!Object.hasOwn(secondPage.search_categories.room_events, 'next_batch'));
+
+  const hiddenPage = await postJson(rig, bob.access_token, '/_matrix/client/v3/search', {
+    search_categories: {
+      room_events: {
+        search_term: 'needle',
+        filter: {
+          rooms: [privateRoomId],
+          limit: 1,
+        },
+      },
+    },
+  });
+  assert.equal(hiddenPage.search_categories.room_events.results.length, 0);
+  assert.equal(hiddenPage.search_categories.room_events.count, 0);
+  assert.ok(!Object.hasOwn(hiddenPage.search_categories.room_events, 'next_batch'));
+});
+
 test('Phase 07 retries shard-registry barriers without duplicating room truth', async (t) => {
   const rig = createGatewayPhase04Rig();
   t.after(() => rig.close());
@@ -1324,4 +1683,307 @@ test('Phase 07 upload failures do not leave pending grants in a live state', asy
     .map((row) => row.state);
   assert.ok(pendingStates.length >= 1);
   assert.ok(pendingStates.every((state) => state !== 'pending'));
+});
+
+test('Phase 07 create reservations respect the effective media upload byte limit', async (t) => {
+  const rig = createGatewayPhase04Rig({
+    MATRIX_MEDIA_MAX_UPLOAD_BYTES: '20',
+    CF_ZONE_BODY_LIMIT_BYTES: '5',
+  });
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, { username: 'phase07-create-limit-alice' });
+  const config = await getJson(rig, alice.access_token, '/_matrix/client/v1/media/config');
+  assert.equal(config['m.upload.size'], 5);
+
+  const createResponse = await rig.gatewayFetch('/_matrix/media/v3/create', {
+    method: 'POST',
+    headers: rig.authHeaders(alice.access_token),
+  });
+  assert.equal(createResponse.status, 200);
+  const reservation = await createResponse.json();
+  const reserved = parseMxc(reservation.content_uri);
+
+  const oversizedUpload = await rig.gatewayFetch(
+    `/_matrix/media/v3/upload/${encodeURIComponent(reserved.serverName)}/${encodeURIComponent(reserved.mediaId)}?filename=too-large-reserved.txt`,
+    {
+      method: 'PUT',
+      headers: {
+        ...rig.authHeaders(alice.access_token),
+        'content-type': 'text/plain; charset=utf-8',
+      },
+      body: '0123456789',
+    },
+  );
+  await expectMatrixError(oversizedUpload, 413, 'M_TOO_LARGE');
+
+  const reservedGrant = rig.getUserDo(alice.user_id).persistence.pendingUploadGrants.list()
+    .find((row) => row.media_id === reserved.mediaId);
+  assert.ok(reservedGrant);
+  assert.equal(reservedGrant.state, 'reverted');
+});
+
+test('Phase 07 gateway thumbnails stream source bodies into R2 writes', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, { username: 'phase07-streaming-thumb-gateway-alice' });
+  const sourceBodyText = 'gateway-streaming-thumbnail-source';
+  const uploadResponse = await rig.gatewayFetch('/_matrix/media/v3/upload?filename=stream-gateway.txt', {
+    method: 'POST',
+    headers: {
+      ...rig.authHeaders(alice.access_token),
+      'content-type': 'text/plain; charset=utf-8',
+    },
+    body: sourceBodyText,
+  });
+  assert.equal(uploadResponse.status, 200);
+  const uploaded = parseMxc((await uploadResponse.json()).content_uri);
+  const sourceKey = buildLocalMediaObjectKey(uploaded.mediaId);
+  const thumbnailKey = buildThumbnailObjectKey({
+    sourceKind: 'local',
+    mediaId: uploaded.mediaId,
+    width: 40,
+    height: 40,
+    method: 'scale',
+    animated: false,
+  });
+  const originalGet = rig.env.MATRIX_MEDIA_BUCKET.get.bind(rig.env.MATRIX_MEDIA_BUCKET);
+  const originalPut = rig.env.MATRIX_MEDIA_BUCKET.put.bind(rig.env.MATRIX_MEDIA_BUCKET);
+  let sawStreamThumbnailWrite = false;
+
+  rig.env.MATRIX_MEDIA_BUCKET.get = async (key) => {
+    const object = await originalGet(key);
+    if (!object || key !== sourceKey) {
+      return object;
+    }
+    return {
+      ...object,
+      size: Buffer.byteLength(sourceBodyText),
+      body: new ReadableStream({
+        start(controller) {
+          controller.enqueue(Buffer.from(sourceBodyText, 'utf8'));
+          controller.close();
+        },
+      }),
+      arrayBuffer: async () => {
+        throw new Error('gateway thumbnail path must not fall back to arrayBuffer');
+      },
+    };
+  };
+
+  rig.env.MATRIX_MEDIA_BUCKET.put = async (key, value, options) => {
+    if (key === thumbnailKey) {
+      sawStreamThumbnailWrite = Boolean(value && typeof value.getReader === 'function');
+    }
+    return originalPut(key, value, options);
+  };
+
+  const thumbnailResponse = await rig.gatewayFetch(
+    `/_matrix/client/v1/media/thumbnail/${encodeURIComponent(uploaded.serverName)}/${encodeURIComponent(uploaded.mediaId)}?width=40&height=40&method=scale`,
+    {
+      headers: rig.authHeaders(alice.access_token),
+    },
+  );
+  assert.equal(thumbnailResponse.status, 200);
+  assert.match(await readResponseText(thumbnailResponse), /^thumbnail:40x40:scale:static\n/);
+  assert.equal(sawStreamThumbnailWrite, true);
+});
+
+test('Phase 07 jobs thumbnails stream source bodies into R2 writes', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, { username: 'phase07-streaming-thumb-jobs-alice' });
+  const sourceBodyText = 'jobs-streaming-thumbnail-source';
+  const uploadResponse = await rig.gatewayFetch('/_matrix/media/v3/upload?filename=stream-jobs.txt', {
+    method: 'POST',
+    headers: {
+      ...rig.authHeaders(alice.access_token),
+      'content-type': 'text/plain; charset=utf-8',
+    },
+    body: sourceBodyText,
+  });
+  assert.equal(uploadResponse.status, 200);
+  const uploaded = parseMxc((await uploadResponse.json()).content_uri);
+  const sourceKey = buildLocalMediaObjectKey(uploaded.mediaId);
+  const thumbnailKey = buildThumbnailObjectKey({
+    sourceKind: 'local',
+    mediaId: uploaded.mediaId,
+    width: 96,
+    height: 96,
+    method: 'scale',
+    animated: false,
+  });
+  const originalGet = rig.env.MATRIX_MEDIA_BUCKET.get.bind(rig.env.MATRIX_MEDIA_BUCKET);
+  const originalPut = rig.env.MATRIX_MEDIA_BUCKET.put.bind(rig.env.MATRIX_MEDIA_BUCKET);
+  let sawStreamThumbnailWrite = false;
+
+  rig.env.MATRIX_MEDIA_BUCKET.get = async (key) => {
+    const object = await originalGet(key);
+    if (!object || key !== sourceKey) {
+      return object;
+    }
+    return {
+      ...object,
+      size: Buffer.byteLength(sourceBodyText),
+      body: new ReadableStream({
+        start(controller) {
+          controller.enqueue(Buffer.from(sourceBodyText, 'utf8'));
+          controller.close();
+        },
+      }),
+      arrayBuffer: async () => {
+        throw new Error('jobs thumbnail path must not fall back to arrayBuffer');
+      },
+    };
+  };
+
+  rig.env.MATRIX_MEDIA_BUCKET.put = async (key, value, options) => {
+    if (key === thumbnailKey) {
+      sawStreamThumbnailWrite = Boolean(value && typeof value.getReader === 'function');
+    }
+    return originalPut(key, value, options);
+  };
+
+  await rig.drainJobsQueues();
+
+  assert.equal(sawStreamThumbnailWrite, true);
+  const thumbnailObject = await originalGet(thumbnailKey);
+  assert.ok(thumbnailObject);
+  assert.match(await thumbnailObject.text(), /^thumbnail:96x96:scale:static\n/);
+});
+
+test('Phase 07 jobs thumbnails generate multiple variants from stream sources without stream-lock failure', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, { username: 'phase07-streaming-thumb-jobs-multi-alice' });
+  const sourceBodyText = 'jobs-streaming-thumbnail-multi-variant-source';
+  const uploadResponse = await rig.gatewayFetch('/_matrix/media/v3/upload?filename=stream-jobs-multi.txt', {
+    method: 'POST',
+    headers: {
+      ...rig.authHeaders(alice.access_token),
+      'content-type': 'text/plain; charset=utf-8',
+    },
+    body: sourceBodyText,
+  });
+  assert.equal(uploadResponse.status, 200);
+  const uploadBody = await uploadResponse.json();
+  const uploaded = parseMxc(uploadBody.content_uri);
+  const sourceKey = buildLocalMediaObjectKey(uploaded.mediaId);
+  const thumbnail96Key = buildThumbnailObjectKey({
+    sourceKind: 'local',
+    mediaId: uploaded.mediaId,
+    width: 96,
+    height: 96,
+    method: 'scale',
+    animated: false,
+  });
+  const thumbnail64Key = buildThumbnailObjectKey({
+    sourceKind: 'local',
+    mediaId: uploaded.mediaId,
+    width: 64,
+    height: 64,
+    method: 'scale',
+    animated: false,
+  });
+  const originalGet = rig.env.MATRIX_MEDIA_BUCKET.get.bind(rig.env.MATRIX_MEDIA_BUCKET);
+  const originalPut = rig.env.MATRIX_MEDIA_BUCKET.put.bind(rig.env.MATRIX_MEDIA_BUCKET);
+  let sawStreamThumbnailWrites = 0;
+
+  rig.queues.media.messages = [];
+
+  rig.env.MATRIX_MEDIA_BUCKET.get = async (key) => {
+    const object = await originalGet(key);
+    if (!object || key !== sourceKey) {
+      return object;
+    }
+    return {
+      ...object,
+      size: Buffer.byteLength(sourceBodyText),
+      body: new ReadableStream({
+        start(controller) {
+          controller.enqueue(Buffer.from(sourceBodyText, 'utf8'));
+          controller.close();
+        },
+      }),
+      arrayBuffer: async () => {
+        throw new Error('jobs multi-variant thumbnail path must not fall back to arrayBuffer');
+      },
+    };
+  };
+
+  rig.env.MATRIX_MEDIA_BUCKET.put = async (key, value, options) => {
+    if (key === thumbnail96Key || key === thumbnail64Key) {
+      sawStreamThumbnailWrites += Boolean(value && typeof value.getReader === 'function') ? 1 : 0;
+    }
+    return originalPut(key, value, options);
+  };
+
+  await rig.queues.media.send({
+    schema_version: 1,
+    mxc_uri: uploadBody.content_uri,
+    source_kind: 'local',
+    r2_object_key: sourceKey,
+    content_type: 'text/plain; charset=utf-8',
+    enqueued_at: new Date().toISOString(),
+    variants: [
+      { width: 96, height: 96, method: 'scale', animated: false },
+      { width: 64, height: 64, method: 'scale', animated: false },
+    ],
+  });
+
+  await rig.drainJobsQueues();
+
+  assert.equal(sawStreamThumbnailWrites, 2);
+  const thumbnail96 = await originalGet(thumbnail96Key);
+  const thumbnail64 = await originalGet(thumbnail64Key);
+  assert.ok(thumbnail96);
+  assert.ok(thumbnail64);
+  assert.match(await thumbnail96.text(), /^thumbnail:96x96:scale:static\n/);
+  assert.match(await thumbnail64.text(), /^thumbnail:64x64:scale:static\n/);
+});
+
+test('Phase 07 degrades animated thumbnails to static for non-animatable media', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, { username: 'phase07-static-thumb-alice' });
+  const uploadResponse = await rig.gatewayFetch('/_matrix/media/v3/upload?filename=plain.txt', {
+    method: 'POST',
+    headers: {
+      ...rig.authHeaders(alice.access_token),
+      'content-type': 'text/plain; charset=utf-8',
+    },
+    body: 'plain-thumbnail-source',
+  });
+  assert.equal(uploadResponse.status, 200);
+  const uploaded = parseMxc((await uploadResponse.json()).content_uri);
+
+  const staticThumbnail = await rig.gatewayFetch(
+    `/_matrix/client/v1/media/thumbnail/${encodeURIComponent(uploaded.serverName)}/${encodeURIComponent(uploaded.mediaId)}?width=48&height=48&method=scale&animated=false`,
+    {
+      headers: rig.authHeaders(alice.access_token),
+    },
+  );
+  assert.equal(staticThumbnail.status, 200);
+  const staticBody = await readResponseText(staticThumbnail);
+  assert.match(staticBody, /^thumbnail:48x48:scale:static\n/);
+
+  const animatedThumbnail = await rig.gatewayFetch(
+    `/_matrix/client/v1/media/thumbnail/${encodeURIComponent(uploaded.serverName)}/${encodeURIComponent(uploaded.mediaId)}?width=48&height=48&method=scale&animated=true`,
+    {
+      headers: rig.authHeaders(alice.access_token),
+    },
+  );
+  assert.equal(animatedThumbnail.status, 200);
+  const animatedBody = await readResponseText(animatedThumbnail);
+  assert.equal(animatedBody, staticBody);
+  assert.match(animatedBody, /^thumbnail:48x48:scale:static\n/);
+
+  const thumbnailKeys = [...rig.buckets.media.objects.keys()]
+    .filter((key) => key.includes(`/${uploaded.mediaId}/48x48/scale/`));
+  assert.ok(thumbnailKeys.some((key) => key.endsWith('/static')));
+  assert.ok(!thumbnailKeys.some((key) => key.endsWith('/animated')));
 });

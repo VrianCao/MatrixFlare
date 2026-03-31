@@ -42,12 +42,15 @@ export {
   buildThumbnailBody,
   buildThumbnailDescriptor,
   computeLegacyUnauthAccessFlag,
+  createThumbnailBodyInput,
   createDefaultThumbnailJob,
+  isAnimatableMediaContentType,
   normalizeDownloadOptions,
   parseLegacyUnauthFreezeAt,
   readBodyWithDigest,
   readReadableStreamDigest,
   readReadableStreamWithDigest,
+  resolveThumbnailAnimationPreference,
   teeBodyStreamWithDigest,
 } from './media-domain.mjs';
 export {
