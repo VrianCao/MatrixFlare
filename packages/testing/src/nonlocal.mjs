@@ -72,6 +72,7 @@ const QUEUE_BINDING_NAMES = Object.freeze([
 const ED25519_PKCS8_PREFIX = Buffer.from('302e020100300506032b657004220420', 'hex');
 const DEFAULT_RELEASE_PROFILE = 'L1';
 const CLOUDFLARE_API_BASE_URL = 'https://api.cloudflare.com/client/v4';
+const CLOUDFLARE_MISSING_WORKER_ERROR_MESSAGE = 'This Worker does not exist on your account.';
 const GITHUB_ACTIONS_OIDC_ISSUER = 'https://token.actions.githubusercontent.com';
 const GITHUB_ACTIONS_OIDC_JWKS_URI = 'https://token.actions.githubusercontent.com/.well-known/jwks';
 const GITHUB_ACTIONS_OIDC_AUDIENCE = 'matrix-phase08-nonlocal';
@@ -798,7 +799,12 @@ async function callCloudflareApi({
     const errorMessage = Array.isArray(payload?.errors) && payload.errors.length > 0
       ? payload.errors.map((entry) => entry.message ?? JSON.stringify(entry)).join('; ')
       : `${method} ${pathname} failed`;
-    throw new Error(`Cloudflare API ${method} ${pathname} failed: ${errorMessage}`);
+    throw Object.assign(new Error(`Cloudflare API ${method} ${pathname} failed: ${errorMessage}`), {
+      response_status: response.status,
+      pathname,
+      method,
+      cloudflare_errors: Array.isArray(payload?.errors) ? payload.errors : [],
+    });
   }
   return payload;
 }
@@ -1105,12 +1111,13 @@ export function summarizeWorkerDeploymentState({
   });
 }
 
-async function fetchWorkerDeploymentState({
+export async function fetchWorkerDeploymentState({
   accountId,
   apiToken,
   scriptName,
+  allowMissingScript = false,
 }) {
-  const [deploymentsPayload, versionsPayload] = await Promise.all([
+  const fetchResults = await Promise.allSettled([
     callCloudflareApi({
       accountId,
       apiToken,
@@ -1122,10 +1129,64 @@ async function fetchWorkerDeploymentState({
       pathname: `/workers/scripts/${scriptName}/versions`,
     }),
   ]);
+  const failures = fetchResults.filter((result) => result.status === 'rejected');
+  if (failures.length > 0) {
+    if (allowMissingScript) {
+      return resolvePreDeployWorkerDeploymentState(scriptName, fetchResults);
+    }
+    throw failures[0].reason;
+  }
+  const [deploymentsPayload, versionsPayload] = fetchResults.map((result) => result.value);
   return summarizeWorkerDeploymentState({
     deployments: extractArrayResult(deploymentsPayload.result, ['deployments']),
     versions: extractArrayResult(versionsPayload.result, ['items', 'versions']),
   });
+}
+
+function isMissingWorkerScriptObservationError(scriptName, error) {
+  if (!isNonEmptyString(scriptName) || (!(error instanceof Error) && !isPlainObject(error))) {
+    return false;
+  }
+  const responseStatus = Number(error.response_status ?? Number.NaN);
+  if (!Number.isNaN(responseStatus) && responseStatus !== 404) {
+    return false;
+  }
+  const message = String(error.message ?? '');
+  if (!message.includes(CLOUDFLARE_MISSING_WORKER_ERROR_MESSAGE)) {
+    return false;
+  }
+  const scriptPattern = escapeRegExp(scriptName);
+  const observationPathPattern = `/workers/scripts/${scriptPattern}/(?:deployments|versions)`;
+  const messagePattern = new RegExp(`Cloudflare API GET ${observationPathPattern} failed:`, 'i');
+  return messagePattern.test(message);
+}
+
+export function resolvePreDeployWorkerDeploymentState(scriptName, fetchResults) {
+  if (!Array.isArray(fetchResults) || fetchResults.length === 0) {
+    throw new TypeError('pre-deploy worker deployment state resolution requires observation results');
+  }
+  if (!fetchResults.every((result) => isPlainObject(result) && (result.status === 'fulfilled' || result.status === 'rejected'))) {
+    throw new TypeError('pre-deploy worker deployment state resolution requires settled promise results');
+  }
+  const failures = fetchResults
+    .filter((result) => result.status === 'rejected')
+    .map((result) => result.reason);
+  if (
+    failures.length === fetchResults.length
+    && failures.every((error) => isMissingWorkerScriptObservationError(scriptName, error))
+  ) {
+    return summarizeWorkerDeploymentState({
+      deployments: [],
+      versions: [],
+    });
+  }
+  if (failures.length !== fetchResults.length) {
+    throw new Error(`Cloudflare worker deployment observations for ${scriptName} were partially fulfilled before bootstrap; refusing to treat the worker as missing`);
+  }
+  if (failures.length > 0) {
+    throw failures[0];
+  }
+  throw new Error(`Cloudflare worker deployment observations for ${scriptName} did not expose a usable bootstrap state`);
 }
 
 export function resolveFreshCloudflareIdentity(previousIds, currentIds, label) {
@@ -1429,6 +1490,7 @@ async function deployWorker(workerName, provisionedEnvironment, {
     accountId,
     apiToken,
     scriptName,
+    allowMissingScript: true,
   });
   const configPath = path.join(workingRoot, `${workerName}.wrangler.json`);
   const secretsPath = path.join(workingRoot, `${workerName}.secrets.json`);

@@ -14,7 +14,9 @@ import {
   buildRemoteHarnessEnvironmentVariablesFromDeployment,
   buildWorkerScriptName,
   createEnvironmentWranglerConfig,
+  fetchWorkerDeploymentState,
   resolveFreshCloudflareIdentity,
+  resolvePreDeployWorkerDeploymentState,
   summarizeWorkerDeploymentState,
   validateLatestActiveCloudflareWorkerIdentity,
   validateRemoteHarnessEnvironmentVariables,
@@ -254,6 +256,167 @@ test('worker deployment state summary keeps only the latest active deployment ve
   assert.equal(summary.latest_active_deployment_id, 'dep-current');
   assert.deepEqual(summary.active_worker_version_ids, ['ver-current']);
   assert.deepEqual(summary.worker_version_ids, ['ver-current', 'ver-old', 'ver-archived']);
+});
+
+test('pre-deploy worker deployment state only treats fully missing script observations as an empty bootstrap state', () => {
+  const scriptName = 'matrix-gateway-worker-staging';
+
+  const missingScriptState = resolvePreDeployWorkerDeploymentState(
+    scriptName,
+    [
+      {
+        status: 'rejected',
+        reason: Object.assign(
+          new Error(`Cloudflare API GET /workers/scripts/${scriptName}/deployments failed: This Worker does not exist on your account.`),
+          { response_status: 404 },
+        ),
+      },
+      {
+        status: 'rejected',
+        reason: Object.assign(
+          new Error(`Cloudflare API GET /workers/scripts/${scriptName}/versions failed: This Worker does not exist on your account.`),
+          { response_status: 404 },
+        ),
+      },
+    ],
+  );
+  assert.equal(missingScriptState.latest_active_deployment_id, null);
+  assert.deepEqual(missingScriptState.deployment_ids, []);
+  assert.deepEqual(missingScriptState.active_worker_version_ids, []);
+  assert.deepEqual(missingScriptState.worker_version_ids, []);
+
+  assert.throws(
+    () => resolvePreDeployWorkerDeploymentState(
+      scriptName,
+      [
+        {
+          status: 'rejected',
+          reason: Object.assign(
+            new Error('Cloudflare API GET /workers/scripts/matrix-gateway-worker-pre-release/deployments failed: This Worker does not exist on your account.'),
+            { response_status: 404 },
+          ),
+        },
+        {
+          status: 'rejected',
+          reason: Object.assign(
+            new Error(`Cloudflare API GET /workers/scripts/${scriptName}/versions failed: This Worker does not exist on your account.`),
+            { response_status: 404 },
+          ),
+        },
+      ],
+    ),
+    /matrix-gateway-worker-pre-release/,
+  );
+
+  assert.throws(
+    () => resolvePreDeployWorkerDeploymentState(
+      scriptName,
+      [
+        {
+          status: 'rejected',
+          reason: Object.assign(
+            new Error(`Cloudflare API GET /workers/scripts/${scriptName}/deployments failed: Unauthorized`),
+            { response_status: 403 },
+          ),
+        },
+        {
+          status: 'rejected',
+          reason: Object.assign(
+            new Error(`Cloudflare API GET /workers/scripts/${scriptName}/versions failed: This Worker does not exist on your account.`),
+            { response_status: 404 },
+          ),
+        },
+      ],
+    ),
+    /Unauthorized/,
+  );
+
+  assert.throws(
+    () => resolvePreDeployWorkerDeploymentState(
+      scriptName,
+      [
+        { status: 'fulfilled', value: { success: true, result: { deployments: [] } } },
+        {
+          status: 'rejected',
+          reason: Object.assign(
+            new Error(`Cloudflare API GET /workers/scripts/${scriptName}/versions failed: This Worker does not exist on your account.`),
+            { response_status: 404 },
+          ),
+        },
+      ],
+    ),
+    /partially fulfilled before bootstrap/,
+  );
+});
+
+test('fetchWorkerDeploymentState only allows bootstrap fallback when both observation endpoints report a missing worker', async () => {
+  const originalFetch = globalThis.fetch;
+  const scriptName = 'matrix-gateway-worker-staging';
+
+  try {
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      success: false,
+      errors: [{ message: 'This Worker does not exist on your account.' }],
+    }), {
+      status: 404,
+      headers: {
+        'content-type': 'application/json',
+      },
+    });
+
+    const missingScriptState = await fetchWorkerDeploymentState({
+      accountId: 'cf-account',
+      apiToken: 'cf-token',
+      scriptName,
+      allowMissingScript: true,
+    });
+    assert.equal(missingScriptState.latest_active_deployment_id, null);
+    assert.deepEqual(missingScriptState.deployment_ids, []);
+    assert.deepEqual(missingScriptState.active_worker_version_ids, []);
+    assert.deepEqual(missingScriptState.worker_version_ids, []);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  try {
+    globalThis.fetch = async (url) => {
+      const pathname = new URL(String(url)).pathname;
+      if (pathname.endsWith('/deployments')) {
+        return new Response(JSON.stringify({
+          success: false,
+          errors: [{ message: 'This Worker does not exist on your account.' }],
+        }), {
+          status: 404,
+          headers: {
+            'content-type': 'application/json',
+          },
+        });
+      }
+      return new Response(JSON.stringify({
+        success: true,
+        result: {
+          items: [],
+        },
+      }), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+        },
+      });
+    };
+
+    await assert.rejects(
+      () => fetchWorkerDeploymentState({
+        accountId: 'cf-account',
+        apiToken: 'cf-token',
+        scriptName,
+        allowMissingScript: true,
+      }),
+      /partially fulfilled before bootstrap/,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test('latest active Cloudflare deployment identity validation rejects stale or mixed deployment/version pairs', () => {
