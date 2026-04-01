@@ -20,6 +20,7 @@ import {
   summarizeWorkerDeploymentState,
   validateLatestActiveCloudflareWorkerIdentity,
   validateRemoteHarnessEnvironmentVariables,
+  writeEnvironmentWranglerConfig,
   writeEnvironmentRunProvenance,
 } from '../../../packages/testing/src/nonlocal.mjs';
 
@@ -93,6 +94,36 @@ test('environment wrangler config rewrites bindings for a specific non-local env
     JSON.parse(config.env['pre-release'].vars.RESOURCE_BINDING_NAMES_JSON).queues.RESTORE_SHARD_QUEUE,
     'matrix-restore-shard-job-pre-release',
   );
+});
+
+test('written non-local wrangler config rewrites main to a real worker entrypoint relative to the generated config', async () => {
+  const repoRoot = path.resolve('.');
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-nonlocal-wrangler-main-'));
+  const plan = buildNonLocalEnvironmentPlan('staging', {
+    workersSubdomain: 'matrixflare',
+  });
+
+  try {
+    for (const workerName of ['gateway-worker', 'jobs-worker', 'ops-worker']) {
+      const outputPath = path.join(tempRoot, workerName, 'wrangler.json');
+      const written = await writeEnvironmentWranglerConfig(workerName, plan, {
+        outputPath,
+        repoRoot,
+        d1DatabaseId: 'db-staging',
+        kvNamespaceId: 'kv-staging',
+        deploymentId: 'gha-staging-test',
+        workerVersionId: `gha-staging-test-${workerName}`,
+        activeDeploymentComposition: [],
+      });
+      const resolvedMainPath = path.resolve(path.dirname(outputPath), written.config.main);
+      assert.equal(
+        resolvedMainPath,
+        path.join(repoRoot, 'apps', workerName, 'src', 'index.mjs'),
+      );
+    }
+  } finally {
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
 });
 
 test('remote harness env vars and GitHub run URLs derive deterministically from the environment plan', () => {

@@ -596,6 +596,14 @@ function buildWorkerVars(workerName, plan, {
   return vars;
 }
 
+function toWranglerPath(value) {
+  return String(value).split(path.sep).join('/');
+}
+
+function resolveWorkerEntryPointPath(workerName, repoRoot, relativeMainPath) {
+  return path.resolve(repoRoot, 'apps', workerName, relativeMainPath);
+}
+
 export function createEnvironmentWranglerConfig(workerName, plan, {
   d1DatabaseId,
   kvNamespaceId,
@@ -696,6 +704,10 @@ export function createEnvironmentWranglerConfig(workerName, plan, {
 export async function writeEnvironmentWranglerConfig(workerName, plan, options) {
   const outputPath = options.outputPath;
   const config = createEnvironmentWranglerConfig(workerName, plan, options);
+  const repoRoot = path.resolve(options.repoRoot ?? process.cwd());
+  const workerEntryPointPath = resolveWorkerEntryPointPath(workerName, repoRoot, config.main);
+  await fs.access(workerEntryPointPath);
+  config.main = toWranglerPath(path.relative(path.dirname(outputPath), workerEntryPointPath));
   await fs.mkdir(path.dirname(outputPath), { recursive: true });
   await fs.writeFile(outputPath, stableJson(config));
   return {
@@ -1496,6 +1508,7 @@ async function deployWorker(workerName, provisionedEnvironment, {
   const secretsPath = path.join(workingRoot, `${workerName}.secrets.json`);
   await writeEnvironmentWranglerConfig(workerName, provisionedEnvironment.plan, {
     outputPath: configPath,
+    repoRoot,
     d1DatabaseId: provisionedEnvironment.resources.d1_database.id,
     kvNamespaceId: provisionedEnvironment.resources.kv_namespace.id,
     gatewayBootstrapMode,
