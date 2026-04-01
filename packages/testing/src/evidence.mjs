@@ -4,10 +4,20 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
 import { execFile } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
-import { analyzeRepository } from '../../spec-tools/src/governance.mjs';
-import { getRequiredTestFiles, getTestEnvironmentDirectory } from './bootstrap.mjs';
+import {
+  analyzeRepository,
+  reserveFreshOutputPaths,
+  resolveEvidenceRunTimestamp,
+  writeGovernanceEvidence,
+} from '../../spec-tools/src/governance.mjs';
+import {
+  getRequiredTestFiles,
+  getTestEnvironmentDefinition,
+  getTestEnvironmentDirectory,
+} from './bootstrap.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -17,6 +27,44 @@ const SHARED_RUN_ENVIRONMENTS = Object.freeze([
   'staging',
   'pre-release',
 ]);
+
+const NON_LOCAL_ENVIRONMENT_ARTIFACT_REQUIREMENTS = Object.freeze({
+  'ci-integration': Object.freeze({
+    artifact_id: 'ci_integration_run_report',
+    description: 'CI integration environment-backed run artifact for the same evidence run.',
+  }),
+  staging: Object.freeze({
+    artifact_id: 'staging_run_report',
+    description: 'Staging environment-backed run artifact for the same evidence run.',
+  }),
+  'pre-release': Object.freeze({
+    artifact_id: 'pre_release_run_report',
+    description: 'Pre-release environment-backed run artifact for the same evidence run.',
+  }),
+});
+
+const SHA256_HEX_RE = /^[a-f0-9]{64}$/;
+const L1_SHARED_TEST_RUN_ROOT = 'evidence/common/_test-runs';
+
+const L1_TEST_IMPLEMENTATION_FILES = Object.freeze({
+  'TEST-CS-001': Object.freeze(['tests/local/client-identity/phase-04.test.mjs']),
+  'TEST-CS-002': Object.freeze(['tests/local/client-identity/phase-05.test.mjs']),
+  'TEST-CS-003': Object.freeze(['tests/local/client-identity/phase-05.test.mjs']),
+  'TEST-CS-004': Object.freeze(['tests/local/client-identity/phase-04.test.mjs']),
+  'TEST-ROOM-001': Object.freeze(['tests/local/client-identity/phase-06.test.mjs']),
+  'TEST-ROOM-002': Object.freeze(['tests/local/client-identity/phase-06.test.mjs']),
+  'TEST-MEDIA-001': Object.freeze(['tests/local/client-identity/phase-07.test.mjs']),
+  'TEST-DER-001': Object.freeze(['tests/local/client-identity/phase-07.test.mjs']),
+  'TEST-SEC-001': Object.freeze([
+    'tests/local/client-identity/phase-04.test.mjs',
+    'tests/local/runtime-foundations/phase-08-runtime-controls.test.mjs',
+  ]),
+  'TEST-OPS-001': Object.freeze([
+    'tests/local/runtime-foundations/phase-08-runtime-controls.test.mjs',
+    'tests/local/control-plane/phase-08-ops.test.mjs',
+  ]),
+  'TEST-COST-001': Object.freeze(['tests/local/runtime-foundations/phase-08-runtime-controls.test.mjs']),
+});
 
 const L1_EVIDENCE_DEFINITIONS = Object.freeze([
   Object.freeze({
@@ -131,9 +179,2994 @@ const L1_EVIDENCE_DEFINITIONS = Object.freeze([
     generation_method: 'monthly dashboard snapshot + model comparison',
     required_environments: ['pre-release'],
     declared_source_ids: ['REQ-OPS-003', 'CF-WKR-015', 'CF-WKR-016', 'CF-WKR-017', 'CF-WKR-018', 'CF-WKR-019', 'CF-DO-011', 'CF-DO-012', 'CF-DO-013', 'CF-D1-006', 'CF-KV-003', 'CF-R2-005', 'CF-QUE-001'],
-    pass_criteria: 'Metrics and cost-attribution surfaces must produce stable pre-release evidence without budget-model drift signals.',
+    required_manual_artifacts: [
+      Object.freeze({
+        artifact_id: 'prod_cost_snapshot',
+        description: 'Production monthly dashboard snapshot + model comparison artifact for the same evidence run.',
+      }),
+    ],
+    pass_criteria: 'Metrics and cost-attribution surfaces must produce stable pre-release evidence without budget-model drift signals, and the same bundle must include the corresponding production monthly dashboard snapshot/model comparison artifact.',
   }),
 ]);
+
+export function getL1EvidenceDefinition(evidenceId) {
+  const definition = L1_EVIDENCE_DEFINITIONS.find((candidate) => candidate.id === evidenceId);
+  if (!definition) {
+    throw new RangeError(`Unknown L1 evidence definition "${evidenceId}"`);
+  }
+  return definition;
+}
+
+export function listL1EvidenceBundleIds() {
+  return ['EVID-GOV-001', ...L1_EVIDENCE_DEFINITIONS.map((definition) => definition.id)];
+}
+
+export function getRequiredTestImplementationFiles(testId) {
+  const files = L1_TEST_IMPLEMENTATION_FILES[testId];
+  if (!Array.isArray(files) || files.length === 0) {
+    throw new RangeError(`Unknown L1 test implementation mapping for "${testId}"`);
+  }
+  return [...files];
+}
+
+export function buildRequiredManualArtifactDefinitions(definition) {
+  if (definition == null || typeof definition !== 'object') {
+    throw new TypeError('definition must be an object');
+  }
+
+  const combined = [];
+  const seenArtifactIds = new Set();
+  const registerRequirement = (requirement) => {
+    if (!requirement || typeof requirement.artifact_id !== 'string') {
+      return;
+    }
+    if (seenArtifactIds.has(requirement.artifact_id)) {
+      return;
+    }
+    seenArtifactIds.add(requirement.artifact_id);
+    combined.push(requirement);
+  };
+
+  for (const environmentName of definition.required_environments ?? []) {
+    registerRequirement(NON_LOCAL_ENVIRONMENT_ARTIFACT_REQUIREMENTS[environmentName] ?? null);
+  }
+  for (const requirement of definition.required_manual_artifacts ?? []) {
+    registerRequirement(requirement);
+  }
+
+  return combined;
+}
+
+function isPlainObject(value) {
+  return value != null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isNonEmptyString(value) {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function isIsoTimestamp(value) {
+  return isNonEmptyString(value) && Number.isFinite(Date.parse(value));
+}
+
+function isNonNegativeInteger(value) {
+  return Number.isInteger(value) && value >= 0;
+}
+
+function isRelativePathList(value) {
+  return Array.isArray(value)
+    && value.every((entry) => typeof entry === 'string' && entry.length > 0 && !path.isAbsolute(entry));
+}
+
+function isNonEmptyStringArray(value) {
+  return Array.isArray(value) && value.length > 0 && value.every((entry) => isNonEmptyString(entry));
+}
+
+function isNonNegativeNumber(value) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+}
+
+function objectHasRequiredNumericFields(value, fieldNames) {
+  return isPlainObject(value) && fieldNames.every((fieldName) => isNonNegativeNumber(value[fieldName]));
+}
+
+function normalizeRepoRelativePath(value) {
+  if (!isNonEmptyString(value) || path.isAbsolute(value)) {
+    return null;
+  }
+  const normalized = path.posix.normalize(String(value).replaceAll('\\', '/'));
+  if (normalized === '.' || normalized === '..' || normalized.startsWith('../')) {
+    return null;
+  }
+  return normalized;
+}
+
+function pathUsesPrefix(relativePath, prefix) {
+  const normalizedRelativePath = normalizeRepoRelativePath(relativePath);
+  const normalizedPrefix = normalizeRepoRelativePath(prefix);
+  if (normalizedRelativePath == null || normalizedPrefix == null) {
+    return false;
+  }
+  return normalizedRelativePath === normalizedPrefix || normalizedRelativePath.startsWith(`${normalizedPrefix}/`);
+}
+
+function pathIsWithinRoot(targetPath, rootPath) {
+  const absoluteTargetPath = path.resolve(targetPath);
+  const absoluteRootPath = path.resolve(rootPath);
+  const relative = path.relative(absoluteRootPath, absoluteTargetPath);
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function isIdentifierBoundaryCharacter(value) {
+  return value == null || !/[A-Za-z0-9_$]/.test(value);
+}
+
+function hasKeywordAt(sourceText, index, keyword) {
+  return sourceText.startsWith(keyword, index)
+    && isIdentifierBoundaryCharacter(sourceText[index - 1])
+    && isIdentifierBoundaryCharacter(sourceText[index + keyword.length]);
+}
+
+function skipLineComment(sourceText, index) {
+  let cursor = index + 2;
+  while (cursor < sourceText.length && sourceText[cursor] !== '\n') {
+    cursor += 1;
+  }
+  return cursor;
+}
+
+function skipBlockComment(sourceText, index) {
+  const endIndex = sourceText.indexOf('*/', index + 2);
+  return endIndex === -1 ? sourceText.length : endIndex + 2;
+}
+
+function skipQuotedString(sourceText, index) {
+  const quote = sourceText[index];
+  let cursor = index + 1;
+  while (cursor < sourceText.length) {
+    const current = sourceText[cursor];
+    if (current === '\\') {
+      cursor += 2;
+      continue;
+    }
+    if (current === quote) {
+      return cursor + 1;
+    }
+    cursor += 1;
+  }
+  return sourceText.length;
+}
+
+function isIdentifierStartCharacter(value) {
+  return value != null && /[A-Za-z_$]/.test(value);
+}
+
+function isIdentifierContinueCharacter(value) {
+  return value != null && /[A-Za-z0-9_$]/.test(value);
+}
+
+function parseIdentifierEscape(sourceText, index) {
+  if (sourceText[index] !== '\\' || sourceText[index + 1] !== 'u') {
+    return null;
+  }
+  if (sourceText[index + 2] === '{') {
+    const closingBraceIndex = sourceText.indexOf('}', index + 3);
+    if (closingBraceIndex === -1) {
+      return null;
+    }
+    const hexCodePoint = sourceText.slice(index + 3, closingBraceIndex);
+    if (!/^[0-9A-Fa-f]+$/.test(hexCodePoint)) {
+      return null;
+    }
+    try {
+      return {
+        value: String.fromCodePoint(Number.parseInt(hexCodePoint, 16)),
+        end: closingBraceIndex + 1,
+      };
+    } catch {
+      return null;
+    }
+  }
+  const hexEscape = sourceText.slice(index + 2, index + 6);
+  if (!/^[0-9A-Fa-f]{4}$/.test(hexEscape)) {
+    return null;
+  }
+  return {
+    value: String.fromCodePoint(Number.parseInt(hexEscape, 16)),
+    end: index + 6,
+  };
+}
+
+function parseIdentifierToken(sourceText, index) {
+  let cursor = index;
+  let value = '';
+
+  const firstEscape = parseIdentifierEscape(sourceText, cursor);
+  if (firstEscape != null) {
+    if (!isIdentifierStartCharacter(firstEscape.value)) {
+      return null;
+    }
+    value += firstEscape.value;
+    cursor = firstEscape.end;
+  } else {
+    const firstCharacter = sourceText[cursor];
+    if (!isIdentifierStartCharacter(firstCharacter)) {
+      return null;
+    }
+    value += firstCharacter;
+    cursor += 1;
+  }
+
+  while (cursor < sourceText.length) {
+    const escapedCharacter = parseIdentifierEscape(sourceText, cursor);
+    if (escapedCharacter != null) {
+      if (!isIdentifierContinueCharacter(escapedCharacter.value)) {
+        break;
+      }
+      value += escapedCharacter.value;
+      cursor = escapedCharacter.end;
+      continue;
+    }
+    const current = sourceText[cursor];
+    if (!isIdentifierContinueCharacter(current)) {
+      break;
+    }
+    value += current;
+    cursor += 1;
+  }
+
+  return {
+    value,
+    end: cursor,
+  };
+}
+
+function skipBalancedCode(sourceText, index, terminator) {
+  let cursor = index;
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  let parenDepth = 0;
+
+  while (cursor < sourceText.length) {
+    const current = sourceText[cursor];
+    const next = sourceText[cursor + 1];
+
+    if (current === '/' && next === '/') {
+      cursor = skipLineComment(sourceText, cursor);
+      continue;
+    }
+    if (current === '/' && next === '*') {
+      cursor = skipBlockComment(sourceText, cursor);
+      continue;
+    }
+    if (current === '\'' || current === '"') {
+      cursor = skipQuotedString(sourceText, cursor);
+      continue;
+    }
+    if (current === '`') {
+      cursor = skipTemplateLiteral(sourceText, cursor);
+      continue;
+    }
+
+    if (current === terminator && braceDepth === 0 && bracketDepth === 0 && parenDepth === 0) {
+      return cursor + 1;
+    }
+    if (current === '{') {
+      braceDepth += 1;
+      cursor += 1;
+      continue;
+    }
+    if (current === '}') {
+      if (braceDepth === 0 && terminator === '}') {
+        return cursor + 1;
+      }
+      braceDepth = Math.max(braceDepth - 1, 0);
+      cursor += 1;
+      continue;
+    }
+    if (current === '[') {
+      bracketDepth += 1;
+      cursor += 1;
+      continue;
+    }
+    if (current === ']') {
+      bracketDepth = Math.max(bracketDepth - 1, 0);
+      cursor += 1;
+      continue;
+    }
+    if (current === '(') {
+      parenDepth += 1;
+      cursor += 1;
+      continue;
+    }
+    if (current === ')') {
+      if (parenDepth === 0 && terminator === ')') {
+        return cursor + 1;
+      }
+      parenDepth = Math.max(parenDepth - 1, 0);
+      cursor += 1;
+      continue;
+    }
+
+    cursor += 1;
+  }
+
+  return sourceText.length;
+}
+
+function skipTemplateLiteral(sourceText, index) {
+  let cursor = index + 1;
+  while (cursor < sourceText.length) {
+    const current = sourceText[cursor];
+    const next = sourceText[cursor + 1];
+    if (current === '\\') {
+      cursor += 2;
+      continue;
+    }
+    if (current === '`') {
+      return cursor + 1;
+    }
+    if (current === '$' && next === '{') {
+      cursor = skipBalancedCode(sourceText, cursor + 2, '}');
+      continue;
+    }
+    cursor += 1;
+  }
+  return sourceText.length;
+}
+
+function skipTrivia(sourceText, index) {
+  let cursor = index;
+  while (cursor < sourceText.length) {
+    const current = sourceText[cursor];
+    const next = sourceText[cursor + 1];
+    if (/\s/.test(current)) {
+      cursor += 1;
+      continue;
+    }
+    if (current === '/' && next === '/') {
+      cursor = skipLineComment(sourceText, cursor);
+      continue;
+    }
+    if (current === '/' && next === '*') {
+      cursor = skipBlockComment(sourceText, cursor);
+      continue;
+    }
+    break;
+  }
+  return cursor;
+}
+
+function parseQuotedStringLiteral(sourceText, index) {
+  const quote = sourceText[index];
+  if (quote !== '\'' && quote !== '"') {
+    return null;
+  }
+  const endIndex = skipQuotedString(sourceText, index);
+  const literalSource = sourceText.slice(index, endIndex);
+  let decodedValue;
+  try {
+    decodedValue = Function(`"use strict"; return (${literalSource});`)();
+  } catch {
+    decodedValue = sourceText.slice(index + 1, Math.max(endIndex - 1, index + 1));
+  }
+  return {
+    value: decodedValue,
+    end: endIndex,
+    hasEscapes: literalSource.includes('\\'),
+  };
+}
+
+function parseSingleStringLiteralExpression(sourceText) {
+  const startIndex = skipTrivia(sourceText, 0);
+  const literal = parseQuotedStringLiteral(sourceText, startIndex);
+  if (literal == null) {
+    return null;
+  }
+  return skipTrivia(sourceText, literal.end) === sourceText.length
+    ? literal.value
+    : null;
+}
+
+function parseSingleIdentifierExpression(sourceText) {
+  let expressionText = sourceText;
+
+  while (true) {
+    const startIndex = skipTrivia(expressionText, 0);
+    const identifierToken = parseIdentifierToken(expressionText, startIndex);
+    if (identifierToken != null && skipTrivia(expressionText, identifierToken.end) === expressionText.length) {
+      return identifierToken.value;
+    }
+
+    if (expressionText[startIndex] !== '(') {
+      return null;
+    }
+    const endIndex = skipBalancedCode(expressionText, startIndex + 1, ')');
+    if (skipTrivia(expressionText, endIndex) !== expressionText.length) {
+      return null;
+    }
+
+    expressionText = expressionText.slice(startIndex + 1, Math.max(endIndex - 1, startIndex + 1));
+  }
+}
+
+function parseObjectLiteralExpression(sourceText) {
+  let expressionText = sourceText;
+
+  while (true) {
+    const startIndex = skipTrivia(expressionText, 0);
+    if (expressionText[startIndex] === '{') {
+      const endIndex = skipBalancedCode(expressionText, startIndex + 1, '}');
+      return skipTrivia(expressionText, endIndex) === expressionText.length
+        ? expressionText.slice(startIndex, endIndex)
+        : null;
+    }
+
+    if (expressionText[startIndex] !== '(') {
+      return null;
+    }
+    const endIndex = skipBalancedCode(expressionText, startIndex + 1, ')');
+    if (skipTrivia(expressionText, endIndex) !== expressionText.length) {
+      return null;
+    }
+
+    expressionText = expressionText.slice(startIndex + 1, Math.max(endIndex - 1, startIndex + 1));
+  }
+}
+
+function cloneAliasClassification(classification) {
+  if (!isPlainObject(classification)) {
+    return null;
+  }
+  return {
+    nodeModuleNamespace: classification.nodeModuleNamespace === true,
+    commonJsFactory: classification.commonJsFactory === true,
+    commonJsLoader: classification.commonJsLoader === true,
+    reflect: classification.reflect === true,
+    unsafeConstructor: classification.unsafeConstructor === true,
+    unsafeReflectMethod: classification.unsafeReflectMethod === true,
+    opaqueCallable: classification.opaqueCallable === true,
+  };
+}
+
+const UNKNOWN_OBJECT_SPREAD_PROPERTY = Symbol('matrix.testing.unknownObjectSpreadProperty');
+
+function getObjectLiteralPropertyValue(propertyMap, propertyName) {
+  if (!(propertyMap instanceof Map)) {
+    return null;
+  }
+  return propertyMap.get(propertyName) ?? propertyMap.get(UNKNOWN_OBJECT_SPREAD_PROPERTY) ?? null;
+}
+
+function parseTemplateStringLiteral(sourceText, index) {
+  if (sourceText[index] !== '`') {
+    return null;
+  }
+  let cursor = index + 1;
+  let value = '';
+  let hasEscapes = false;
+  while (cursor < sourceText.length) {
+    const current = sourceText[cursor];
+    const next = sourceText[cursor + 1];
+    if (current === '\\') {
+      hasEscapes = true;
+      cursor += 2;
+      continue;
+    }
+    if (current === '`') {
+      const literalSource = sourceText.slice(index, cursor + 1);
+      let decodedValue;
+      try {
+        decodedValue = Function(`"use strict"; return (${literalSource});`)();
+      } catch {
+        decodedValue = sourceText.slice(index + 1, cursor);
+      }
+      return {
+        value: decodedValue,
+        end: cursor + 1,
+        hasEscapes,
+        dynamic: false,
+      };
+    }
+    if (current === '$' && next === '{') {
+      return {
+        value: null,
+        end: skipTemplateLiteral(sourceText, index),
+        hasEscapes,
+        dynamic: true,
+      };
+    }
+    value += current;
+    cursor += 1;
+  }
+  return {
+    value: null,
+    end: sourceText.length,
+    hasEscapes,
+    dynamic: true,
+  };
+}
+
+function parseStaticStringOperand(sourceText, index) {
+  const quotedLiteral = parseQuotedStringLiteral(sourceText, index);
+  if (quotedLiteral != null) {
+    return {
+      value: quotedLiteral.value,
+      end: quotedLiteral.end,
+      hasEscapes: quotedLiteral.hasEscapes,
+      dynamic: false,
+    };
+  }
+  if (sourceText[index] === '(') {
+    const endIndex = skipBalancedCode(sourceText, index + 1, ')');
+    const innerExpressionText = sourceText.slice(index + 1, Math.max(endIndex - 1, index + 1));
+    const innerExpression = parseStaticStringExpression(innerExpressionText);
+    return {
+      value: innerExpression.complete ? innerExpression.value : null,
+      end: endIndex,
+      hasEscapes: innerExpression.hasEscapes,
+      dynamic: !innerExpression.complete,
+    };
+  }
+  return parseTemplateStringLiteral(sourceText, index);
+}
+
+function parseStaticStringExpression(sourceText) {
+  let cursor = 0;
+  let value = '';
+  let containsStringLike = false;
+  let hasEscapes = false;
+
+  while (cursor < sourceText.length) {
+    cursor = skipTrivia(sourceText, cursor);
+    const operand = parseStaticStringOperand(sourceText, cursor);
+    if (operand == null) {
+      return {
+        value: null,
+        containsStringLike,
+        hasEscapes,
+        complete: false,
+      };
+    }
+    containsStringLike = true;
+    hasEscapes = hasEscapes || operand.hasEscapes;
+    if (operand.dynamic) {
+      return {
+        value: null,
+        containsStringLike,
+        hasEscapes,
+        complete: false,
+      };
+    }
+    value += operand.value;
+    cursor = skipTrivia(sourceText, operand.end);
+    if (cursor >= sourceText.length) {
+      return {
+        value,
+        containsStringLike,
+        hasEscapes,
+        complete: true,
+      };
+    }
+    if (sourceText[cursor] !== '+') {
+      return {
+        value: null,
+        containsStringLike,
+        hasEscapes,
+        complete: false,
+      };
+    }
+    cursor += 1;
+  }
+
+  return {
+    value: null,
+    containsStringLike,
+    hasEscapes,
+    complete: false,
+  };
+}
+
+function parseBracketPropertyExpression(sourceText, index) {
+  if (sourceText[index] !== '[') {
+    return null;
+  }
+  const bracketEndIndex = skipBalancedCode(sourceText, index + 1, ']');
+  const expressionText = sourceText.slice(index + 1, Math.max(bracketEndIndex - 1, index + 1));
+  const staticStringExpression = parseStaticStringExpression(expressionText);
+  return {
+    end: bracketEndIndex,
+    expressionText,
+    ...staticStringExpression,
+  };
+}
+
+function isStringEvaluatorName(value) {
+  return value === 'eval' || value === 'Function';
+}
+
+function isCommonJsLoaderName(value) {
+  return value === 'require' || value === 'createRequire';
+}
+
+function isUnsafeConstructorContinuationName(value) {
+  return value === 'constructor' || value === 'call' || value === 'apply' || value === 'bind';
+}
+
+function isCallableContinuationMethodName(value) {
+  return value === 'call' || value === 'apply' || value === 'bind';
+}
+
+function isUnsafeReflectMethodName(value) {
+  return value === 'get' || value === 'apply' || value === 'construct';
+}
+
+function readNextPropertyName(sourceText, index) {
+  let cursor = skipTrivia(sourceText, index);
+  const usesOptionalChain = sourceText[cursor] === '?' && sourceText[cursor + 1] === '.';
+  if (usesOptionalChain) {
+    cursor = skipTrivia(sourceText, cursor + 2);
+  }
+  if (sourceText[cursor] === '.') {
+    const identifierToken = parseIdentifierToken(sourceText, skipTrivia(sourceText, cursor + 1));
+    return identifierToken == null
+      ? null
+      : {
+          name: identifierToken.value,
+          end: identifierToken.end,
+        };
+  }
+  if (sourceText[cursor] === '[') {
+    const bracketProperty = parseBracketPropertyExpression(sourceText, cursor);
+    const propertyName = getStaticBracketPropertyName(bracketProperty);
+    return propertyName == null
+      ? null
+      : {
+          name: propertyName,
+          end: bracketProperty.end,
+        };
+  }
+  if (usesOptionalChain) {
+    const identifierToken = parseIdentifierToken(sourceText, cursor);
+    return identifierToken == null
+      ? null
+      : {
+          name: identifierToken.value,
+          end: identifierToken.end,
+        };
+  }
+  return null;
+}
+
+function readChainedPropertyName(sourceText, index) {
+  let cursor = skipTrivia(sourceText, index);
+  while (sourceText[cursor] === ')') {
+    cursor = skipTrivia(sourceText, cursor + 1);
+  }
+  return readNextPropertyName(sourceText, cursor);
+}
+
+function skipWhitespaceBackward(sourceText, index) {
+  let cursor = index;
+  while (cursor >= 0 && /\s/.test(sourceText[cursor])) {
+    cursor -= 1;
+  }
+  return cursor;
+}
+
+function findMatchingOpeningParen(sourceText, closingIndex) {
+  const stack = [];
+  let cursor = 0;
+
+  while (cursor <= closingIndex && cursor < sourceText.length) {
+    const current = sourceText[cursor];
+    const next = sourceText[cursor + 1];
+
+    if (current === '/' && next === '/') {
+      cursor = skipLineComment(sourceText, cursor);
+      continue;
+    }
+    if (current === '/' && next === '*') {
+      cursor = skipBlockComment(sourceText, cursor);
+      continue;
+    }
+    if (current === '\'' || current === '"') {
+      cursor = skipQuotedString(sourceText, cursor);
+      continue;
+    }
+    if (current === '`') {
+      cursor = skipTemplateLiteral(sourceText, cursor);
+      continue;
+    }
+    if (current === '(') {
+      stack.push(cursor);
+      cursor += 1;
+      continue;
+    }
+    if (current === ')') {
+      const openingIndex = stack.pop() ?? null;
+      if (cursor === closingIndex) {
+        return openingIndex;
+      }
+      cursor += 1;
+      continue;
+    }
+    cursor += 1;
+  }
+
+  return null;
+}
+
+function getInlineObjectLiteralPropertyClassification(sourceText, memberStartIndex, propertyName, aliasState) {
+  const receiverEndIndex = skipWhitespaceBackward(sourceText, memberStartIndex - 1);
+  if (receiverEndIndex < 0 || sourceText[receiverEndIndex] !== ')') {
+    return null;
+  }
+  const openingParenIndex = findMatchingOpeningParen(sourceText, receiverEndIndex);
+  if (openingParenIndex == null) {
+    return null;
+  }
+  const receiverExpressionText = sourceText.slice(openingParenIndex, receiverEndIndex + 1);
+  const objectLiteralText = parseObjectLiteralExpression(receiverExpressionText);
+  if (objectLiteralText == null) {
+    return null;
+  }
+  const propertyMap = parseObjectLiteralPropertyMap(objectLiteralText, aliasState.objectPropertyAliases);
+  const propertyValue = getObjectLiteralPropertyValue(propertyMap, propertyName);
+  return resolveObjectLiteralPropertyClassification(propertyValue, aliasState);
+}
+
+function stripCommentsPreservingStrings(sourceText) {
+  let cursor = 0;
+  let normalizedSourceText = '';
+
+  while (cursor < sourceText.length) {
+    const current = sourceText[cursor];
+    const next = sourceText[cursor + 1];
+
+    if (current === '/' && next === '/') {
+      const endIndex = skipLineComment(sourceText, cursor);
+      normalizedSourceText += ' '.repeat(endIndex - cursor);
+      cursor = endIndex;
+      continue;
+    }
+    if (current === '/' && next === '*') {
+      const endIndex = skipBlockComment(sourceText, cursor);
+      normalizedSourceText += ' '.repeat(endIndex - cursor);
+      cursor = endIndex;
+      continue;
+    }
+    if (current === '\'' || current === '"') {
+      const endIndex = skipQuotedString(sourceText, cursor);
+      normalizedSourceText += sourceText.slice(cursor, endIndex);
+      cursor = endIndex;
+      continue;
+    }
+    if (current === '`') {
+      const endIndex = skipTemplateLiteral(sourceText, cursor);
+      normalizedSourceText += sourceText.slice(cursor, endIndex);
+      cursor = endIndex;
+      continue;
+    }
+
+    normalizedSourceText += current;
+    cursor += 1;
+  }
+
+  return normalizedSourceText;
+}
+
+const IDENTIFIER_ESCAPE_PATTERN = String.raw`(?:\\u\{[0-9A-Fa-f]+\}|\\u[0-9A-Fa-f]{4})`;
+const IDENTIFIER_TOKEN_PATTERN = String.raw`(?:${IDENTIFIER_ESCAPE_PATTERN}|[A-Za-z_$])(?:${IDENTIFIER_ESCAPE_PATTERN}|[A-Za-z0-9_$])*`;
+const STRING_LITERAL_PATTERN = String.raw`(?:'[^'\\]*(?:\\.[^'\\]*)*'|"[^"\\]*(?:\\.[^"\\]*)*")`;
+
+const NAMED_ALIAS_ENTRY_RE = new RegExp(
+  String.raw`^(${IDENTIFIER_TOKEN_PATTERN})(?:(?:\s+as\s+|\s*:\s*)(${IDENTIFIER_TOKEN_PATTERN}))?$`,
+);
+const DECLARED_CONSTRUCTOR_BRACKET_ALIAS_RE = new RegExp(
+  String.raw`\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*[^\n;]*\[\s*(${STRING_LITERAL_PATTERN})\s*\]\s*(?:[;,]|\n|$)`,
+  'g',
+);
+const ASSIGNED_CONSTRUCTOR_BRACKET_ALIAS_RE = new RegExp(
+  String.raw`(?:^|[;\n])\s*(?:\(\s*)*([A-Za-z_$][\w$]*)\s*=\s*[^\n;]*\[\s*(${STRING_LITERAL_PATTERN})\s*\]\s*(?:\s*\))*\s*(?:[;,]|\n|$)`,
+  'gm',
+);
+const DECLARED_MEMBER_ALIAS_RE = new RegExp(
+  String.raw`\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:\(\s*)*([A-Za-z_$][\w$]*)(?:\s*\))*\s*(?:\?\.\s*|\.\s*)(${IDENTIFIER_TOKEN_PATTERN})`,
+  'g',
+);
+const ASSIGNED_MEMBER_ALIAS_RE = new RegExp(
+  String.raw`(?:^|[;\n])\s*(?:\(\s*)*([A-Za-z_$][\w$]*)\s*=\s*(?:\(\s*)*([A-Za-z_$][\w$]*)(?:\s*\))*\s*(?:\?\.\s*|\.\s*)(${IDENTIFIER_TOKEN_PATTERN})`,
+  'gm',
+);
+const DECLARED_BRACKET_MEMBER_ALIAS_RE = new RegExp(
+  String.raw`\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:\(\s*)*([A-Za-z_$][\w$]*)(?:\s*\))*\s*(?:\?\.\s*)?\[\s*(${STRING_LITERAL_PATTERN})\s*\]`,
+  'g',
+);
+const ASSIGNED_BRACKET_MEMBER_ALIAS_RE = new RegExp(
+  String.raw`(?:^|[;\n])\s*(?:\(\s*)*([A-Za-z_$][\w$]*)\s*=\s*(?:\(\s*)*([A-Za-z_$][\w$]*)(?:\s*\))*\s*(?:\?\.\s*)?\[\s*(${STRING_LITERAL_PATTERN})\s*\]`,
+  'gm',
+);
+const SIMPLE_MEMBER_ALIAS_RE = new RegExp(
+  String.raw`^(?:\(\s*)*([A-Za-z_$][\w$]*)(?:\s*\))*\s*(?:\?\.\s*|\.\s*)(${IDENTIFIER_TOKEN_PATTERN})\s*$`,
+);
+const SIMPLE_BRACKET_MEMBER_ALIAS_RE = new RegExp(
+  String.raw`^(?:\(\s*)*([A-Za-z_$][\w$]*)(?:\s*\))*\s*(?:\?\.\s*)?\[\s*(${STRING_LITERAL_PATTERN})\s*\]\s*$`,
+);
+const TRAILING_BRACKET_PROPERTY_RE = new RegExp(
+  String.raw`\[\s*(${STRING_LITERAL_PATTERN})\s*\]\s*$`,
+);
+const DESTRUCTURED_OBJECT_LITERAL_DECLARATION_RE = /\b(?:const|let|var)\s*\{/g;
+const DESTRUCTURED_OBJECT_LITERAL_ASSIGNMENT_RE = /(?:^|[;\n])\s*(?:\(\s*)?\{/gm;
+const OBJECT_LITERAL_DECLARATION_RE = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:\(\s*)*\{/g;
+const OBJECT_LITERAL_ASSIGNMENT_RE = /(?:^|[;\n])\s*(?:\(\s*)*([A-Za-z_$][\w$]*)\s*=\s*(?:\(\s*)*\{/gm;
+const NAMED_EXPRESSION_DECLARATION_RE = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*/g;
+const NAMED_EXPRESSION_ASSIGNMENT_RE = /(?:^|[;\n])\s*(?:\(\s*)*([A-Za-z_$][\w$]*)\s*=\s*/gm;
+
+function createAliasClassification() {
+  return {
+    nodeModuleNamespace: false,
+    commonJsFactory: false,
+    commonJsLoader: false,
+    reflect: false,
+    unsafeConstructor: false,
+    unsafeReflectMethod: false,
+    opaqueCallable: false,
+  };
+}
+
+function createOpaqueCallableClassification() {
+  const classification = createAliasClassification();
+  classification.opaqueCallable = true;
+  return classification;
+}
+
+function markUnknownObjectSpread(propertyMap) {
+  if (!(propertyMap instanceof Map) || propertyMap.has(UNKNOWN_OBJECT_SPREAD_PROPERTY)) {
+    return;
+  }
+  propertyMap.set(UNKNOWN_OBJECT_SPREAD_PROPERTY, createOpaqueCallableClassification());
+}
+
+function decodeAliasIdentifierToken(tokenText) {
+  if (typeof tokenText !== 'string' || tokenText.length === 0) {
+    return null;
+  }
+  const identifierToken = parseIdentifierToken(tokenText, 0);
+  return identifierToken != null && skipTrivia(tokenText, identifierToken.end) === tokenText.length
+    ? identifierToken.value
+    : null;
+}
+
+function decodePropertyLiteralToken(tokenText) {
+  if (typeof tokenText !== 'string' || tokenText.length === 0) {
+    return null;
+  }
+  const propertyName = parseSingleStringLiteralExpression(tokenText);
+  return typeof propertyName === 'string' ? propertyName : null;
+}
+
+function normalizeSimpleNumericPropertyName(expressionText) {
+  if (!isSimpleNumericExpression(expressionText)) {
+    return null;
+  }
+  const numericValue = Number(expressionText.trim());
+  return !Number.isNaN(numericValue)
+    ? String(numericValue)
+    : null;
+}
+
+function getStaticBracketPropertyName(bracketProperty) {
+  if (bracketProperty?.complete) {
+    return bracketProperty.value;
+  }
+  return normalizeSimpleNumericPropertyName(bracketProperty?.expressionText ?? '');
+}
+
+function readTopLevelExpressionEnd(sourceText, index) {
+  let cursor = index;
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  let parenDepth = 0;
+
+  while (cursor < sourceText.length) {
+    const current = sourceText[cursor];
+    const next = sourceText[cursor + 1];
+
+    if (current === '/' && next === '/') {
+      cursor = skipLineComment(sourceText, cursor);
+      continue;
+    }
+    if (current === '/' && next === '*') {
+      cursor = skipBlockComment(sourceText, cursor);
+      continue;
+    }
+    if (current === '\'' || current === '"') {
+      cursor = skipQuotedString(sourceText, cursor);
+      continue;
+    }
+    if (current === '`') {
+      cursor = skipTemplateLiteral(sourceText, cursor);
+      continue;
+    }
+    if (braceDepth === 0 && bracketDepth === 0 && parenDepth === 0 && (current === ',' || current === '}')) {
+      return cursor;
+    }
+    if (current === '{') {
+      braceDepth += 1;
+      cursor += 1;
+      continue;
+    }
+    if (current === '}') {
+      if (braceDepth > 0) {
+        braceDepth -= 1;
+        cursor += 1;
+        continue;
+      }
+      return cursor;
+    }
+    if (current === '[') {
+      bracketDepth += 1;
+      cursor += 1;
+      continue;
+    }
+    if (current === ']') {
+      bracketDepth = Math.max(bracketDepth - 1, 0);
+      cursor += 1;
+      continue;
+    }
+    if (current === '(') {
+      parenDepth += 1;
+      cursor += 1;
+      continue;
+    }
+    if (current === ')') {
+      parenDepth = Math.max(parenDepth - 1, 0);
+      cursor += 1;
+      continue;
+    }
+
+    cursor += 1;
+  }
+
+  return cursor;
+}
+
+function readStatementExpressionEnd(sourceText, index) {
+  let cursor = index;
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  let parenDepth = 0;
+
+  while (cursor < sourceText.length) {
+    const current = sourceText[cursor];
+    const next = sourceText[cursor + 1];
+
+    if (current === '/' && next === '/') {
+      cursor = skipLineComment(sourceText, cursor);
+      continue;
+    }
+    if (current === '/' && next === '*') {
+      cursor = skipBlockComment(sourceText, cursor);
+      continue;
+    }
+    if (current === '\'' || current === '"') {
+      cursor = skipQuotedString(sourceText, cursor);
+      continue;
+    }
+    if (current === '`') {
+      cursor = skipTemplateLiteral(sourceText, cursor);
+      continue;
+    }
+    if (braceDepth === 0 && bracketDepth === 0 && parenDepth === 0 && (current === ',' || current === ';' || current === '\n')) {
+      return cursor;
+    }
+    if (current === '{') {
+      braceDepth += 1;
+      cursor += 1;
+      continue;
+    }
+    if (current === '}') {
+      if (braceDepth > 0) {
+        braceDepth -= 1;
+        cursor += 1;
+        continue;
+      }
+      return cursor;
+    }
+    if (current === '[') {
+      bracketDepth += 1;
+      cursor += 1;
+      continue;
+    }
+    if (current === ']') {
+      bracketDepth = Math.max(bracketDepth - 1, 0);
+      cursor += 1;
+      continue;
+    }
+    if (current === '(') {
+      parenDepth += 1;
+      cursor += 1;
+      continue;
+    }
+    if (current === ')') {
+      parenDepth = Math.max(parenDepth - 1, 0);
+      cursor += 1;
+      continue;
+    }
+
+    cursor += 1;
+  }
+
+  return cursor;
+}
+
+function parseObjectLiteralPropertyName(sourceText, index) {
+  const cursor = skipTrivia(sourceText, index);
+  const quotedProperty = parseQuotedStringLiteral(sourceText, cursor);
+  if (quotedProperty != null) {
+    return {
+      name: quotedProperty.value,
+      end: quotedProperty.end,
+    };
+  }
+  const computedProperty = parseBracketPropertyExpression(sourceText, cursor);
+  const computedPropertyName = getStaticBracketPropertyName(computedProperty);
+  if (computedPropertyName != null) {
+    return {
+      name: computedPropertyName,
+      end: computedProperty.end,
+    };
+  }
+  const identifierToken = parseIdentifierToken(sourceText, cursor);
+  return identifierToken == null
+    ? null
+    : {
+        name: identifierToken.value,
+        end: identifierToken.end,
+      };
+}
+
+function findStaticTrailingMemberAccess(expressionText) {
+  let cursor = 0;
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  let parenDepth = 0;
+
+  while (cursor < expressionText.length) {
+    const current = expressionText[cursor];
+    const next = expressionText[cursor + 1];
+
+    if (current === '/' && next === '/') {
+      cursor = skipLineComment(expressionText, cursor);
+      continue;
+    }
+    if (current === '/' && next === '*') {
+      cursor = skipBlockComment(expressionText, cursor);
+      continue;
+    }
+    if (current === '\'' || current === '"') {
+      cursor = skipQuotedString(expressionText, cursor);
+      continue;
+    }
+    if (current === '`') {
+      cursor = skipTemplateLiteral(expressionText, cursor);
+      continue;
+    }
+
+    if (braceDepth === 0 && bracketDepth === 0 && parenDepth === 0) {
+      if (current === '.' || (current === '?' && next === '.')) {
+        const property = readNextPropertyName(expressionText, cursor);
+        if (property != null && skipTrivia(expressionText, property.end) === expressionText.length) {
+          const receiverExpressionText = expressionText.slice(0, cursor).trimEnd();
+          return receiverExpressionText.length === 0
+            ? null
+            : {
+                receiverExpressionText,
+                propertyName: property.name,
+              };
+        }
+      }
+      if (current === '[') {
+        const bracketProperty = parseBracketPropertyExpression(expressionText, cursor);
+        const propertyName = getStaticBracketPropertyName(bracketProperty);
+        if (propertyName != null && skipTrivia(expressionText, bracketProperty.end) === expressionText.length) {
+          let receiverEnd = cursor;
+          const optionalChainCursor = skipWhitespaceBackward(expressionText, cursor - 1);
+          if (expressionText[optionalChainCursor] === '.' && expressionText[optionalChainCursor - 1] === '?') {
+            receiverEnd = optionalChainCursor - 1;
+          }
+          const receiverExpressionText = expressionText.slice(0, receiverEnd).trimEnd();
+          return receiverExpressionText.length === 0
+            ? null
+            : {
+                receiverExpressionText,
+                propertyName,
+              };
+        }
+        if (bracketProperty != null) {
+          cursor = bracketProperty.end;
+          continue;
+        }
+      }
+    }
+
+    if (current === '{') {
+      braceDepth += 1;
+      cursor += 1;
+      continue;
+    }
+    if (current === '}') {
+      braceDepth = Math.max(braceDepth - 1, 0);
+      cursor += 1;
+      continue;
+    }
+    if (current === '[') {
+      bracketDepth += 1;
+      cursor += 1;
+      continue;
+    }
+    if (current === ']') {
+      bracketDepth = Math.max(bracketDepth - 1, 0);
+      cursor += 1;
+      continue;
+    }
+    if (current === '(') {
+      parenDepth += 1;
+      cursor += 1;
+      continue;
+    }
+    if (current === ')') {
+      parenDepth = Math.max(parenDepth - 1, 0);
+      cursor += 1;
+      continue;
+    }
+
+    cursor += 1;
+  }
+
+  return null;
+}
+
+function parseObjectLiteralCallableMember(objectLiteralText, index) {
+  let cursor = skipTrivia(objectLiteralText, index);
+  let property = null;
+
+  const prefixToken = parseIdentifierToken(objectLiteralText, cursor);
+  if (prefixToken?.value === 'get' || prefixToken?.value === 'set') {
+    const propertyCursor = skipTrivia(objectLiteralText, prefixToken.end);
+    const accessorProperty = parseObjectLiteralPropertyName(objectLiteralText, propertyCursor);
+    if (accessorProperty != null) {
+      const afterProperty = skipTrivia(objectLiteralText, accessorProperty.end);
+      if (objectLiteralText[afterProperty] === '(') {
+        property = accessorProperty;
+        cursor = afterProperty;
+      }
+    }
+  } else {
+    if (prefixToken?.value === 'async') {
+      cursor = skipTrivia(objectLiteralText, prefixToken.end);
+    }
+    if (objectLiteralText[cursor] === '*') {
+      cursor = skipTrivia(objectLiteralText, cursor + 1);
+    }
+    const methodProperty = parseObjectLiteralPropertyName(objectLiteralText, cursor);
+    if (methodProperty != null) {
+      const afterProperty = skipTrivia(objectLiteralText, methodProperty.end);
+      if (objectLiteralText[afterProperty] === '(') {
+        property = methodProperty;
+        cursor = afterProperty;
+      }
+    }
+  }
+
+  if (property == null || objectLiteralText[cursor] !== '(') {
+    return null;
+  }
+
+  const paramsEnd = skipBalancedCode(objectLiteralText, cursor + 1, ')');
+  const bodyStart = skipTrivia(objectLiteralText, paramsEnd);
+  if (objectLiteralText[bodyStart] !== '{') {
+    return null;
+  }
+  const bodyEnd = skipBalancedCode(objectLiteralText, bodyStart + 1, '}');
+  return {
+    propertyName: property.name,
+    propertyValue: createOpaqueCallableClassification(),
+    end: bodyEnd,
+  };
+}
+
+function parseObjectLiteralPropertyMap(objectLiteralText, objectPropertyAliases = null) {
+  let cursor = skipTrivia(objectLiteralText, 0);
+  if (objectLiteralText[cursor] !== '{') {
+    return null;
+  }
+  cursor += 1;
+  const propertyMap = new Map();
+
+  while (cursor < objectLiteralText.length) {
+    cursor = skipTrivia(objectLiteralText, cursor);
+    if (objectLiteralText[cursor] === '}') {
+      return propertyMap;
+    }
+    if (objectLiteralText.startsWith('...', cursor)) {
+      const spreadStart = skipTrivia(objectLiteralText, cursor + 3);
+      const spreadEnd = readTopLevelExpressionEnd(objectLiteralText, spreadStart);
+      const spreadExpressionText = objectLiteralText.slice(spreadStart, spreadEnd).trim();
+      let spreadProperties = null;
+      if (spreadExpressionText.startsWith('{')) {
+        spreadProperties = parseObjectLiteralPropertyMap(spreadExpressionText, objectPropertyAliases);
+      } else if (objectPropertyAliases instanceof Map) {
+        const spreadSourceName = parseSingleIdentifierExpression(spreadExpressionText);
+        const sourceProperties = spreadSourceName == null ? null : objectPropertyAliases.get(spreadSourceName);
+        if (sourceProperties instanceof Map) {
+          spreadProperties = new Map();
+          for (const [propertyName, classification] of sourceProperties.entries()) {
+            spreadProperties.set(propertyName, cloneAliasClassification(classification));
+          }
+        }
+      }
+      if (spreadProperties != null) {
+        for (const [propertyName, valueText] of spreadProperties) {
+          propertyMap.set(propertyName, valueText);
+        }
+      } else {
+        markUnknownObjectSpread(propertyMap);
+      }
+      cursor = skipTrivia(objectLiteralText, spreadEnd);
+      if (objectLiteralText[cursor] === ',') {
+        cursor += 1;
+        continue;
+      }
+      if (objectLiteralText[cursor] === '}') {
+        return propertyMap;
+      }
+      return null;
+    }
+
+    const callableMember = parseObjectLiteralCallableMember(objectLiteralText, cursor);
+    if (callableMember != null) {
+      propertyMap.set(callableMember.propertyName, callableMember.propertyValue);
+      cursor = skipTrivia(objectLiteralText, callableMember.end);
+      if (objectLiteralText[cursor] === ',') {
+        cursor += 1;
+        continue;
+      }
+      if (objectLiteralText[cursor] === '}') {
+        return propertyMap;
+      }
+      return null;
+    }
+
+    const property = parseObjectLiteralPropertyName(objectLiteralText, cursor);
+    if (property == null) {
+      return null;
+    }
+    cursor = skipTrivia(objectLiteralText, property.end);
+
+    let valueText;
+    if (objectLiteralText[cursor] === ':') {
+      const valueStart = skipTrivia(objectLiteralText, cursor + 1);
+      const valueEnd = readTopLevelExpressionEnd(objectLiteralText, valueStart);
+      valueText = objectLiteralText.slice(valueStart, valueEnd).trim();
+      cursor = valueEnd;
+    } else {
+      valueText = property.name;
+    }
+    propertyMap.set(property.name, valueText);
+
+    cursor = skipTrivia(objectLiteralText, cursor);
+    if (objectLiteralText[cursor] === ',') {
+      cursor += 1;
+      continue;
+    }
+    if (objectLiteralText[cursor] === '}') {
+      return propertyMap;
+    }
+    return null;
+  }
+
+  return null;
+}
+
+function resolveObjectLiteralPropertyClassification(propertyValue, aliasState) {
+  if (typeof propertyValue === 'string') {
+    return classifyAliasExpression(propertyValue, aliasState);
+  }
+  return cloneAliasClassification(propertyValue);
+}
+
+function collectDestructuredObjectLiteralAssignments(sourceText) {
+  const assignments = [];
+  const collectMatches = (pattern) => {
+    for (const match of sourceText.matchAll(pattern)) {
+      const bindingStartIndex = sourceText.indexOf('{', match.index);
+      if (bindingStartIndex === -1) {
+        continue;
+      }
+      const bindingEndIndex = skipBalancedCode(sourceText, bindingStartIndex + 1, '}');
+      let cursor = skipTrivia(sourceText, bindingEndIndex);
+      if (sourceText[cursor] !== '=') {
+        continue;
+      }
+      cursor = skipTrivia(sourceText, cursor + 1);
+      if (sourceText[cursor] !== '{') {
+        continue;
+      }
+      const objectEndIndex = skipBalancedCode(sourceText, cursor + 1, '}');
+      assignments.push({
+        bindingText: sourceText.slice(bindingStartIndex + 1, Math.max(bindingEndIndex - 1, bindingStartIndex + 1)),
+        objectLiteralText: sourceText.slice(cursor, objectEndIndex),
+      });
+    }
+  };
+
+  collectMatches(DESTRUCTURED_OBJECT_LITERAL_DECLARATION_RE);
+  collectMatches(DESTRUCTURED_OBJECT_LITERAL_ASSIGNMENT_RE);
+  return assignments;
+}
+
+function collectObjectLiteralAssignments(sourceText) {
+  const assignments = [];
+  const collectMatches = (pattern) => {
+    for (const match of sourceText.matchAll(pattern)) {
+      const objectStartIndex = match.index + match[0].lastIndexOf('{');
+      const objectEndIndex = skipBalancedCode(sourceText, objectStartIndex + 1, '}');
+      assignments.push({
+        targetName: match[1],
+        objectLiteralText: sourceText.slice(objectStartIndex, objectEndIndex),
+      });
+    }
+  };
+
+  collectMatches(OBJECT_LITERAL_DECLARATION_RE);
+  collectMatches(OBJECT_LITERAL_ASSIGNMENT_RE);
+  return assignments;
+}
+
+function collectNamedExpressionAssignments(sourceText) {
+  const assignments = [];
+  const collectMatches = (pattern) => {
+    for (const match of sourceText.matchAll(pattern)) {
+      const expressionStart = match.index + match[0].length;
+      const expressionEnd = readStatementExpressionEnd(sourceText, expressionStart);
+      assignments.push({
+        index: match.index,
+        targetName: match[1],
+        expressionText: sourceText.slice(expressionStart, expressionEnd),
+      });
+    }
+  };
+
+  collectMatches(NAMED_EXPRESSION_DECLARATION_RE);
+  collectMatches(NAMED_EXPRESSION_ASSIGNMENT_RE);
+  assignments.sort((left, right) => left.index - right.index);
+  return assignments;
+}
+
+function mergeAliasClassification(target, source) {
+  let changed = false;
+  for (const key of Object.keys(target)) {
+    if (source[key] && !target[key]) {
+      target[key] = true;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function getObjectPropertyAliasClassification(objectPropertyAliases, objectName, propertyName) {
+  return getObjectLiteralPropertyValue(objectPropertyAliases.get(objectName), propertyName);
+}
+
+function mergeReceiverPropertyAliasClassification(target, receiverExpressionText, propertyName, aliasState) {
+  const receiverName = parseSingleIdentifierExpression(receiverExpressionText);
+  if (receiverName != null) {
+    target.commonJsFactory = target.commonJsFactory
+      || (aliasState.nodeModuleNamespaceAliases.has(receiverName) && propertyName === 'createRequire');
+    target.unsafeConstructor = target.unsafeConstructor
+      || (aliasState.unsafeConstructorAliases.has(receiverName) && isUnsafeConstructorContinuationName(propertyName));
+    target.unsafeReflectMethod = target.unsafeReflectMethod
+      || (aliasState.reflectAliases.has(receiverName) && isUnsafeReflectMethodName(propertyName));
+    const objectPropertyClassification = getObjectPropertyAliasClassification(
+      aliasState.objectPropertyAliases,
+      receiverName,
+      propertyName,
+    );
+    if (objectPropertyClassification != null) {
+      mergeAliasClassification(target, objectPropertyClassification);
+    }
+    return;
+  }
+
+  const objectLiteralText = parseObjectLiteralExpression(receiverExpressionText);
+  if (objectLiteralText == null) {
+    return;
+  }
+  const propertyMap = parseObjectLiteralPropertyMap(objectLiteralText, aliasState.objectPropertyAliases);
+  if (propertyMap == null) {
+    return;
+  }
+  const propertyValue = getObjectLiteralPropertyValue(propertyMap, propertyName);
+  const propertyClassification = resolveObjectLiteralPropertyClassification(propertyValue, aliasState);
+  if (propertyClassification != null) {
+    mergeAliasClassification(target, propertyClassification);
+  }
+}
+
+function recordObjectPropertyAlias(objectPropertyAliases, objectName, propertyName, classification) {
+  if (!classification.nodeModuleNamespace
+    && !classification.commonJsFactory
+    && !classification.commonJsLoader
+    && !classification.reflect
+    && !classification.unsafeConstructor
+    && !classification.unsafeReflectMethod
+    && !classification.opaqueCallable) {
+    return false;
+  }
+  let propertyMap = objectPropertyAliases.get(objectName);
+  if (propertyMap == null) {
+    propertyMap = new Map();
+    objectPropertyAliases.set(objectName, propertyMap);
+  }
+  let propertyClassification = propertyMap.get(propertyName);
+  if (propertyClassification == null) {
+    propertyClassification = createAliasClassification();
+    propertyMap.set(propertyName, propertyClassification);
+  }
+  return mergeAliasClassification(propertyClassification, classification);
+}
+
+function cloneObjectPropertyAliases(objectPropertyAliases, targetName, sourceName) {
+  const sourceProperties = objectPropertyAliases.get(sourceName);
+  if (sourceProperties == null) {
+    return false;
+  }
+  let changed = false;
+  for (const [propertyName, classification] of sourceProperties.entries()) {
+    changed = recordObjectPropertyAlias(objectPropertyAliases, targetName, propertyName, classification) || changed;
+  }
+  return changed;
+}
+
+function classifyAliasExpression(expressionText, aliasState) {
+  const classification = createAliasClassification();
+  const trimmed = expressionText.trim();
+  if (trimmed.length === 0) {
+    return classification;
+  }
+
+  const identifierValue = decodeAliasIdentifierToken(trimmed);
+  if (identifierValue != null) {
+    classification.nodeModuleNamespace = aliasState.nodeModuleNamespaceAliases.has(identifierValue);
+    classification.commonJsFactory = aliasState.commonJsFactoryAliases.has(identifierValue);
+    classification.commonJsLoader = aliasState.commonJsLoaderAliases.has(identifierValue);
+    classification.reflect = aliasState.reflectAliases.has(identifierValue);
+    classification.unsafeConstructor = identifierValue === 'constructor'
+      || aliasState.unsafeConstructorAliases.has(identifierValue);
+    classification.unsafeReflectMethod = aliasState.unsafeReflectMethodAliases.has(identifierValue);
+    classification.opaqueCallable = aliasState.opaqueCallableAliases.has(identifierValue);
+  }
+
+  if (/\.\s*constructor\s*$/.test(trimmed)) {
+    classification.unsafeConstructor = true;
+  }
+  const trailingBracketProperty = TRAILING_BRACKET_PROPERTY_RE.exec(trimmed);
+  if (decodePropertyLiteralToken(trailingBracketProperty?.[1]) === 'constructor') {
+    classification.unsafeConstructor = true;
+  }
+
+  const memberAlias = SIMPLE_MEMBER_ALIAS_RE.exec(trimmed);
+  if (memberAlias != null) {
+    const [, receiverName, propertyToken] = memberAlias;
+    const propertyName = decodeAliasIdentifierToken(propertyToken);
+    if (propertyName != null) {
+      classification.commonJsFactory = classification.commonJsFactory
+        || (aliasState.nodeModuleNamespaceAliases.has(receiverName) && propertyName === 'createRequire');
+      classification.unsafeConstructor = classification.unsafeConstructor
+        || (aliasState.unsafeConstructorAliases.has(receiverName) && isUnsafeConstructorContinuationName(propertyName));
+      classification.unsafeReflectMethod = classification.unsafeReflectMethod
+        || (aliasState.reflectAliases.has(receiverName) && isUnsafeReflectMethodName(propertyName));
+      const objectPropertyClassification = getObjectPropertyAliasClassification(
+        aliasState.objectPropertyAliases,
+        receiverName,
+        propertyName,
+      );
+      if (objectPropertyClassification != null) {
+        mergeAliasClassification(classification, objectPropertyClassification);
+      }
+    }
+  }
+
+  const bracketMemberAlias = SIMPLE_BRACKET_MEMBER_ALIAS_RE.exec(trimmed);
+  if (bracketMemberAlias != null) {
+    const [, receiverName, propertyLiteral] = bracketMemberAlias;
+    const propertyName = decodePropertyLiteralToken(propertyLiteral);
+    if (propertyName != null) {
+      classification.commonJsFactory = classification.commonJsFactory
+        || (aliasState.nodeModuleNamespaceAliases.has(receiverName) && propertyName === 'createRequire');
+      classification.unsafeConstructor = classification.unsafeConstructor
+        || (aliasState.unsafeConstructorAliases.has(receiverName) && isUnsafeConstructorContinuationName(propertyName));
+      classification.unsafeReflectMethod = classification.unsafeReflectMethod
+        || (aliasState.reflectAliases.has(receiverName) && isUnsafeReflectMethodName(propertyName));
+      const objectPropertyClassification = getObjectPropertyAliasClassification(
+        aliasState.objectPropertyAliases,
+        receiverName,
+        propertyName,
+      );
+      if (objectPropertyClassification != null) {
+        mergeAliasClassification(classification, objectPropertyClassification);
+      }
+    }
+  }
+
+  const trailingMemberAccess = findStaticTrailingMemberAccess(trimmed);
+  if (trailingMemberAccess != null) {
+    mergeReceiverPropertyAliasClassification(
+      classification,
+      trailingMemberAccess.receiverExpressionText,
+      trailingMemberAccess.propertyName,
+      aliasState,
+    );
+  }
+
+  const callIdentifier = parseIdentifierToken(trimmed, 0);
+  if (callIdentifier != null && isCallLikeExpressionAt(trimmed, callIdentifier.end)) {
+    classification.commonJsLoader = classification.commonJsLoader
+      || aliasState.commonJsFactoryAliases.has(callIdentifier.value);
+  }
+
+  return classification;
+}
+
+function parseNamedAliasEntries(bindingText) {
+  return bindingText
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => {
+      const aliasMatch = NAMED_ALIAS_ENTRY_RE.exec(entry);
+      if (aliasMatch == null) {
+        return null;
+      }
+      const sourceName = decodeAliasIdentifierToken(aliasMatch[1]);
+      const localName = decodeAliasIdentifierToken(aliasMatch[2] ?? aliasMatch[1]);
+      return sourceName == null || localName == null
+        ? null
+        : {
+            sourceName,
+            localName,
+          };
+    })
+    .filter(Boolean);
+}
+
+function addAlias(targetSet, value) {
+  if (typeof value !== 'string' || value.length === 0 || targetSet.has(value)) {
+    return false;
+  }
+  targetSet.add(value);
+  return true;
+}
+
+function applyClassificationToAliasSets(classification, localName, aliasSets) {
+  let changed = false;
+  if (classification.nodeModuleNamespace) {
+    changed = addAlias(aliasSets.nodeModuleNamespaceAliases, localName) || changed;
+  }
+  if (classification.commonJsFactory) {
+    changed = addAlias(aliasSets.commonJsFactoryAliases, localName) || changed;
+  }
+  if (classification.commonJsLoader) {
+    changed = addAlias(aliasSets.commonJsLoaderAliases, localName) || changed;
+  }
+  if (classification.reflect) {
+    changed = addAlias(aliasSets.reflectAliases, localName) || changed;
+  }
+  if (classification.unsafeConstructor) {
+    changed = addAlias(aliasSets.unsafeConstructorAliases, localName) || changed;
+  }
+  if (classification.unsafeReflectMethod) {
+    changed = addAlias(aliasSets.unsafeReflectMethodAliases, localName) || changed;
+  }
+  if (classification.opaqueCallable) {
+    changed = addAlias(aliasSets.opaqueCallableAliases, localName) || changed;
+  }
+  return changed;
+}
+
+function collectAliasState(sourceText) {
+  const normalizedSourceText = stripCommentsPreservingStrings(sourceText);
+  const commonJsFactoryAliases = new Set(['createRequire']);
+  const commonJsLoaderAliases = new Set(['require']);
+  const reflectAliases = new Set(['Reflect']);
+  const nodeModuleNamespaceAliases = new Set();
+  const unsafeConstructorAliases = new Set();
+  const unsafeReflectMethodAliases = new Set();
+  const opaqueCallableAliases = new Set();
+  const objectPropertyAliases = new Map();
+
+  for (const match of normalizedSourceText.matchAll(/\bimport\s*\{([^}]*)\}\s*from\s*(["'])node:module\2/g)) {
+    for (const entry of parseNamedAliasEntries(match[1])) {
+      if (entry.sourceName === 'createRequire') {
+        addAlias(commonJsFactoryAliases, entry.localName);
+      }
+    }
+  }
+  for (const match of normalizedSourceText.matchAll(/\bimport\s*\*\s*as\s*([A-Za-z_$][\w$]*)\s*from\s*(["'])node:module\2/g)) {
+    addAlias(nodeModuleNamespaceAliases, match[1]);
+  }
+
+  let changed = true;
+  while (changed) {
+    changed = false;
+
+    for (const match of normalizedSourceText.matchAll(/\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:\(\s*)*([A-Za-z_$][\w$]*)(?:\s*\))*\s*(?:[;,]|\n|$)/g)) {
+      const [, localName, sourceName] = match;
+      if (nodeModuleNamespaceAliases.has(sourceName)) {
+        changed = addAlias(nodeModuleNamespaceAliases, localName) || changed;
+      }
+      if (commonJsFactoryAliases.has(sourceName)) {
+        changed = addAlias(commonJsFactoryAliases, localName) || changed;
+      }
+      if (commonJsLoaderAliases.has(sourceName)) {
+        changed = addAlias(commonJsLoaderAliases, localName) || changed;
+      }
+      if (reflectAliases.has(sourceName)) {
+        changed = addAlias(reflectAliases, localName) || changed;
+      }
+      if (unsafeConstructorAliases.has(sourceName)) {
+        changed = addAlias(unsafeConstructorAliases, localName) || changed;
+      }
+      if (unsafeReflectMethodAliases.has(sourceName)) {
+        changed = addAlias(unsafeReflectMethodAliases, localName) || changed;
+      }
+      if (opaqueCallableAliases.has(sourceName)) {
+        changed = addAlias(opaqueCallableAliases, localName) || changed;
+      }
+      changed = cloneObjectPropertyAliases(objectPropertyAliases, localName, sourceName) || changed;
+    }
+
+    for (const match of normalizedSourceText.matchAll(/(?:^|[;\n])\s*(?:\(\s*)*([A-Za-z_$][\w$]*)\s*=\s*(?:\(\s*)*([A-Za-z_$][\w$]*)(?:\s*\))*\s*(?:\s*\))*\s*(?:[;,]|\n|$)/gm)) {
+      const [, localName, sourceName] = match;
+      if (nodeModuleNamespaceAliases.has(sourceName)) {
+        changed = addAlias(nodeModuleNamespaceAliases, localName) || changed;
+      }
+      if (commonJsFactoryAliases.has(sourceName)) {
+        changed = addAlias(commonJsFactoryAliases, localName) || changed;
+      }
+      if (commonJsLoaderAliases.has(sourceName)) {
+        changed = addAlias(commonJsLoaderAliases, localName) || changed;
+      }
+      if (reflectAliases.has(sourceName)) {
+        changed = addAlias(reflectAliases, localName) || changed;
+      }
+      if (unsafeConstructorAliases.has(sourceName)) {
+        changed = addAlias(unsafeConstructorAliases, localName) || changed;
+      }
+      if (unsafeReflectMethodAliases.has(sourceName)) {
+        changed = addAlias(unsafeReflectMethodAliases, localName) || changed;
+      }
+      if (opaqueCallableAliases.has(sourceName)) {
+        changed = addAlias(opaqueCallableAliases, localName) || changed;
+      }
+      changed = cloneObjectPropertyAliases(objectPropertyAliases, localName, sourceName) || changed;
+    }
+
+    for (const match of normalizedSourceText.matchAll(/\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*[^\n;]*\.\s*constructor\b\s*(?:[;,]|\n|$)/g)) {
+      const [, localName] = match;
+      changed = addAlias(unsafeConstructorAliases, localName) || changed;
+    }
+
+    for (const match of normalizedSourceText.matchAll(DECLARED_CONSTRUCTOR_BRACKET_ALIAS_RE)) {
+      const [, localName, propertyLiteral] = match;
+      if (decodePropertyLiteralToken(propertyLiteral) === 'constructor') {
+        changed = addAlias(unsafeConstructorAliases, localName) || changed;
+      }
+    }
+
+    for (const match of normalizedSourceText.matchAll(/(?:^|[;\n])\s*(?:\(\s*)*([A-Za-z_$][\w$]*)\s*=\s*[^\n;]*\.\s*constructor\b\s*(?:\s*\))*\s*(?:[;,]|\n|$)/gm)) {
+      const [, localName] = match;
+      changed = addAlias(unsafeConstructorAliases, localName) || changed;
+    }
+
+    for (const match of normalizedSourceText.matchAll(ASSIGNED_CONSTRUCTOR_BRACKET_ALIAS_RE)) {
+      const [, localName, propertyLiteral] = match;
+      if (decodePropertyLiteralToken(propertyLiteral) === 'constructor') {
+        changed = addAlias(unsafeConstructorAliases, localName) || changed;
+      }
+    }
+
+    for (const match of normalizedSourceText.matchAll(DECLARED_MEMBER_ALIAS_RE)) {
+      const [, localName, receiverName, propertyToken] = match;
+      const propertyName = decodeAliasIdentifierToken(propertyToken);
+      if (propertyName == null) {
+        continue;
+      }
+      if (nodeModuleNamespaceAliases.has(receiverName) && propertyName === 'createRequire') {
+        changed = addAlias(commonJsFactoryAliases, localName) || changed;
+      }
+      if (unsafeConstructorAliases.has(receiverName) && isUnsafeConstructorContinuationName(propertyName)) {
+        changed = addAlias(unsafeConstructorAliases, localName) || changed;
+      }
+      if (reflectAliases.has(receiverName) && isUnsafeReflectMethodName(propertyName)) {
+        changed = addAlias(unsafeReflectMethodAliases, localName) || changed;
+      }
+      const objectPropertyClassification = getObjectPropertyAliasClassification(objectPropertyAliases, receiverName, propertyName);
+      if (objectPropertyClassification != null) {
+        changed = applyClassificationToAliasSets(objectPropertyClassification, localName, {
+          nodeModuleNamespaceAliases,
+          commonJsFactoryAliases,
+          commonJsLoaderAliases,
+          reflectAliases,
+          unsafeConstructorAliases,
+          unsafeReflectMethodAliases,
+          opaqueCallableAliases,
+        }) || changed;
+      }
+    }
+
+    for (const match of normalizedSourceText.matchAll(ASSIGNED_MEMBER_ALIAS_RE)) {
+      const [, localName, receiverName, propertyToken] = match;
+      const propertyName = decodeAliasIdentifierToken(propertyToken);
+      if (propertyName == null) {
+        continue;
+      }
+      if (nodeModuleNamespaceAliases.has(receiverName) && propertyName === 'createRequire') {
+        changed = addAlias(commonJsFactoryAliases, localName) || changed;
+      }
+      if (unsafeConstructorAliases.has(receiverName) && isUnsafeConstructorContinuationName(propertyName)) {
+        changed = addAlias(unsafeConstructorAliases, localName) || changed;
+      }
+      if (reflectAliases.has(receiverName) && isUnsafeReflectMethodName(propertyName)) {
+        changed = addAlias(unsafeReflectMethodAliases, localName) || changed;
+      }
+      const objectPropertyClassification = getObjectPropertyAliasClassification(objectPropertyAliases, receiverName, propertyName);
+      if (objectPropertyClassification != null) {
+        changed = applyClassificationToAliasSets(objectPropertyClassification, localName, {
+          nodeModuleNamespaceAliases,
+          commonJsFactoryAliases,
+          commonJsLoaderAliases,
+          reflectAliases,
+          unsafeConstructorAliases,
+          unsafeReflectMethodAliases,
+          opaqueCallableAliases,
+        }) || changed;
+      }
+    }
+
+    for (const match of normalizedSourceText.matchAll(DECLARED_BRACKET_MEMBER_ALIAS_RE)) {
+      const [, localName, receiverName, propertyLiteral] = match;
+      const propertyName = decodePropertyLiteralToken(propertyLiteral);
+      if (propertyName == null) {
+        continue;
+      }
+      if (nodeModuleNamespaceAliases.has(receiverName) && propertyName === 'createRequire') {
+        changed = addAlias(commonJsFactoryAliases, localName) || changed;
+      }
+      if (unsafeConstructorAliases.has(receiverName) && isUnsafeConstructorContinuationName(propertyName)) {
+        changed = addAlias(unsafeConstructorAliases, localName) || changed;
+      }
+      if (reflectAliases.has(receiverName) && isUnsafeReflectMethodName(propertyName)) {
+        changed = addAlias(unsafeReflectMethodAliases, localName) || changed;
+      }
+      const objectPropertyClassification = getObjectPropertyAliasClassification(objectPropertyAliases, receiverName, propertyName);
+      if (objectPropertyClassification != null) {
+        changed = applyClassificationToAliasSets(objectPropertyClassification, localName, {
+          nodeModuleNamespaceAliases,
+          commonJsFactoryAliases,
+          commonJsLoaderAliases,
+          reflectAliases,
+          unsafeConstructorAliases,
+          unsafeReflectMethodAliases,
+          opaqueCallableAliases,
+        }) || changed;
+      }
+    }
+
+    for (const match of normalizedSourceText.matchAll(ASSIGNED_BRACKET_MEMBER_ALIAS_RE)) {
+      const [, localName, receiverName, propertyLiteral] = match;
+      const propertyName = decodePropertyLiteralToken(propertyLiteral);
+      if (propertyName == null) {
+        continue;
+      }
+      if (nodeModuleNamespaceAliases.has(receiverName) && propertyName === 'createRequire') {
+        changed = addAlias(commonJsFactoryAliases, localName) || changed;
+      }
+      if (unsafeConstructorAliases.has(receiverName) && isUnsafeConstructorContinuationName(propertyName)) {
+        changed = addAlias(unsafeConstructorAliases, localName) || changed;
+      }
+      if (reflectAliases.has(receiverName) && isUnsafeReflectMethodName(propertyName)) {
+        changed = addAlias(unsafeReflectMethodAliases, localName) || changed;
+      }
+      const objectPropertyClassification = getObjectPropertyAliasClassification(objectPropertyAliases, receiverName, propertyName);
+      if (objectPropertyClassification != null) {
+        changed = applyClassificationToAliasSets(objectPropertyClassification, localName, {
+          nodeModuleNamespaceAliases,
+          commonJsFactoryAliases,
+          commonJsLoaderAliases,
+          reflectAliases,
+          unsafeConstructorAliases,
+          unsafeReflectMethodAliases,
+          opaqueCallableAliases,
+        }) || changed;
+      }
+    }
+
+    for (const match of normalizedSourceText.matchAll(/\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*([A-Za-z_$][\w$]*)\s*\(/g)) {
+      const [, localName, calleeName] = match;
+      if (commonJsFactoryAliases.has(calleeName)) {
+        changed = addAlias(commonJsLoaderAliases, localName) || changed;
+      }
+    }
+
+    for (const match of normalizedSourceText.matchAll(/(?:^|[;\n])\s*(?:\(\s*)*([A-Za-z_$][\w$]*)\s*=\s*([A-Za-z_$][\w$]*)\s*\(/gm)) {
+      const [, localName, calleeName] = match;
+      if (commonJsFactoryAliases.has(calleeName)) {
+        changed = addAlias(commonJsLoaderAliases, localName) || changed;
+      }
+    }
+
+    for (const match of normalizedSourceText.matchAll(/\b(?:const|let|var)\s*\{([^}]*)\}\s*=\s*(?:\(\s*)*([A-Za-z_$][\w$]*)(?:\s*\))*/g)) {
+      const [, bindingText, sourceName] = match;
+      for (const entry of parseNamedAliasEntries(bindingText)) {
+        if (nodeModuleNamespaceAliases.has(sourceName) && entry.sourceName === 'createRequire') {
+          changed = addAlias(commonJsFactoryAliases, entry.localName) || changed;
+        }
+        if (unsafeConstructorAliases.has(sourceName) && isUnsafeConstructorContinuationName(entry.sourceName)) {
+          changed = addAlias(unsafeConstructorAliases, entry.localName) || changed;
+        }
+        if (reflectAliases.has(sourceName) && isUnsafeReflectMethodName(entry.sourceName)) {
+          changed = addAlias(unsafeReflectMethodAliases, entry.localName) || changed;
+        }
+        const objectPropertyClassification = getObjectPropertyAliasClassification(objectPropertyAliases, sourceName, entry.sourceName);
+        if (objectPropertyClassification != null) {
+          changed = applyClassificationToAliasSets(objectPropertyClassification, entry.localName, {
+            nodeModuleNamespaceAliases,
+            commonJsFactoryAliases,
+            commonJsLoaderAliases,
+            reflectAliases,
+            unsafeConstructorAliases,
+            unsafeReflectMethodAliases,
+            opaqueCallableAliases,
+          }) || changed;
+        }
+      }
+    }
+
+    for (const match of normalizedSourceText.matchAll(/(?:^|[;\n])\s*(?:\(\s*)?\{([^}]*)\}\s*=\s*(?:\(\s*)*([A-Za-z_$][\w$]*)(?:\s*\))*/gm)) {
+      const [, bindingText, sourceName] = match;
+      for (const entry of parseNamedAliasEntries(bindingText)) {
+        if (nodeModuleNamespaceAliases.has(sourceName) && entry.sourceName === 'createRequire') {
+          changed = addAlias(commonJsFactoryAliases, entry.localName) || changed;
+        }
+        if (unsafeConstructorAliases.has(sourceName) && isUnsafeConstructorContinuationName(entry.sourceName)) {
+          changed = addAlias(unsafeConstructorAliases, entry.localName) || changed;
+        }
+        if (reflectAliases.has(sourceName) && isUnsafeReflectMethodName(entry.sourceName)) {
+          changed = addAlias(unsafeReflectMethodAliases, entry.localName) || changed;
+        }
+        const objectPropertyClassification = getObjectPropertyAliasClassification(objectPropertyAliases, sourceName, entry.sourceName);
+        if (objectPropertyClassification != null) {
+          changed = applyClassificationToAliasSets(objectPropertyClassification, entry.localName, {
+            nodeModuleNamespaceAliases,
+            commonJsFactoryAliases,
+            commonJsLoaderAliases,
+            reflectAliases,
+            unsafeConstructorAliases,
+            unsafeReflectMethodAliases,
+            opaqueCallableAliases,
+          }) || changed;
+        }
+      }
+    }
+
+    for (const assignment of collectObjectLiteralAssignments(normalizedSourceText)) {
+      const propertyMap = parseObjectLiteralPropertyMap(assignment.objectLiteralText, objectPropertyAliases);
+      if (propertyMap == null) {
+        continue;
+      }
+      for (const [propertyName, propertyValue] of propertyMap.entries()) {
+        const classification = resolveObjectLiteralPropertyClassification(propertyValue, {
+          nodeModuleNamespaceAliases,
+          commonJsFactoryAliases,
+          commonJsLoaderAliases,
+          reflectAliases,
+          unsafeConstructorAliases,
+          unsafeReflectMethodAliases,
+          opaqueCallableAliases,
+          objectPropertyAliases,
+        });
+        if (classification == null) {
+          continue;
+        }
+        changed = recordObjectPropertyAlias(objectPropertyAliases, assignment.targetName, propertyName, classification) || changed;
+      }
+    }
+
+    for (const assignment of collectDestructuredObjectLiteralAssignments(normalizedSourceText)) {
+      const propertyMap = parseObjectLiteralPropertyMap(assignment.objectLiteralText, objectPropertyAliases);
+      if (propertyMap == null) {
+        continue;
+      }
+      for (const entry of parseNamedAliasEntries(assignment.bindingText)) {
+        const propertyValue = getObjectLiteralPropertyValue(propertyMap, entry.sourceName);
+        const classification = resolveObjectLiteralPropertyClassification(propertyValue, {
+          nodeModuleNamespaceAliases,
+          commonJsFactoryAliases,
+          commonJsLoaderAliases,
+          reflectAliases,
+          unsafeConstructorAliases,
+          unsafeReflectMethodAliases,
+          opaqueCallableAliases,
+          objectPropertyAliases,
+        });
+        if (classification == null) {
+          continue;
+        }
+        changed = applyClassificationToAliasSets(classification, entry.localName, {
+          nodeModuleNamespaceAliases,
+          commonJsFactoryAliases,
+          commonJsLoaderAliases,
+          reflectAliases,
+          unsafeConstructorAliases,
+          unsafeReflectMethodAliases,
+          opaqueCallableAliases,
+        }) || changed;
+      }
+    }
+
+    for (const assignment of collectNamedExpressionAssignments(normalizedSourceText)) {
+      const classification = classifyAliasExpression(assignment.expressionText, {
+        nodeModuleNamespaceAliases,
+        commonJsFactoryAliases,
+        commonJsLoaderAliases,
+        reflectAliases,
+        unsafeConstructorAliases,
+        unsafeReflectMethodAliases,
+        opaqueCallableAliases,
+        objectPropertyAliases,
+      });
+      changed = applyClassificationToAliasSets(classification, assignment.targetName, {
+        nodeModuleNamespaceAliases,
+        commonJsFactoryAliases,
+        commonJsLoaderAliases,
+        reflectAliases,
+        unsafeConstructorAliases,
+        unsafeReflectMethodAliases,
+        opaqueCallableAliases,
+      }) || changed;
+    }
+  }
+
+  return {
+    nodeModuleNamespaceAliases,
+    commonJsFactoryAliases,
+    commonJsLoaderAliases,
+    reflectAliases,
+    unsafeConstructorAliases,
+    unsafeReflectMethodAliases,
+    opaqueCallableAliases,
+    objectPropertyAliases,
+  };
+}
+
+function isSimpleNumericExpression(sourceText) {
+  const trimmed = sourceText.trim();
+  if (trimmed.length === 0) {
+    return false;
+  }
+  if (trimmed.startsWith('(') && trimmed.endsWith(')')) {
+    return isSimpleNumericExpression(trimmed.slice(1, -1));
+  }
+  return /^[+-]?\d+(?:\.\d+)?(?:e[+-]?\d+)?$/i.test(trimmed);
+}
+
+function isCallLikeExpressionAt(sourceText, index) {
+  let cursor = skipTrivia(sourceText, index);
+  while (sourceText[cursor] === ')') {
+    cursor = skipTrivia(sourceText, cursor + 1);
+  }
+  if (sourceText[cursor] === '(') {
+    return true;
+  }
+  if (sourceText[cursor] === '?' && sourceText[cursor + 1] === '.') {
+    cursor = skipTrivia(sourceText, cursor + 2);
+    while (sourceText[cursor] === ')') {
+      cursor = skipTrivia(sourceText, cursor + 1);
+    }
+    return sourceText[cursor] === '(';
+  }
+  return false;
+}
+
+function readCallableContinuationInvocationProperty(sourceText, index) {
+  const property = readChainedPropertyName(sourceText, index);
+  if (property == null || !isCallableContinuationMethodName(property.name)) {
+    return null;
+  }
+  return isCallLikeExpressionAt(sourceText, property.end)
+    ? property
+    : null;
+}
+
+function isFileUrlSpecifier(specifier) {
+  return typeof specifier === 'string' && specifier.slice(0, 'file://'.length).toLowerCase() === 'file://';
+}
+
+function hasExplicitModuleScheme(specifier) {
+  return typeof specifier === 'string' && /^[A-Za-z][A-Za-z0-9+.-]*:/.test(specifier);
+}
+
+function isSafeBuiltinModuleSpecifier(specifier) {
+  return typeof specifier === 'string' && specifier.startsWith('node:');
+}
+
+function isTrackedModuleSpecifier(specifier) {
+  return typeof specifier === 'string'
+    && (
+      specifier.startsWith('.')
+      || path.isAbsolute(specifier)
+      || isFileUrlSpecifier(specifier)
+    );
+}
+
+function findStaticModuleSpecifier(sourceText, startIndex) {
+  let cursor = skipTrivia(sourceText, startIndex);
+  const directLiteral = parseQuotedStringLiteral(sourceText, cursor);
+  if (directLiteral != null) {
+    return {
+      specifier: directLiteral.value,
+      nextIndex: directLiteral.end,
+    };
+  }
+
+  while (cursor < sourceText.length) {
+    const current = sourceText[cursor];
+    const next = sourceText[cursor + 1];
+
+    if (current === '/' && next === '/') {
+      cursor = skipLineComment(sourceText, cursor);
+      continue;
+    }
+    if (current === '/' && next === '*') {
+      cursor = skipBlockComment(sourceText, cursor);
+      continue;
+    }
+    if (current === '\'' || current === '"') {
+      cursor = skipQuotedString(sourceText, cursor);
+      continue;
+    }
+    if (current === '`') {
+      cursor = skipTemplateLiteral(sourceText, cursor);
+      continue;
+    }
+    if (current === ';') {
+      return null;
+    }
+    if (hasKeywordAt(sourceText, cursor, 'from')) {
+      const literalStartIndex = skipTrivia(sourceText, cursor + 4);
+      const literal = parseQuotedStringLiteral(sourceText, literalStartIndex);
+      if (literal != null) {
+        return {
+          specifier: literal.value,
+          nextIndex: literal.end,
+        };
+      }
+    }
+    cursor += 1;
+  }
+
+  return null;
+}
+
+function collectRelativeModuleDependencies(sourceText) {
+  const moduleSpecifiers = [];
+  let hasUnresolvedDynamicImport = false;
+  let cursor = 0;
+  const aliasState = collectAliasState(sourceText);
+
+  while (cursor < sourceText.length) {
+    const current = sourceText[cursor];
+    const next = sourceText[cursor + 1];
+
+    if (/\s/.test(current)) {
+      cursor += 1;
+      continue;
+    }
+    if (current === '/' && next === '/') {
+      cursor = skipLineComment(sourceText, cursor);
+      continue;
+    }
+    if (current === '/' && next === '*') {
+      cursor = skipBlockComment(sourceText, cursor);
+      continue;
+    }
+    if (current === '.' || (current === '?' && next === '.')) {
+      const property = readNextPropertyName(sourceText, cursor);
+      if (property != null) {
+        const propertyCallLike = isCallLikeExpressionAt(sourceText, property.end);
+        const callableContinuation = readCallableContinuationInvocationProperty(sourceText, property.end);
+        const inlineObjectPropertyClassification = getInlineObjectLiteralPropertyClassification(
+          sourceText,
+          cursor,
+          property.name,
+          aliasState,
+        );
+        const nextProperty = property.name === 'constructor'
+          ? readChainedPropertyName(sourceText, property.end)
+          : callableContinuation;
+        if (
+          isStringEvaluatorName(property.name)
+          || (isCommonJsLoaderName(property.name) && (propertyCallLike || callableContinuation != null))
+          || (
+            inlineObjectPropertyClassification != null
+            && (
+              (
+                (inlineObjectPropertyClassification.commonJsFactory || inlineObjectPropertyClassification.commonJsLoader)
+                && (propertyCallLike || callableContinuation != null)
+              )
+              || (
+                inlineObjectPropertyClassification.unsafeConstructor
+                && (
+                  propertyCallLike
+                  || isUnsafeConstructorContinuationName(nextProperty?.name)
+                )
+              )
+              || (inlineObjectPropertyClassification.opaqueCallable && (propertyCallLike || callableContinuation != null))
+              || (inlineObjectPropertyClassification.unsafeReflectMethod && (propertyCallLike || callableContinuation != null))
+            )
+          )
+          || (property.name === 'constructor' && (
+            propertyCallLike
+            || isUnsafeConstructorContinuationName(nextProperty?.name)
+          ))
+        ) {
+          hasUnresolvedDynamicImport = true;
+        }
+        cursor = nextProperty?.end ?? property.end;
+        continue;
+      }
+    }
+    if (current === '[') {
+      const bracketProperty = parseBracketPropertyExpression(sourceText, cursor);
+      if (bracketProperty != null) {
+        const staticBracketPropertyName = getStaticBracketPropertyName(bracketProperty);
+        const bracketCallLike = isCallLikeExpressionAt(sourceText, bracketProperty.end);
+        const callableContinuation = readCallableContinuationInvocationProperty(sourceText, bracketProperty.end);
+        const inlineObjectPropertyClassification = staticBracketPropertyName == null
+          ? null
+          : getInlineObjectLiteralPropertyClassification(
+              sourceText,
+              cursor,
+              staticBracketPropertyName,
+              aliasState,
+            );
+        const nextProperty = staticBracketPropertyName === 'constructor'
+          ? readChainedPropertyName(sourceText, bracketProperty.end)
+          : callableContinuation;
+        if (
+          (staticBracketPropertyName != null && isStringEvaluatorName(staticBracketPropertyName))
+          || (staticBracketPropertyName != null && isCommonJsLoaderName(staticBracketPropertyName) && (
+            bracketCallLike
+            || callableContinuation != null
+          ))
+          || (
+            inlineObjectPropertyClassification != null
+            && (
+              (
+                (inlineObjectPropertyClassification.commonJsFactory || inlineObjectPropertyClassification.commonJsLoader)
+                && (
+                  bracketCallLike
+                  || callableContinuation != null
+                )
+              )
+              || (
+                inlineObjectPropertyClassification.unsafeConstructor
+                && (
+                  bracketCallLike
+                  || isUnsafeConstructorContinuationName(nextProperty?.name)
+                )
+              )
+              || (inlineObjectPropertyClassification.opaqueCallable && (
+                bracketCallLike
+                || callableContinuation != null
+              ))
+              || (inlineObjectPropertyClassification.unsafeReflectMethod && (
+                bracketCallLike
+                || callableContinuation != null
+              ))
+            )
+          )
+          || (staticBracketPropertyName === 'constructor' && (
+            bracketCallLike
+            || isUnsafeConstructorContinuationName(nextProperty?.name)
+          ))
+          || (staticBracketPropertyName == null && !isSimpleNumericExpression(bracketProperty.expressionText))
+        ) {
+          hasUnresolvedDynamicImport = true;
+        }
+        cursor = nextProperty?.end ?? bracketProperty.end;
+        continue;
+      }
+    }
+    if (current === '\'' || current === '"') {
+      cursor = skipQuotedString(sourceText, cursor);
+      continue;
+    }
+    if (current === '`') {
+      cursor = skipTemplateLiteral(sourceText, cursor);
+      continue;
+    }
+    const identifierToken = parseIdentifierToken(sourceText, cursor);
+    if (identifierToken != null) {
+      const identifierCallLike = isCallLikeExpressionAt(sourceText, identifierToken.end);
+      const callableContinuation = readCallableContinuationInvocationProperty(sourceText, identifierToken.end);
+      const isUnsafeConstructorAlias = identifierToken.value === 'constructor'
+        || aliasState.unsafeConstructorAliases.has(identifierToken.value);
+      const isCommonJsLikeIdentifier = isCommonJsLoaderName(identifierToken.value)
+        || aliasState.commonJsFactoryAliases.has(identifierToken.value)
+        || aliasState.commonJsLoaderAliases.has(identifierToken.value);
+      const isReflectLikeIdentifier = aliasState.reflectAliases.has(identifierToken.value);
+      const isOpaqueCallableAlias = aliasState.opaqueCallableAliases.has(identifierToken.value);
+      const objectPropertyAliasMap = aliasState.objectPropertyAliases.get(identifierToken.value);
+      const nextProperty = isUnsafeConstructorAlias || isCommonJsLikeIdentifier || isReflectLikeIdentifier || objectPropertyAliasMap != null
+        ? readChainedPropertyName(sourceText, identifierToken.end)
+        : null;
+      const objectPropertyClassification = nextProperty == null
+        ? null
+        : getObjectPropertyAliasClassification(
+            aliasState.objectPropertyAliases,
+            identifierToken.value,
+            nextProperty.name,
+          );
+      const nextObjectProperty = objectPropertyClassification?.unsafeConstructor
+        ? readChainedPropertyName(sourceText, nextProperty.end)
+        : null;
+      const objectPropertyCallableContinuation = nextProperty == null
+        ? null
+        : readCallableContinuationInvocationProperty(sourceText, nextProperty.end);
+      if (
+        isStringEvaluatorName(identifierToken.value)
+        || (
+          isCommonJsLikeIdentifier
+          && (
+            identifierCallLike
+            || callableContinuation != null
+          )
+        )
+        || (
+          isUnsafeConstructorAlias
+          && (
+            identifierCallLike
+            || isUnsafeConstructorContinuationName(nextProperty?.name)
+          )
+        )
+        || (aliasState.unsafeReflectMethodAliases.has(identifierToken.value) && identifierCallLike)
+        || (
+          isOpaqueCallableAlias
+          && identifierCallLike
+        )
+        || (
+          isReflectLikeIdentifier
+          && isUnsafeReflectMethodName(nextProperty?.name)
+          && isCallLikeExpressionAt(sourceText, nextProperty.end)
+        )
+        || (
+          objectPropertyClassification != null
+          && (
+            (
+              (objectPropertyClassification.commonJsFactory || objectPropertyClassification.commonJsLoader)
+              && (
+                isCallLikeExpressionAt(sourceText, nextProperty.end)
+                || objectPropertyCallableContinuation != null
+              )
+            )
+            || (
+              objectPropertyClassification.unsafeConstructor
+              && (
+                isCallLikeExpressionAt(sourceText, nextProperty.end)
+                || isUnsafeConstructorContinuationName(nextObjectProperty?.name)
+              )
+            )
+            || (objectPropertyClassification.opaqueCallable && isCallLikeExpressionAt(sourceText, nextProperty.end))
+            || (objectPropertyClassification.unsafeReflectMethod && isCallLikeExpressionAt(sourceText, nextProperty.end))
+          )
+        )
+      ) {
+        hasUnresolvedDynamicImport = true;
+        cursor = objectPropertyCallableContinuation?.end ?? callableContinuation?.end ?? nextObjectProperty?.end ?? nextProperty?.end ?? identifierToken.end;
+        continue;
+      }
+    }
+    if (hasKeywordAt(sourceText, cursor, 'eval')) {
+      hasUnresolvedDynamicImport = true;
+      cursor += 'eval'.length;
+      continue;
+    }
+    if (hasKeywordAt(sourceText, cursor, 'Function')) {
+      hasUnresolvedDynamicImport = true;
+      cursor += 'Function'.length;
+      continue;
+    }
+    if (hasKeywordAt(sourceText, cursor, 'import')) {
+      const expressionStartIndex = skipTrivia(sourceText, cursor + 'import'.length);
+      if (sourceText[expressionStartIndex] === '(') {
+        const expressionEndIndex = skipBalancedCode(sourceText, expressionStartIndex + 1, ')');
+        const expressionText = sourceText.slice(expressionStartIndex + 1, Math.max(expressionEndIndex - 1, expressionStartIndex + 1));
+        const literalSpecifier = parseSingleStringLiteralExpression(expressionText);
+        if (literalSpecifier == null) {
+          hasUnresolvedDynamicImport = true;
+        } else if (isTrackedModuleSpecifier(literalSpecifier)) {
+          moduleSpecifiers.push(literalSpecifier);
+        } else if (hasExplicitModuleScheme(literalSpecifier) && !isSafeBuiltinModuleSpecifier(literalSpecifier)) {
+          hasUnresolvedDynamicImport = true;
+        }
+        cursor = expressionEndIndex;
+        continue;
+      }
+      if (sourceText[expressionStartIndex] === '.') {
+        cursor = expressionStartIndex + 1;
+        continue;
+      }
+      const staticSpecifier = findStaticModuleSpecifier(sourceText, expressionStartIndex);
+      if (staticSpecifier != null) {
+        if (isTrackedModuleSpecifier(staticSpecifier.specifier)) {
+          moduleSpecifiers.push(staticSpecifier.specifier);
+        } else if (
+          hasExplicitModuleScheme(staticSpecifier.specifier)
+          && !isSafeBuiltinModuleSpecifier(staticSpecifier.specifier)
+        ) {
+          hasUnresolvedDynamicImport = true;
+        }
+        cursor = staticSpecifier.nextIndex;
+        continue;
+      }
+      cursor = expressionStartIndex;
+      continue;
+    }
+    if (hasKeywordAt(sourceText, cursor, 'export')) {
+      const staticSpecifier = findStaticModuleSpecifier(sourceText, skipTrivia(sourceText, cursor + 'export'.length));
+      if (staticSpecifier != null) {
+        if (isTrackedModuleSpecifier(staticSpecifier.specifier)) {
+          moduleSpecifiers.push(staticSpecifier.specifier);
+        } else if (
+          hasExplicitModuleScheme(staticSpecifier.specifier)
+          && !isSafeBuiltinModuleSpecifier(staticSpecifier.specifier)
+        ) {
+          hasUnresolvedDynamicImport = true;
+        }
+        cursor = staticSpecifier.nextIndex;
+        continue;
+      }
+      cursor += 'export'.length;
+      continue;
+    }
+
+    cursor += 1;
+  }
+
+  return {
+    moduleSpecifiers: [...new Set(moduleSpecifiers)],
+    hasUnresolvedDynamicImport,
+  };
+}
+
+async function resolveOwnedPath(candidatePath, repoRoot) {
+  const absoluteCandidatePath = path.resolve(candidatePath);
+  if (!pathIsWithinRoot(absoluteCandidatePath, repoRoot)) {
+    return null;
+  }
+  try {
+    const realCandidatePath = await fs.realpath(absoluteCandidatePath);
+    return pathIsWithinRoot(realCandidatePath, repoRoot)
+      ? realCandidatePath
+      : null;
+  } catch (error) {
+    if (error && error.code === 'ENOENT') {
+      return absoluteCandidatePath;
+    }
+    throw error;
+  }
+}
+
+async function resolveImportedModulePath(specifier, entryFile, repoRoot) {
+  let basePath = null;
+  if (specifier.startsWith('.')) {
+    basePath = path.resolve(path.dirname(entryFile), specifier);
+  } else if (path.isAbsolute(specifier)) {
+    basePath = specifier;
+  } else if (isFileUrlSpecifier(specifier)) {
+    try {
+      basePath = fileURLToPath(new URL(specifier));
+    } catch {
+      return null;
+    }
+  }
+  if (basePath == null) {
+    return null;
+  }
+
+  const candidatePaths = path.extname(basePath)
+    ? [basePath]
+    : [basePath, `${basePath}.mjs`];
+  for (const candidatePath of candidatePaths) {
+    const ownedPath = await resolveOwnedPath(candidatePath, repoRoot);
+    if (ownedPath != null) {
+      return ownedPath;
+    }
+  }
+  return null;
+}
+
+async function areSameFilesystemEntry(leftPath, rightPath) {
+  try {
+    const [leftStat, rightStat] = await Promise.all([
+      fs.stat(leftPath),
+      fs.stat(rightPath),
+    ]);
+    return leftStat.dev === rightStat.dev && leftStat.ino === rightStat.ino;
+  } catch (error) {
+    if (error && error.code === 'ENOENT') {
+      return false;
+    }
+    throw error;
+  }
+}
+
+async function isAliasOfSharedRunArtifact(candidatePath, repoRoot) {
+  const sharedRunRoot = path.join(repoRoot, L1_SHARED_TEST_RUN_ROOT);
+  const visitedDirectories = new Set();
+
+  async function walkDirectory(currentDirectory) {
+    const normalizedDirectory = path.resolve(currentDirectory);
+    if (visitedDirectories.has(normalizedDirectory)) {
+      return false;
+    }
+    visitedDirectories.add(normalizedDirectory);
+
+    let entries;
+    try {
+      entries = await fs.readdir(normalizedDirectory, { withFileTypes: true });
+    } catch (error) {
+      if (error && error.code === 'ENOENT') {
+        return false;
+      }
+      throw error;
+    }
+
+    for (const entry of entries) {
+      const entryPath = path.join(normalizedDirectory, entry.name);
+      if (entry.isDirectory()) {
+        if (await walkDirectory(entryPath)) {
+          return true;
+        }
+        continue;
+      }
+      if (!entry.isFile()) {
+        continue;
+      }
+      if (await areSameFilesystemEntry(candidatePath, entryPath)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  return walkDirectory(sharedRunRoot);
+}
+
+function resolveEnvironmentNameForArtifactId(artifactId) {
+  for (const [environmentName, requirement] of Object.entries(NON_LOCAL_ENVIRONMENT_ARTIFACT_REQUIREMENTS)) {
+    if (requirement.artifact_id === artifactId) {
+      return environmentName;
+    }
+  }
+  return null;
+}
+
+function requiresExternalManualArtifactEvidence(artifactId) {
+  return resolveEnvironmentNameForArtifactId(artifactId) != null || artifactId === 'prod_cost_snapshot';
+}
+
+export function validateManualArtifactPayload(artifactId, payload, {
+  runTimestamp = null,
+} = {}) {
+  if (!isPlainObject(payload)) {
+    return {
+      valid: false,
+      error: 'artifact payload must be a JSON object',
+    };
+  }
+
+  const expectedEnvironmentName = resolveEnvironmentNameForArtifactId(artifactId);
+  if (expectedEnvironmentName) {
+    const environmentDefinition = getTestEnvironmentDefinition(expectedEnvironmentName);
+    const normalizedTestFiles = Array.isArray(payload.test_files)
+      ? payload.test_files.map((entry) => normalizeRepoRelativePath(entry))
+      : null;
+    const normalizedExpandedTestFiles = Array.isArray(payload.expanded_test_files)
+      ? payload.expanded_test_files.map((entry) => normalizeRepoRelativePath(entry))
+      : null;
+    if (payload.environment_name !== expectedEnvironmentName) {
+      return {
+        valid: false,
+        error: `environment_name must be ${expectedEnvironmentName}`,
+      };
+    }
+    if (payload.status !== 'pass') {
+      return {
+        valid: false,
+        error: 'environment run report must have status "pass"',
+      };
+    }
+    if (payload.exit_code !== 0) {
+      return {
+        valid: false,
+        error: 'environment run report must have exit_code 0',
+      };
+    }
+    if (runTimestamp != null && payload.run_timestamp !== runTimestamp) {
+      return {
+        valid: false,
+        error: `environment run report must have run_timestamp ${runTimestamp}`,
+      };
+    }
+    if (!isNonEmptyString(payload.command)) {
+      return {
+        valid: false,
+        error: 'environment run report must include a non-empty command',
+      };
+    }
+    if (payload.test_directory !== environmentDefinition.directory) {
+      return {
+        valid: false,
+        error: `environment run report must use test_directory ${environmentDefinition.directory}`,
+      };
+    }
+    if (!isNonNegativeInteger(payload.test_file_count) || payload.test_file_count === 0) {
+      return {
+        valid: false,
+        error: 'environment run report must have a positive test_file_count',
+      };
+    }
+    if (!isRelativePathList(payload.test_files) || normalizedTestFiles == null || normalizedTestFiles.some((entry) => entry == null) || payload.test_files.length !== payload.test_file_count) {
+      return {
+        valid: false,
+        error: 'environment run report must include test_files matching test_file_count',
+      };
+    }
+    if (!normalizedTestFiles.every((file) => pathUsesPrefix(file, environmentDefinition.directory))) {
+      return {
+        valid: false,
+        error: `environment run report test_files must stay within ${environmentDefinition.directory}`,
+      };
+    }
+    if (!isNonNegativeInteger(payload.expanded_test_file_count) || payload.expanded_test_file_count === 0) {
+      return {
+        valid: false,
+        error: 'environment run report must have a positive expanded_test_file_count',
+      };
+    }
+    if (!isRelativePathList(payload.expanded_test_files) || normalizedExpandedTestFiles == null || normalizedExpandedTestFiles.some((entry) => entry == null) || payload.expanded_test_files.length !== payload.expanded_test_file_count) {
+      return {
+        valid: false,
+        error: 'environment run report must include expanded_test_files matching expanded_test_file_count',
+      };
+    }
+    if (normalizedExpandedTestFiles.some((file) => pathUsesPrefix(file, 'tests/local'))) {
+      return {
+        valid: false,
+        error: 'environment run report must not expand local test implementations',
+      };
+    }
+    if (!isIsoTimestamp(payload.started_at) || !isIsoTimestamp(payload.completed_at)) {
+      return {
+        valid: false,
+        error: 'environment run report must include parseable started_at and completed_at timestamps',
+      };
+    }
+    if (!isNonNegativeInteger(payload.duration_ms)) {
+      return {
+        valid: false,
+        error: 'environment run report must include a non-negative duration_ms',
+      };
+    }
+    if (!isNonEmptyString(payload.output_sha256) || !SHA256_HEX_RE.test(payload.output_sha256)) {
+      return {
+        valid: false,
+        error: 'environment run report must include a 64-character hex output_sha256',
+      };
+    }
+    if (payload.error_message !== null) {
+      return {
+        valid: false,
+        error: 'environment run report error_message must be null',
+      };
+    }
+    if (!isNonEmptyString(payload.log_artifact)) {
+      return {
+        valid: false,
+        error: 'environment run report must include a non-empty log_artifact',
+      };
+    }
+    if (!isNonEmptyString(payload.executed_by)) {
+      return {
+        valid: false,
+        error: 'environment run report must include executed_by',
+      };
+    }
+    if (!isNonEmptyString(payload.reviewed_by)) {
+      return {
+        valid: false,
+        error: 'environment run report must include reviewed_by',
+      };
+    }
+    if (!isNonEmptyString(payload.source_run_uri)) {
+      return {
+        valid: false,
+        error: 'environment run report must include source_run_uri',
+      };
+    }
+    if (!isNonEmptyString(payload.topology_kind) || payload.topology_kind === 'local') {
+      return {
+        valid: false,
+        error: 'environment run report must include a non-local topology_kind',
+      };
+    }
+    if (!isPlainObject(payload.cloudflare_resources)) {
+      return {
+        valid: false,
+        error: 'environment run report must include cloudflare_resources',
+      };
+    }
+    for (const resourceName of ['workers', 'durable_objects', 'd1_databases', 'r2_buckets', 'kv_namespaces', 'queues']) {
+      if (!isNonEmptyStringArray(payload.cloudflare_resources[resourceName])) {
+        return {
+          valid: false,
+          error: `environment run report cloudflare_resources.${resourceName} must be a non-empty string array`,
+        };
+      }
+    }
+    return {
+      valid: true,
+      error: null,
+    };
+  }
+
+  if (artifactId === 'prod_cost_snapshot') {
+    if (payload.artifact_id !== 'prod_cost_snapshot') {
+      return {
+        valid: false,
+        error: 'prod_cost_snapshot artifact_id must be "prod_cost_snapshot"',
+      };
+    }
+    if (payload.source_environment !== 'prod') {
+      return {
+        valid: false,
+        error: 'prod_cost_snapshot source_environment must be "prod"',
+      };
+    }
+    if (typeof payload.captured_at !== 'string' || payload.captured_at.trim().length === 0) {
+      return {
+        valid: false,
+        error: 'prod_cost_snapshot captured_at must be a non-empty string',
+      };
+    }
+    if (!isIsoTimestamp(payload.captured_at)) {
+      return {
+        valid: false,
+        error: 'prod_cost_snapshot captured_at must be a parseable timestamp',
+      };
+    }
+    if (runTimestamp != null && payload.run_timestamp !== runTimestamp) {
+      return {
+        valid: false,
+        error: `prod_cost_snapshot must have run_timestamp ${runTimestamp}`,
+      };
+    }
+    if (!isNonEmptyString(payload.captured_by)) {
+      return {
+        valid: false,
+        error: 'prod_cost_snapshot must include captured_by',
+      };
+    }
+    if (!isNonEmptyString(payload.reviewed_by)) {
+      return {
+        valid: false,
+        error: 'prod_cost_snapshot must include reviewed_by',
+      };
+    }
+    if (!isNonEmptyString(payload.source_dashboard_uri)) {
+      return {
+        valid: false,
+        error: 'prod_cost_snapshot must include source_dashboard_uri',
+      };
+    }
+    if (!isNonEmptyString(payload.topology_kind) || payload.topology_kind === 'local') {
+      return {
+        valid: false,
+        error: 'prod_cost_snapshot must include a non-local topology_kind',
+      };
+    }
+    if (!isPlainObject(payload.cloudflare_resources)) {
+      return {
+        valid: false,
+        error: 'prod_cost_snapshot must include cloudflare_resources',
+      };
+    }
+    for (const resourceName of ['workers', 'durable_objects', 'd1_databases', 'r2_buckets', 'kv_namespaces', 'queues']) {
+      if (!isNonEmptyStringArray(payload.cloudflare_resources[resourceName])) {
+        return {
+          valid: false,
+          error: `prod_cost_snapshot cloudflare_resources.${resourceName} must be a non-empty string array`,
+        };
+      }
+    }
+    if (!isPlainObject(payload.billing_period)) {
+      return {
+        valid: false,
+        error: 'prod_cost_snapshot must include billing_period',
+      };
+    }
+    if (!isIsoTimestamp(payload.billing_period.start) || !isIsoTimestamp(payload.billing_period.end)) {
+      return {
+        valid: false,
+        error: 'prod_cost_snapshot billing_period must include parseable start and end timestamps',
+      };
+    }
+    if (Date.parse(payload.billing_period.start) > Date.parse(payload.billing_period.end)) {
+      return {
+        valid: false,
+        error: 'prod_cost_snapshot billing_period start must be earlier than end',
+      };
+    }
+    if (!isPlainObject(payload.cost_surfaces)) {
+      return {
+        valid: false,
+        error: 'prod_cost_snapshot must include cost_surfaces',
+      };
+    }
+    const requiredCostSurfaceMetrics = {
+      workers: ['request_count', 'cpu_ms', 'log_event_count'],
+      durable_objects: ['request_count', 'duration_gb_s', 'sqlite_row_reads', 'sqlite_row_writes'],
+      d1: ['read_rows', 'write_rows'],
+      r2: ['storage_gb_month', 'class_a_ops', 'class_b_ops'],
+      kv: ['read_ops', 'write_ops', 'delete_ops', 'list_ops'],
+      queues: ['write_ops', 'read_ops', 'delete_ops'],
+    };
+    for (const [surfaceName, requiredFieldNames] of Object.entries(requiredCostSurfaceMetrics)) {
+      if (!objectHasRequiredNumericFields(payload.cost_surfaces[surfaceName], requiredFieldNames)) {
+        return {
+          valid: false,
+          error: `prod_cost_snapshot cost_surfaces.${surfaceName} must include ${requiredFieldNames.join(', ')}`,
+        };
+      }
+    }
+    if (payload.cost_surfaces.telemetry_export != null && !objectHasRequiredNumericFields(
+      payload.cost_surfaces.telemetry_export,
+      ['trace_span_count', 'exported_log_event_count'],
+    )) {
+      return {
+        valid: false,
+        error: 'prod_cost_snapshot cost_surfaces.telemetry_export must include trace_span_count and exported_log_event_count when present',
+      };
+    }
+    if (payload.cost_surfaces.telemetry_export != null && typeof payload.cost_surfaces.telemetry_export.persist_enabled !== 'boolean') {
+      return {
+        valid: false,
+        error: 'prod_cost_snapshot cost_surfaces.telemetry_export.persist_enabled must be boolean when telemetry_export is present',
+      };
+    }
+    if (!isPlainObject(payload.model_comparison)) {
+      return {
+        valid: false,
+        error: 'prod_cost_snapshot must include model_comparison',
+      };
+    }
+    if (!isNonEmptyString(payload.model_comparison.status)) {
+      return {
+        valid: false,
+        error: 'prod_cost_snapshot model_comparison.status must be a non-empty string',
+      };
+    }
+    if (!isNonEmptyString(payload.model_comparison.summary)) {
+      return {
+        valid: false,
+        error: 'prod_cost_snapshot model_comparison.summary must be a non-empty string',
+      };
+    }
+    if (!isNonNegativeNumber(payload.model_comparison.actual_total_usd)) {
+      return {
+        valid: false,
+        error: 'prod_cost_snapshot model_comparison.actual_total_usd must be a non-negative number',
+      };
+    }
+    if (!isNonNegativeNumber(payload.model_comparison.modeled_total_usd)) {
+      return {
+        valid: false,
+        error: 'prod_cost_snapshot model_comparison.modeled_total_usd must be a non-negative number',
+      };
+    }
+    if (!isNonNegativeNumber(payload.model_comparison.drift_ratio)) {
+      return {
+        valid: false,
+        error: 'prod_cost_snapshot model_comparison.drift_ratio must be a non-negative number',
+      };
+    }
+  }
+
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+async function collectTransitiveTestFiles(entryFile, repoRoot, visited = new Set()) {
+  const ownedEntryFile = await resolveOwnedPath(entryFile, repoRoot);
+  if (ownedEntryFile == null) {
+    return {
+      files: [],
+      repo_boundary_escapes: [],
+      unresolved_dynamic_imports: [],
+    };
+  }
+
+  const normalizedEntryFile = normalizePathForMarkdown(path.relative(repoRoot, ownedEntryFile));
+  if (visited.has(normalizedEntryFile)) {
+    return {
+      files: [],
+      repo_boundary_escapes: [],
+      unresolved_dynamic_imports: [],
+    };
+  }
+  visited.add(normalizedEntryFile);
+
+  let sourceText = '';
+  try {
+    sourceText = await fs.readFile(ownedEntryFile, 'utf8');
+  } catch {
+    return {
+      files: [normalizedEntryFile],
+      repo_boundary_escapes: [],
+      unresolved_dynamic_imports: [],
+    };
+  }
+
+  const transitiveFiles = new Set([normalizedEntryFile]);
+  const repoBoundaryEscapes = [];
+  const unresolvedDynamicImports = [];
+  const dependencyScan = collectRelativeModuleDependencies(sourceText);
+  if (dependencyScan.hasUnresolvedDynamicImport) {
+    unresolvedDynamicImports.push(normalizedEntryFile);
+  }
+  for (const specifier of dependencyScan.moduleSpecifiers) {
+    const ownedResolvedPath = await resolveImportedModulePath(specifier, entryFile, repoRoot);
+    if (ownedResolvedPath == null) {
+      repoBoundaryEscapes.push(`${normalizedEntryFile} -> ${specifier}`);
+      continue;
+    }
+    const nestedResult = await collectTransitiveTestFiles(ownedResolvedPath, repoRoot, visited);
+    for (const nestedFile of nestedResult.files) {
+      transitiveFiles.add(nestedFile);
+    }
+    for (const repoBoundaryEscape of nestedResult.repo_boundary_escapes) {
+      repoBoundaryEscapes.push(repoBoundaryEscape);
+    }
+    for (const unresolvedImport of nestedResult.unresolved_dynamic_imports) {
+      unresolvedDynamicImports.push(unresolvedImport);
+    }
+  }
+  return {
+    files: [...transitiveFiles].sort(),
+    repo_boundary_escapes: [...new Set(repoBoundaryEscapes)].sort(),
+    unresolved_dynamic_imports: [...new Set(unresolvedDynamicImports)].sort(),
+  };
+}
+
+async function expandEnvironmentTestFiles(files, repoRoot) {
+  const expanded = new Set();
+  const repoBoundaryEscapes = new Set();
+  const unresolvedDynamicImports = new Set();
+  for (const file of files) {
+    const absoluteFile = path.isAbsolute(file)
+      ? file
+      : path.join(repoRoot, file);
+    const expansionResult = await collectTransitiveTestFiles(absoluteFile, repoRoot);
+    for (const expandedFile of expansionResult.files) {
+      expanded.add(expandedFile);
+    }
+    for (const repoBoundaryEscape of expansionResult.repo_boundary_escapes) {
+      repoBoundaryEscapes.add(repoBoundaryEscape);
+    }
+    for (const unresolvedImport of expansionResult.unresolved_dynamic_imports) {
+      unresolvedDynamicImports.add(unresolvedImport);
+    }
+  }
+  return {
+    expanded_test_files: [...expanded].sort(),
+    repo_boundary_escapes: [...repoBoundaryEscapes].sort(),
+    unresolved_dynamic_imports: [...unresolvedDynamicImports].sort(),
+  };
+}
+
+function buildL1EvidenceOutputPaths(repoRoot, runTimestamp) {
+  return [
+    path.join(repoRoot, L1_SHARED_TEST_RUN_ROOT, runTimestamp),
+    ...L1_EVIDENCE_DEFINITIONS.map((definition) => path.join(
+      repoRoot,
+      `evidence/${definition.scope}/${definition.id}/${runTimestamp}`,
+    )),
+  ];
+}
+
+export async function assessNonLocalEnvironmentHarnessReadiness(environmentName, repoRoot = process.cwd()) {
+  let result;
+  try {
+    const testFiles = await getRequiredTestFiles(environmentName, repoRoot);
+    const relativeTestFiles = testFiles.map((file) => normalizePathForMarkdown(path.relative(repoRoot, file)));
+    const {
+      expanded_test_files: expandedTestFiles,
+      repo_boundary_escapes: repoBoundaryEscapes,
+      unresolved_dynamic_imports: unresolvedDynamicImports,
+    } = await expandEnvironmentTestFiles(testFiles, repoRoot);
+    const localTestExpansions = expandedTestFiles.filter((file) => pathUsesPrefix(file, 'tests/local'));
+    result = localTestExpansions.length === 0
+      && unresolvedDynamicImports.length === 0
+      && repoBoundaryEscapes.length === 0
+      ? {
+          ready: true,
+          reason: null,
+          test_files: relativeTestFiles,
+          expanded_test_files: expandedTestFiles,
+          local_test_expansions: [],
+          repo_boundary_escapes: [],
+          unresolved_dynamic_imports: [],
+        }
+      : localTestExpansions.length > 0
+        ? {
+          ready: false,
+          reason: `${environmentName} harness still expands local test implementations`,
+          test_files: relativeTestFiles,
+          expanded_test_files: expandedTestFiles,
+          local_test_expansions: localTestExpansions,
+          repo_boundary_escapes: repoBoundaryEscapes,
+          unresolved_dynamic_imports: unresolvedDynamicImports,
+        }
+        : repoBoundaryEscapes.length > 0
+          ? {
+              ready: false,
+              reason: `${environmentName} harness escapes repo-owned test dependencies`,
+              test_files: relativeTestFiles,
+              expanded_test_files: expandedTestFiles,
+              local_test_expansions: [],
+              repo_boundary_escapes: repoBoundaryEscapes,
+              unresolved_dynamic_imports: unresolvedDynamicImports,
+            }
+        : {
+            ready: false,
+            reason: `${environmentName} harness contains non-literal dynamic imports`,
+            test_files: relativeTestFiles,
+            expanded_test_files: expandedTestFiles,
+            local_test_expansions: [],
+            repo_boundary_escapes: repoBoundaryEscapes,
+            unresolved_dynamic_imports: unresolvedDynamicImports,
+          };
+  } catch (error) {
+    result = {
+      ready: false,
+      reason: error instanceof Error ? error.message : String(error),
+      test_files: [],
+      expanded_test_files: [],
+      local_test_expansions: [],
+      repo_boundary_escapes: [],
+      unresolved_dynamic_imports: [],
+    };
+  }
+  return result;
+}
 
 function slugifyTimestamp(date = new Date()) {
   return date.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
@@ -149,6 +3182,15 @@ function sha256Hex(value) {
 
 function normalizePathForMarkdown(value) {
   return String(value).replaceAll(path.sep, '/');
+}
+
+function normalizeOptionalArtifactPath(repoRoot, artifactPath) {
+  if (typeof artifactPath !== 'string' || artifactPath.trim().length === 0) {
+    return null;
+  }
+  return path.isAbsolute(artifactPath)
+    ? artifactPath
+    : path.join(repoRoot, artifactPath.trim());
 }
 
 async function collectCodeVersionContext(repoRoot) {
@@ -195,7 +3237,7 @@ function quoteCommand(argumentsList) {
   return argumentsList.map((argument) => (/\s/.test(argument) ? JSON.stringify(argument) : argument)).join(' ');
 }
 
-async function runEnvironmentSuite(environmentName, repoRoot, sharedRunRoot) {
+async function runEnvironmentSuite(environmentName, repoRoot, sharedRunRoot, runTimestamp) {
   const startedAt = new Date().toISOString();
   let files;
   let errorMessage = null;
@@ -205,6 +3247,9 @@ async function runEnvironmentSuite(environmentName, repoRoot, sharedRunRoot) {
     files = [];
     errorMessage = error.message;
   }
+  const expandedTestFiles = errorMessage == null
+    ? (await expandEnvironmentTestFiles(files, repoRoot)).expanded_test_files
+    : [];
 
   const commandArgs = errorMessage
     ? []
@@ -248,6 +3293,7 @@ async function runEnvironmentSuite(environmentName, repoRoot, sharedRunRoot) {
   const summaryFile = path.join(sharedRunRoot, `${environmentName}.json`);
   const record = {
     environment_name: environmentName,
+    run_timestamp: runTimestamp,
     status: exitCode === 0 ? 'pass' : 'fail',
     exit_code: exitCode,
     started_at: startedAt,
@@ -257,6 +3303,8 @@ async function runEnvironmentSuite(environmentName, repoRoot, sharedRunRoot) {
     test_directory: normalizePathForMarkdown(path.relative(repoRoot, getTestEnvironmentDirectory(environmentName, repoRoot))),
     test_file_count: files.length,
     test_files: files.map((file) => normalizePathForMarkdown(path.relative(repoRoot, file))),
+    expanded_test_file_count: expandedTestFiles.length,
+    expanded_test_files: expandedTestFiles,
     output_sha256: sha256Hex(logText),
     error_message: errorMessage,
     log_artifact: normalizePathForMarkdown(path.relative(repoRoot, logFile)),
@@ -298,6 +3346,105 @@ function buildApplicableSourceIds(definition, expandedSourceIds) {
   return expandedSourceIds.filter((sourceId) => !excluded.has(sourceId));
 }
 
+export async function collectManualArtifactResults(definition, repoRoot, manualArtifacts = {}, runTimestamp) {
+  const requiredManualArtifacts = buildRequiredManualArtifactDefinitions(definition);
+  return Promise.all(requiredManualArtifacts.map(async (artifactRequirement) => {
+    const resolvedPath = normalizeOptionalArtifactPath(repoRoot, manualArtifacts[artifactRequirement.artifact_id]);
+    const providedPath = resolvedPath == null ? null : normalizePathForMarkdown(path.relative(repoRoot, resolvedPath));
+    const expectedEnvironmentName = resolveEnvironmentNameForArtifactId(artifactRequirement.artifact_id);
+    const requiresExternalEvidence = requiresExternalManualArtifactEvidence(artifactRequirement.artifact_id);
+    const harnessReadiness = expectedEnvironmentName == null
+      ? null
+      : await assessNonLocalEnvironmentHarnessReadiness(expectedEnvironmentName, repoRoot);
+    let exists = false;
+    let sha256 = null;
+    let valid = false;
+    let validation_error = null;
+    let resolvedRealPath = null;
+    let sharedRunArtifactAlias = false;
+    if (resolvedPath) {
+      try {
+        const fileContents = await fs.readFile(resolvedPath);
+        exists = true;
+        sha256 = sha256Hex(fileContents);
+        try {
+          resolvedRealPath = await fs.realpath(resolvedPath);
+        } catch (error) {
+          if (!error || error.code !== 'ENOENT') {
+            throw error;
+          }
+        }
+        let parsedPayload;
+        try {
+          parsedPayload = JSON.parse(fileContents.toString('utf8'));
+        } catch {
+          parsedPayload = null;
+        }
+        const validation = validateManualArtifactPayload(artifactRequirement.artifact_id, parsedPayload, {
+          runTimestamp,
+        });
+        valid = validation.valid;
+        validation_error = validation.error;
+        if (requiresExternalEvidence) {
+          sharedRunArtifactAlias = await isAliasOfSharedRunArtifact(
+            resolvedPath,
+            repoRoot,
+          );
+        }
+        if (
+          valid
+          && requiresExternalEvidence
+          && (
+            (providedPath != null && pathUsesPrefix(providedPath, L1_SHARED_TEST_RUN_ROOT))
+            || (resolvedRealPath != null && pathIsWithinRoot(resolvedRealPath, path.join(repoRoot, L1_SHARED_TEST_RUN_ROOT)))
+            || sharedRunArtifactAlias
+          )
+        ) {
+          valid = false;
+          validation_error = `${artifactRequirement.artifact_id} must come from external non-local evidence, not evidence/common/_test-runs`;
+        }
+        if (valid && expectedEnvironmentName != null && harnessReadiness?.ready === false) {
+          valid = false;
+          validation_error = `${expectedEnvironmentName} harness is not environment-backed: ${harnessReadiness.reason}`;
+        }
+      } catch {
+        exists = false;
+      }
+    }
+    return {
+      artifact_id: artifactRequirement.artifact_id,
+      description: artifactRequirement.description,
+      provided_path: providedPath,
+      exists,
+      valid,
+      sha256,
+      validation_error,
+      environment_harness_ready: harnessReadiness?.ready ?? null,
+      environment_harness_reason: harnessReadiness?.reason ?? null,
+    };
+  }));
+}
+
+export function collectTestCoverageResults(definition, environmentRuns) {
+  return definition.required_environments.flatMap((environmentName) => {
+    const environmentRun = environmentRuns[environmentName];
+    const executedFiles = new Set(environmentRun?.expanded_test_files ?? []);
+    return definition.test_ids.map((testId) => {
+      const requiredFiles = getRequiredTestImplementationFiles(testId);
+      const matchedFiles = requiredFiles.filter((file) => executedFiles.has(file));
+      const missingFiles = requiredFiles.filter((file) => !executedFiles.has(file));
+      return {
+        environment_name: environmentName,
+        test_id: testId,
+        required_files: requiredFiles,
+        matched_files: matchedFiles,
+        missing_files: missingFiles,
+        satisfied: missingFiles.length === 0,
+      };
+    });
+  });
+}
+
 async function writeEvidenceBundle(repoRoot, {
   definition,
   analysis,
@@ -307,6 +3454,7 @@ async function writeEvidenceBundle(repoRoot, {
   runTimestamp,
   sharedRunRoot,
   environmentRuns,
+  manualArtifacts,
 }) {
   const evidenceRoot = path.join(repoRoot, `evidence/${definition.scope}/${definition.id}/${runTimestamp}`);
   const artifactsDir = path.join(evidenceRoot, 'artifacts');
@@ -316,7 +3464,11 @@ async function writeEvidenceBundle(repoRoot, {
   const supportingEnvironments = SHARED_RUN_ENVIRONMENTS
     .filter((environmentName) => !definition.required_environments.includes(environmentName))
     .map((environmentName) => environmentRuns[environmentName]);
+  const manualArtifactResults = await collectManualArtifactResults(definition, repoRoot, manualArtifacts, runTimestamp);
+  const testCoverageResults = collectTestCoverageResults(definition, environmentRuns);
   const status = analysis.valid && requiredEnvironments.every((environmentRun) => environmentRun.exit_code === 0)
+    && testCoverageResults.every((result) => result.satisfied)
+    && manualArtifactResults.every((artifact) => artifact.valid)
     ? 'pass'
     : 'fail';
 
@@ -342,6 +3494,7 @@ async function writeEvidenceBundle(repoRoot, {
       summary_artifact: normalizePathForMarkdown(path.relative(evidenceRoot, environmentRun.summary_file)),
     })),
     shared_run_root: normalizePathForMarkdown(path.relative(evidenceRoot, sharedRunRoot)),
+    manual_requirements: manualArtifactResults,
   };
 
   const contextRecord = {
@@ -370,6 +3523,8 @@ async function writeEvidenceBundle(repoRoot, {
     fs.writeFile(path.join(artifactsDir, 'context.json'), stableJson(contextRecord)),
     fs.writeFile(path.join(artifactsDir, 'source-ids.json'), stableJson(sourceIdsRecord)),
     fs.writeFile(path.join(artifactsDir, 'environment-results.json'), stableJson(environmentResults)),
+    fs.writeFile(path.join(artifactsDir, 'test-coverage.json'), stableJson(testCoverageResults)),
+    fs.writeFile(path.join(artifactsDir, 'manual-artifacts.json'), stableJson(manualArtifactResults)),
   ]);
 
   const summaryLines = [
@@ -423,11 +3578,33 @@ async function writeEvidenceBundle(repoRoot, {
   summaryLines.push('');
   summaryLines.push(`- ${definition.pass_criteria}`);
   summaryLines.push('');
+  summaryLines.push('## Test Coverage');
+  summaryLines.push('');
+  for (const coverageResult of testCoverageResults) {
+    summaryLines.push(`- \`${coverageResult.environment_name}\` / \`${coverageResult.test_id}\`: ${coverageResult.satisfied ? 'covered' : 'missing'} via ${coverageResult.required_files.map((file) => `\`${file}\``).join(', ')}`);
+  }
+  if (manualArtifactResults.length > 0) {
+    summaryLines.push('');
+    summaryLines.push('## Manual Artifacts');
+    summaryLines.push('');
+    for (const artifact of manualArtifactResults) {
+      const state = !artifact.exists
+        ? 'missing'
+        : (artifact.valid ? 'valid' : 'invalid');
+      const reason = artifact.validation_error == null ? '' : `: ${artifact.validation_error}`;
+      summaryLines.push(`- \`${artifact.artifact_id}\`: ${state}${artifact.provided_path == null ? '' : ` (\`${artifact.provided_path}\`)`}${reason}`);
+    }
+  }
+  summaryLines.push('');
   summaryLines.push('## Artifacts');
   summaryLines.push('');
   summaryLines.push('- `artifacts/context.json`');
   summaryLines.push('- `artifacts/source-ids.json`');
   summaryLines.push('- `artifacts/environment-results.json`');
+  summaryLines.push('- `artifacts/test-coverage.json`');
+  if (manualArtifactResults.length > 0) {
+    summaryLines.push('- `artifacts/manual-artifacts.json`');
+  }
 
   await fs.writeFile(path.join(evidenceRoot, 'summary.md'), summaryLines.join('\n') + '\n');
 
@@ -439,21 +3616,30 @@ async function writeEvidenceBundle(repoRoot, {
 }
 
 export async function writeL1Evidence(repoRoot = process.cwd(), options = {}) {
+  const runTimestamp = resolveEvidenceRunTimestamp(options.timestamp ?? null);
   const analysis = await analyzeRepository(repoRoot);
-  const runTimestamp = options.timestamp ?? slugifyTimestamp();
   const generatedAt = new Date().toISOString();
-  const sharedRunRoot = path.join(repoRoot, 'evidence/common/_test-runs', runTimestamp);
+  const sharedRunRoot = path.join(repoRoot, L1_SHARED_TEST_RUN_ROOT, runTimestamp);
   const codeVersion = await collectCodeVersionContext(repoRoot);
   const dataVersion = collectDataVersionContext(analysis);
+  await reserveFreshOutputPaths(buildL1EvidenceOutputPaths(repoRoot, runTimestamp), {
+    label: `L1 evidence output paths for run ${runTimestamp}`,
+  });
+  const governanceBundle = await writeGovernanceEvidence(repoRoot, { timestamp: runTimestamp });
 
   await fs.mkdir(sharedRunRoot, { recursive: true });
 
   const environmentRuns = {};
   for (const environmentName of SHARED_RUN_ENVIRONMENTS) {
-    environmentRuns[environmentName] = await runEnvironmentSuite(environmentName, repoRoot, sharedRunRoot);
+    environmentRuns[environmentName] = await runEnvironmentSuite(environmentName, repoRoot, sharedRunRoot, runTimestamp);
   }
 
   const bundles = [];
+  bundles.push({
+    evid_id: 'EVID-GOV-001',
+    evidence_root: governanceBundle.evidenceRoot,
+    status: governanceBundle.analysis.valid ? 'pass' : 'fail',
+  });
   for (const definition of L1_EVIDENCE_DEFINITIONS) {
     bundles.push(await writeEvidenceBundle(repoRoot, {
       definition,
@@ -464,6 +3650,7 @@ export async function writeL1Evidence(repoRoot = process.cwd(), options = {}) {
       runTimestamp,
       sharedRunRoot,
       environmentRuns,
+      manualArtifacts: options.manualArtifacts ?? {},
     }));
   }
 
@@ -472,6 +3659,7 @@ export async function writeL1Evidence(repoRoot = process.cwd(), options = {}) {
     generated_at: generatedAt,
     run_timestamp: runTimestamp,
     shared_run_root: sharedRunRoot,
+    governance_bundle: governanceBundle,
     code_version: codeVersion,
     data_version: dataVersion,
     environment_runs: environmentRuns,
