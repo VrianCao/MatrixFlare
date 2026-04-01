@@ -107,156 +107,175 @@ const REQUIRED_CONTROL_PLANE_TABLES = Object.freeze([
   'appservice_configs',
 ]);
 
-export const CONTROL_PLANE_SCHEMA_SQL = `
-CREATE TABLE IF NOT EXISTS operator_authz_policies (
-  principal_id TEXT PRIMARY KEY,
-  principal_type TEXT NOT NULL,
-  access_issuer TEXT NOT NULL,
-  access_audience TEXT NOT NULL,
-  access_subject_binding TEXT NOT NULL,
-  access_subject_value TEXT NOT NULL,
-  allowed_scopes TEXT NOT NULL,
-  target_scope_constraints TEXT NOT NULL,
-  expires_at TEXT,
-  disabled_at TEXT,
-  require_reason INTEGER NOT NULL DEFAULT 0,
-  require_ticket INTEGER NOT NULL DEFAULT 0,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_operator_authz_lookup
-  ON operator_authz_policies (access_issuer, access_audience, access_subject_value);
+const CONTROL_PLANE_SCHEMA_STATEMENTS = Object.freeze([
+  `
+  CREATE TABLE IF NOT EXISTS operator_authz_policies (
+    principal_id TEXT PRIMARY KEY,
+    principal_type TEXT NOT NULL,
+    access_issuer TEXT NOT NULL,
+    access_audience TEXT NOT NULL,
+    access_subject_binding TEXT NOT NULL,
+    access_subject_value TEXT NOT NULL,
+    allowed_scopes TEXT NOT NULL,
+    target_scope_constraints TEXT NOT NULL,
+    expires_at TEXT,
+    disabled_at TEXT,
+    require_reason INTEGER NOT NULL DEFAULT 0,
+    require_ticket INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )
+  `,
+  `
+  CREATE INDEX IF NOT EXISTS idx_operator_authz_lookup
+    ON operator_authz_policies (access_issuer, access_audience, access_subject_value)
+  `,
+  `
+  CREATE TABLE IF NOT EXISTS audit_events (
+    event_id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    operator_principal_id TEXT NOT NULL,
+    auth_mechanism TEXT NOT NULL,
+    scope_kind TEXT NOT NULL,
+    scope_id TEXT,
+    scope_token TEXT NOT NULL,
+    request_id TEXT,
+    idempotency_key TEXT,
+    request_fingerprint TEXT,
+    job_id TEXT,
+    causation_id TEXT,
+    result_code TEXT NOT NULL,
+    affected_objects TEXT NOT NULL,
+    details_json TEXT
+  )
+  `,
+  `
+  CREATE INDEX IF NOT EXISTS idx_audit_events_job_id
+    ON audit_events (job_id, occurred_at)
+  `,
+  `
+  CREATE TABLE IF NOT EXISTS request_dedupe_projection (
+    operator_principal_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    scope_token TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL,
+    job_id TEXT,
+    result_code TEXT NOT NULL,
+    response_payload_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (operator_principal_id, idempotency_key, scope_token)
+  )
+  `,
+  `
+  CREATE TABLE IF NOT EXISTS jobs (
+    job_id TEXT PRIMARY KEY,
+    job_type TEXT NOT NULL,
+    internal_state TEXT NOT NULL,
+    scope_kind TEXT NOT NULL,
+    scope_id TEXT,
+    scope_token TEXT NOT NULL,
+    operator_principal_id TEXT NOT NULL,
+    auth_mechanism TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL,
+    accepted_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    completed_at TEXT,
+    canceled_at TEXT,
+    cancel_reason TEXT,
+    spec_json TEXT NOT NULL,
+    checkpoint_state_json TEXT,
+    progress_completed_units INTEGER NOT NULL DEFAULT 0,
+    progress_total_units INTEGER NOT NULL DEFAULT 0,
+    progress_unit_name TEXT NOT NULL DEFAULT 'shard',
+    last_error_json TEXT,
+    registry_snapshot_id TEXT,
+    export_epoch TEXT,
+    result_summary_json TEXT
+  )
+  `,
+  `
+  CREATE INDEX IF NOT EXISTS idx_jobs_filters
+    ON jobs (job_type, internal_state, scope_token, created_at, job_id)
+  `,
+  `
+  CREATE TABLE IF NOT EXISTS job_checkpoints (
+    job_id TEXT NOT NULL,
+    shard_type TEXT NOT NULL,
+    shard_key TEXT NOT NULL,
+    checkpoint_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (job_id, shard_type, shard_key)
+  )
+  `,
+  `
+  CREATE TABLE IF NOT EXISTS replay_manifests (
+    job_id TEXT PRIMARY KEY,
+    manifest_kind TEXT NOT NULL,
+    manifest_json TEXT NOT NULL,
+    manifest_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    export_epoch TEXT,
+    registry_snapshot_id TEXT,
+    r2_object_key TEXT
+  )
+  `,
+  `
+  CREATE TABLE IF NOT EXISTS repair_decisions (
+    decision_id TEXT PRIMARY KEY,
+    repair_kind TEXT NOT NULL,
+    scope_kind TEXT NOT NULL,
+    scope_id TEXT,
+    scope_token TEXT NOT NULL,
+    dry_run INTEGER NOT NULL DEFAULT 0,
+    reason TEXT NOT NULL,
+    ticket_id TEXT,
+    created_at TEXT NOT NULL,
+    details_json TEXT
+  )
+  `,
+  `
+  CREATE TABLE IF NOT EXISTS shard_registry (
+    shard_type TEXT NOT NULL,
+    shard_key TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    schema_version INTEGER NOT NULL,
+    disabled_at TEXT,
+    PRIMARY KEY (shard_type, shard_key)
+  )
+  `,
+  `
+  CREATE TABLE IF NOT EXISTS registry_snapshots (
+    registry_snapshot_id TEXT PRIMARY KEY,
+    export_epoch TEXT NOT NULL,
+    scope_kind TEXT NOT NULL,
+    scope_id TEXT,
+    scope_token TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    row_count INTEGER NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    snapshot_hash TEXT NOT NULL,
+    signature TEXT,
+    signing_key_version TEXT,
+    r2_object_key TEXT
+  )
+  `,
+  `
+  CREATE TABLE IF NOT EXISTS appservice_configs (
+    appservice_id TEXT PRIMARY KEY,
+    descriptor_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    disabled_at TEXT
+  )
+  `,
+].map((statement) => statement.trim()));
 
-CREATE TABLE IF NOT EXISTS audit_events (
-  event_id TEXT PRIMARY KEY,
-  event_type TEXT NOT NULL,
-  occurred_at TEXT NOT NULL,
-  operator_principal_id TEXT NOT NULL,
-  auth_mechanism TEXT NOT NULL,
-  scope_kind TEXT NOT NULL,
-  scope_id TEXT,
-  scope_token TEXT NOT NULL,
-  request_id TEXT,
-  idempotency_key TEXT,
-  request_fingerprint TEXT,
-  job_id TEXT,
-  causation_id TEXT,
-  result_code TEXT NOT NULL,
-  affected_objects TEXT NOT NULL,
-  details_json TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_audit_events_job_id
-  ON audit_events (job_id, occurred_at);
-
-CREATE TABLE IF NOT EXISTS request_dedupe_projection (
-  operator_principal_id TEXT NOT NULL,
-  idempotency_key TEXT NOT NULL,
-  scope_token TEXT NOT NULL,
-  request_fingerprint TEXT NOT NULL,
-  job_id TEXT,
-  result_code TEXT NOT NULL,
-  response_payload_json TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  PRIMARY KEY (operator_principal_id, idempotency_key, scope_token)
-);
-
-CREATE TABLE IF NOT EXISTS jobs (
-  job_id TEXT PRIMARY KEY,
-  job_type TEXT NOT NULL,
-  internal_state TEXT NOT NULL,
-  scope_kind TEXT NOT NULL,
-  scope_id TEXT,
-  scope_token TEXT NOT NULL,
-  operator_principal_id TEXT NOT NULL,
-  auth_mechanism TEXT NOT NULL,
-  idempotency_key TEXT NOT NULL,
-  request_fingerprint TEXT NOT NULL,
-  accepted_at TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  started_at TEXT,
-  completed_at TEXT,
-  canceled_at TEXT,
-  cancel_reason TEXT,
-  spec_json TEXT NOT NULL,
-  checkpoint_state_json TEXT,
-  progress_completed_units INTEGER NOT NULL DEFAULT 0,
-  progress_total_units INTEGER NOT NULL DEFAULT 0,
-  progress_unit_name TEXT NOT NULL DEFAULT 'shard',
-  last_error_json TEXT,
-  registry_snapshot_id TEXT,
-  export_epoch TEXT,
-  result_summary_json TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_jobs_filters
-  ON jobs (job_type, internal_state, scope_token, created_at, job_id);
-
-CREATE TABLE IF NOT EXISTS job_checkpoints (
-  job_id TEXT NOT NULL,
-  shard_type TEXT NOT NULL,
-  shard_key TEXT NOT NULL,
-  checkpoint_json TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  PRIMARY KEY (job_id, shard_type, shard_key)
-);
-
-CREATE TABLE IF NOT EXISTS replay_manifests (
-  job_id TEXT PRIMARY KEY,
-  manifest_kind TEXT NOT NULL,
-  manifest_json TEXT NOT NULL,
-  manifest_hash TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  export_epoch TEXT,
-  registry_snapshot_id TEXT,
-  r2_object_key TEXT
-);
-
-CREATE TABLE IF NOT EXISTS repair_decisions (
-  decision_id TEXT PRIMARY KEY,
-  repair_kind TEXT NOT NULL,
-  scope_kind TEXT NOT NULL,
-  scope_id TEXT,
-  scope_token TEXT NOT NULL,
-  dry_run INTEGER NOT NULL DEFAULT 0,
-  reason TEXT NOT NULL,
-  ticket_id TEXT,
-  created_at TEXT NOT NULL,
-  details_json TEXT
-);
-
-CREATE TABLE IF NOT EXISTS shard_registry (
-  shard_type TEXT NOT NULL,
-  shard_key TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  last_seen_at TEXT NOT NULL,
-  schema_version INTEGER NOT NULL,
-  disabled_at TEXT,
-  PRIMARY KEY (shard_type, shard_key)
-);
-
-CREATE TABLE IF NOT EXISTS registry_snapshots (
-  registry_snapshot_id TEXT PRIMARY KEY,
-  export_epoch TEXT NOT NULL,
-  scope_kind TEXT NOT NULL,
-  scope_id TEXT,
-  scope_token TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  row_count INTEGER NOT NULL,
-  snapshot_json TEXT NOT NULL,
-  snapshot_hash TEXT NOT NULL,
-  signature TEXT,
-  signing_key_version TEXT,
-  r2_object_key TEXT
-);
-
-CREATE TABLE IF NOT EXISTS appservice_configs (
-  appservice_id TEXT PRIMARY KEY,
-  descriptor_json TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  disabled_at TEXT
-);
-`;
+export const CONTROL_PLANE_SCHEMA_SQL = `${CONTROL_PLANE_SCHEMA_STATEMENTS.join(';\n\n')};\n`;
 
 export function createD1ControlPlanePersistence(db) {
   if (!db || typeof db.prepare !== 'function' || typeof db.exec !== 'function') {
@@ -265,7 +284,11 @@ export function createD1ControlPlanePersistence(db) {
 
   return Object.freeze({
     async ensureSchema() {
-      await db.exec(CONTROL_PLANE_SCHEMA_SQL);
+      // D1 documents exec() as a maintenance-oriented raw SQL surface; request-path schema bootstrap
+      // must execute complete prepared statements so multiline CREATE TABLE literals stay portable.
+      for (const statementSql of CONTROL_PLANE_SCHEMA_STATEMENTS) {
+        await statementRun(db.prepare(statementSql));
+      }
     },
     async isSchemaReady() {
       const rows = await statementAll(

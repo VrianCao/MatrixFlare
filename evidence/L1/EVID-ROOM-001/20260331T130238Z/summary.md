@@ -1,8 +1,10 @@
 # EVID-ROOM-001 Summary
 
-- status: pass
+- status: superseded
 - generated_at: 2026-03-31T13:02:45.600Z
 - run_ts: 20260331T130238Z
+- superseded_by: https://github.com/VrianCao/MatrixFlare/actions/runs/23855295188
+- supersede_reason: superseded because later review on GitHub Actions run 23855295188 proved this report-based snapshot relied on raw _test-runs artifacts that are no longer valid release-gate inputs after the DEC-0002 attestation-only fail-closed cutover
 - scope: L1
 - target_profile: L1
 - evidence_type: property/integration

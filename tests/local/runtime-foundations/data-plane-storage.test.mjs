@@ -857,6 +857,44 @@ test('derived D1 schema bootstrap avoids exec() so non-local publicRooms does no
   d1.close();
 });
 
+test('control-plane D1 schema bootstrap avoids exec() so non-local publicRooms does not fail on newline-delimited D1 exec semantics', async () => {
+  const d1 = createFakeD1Database();
+  let execCalls = 0;
+  d1.exec = async () => {
+    execCalls += 1;
+    throw new Error('D1_EXEC_ERROR: Error in line 1: CREATE TABLE IF NOT EXISTS operator_authz_policies (: incomplete input: SQLITE_ERROR');
+  };
+
+  const controlPlane = createD1ControlPlanePersistence(d1);
+  await controlPlane.ensureSchema();
+
+  assert.equal(execCalls, 0);
+  assert.equal(await controlPlane.isSchemaReady(), true);
+  await controlPlane.upsertOperatorPolicy({
+    principal_id: 'ops-alice',
+    principal_type: 'human',
+    access_issuer: 'https://matrix.cloudflareaccess.com',
+    access_audience: 'aud',
+    access_subject_binding: { mode: 'sub' },
+    access_subject_value: 'alice-subject',
+    allowed_scopes: ['ops.read'],
+    target_scope_constraints: { global: true },
+    expires_at: null,
+    disabled_at: null,
+    require_reason: false,
+    require_ticket: false,
+    created_at: '2026-04-01T15:00:00.000Z',
+    updated_at: '2026-04-01T15:00:00.000Z',
+  });
+  const activePolicies = await controlPlane.listActiveOperatorPolicies({
+    issuer: 'https://matrix.cloudflareaccess.com',
+    audience: 'aud',
+    now: '2026-04-01T15:00:01.000Z',
+  });
+  assert.equal(activePolicies.length, 1);
+  d1.close();
+});
+
 test('R2 and KV keyspace builders plus wrappers cover DATA-R2-001 through DATA-R2-006 and DATA-KV-001 through DATA-KV-002', async () => {
   const bucket = new FakeR2Bucket();
   const kv = new FakeKvNamespace({ pageSize: 1 });
