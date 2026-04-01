@@ -12,6 +12,7 @@ import {
   buildNonProductionSecretBundle,
   buildRemoteHarnessEnvironmentVariables,
   buildRemoteHarnessEnvironmentVariablesFromDeployment,
+  buildRuntimeWorkerVersionTag,
   buildWorkerScriptName,
   createEnvironmentWranglerConfig,
   fetchWorkerDeploymentState,
@@ -124,6 +125,22 @@ test('written non-local wrangler config rewrites main to a real worker entrypoin
   } finally {
     await fs.rm(tempRoot, { recursive: true, force: true });
   }
+});
+
+test('wrangler deploy version tags stay deterministic, worker-specific, and within Cloudflare limits', () => {
+  const deploymentId = 'gha-ci-integration-20260401T131924Z-23850666522-1';
+  const gatewayDeployTag = buildRuntimeWorkerVersionTag(deploymentId, 'gateway-worker');
+  const gatewayBootstrapTag = buildRuntimeWorkerVersionTag(deploymentId, 'gateway-worker', {
+    gatewayBootstrapMode: true,
+  });
+  const jobsDeployTag = buildRuntimeWorkerVersionTag(deploymentId, 'jobs-worker');
+
+  assert.equal(gatewayDeployTag, buildRuntimeWorkerVersionTag(deploymentId, 'gateway-worker'));
+  assert.equal(gatewayDeployTag.length <= 25, true);
+  assert.equal(gatewayBootstrapTag.length <= 25, true);
+  assert.equal(jobsDeployTag.length <= 25, true);
+  assert.notEqual(gatewayDeployTag, gatewayBootstrapTag);
+  assert.notEqual(gatewayDeployTag, jobsDeployTag);
 });
 
 test('remote harness env vars and GitHub run URLs derive deterministically from the environment plan', () => {

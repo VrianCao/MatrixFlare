@@ -69,10 +69,17 @@ const QUEUE_BINDING_NAMES = Object.freeze([
   ['REPAIR_SHARD_QUEUE', 'matrix-repair-shard-job'],
 ]);
 
+const WORKER_TAG_ALIASES = Object.freeze({
+  'gateway-worker': 'gw',
+  'jobs-worker': 'jw',
+  'ops-worker': 'ow',
+});
+
 const ED25519_PKCS8_PREFIX = Buffer.from('302e020100300506032b657004220420', 'hex');
 const DEFAULT_RELEASE_PROFILE = 'L1';
 const CLOUDFLARE_API_BASE_URL = 'https://api.cloudflare.com/client/v4';
 const CLOUDFLARE_MISSING_WORKER_ERROR_MESSAGE = 'This Worker does not exist on your account.';
+const CLOUDFLARE_WORKER_TAG_MAX_LENGTH = 25;
 const GITHUB_ACTIONS_OIDC_ISSUER = 'https://token.actions.githubusercontent.com';
 const GITHUB_ACTIONS_OIDC_JWKS_URI = 'https://token.actions.githubusercontent.com/.well-known/jwks';
 const GITHUB_ACTIONS_OIDC_AUDIENCE = 'matrix-phase08-nonlocal';
@@ -1245,6 +1252,22 @@ function buildRuntimeWorkerVersionId(deploymentId, workerName) {
   return `${deploymentId}-${slugifyLabel(workerName)}`;
 }
 
+export function buildRuntimeWorkerVersionTag(deploymentId, workerName, {
+  gatewayBootstrapMode = false,
+} = {}) {
+  const workerAlias = WORKER_TAG_ALIASES[workerName];
+  if (!isNonEmptyString(workerAlias)) {
+    throw new RangeError(`Unsupported worker for wrangler tag generation: ${workerName}`);
+  }
+  const modeAlias = gatewayBootstrapMode ? 'b' : 'd';
+  const digest = sha256Hex(`${deploymentId}:${workerName}:${modeAlias}`).slice(0, 16);
+  const tag = `mx-${workerAlias}-${modeAlias}-${digest}`;
+  if (tag.length > CLOUDFLARE_WORKER_TAG_MAX_LENGTH) {
+    throw new RangeError(`wrangler version tag must be <= ${CLOUDFLARE_WORKER_TAG_MAX_LENGTH} characters`);
+  }
+  return tag;
+}
+
 export async function ensureNonLocalEnvironmentResources(environmentName, {
   repoRoot = process.cwd(),
   outputPath = null,
@@ -1533,7 +1556,9 @@ async function deployWorker(workerName, provisionedEnvironment, {
     '--message',
     `${deploymentId}:${workerName}${gatewayBootstrapMode ? ':bootstrap' : ':deploy'}`,
     '--tag',
-    `${deploymentId}-${slugifyLabel(workerName)}${gatewayBootstrapMode ? '-bootstrap' : ''}`,
+    buildRuntimeWorkerVersionTag(deploymentId, workerName, {
+      gatewayBootstrapMode,
+    }),
     '--secrets-file',
     secretsPath,
   ], {
