@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { generateKeyPairSync } from 'node:crypto';
 import test from 'node:test';
 
+import jobsWorkerModule from '../../../apps/jobs-worker/src/index.mjs';
 import opsWorkerModule from '../../../apps/ops-worker/src/index.mjs';
 import {
   createD1ControlPlanePersistence,
@@ -1168,9 +1169,10 @@ test('Phase 07 covers derived queries, alias lookup, hierarchy, and rebuild from
   assert.ok(rebuiltJob.checkpoint_state?.last_completed_checkpoint_id);
 });
 
-test('Phase 07 rebuild fails closed when a shard snapshot exceeds the single-invocation D1 budget', async (t) => {
+test('Phase 07 rebuild checkpoints large room shards across multiple queue invocations within the D1 budget', async (t) => {
   const rig = createGatewayPhase04Rig();
   t.after(() => rig.close());
+  const derived = createD1DerivedDataPersistence(rig.d1);
 
   const alice = await registerUser(rig, { username: 'phase07-budget-alice' });
   const room = await postJson(rig, alice.access_token, '/_matrix/client/v3/createRoom', {
@@ -1180,24 +1182,44 @@ test('Phase 07 rebuild fails closed when a shard snapshot exceeds the single-inv
     name: 'Phase 07 Budget Room',
   });
   const roomId = room.room_id;
+  await rig.drainJobsQueues();
   const roomDo = rig.getRoomDo(roomId);
+  const searchRows = Array.from({ length: 11_000 }, (_, index) => ({
+    event_id: `$phase07-budget-${index}`,
+    room_id: roomId,
+    event_type: 'm.room.message',
+    origin_server_ts: index + 1,
+    sender_user_id: alice.user_id,
+    search_vector_text: `phase07 budget row ${index}`,
+    visibility_scope: 'shared',
+    updated_at: new Date().toISOString(),
+    record_json: {
+      room_pos: index + 1,
+    },
+  }));
   roomDo.exportDerivedShard = async function exportOversizedDerivedShard() {
+    const [request = {}] = arguments;
+    const offset = Number.isInteger(request.search_row_offset) && request.search_row_offset >= 0
+      ? request.search_row_offset
+      : 0;
+    const limit = Number.isInteger(request.search_limit) && request.search_limit >= 1
+      ? request.search_limit
+      : searchRows.length;
+    const searchChunk = request.include_search_index_rows === false
+      ? []
+      : searchRows.slice(offset, offset + limit);
+    const nextOffset = offset + searchChunk.length < searchRows.length
+      ? offset + searchChunk.length
+      : null;
     return {
       ok: true,
       room_id: roomId,
-      search_index_rows: Array.from({ length: 11_000 }, (_, index) => ({
-        event_id: `$phase07-budget-${index}`,
-        room_id: roomId,
-        event_type: 'm.room.message',
-        origin_server_ts: index + 1,
-        sender_user_id: alice.user_id,
-        search_vector_text: `phase07 budget row ${index}`,
-        visibility_scope: 'shared',
-        updated_at: new Date().toISOString(),
-        record_json: {
-          room_pos: index + 1,
-        },
-      })),
+      max_room_pos: request.max_room_pos ?? searchRows.length,
+      search_row_offset: offset,
+      next_search_row_offset: nextOffset,
+      total_search_index_rows: request.include_search_index_rows === false ? 0 : searchRows.length,
+      has_more_search_index_rows: nextOffset != null,
+      search_index_rows: searchChunk,
       public_room_directory_entry: null,
     };
   };
@@ -1227,13 +1249,60 @@ test('Phase 07 rebuild fails closed when a shard snapshot exceeds the single-inv
   assert.equal(rebuildHandle.job_type, 'rebuild');
   assert.equal(rig.queues.rebuild.messages.length, 1);
 
+  const initialBatch = rig.queues.rebuild.drainBatch();
+  const initialMessageBody = structuredClone(initialBatch.messages[0].body);
+  await jobsWorkerModule.queue(initialBatch, rig.env);
+  assert.ok(rig.queues.rebuild.messages.length >= 1);
+
+  const staleRetryBatch = {
+    queue: rig.env.REBUILD_SHARD_QUEUE.queueName,
+    messages: [{
+      body: initialMessageBody,
+      acked: false,
+      retried: false,
+      ack() {
+        this.acked = true;
+      },
+      retry() {
+        this.retried = true;
+      },
+    }],
+  };
+  await jobsWorkerModule.queue(staleRetryBatch, rig.env);
+  assert.equal(staleRetryBatch.messages[0].acked, true);
+  assert.equal(staleRetryBatch.messages[0].retried, false);
+
   await rig.drainJobsQueues();
 
-  const failedJob = await opsHarness.persistence.getJob(rebuildHandle.job_id);
-  assert.ok(failedJob);
-  assert.equal(failedJob.internal_state, 'failed');
-  assert.equal(failedJob.last_error.code, 'precondition_failed');
-  assert.match(failedJob.last_error.message, /single-invocation D1 budget/i);
+  const rebuiltSearch = await derived.searchIndex.list();
+  assert.equal(rebuiltSearch.length, searchRows.length);
+  assert.equal(rebuiltSearch[0].event_id, searchRows[0].event_id);
+  assert.equal(rebuiltSearch.at(-1).event_id, searchRows.at(-1).event_id);
+
+  const rebuiltJob = await opsHarness.persistence.getJob(rebuildHandle.job_id);
+  assert.ok(rebuiltJob);
+  assert.equal(rebuiltJob.internal_state, 'completed');
+  assert.equal(rebuiltJob.result_summary?.terminal_state, 'succeeded');
+  assert.equal(
+    rebuiltJob.checkpoint_state?.rebuild_shard_progress?.search_rows_applied,
+    searchRows.length,
+  );
+  assert.equal(
+    rebuiltJob.checkpoint_state?.rebuild_shard_progress?.chunks_completed,
+    2,
+  );
+  assert.equal(
+    rebuiltJob.checkpoint_state?.rebuild_shard_progress?.next_chunk_cursor,
+    null,
+  );
+  const checkpoint = await opsHarness.persistence.getJobCheckpoint({
+    job_id: rebuildHandle.job_id,
+    shard_type: 'RoomDO',
+    shard_key: roomId,
+  });
+  assert.equal(checkpoint.checkpoint.status, 'complete');
+  assert.equal(checkpoint.checkpoint.rebuild_progress.search_rows_applied, searchRows.length);
+  assert.equal(checkpoint.checkpoint.rebuild_progress.chunks_completed, 2);
 });
 
 test('Phase 07 maps derived query validation failures to deterministic Matrix invalid-param errors', async (t) => {

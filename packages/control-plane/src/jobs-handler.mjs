@@ -38,20 +38,38 @@ import {
 const TERMINAL_JOB_STATES = new Set(['completed', 'finalized', 'failed', 'canceled']);
 const MAX_D1_QUERIES_PER_INVOCATION = 1_000;
 const REBUILD_D1_QUERY_HEADROOM = 32;
+const MAX_SEARCH_ROWS_PER_REBUILD_CHUNK = 10_000;
 
-function assertRebuildInvocationBudget({ target, searchRowCount = 0 }) {
+function assertRebuildInvocationBudget({
+  includeSearchIndex = false,
+  searchRowCount = 0,
+  includeSearchClear = false,
+  includePublicRoomDirectory = false,
+  includePublicRoomDirectoryClear = false,
+  includeUserDirectory = false,
+  includeUserDirectoryClear = false,
+}) {
   const normalizedSearchRowCount = Number.isInteger(searchRowCount) && searchRowCount > 0
     ? searchRowCount
     : 0;
   let estimatedQueries = 1 + REBUILD_D1_QUERY_HEADROOM;
-  if (target === 'search_index' || target === 'all_derived') {
+  if (includeSearchIndex) {
     estimatedQueries += 1 + Math.ceil(normalizedSearchRowCount / SEARCH_INDEX_BATCH_ROWS_PER_STATEMENT);
+    if (includeSearchClear) {
+      estimatedQueries += 1;
+    }
   }
-  if (target === 'public_room_directory' || target === 'all_derived') {
-    estimatedQueries += 2;
+  if (includePublicRoomDirectory) {
+    estimatedQueries += 1;
+    if (includePublicRoomDirectoryClear) {
+      estimatedQueries += 1;
+    }
   }
-  if (target === 'user_directory' || target === 'all_derived') {
-    estimatedQueries += 2;
+  if (includeUserDirectory) {
+    estimatedQueries += 1;
+    if (includeUserDirectoryClear) {
+      estimatedQueries += 1;
+    }
   }
   if (estimatedQueries > MAX_D1_QUERIES_PER_INVOCATION) {
     throw Object.assign(new Error(
@@ -61,6 +79,72 @@ function assertRebuildInvocationBudget({ target, searchRowCount = 0 }) {
       retryable: false,
     });
   }
+}
+
+function normalizeRebuildChunkCursor(value) {
+  if (value == null || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+  const maxRoomPos = Number.isInteger(value.max_room_pos) && value.max_room_pos >= 0
+    ? value.max_room_pos
+    : null;
+  const searchRowOffset = Number.isInteger(value.search_row_offset) && value.search_row_offset >= 0
+    ? value.search_row_offset
+    : 0;
+  if (maxRoomPos == null) {
+    return null;
+  }
+  return {
+    max_room_pos: maxRoomPos,
+    search_row_offset: searchRowOffset,
+  };
+}
+
+function sameRebuildChunkCursor(left, right) {
+  if (left == null && right == null) {
+    return true;
+  }
+  if (left == null || right == null) {
+    return false;
+  }
+  return left.max_room_pos === right.max_room_pos
+    && left.search_row_offset === right.search_row_offset;
+}
+
+function normalizeRebuildProgress(checkpoint, messageBody) {
+  const stored = checkpoint?.rebuild_progress ?? {};
+  return {
+    chunks_completed: Number.isInteger(stored.chunks_completed) && stored.chunks_completed >= 0
+      ? stored.chunks_completed
+      : 0,
+    search_rows_applied: Number.isInteger(stored.search_rows_applied) && stored.search_rows_applied >= 0
+      ? stored.search_rows_applied
+      : 0,
+    total_search_index_rows: Number.isInteger(stored.total_search_index_rows) && stored.total_search_index_rows >= 0
+      ? stored.total_search_index_rows
+      : null,
+    next_chunk_cursor: normalizeRebuildChunkCursor(stored.next_chunk_cursor)
+      ?? normalizeRebuildChunkCursor(messageBody.chunk_cursor),
+    search_index_cleared: stored.search_index_cleared === true,
+    public_room_directory_cleared: stored.public_room_directory_cleared === true,
+    public_room_directory_applied: stored.public_room_directory_applied === true,
+  };
+}
+
+function buildRebuildCheckpointState(progress, { shardType, shardKey }) {
+  return {
+    rebuild_shard_progress: {
+      shard_type: shardType,
+      shard_key: shardKey,
+      chunks_completed: progress.chunks_completed,
+      search_rows_applied: progress.search_rows_applied,
+      total_search_index_rows: progress.total_search_index_rows,
+      next_chunk_cursor: progress.next_chunk_cursor,
+      search_index_cleared: progress.search_index_cleared,
+      public_room_directory_cleared: progress.public_room_directory_cleared,
+      public_room_directory_applied: progress.public_room_directory_applied,
+    },
+  };
 }
 
 function assertSupportedExportMaterializationTarget({ shardType, shardKey }) {
@@ -586,41 +670,112 @@ async function executeRebuildAction({
   job,
   messageBody,
   env,
+  existingCheckpoint,
 }) {
   const target = messageBody.rebuild_target;
   if (messageBody.shard_type === 'RoomDO') {
+    const existingProgress = normalizeRebuildProgress(existingCheckpoint?.checkpoint, messageBody);
+    const includeSearchIndex = target === 'search_index' || target === 'all_derived';
+    const includePublicRoomDirectory = target === 'public_room_directory' || target === 'all_derived';
+    const chunkCursor = normalizeRebuildChunkCursor(messageBody.chunk_cursor);
     const roomDo = getDurableObjectStub(env.ROOM_DO, messageBody.shard_key, 'ROOM_DO');
     const snapshot = await roomDo.exportDerivedShard({
       updated_at: new Date().toISOString(),
+      include_search_index_rows: includeSearchIndex,
+      include_public_room_directory_entry: includePublicRoomDirectory,
+      max_room_pos: chunkCursor?.max_room_pos ?? null,
+      search_row_offset: chunkCursor?.search_row_offset ?? 0,
+      search_limit: includeSearchIndex
+        ? (messageBody.chunk_limit ?? MAX_SEARCH_ROWS_PER_REBUILD_CHUNK)
+        : null,
     });
     if (!snapshot?.ok) {
       throw snapshot?.error ?? new Error(`RoomDO exportDerivedShard failed for ${messageBody.shard_key}`);
     }
     assertRebuildInvocationBudget({
-      target,
+      includeSearchIndex,
       searchRowCount: snapshot.search_index_rows?.length ?? 0,
+      includeSearchClear: includeSearchIndex && existingProgress.search_index_cleared !== true,
+      includePublicRoomDirectory: includePublicRoomDirectory && snapshot.has_more_search_index_rows !== true,
+      includePublicRoomDirectoryClear: includePublicRoomDirectory && existingProgress.public_room_directory_cleared !== true,
     });
-    if (target === 'search_index' || target === 'all_derived') {
+    if (includeSearchIndex && existingProgress.search_index_cleared !== true) {
       await clearDerivedTarget(env, {
         target: 'search_index',
         roomId: messageBody.shard_key,
       });
-      await applySearchIndexProjectionBatch(env, snapshot.search_index_rows ?? []);
     }
-    if (target === 'public_room_directory' || target === 'all_derived') {
+    if (includePublicRoomDirectory && existingProgress.public_room_directory_cleared !== true) {
       await clearDerivedTarget(env, {
         target: 'public_room_directory',
         roomId: messageBody.shard_key,
       });
-      if (snapshot.public_room_directory_entry) {
-        await applyPublicRoomDirectoryProjection(env, snapshot.public_room_directory_entry);
-      }
+    }
+    if (includeSearchIndex && (snapshot.search_index_rows?.length ?? 0) > MAX_SEARCH_ROWS_PER_REBUILD_CHUNK) {
+      throw Object.assign(new Error(
+        `RoomDO exportDerivedShard exceeded the chunk budget (${snapshot.search_index_rows.length} rows > ${MAX_SEARCH_ROWS_PER_REBUILD_CHUNK})`,
+      ), {
+        code: 'job_conflict',
+        retryable: false,
+      });
+    }
+    if (includeSearchIndex) {
+      await applySearchIndexProjectionBatch(env, snapshot.search_index_rows ?? []);
+    }
+    const nextProgress = {
+      ...existingProgress,
+      chunks_completed: existingProgress.chunks_completed + 1,
+      search_rows_applied: existingProgress.search_rows_applied + (snapshot.search_index_rows?.length ?? 0),
+      total_search_index_rows: includeSearchIndex
+        ? (snapshot.total_search_index_rows ?? existingProgress.total_search_index_rows ?? 0)
+        : (existingProgress.total_search_index_rows ?? 0),
+      next_chunk_cursor: null,
+      search_index_cleared: existingProgress.search_index_cleared || includeSearchIndex,
+      public_room_directory_cleared: existingProgress.public_room_directory_cleared || includePublicRoomDirectory,
+      public_room_directory_applied: existingProgress.public_room_directory_applied,
+    };
+    if (includeSearchIndex && snapshot.has_more_search_index_rows === true) {
+      const nextChunkCursor = {
+        max_room_pos: snapshot.max_room_pos,
+        search_row_offset: snapshot.next_search_row_offset,
+      };
+      const continuationPayload = buildRebuildShardJob({
+        jobId: job.job_id,
+        rebuildTarget: messageBody.rebuild_target,
+        shardType: messageBody.shard_type,
+        shardKey: messageBody.shard_key,
+        chunkCursor: nextChunkCursor,
+        chunkLimit: messageBody.chunk_limit ?? MAX_SEARCH_ROWS_PER_REBUILD_CHUNK,
+        attempt: messageBody.attempt + 1,
+      });
+      nextProgress.next_chunk_cursor = nextChunkCursor;
+      return {
+        continuationPayload,
+        queuedCheckpoint: {
+          status: 'queued',
+          queue_name: QUEUE_NAMES.rebuild,
+          attempt: continuationPayload.attempt,
+          queue_delivery_state: 'staged',
+          queued_payload: continuationPayload,
+          rebuild_progress: nextProgress,
+        },
+        checkpointState: buildRebuildCheckpointState(nextProgress, {
+          shardType: messageBody.shard_type,
+          shardKey: messageBody.shard_key,
+        }),
+      };
+    }
+    if (includePublicRoomDirectory && snapshot.public_room_directory_entry) {
+      await applyPublicRoomDirectoryProjection(env, snapshot.public_room_directory_entry);
+      nextProgress.public_room_directory_applied = true;
     }
     return {
       rebuilt_kind: 'room',
       room_id: messageBody.shard_key,
-      search_rows: snapshot.search_index_rows?.length ?? 0,
-      public_room_directory: snapshot.public_room_directory_entry ? 1 : 0,
+      search_rows: nextProgress.search_rows_applied,
+      public_room_directory: nextProgress.public_room_directory_applied ? 1 : 0,
+      chunks_completed: nextProgress.chunks_completed,
+      rebuild_progress: nextProgress,
     };
   }
 
@@ -634,7 +789,8 @@ async function executeRebuildAction({
       throw snapshot?.error ?? new Error(`UserDO getUserDirectoryEntry failed for ${messageBody.shard_key}`);
     }
     assertRebuildInvocationBudget({
-      target,
+      includeUserDirectory: target === 'user_directory' || target === 'all_derived',
+      includeUserDirectoryClear: target === 'user_directory' || target === 'all_derived',
     });
     if (target === 'user_directory' || target === 'all_derived') {
       await clearDerivedTarget(env, {
@@ -774,6 +930,36 @@ async function processQueueMessage({
       reason: 'checkpoint_already_complete',
     };
   }
+  if (queueName === QUEUE_NAMES.rebuild && existingCheckpoint?.checkpoint?.status === 'queued') {
+    const expectedChunkCursor = normalizeRebuildProgress(existingCheckpoint.checkpoint, messageBody).next_chunk_cursor;
+    const messageChunkCursor = normalizeRebuildChunkCursor(messageBody.chunk_cursor);
+    if (!sameRebuildChunkCursor(expectedChunkCursor, messageChunkCursor)) {
+      if (
+        existingCheckpoint.checkpoint.queue_delivery_state === 'staged'
+        && existingCheckpoint.checkpoint.queued_payload != null
+      ) {
+        await sendQueueMessage(env.REBUILD_SHARD_QUEUE, existingCheckpoint.checkpoint.queued_payload);
+        await persistence.upsertJobCheckpoint({
+          job_id: job.job_id,
+          shard_type: checkpointShardType,
+          shard_key: checkpointShardKey,
+          checkpoint: {
+            ...existingCheckpoint.checkpoint,
+            queue_delivery_state: 'published',
+          },
+          updated_at: now.toISOString(),
+        });
+        return {
+          acknowledged: true,
+          reason: 'rebuild_continuation_republished',
+        };
+      }
+      return {
+        acknowledged: true,
+        reason: 'stale_rebuild_chunk',
+      };
+    }
+  }
   if (existingCheckpoint.checkpoint?.status !== 'queued') {
     throw new Error(`Checkpoint ${job.job_id}/${checkpointShardType}/${checkpointShardKey} has unexpected status ${existingCheckpoint.checkpoint?.status ?? 'missing'}`);
   }
@@ -870,14 +1056,78 @@ async function processQueueMessage({
       apply_phase: matchedCheckpoint.apply_phase,
     };
   } else if (queueName === QUEUE_NAMES.rebuild) {
-    const rebuildSummary = await executeRebuildAction({
+    const rebuildResult = await executeRebuildAction({
       job,
       messageBody,
       env,
+      existingCheckpoint,
     });
+    if (rebuildResult?.continuationPayload) {
+      await persistence.upsertJobCheckpoint({
+        job_id: job.job_id,
+        shard_type: checkpointShardType,
+        shard_key: checkpointShardKey,
+        checkpoint: rebuildResult.queuedCheckpoint,
+        updated_at: now.toISOString(),
+      });
+      await sendQueueMessage(env.REBUILD_SHARD_QUEUE, rebuildResult.continuationPayload);
+      await persistence.upsertJobCheckpoint({
+        job_id: job.job_id,
+        shard_type: checkpointShardType,
+        shard_key: checkpointShardKey,
+        checkpoint: {
+          ...rebuildResult.queuedCheckpoint,
+          queue_delivery_state: 'published',
+        },
+        updated_at: now.toISOString(),
+      });
+      const checkpoints = await persistence.listJobCheckpoints(job.job_id);
+      const completedUnits = checkpoints.filter((entry) => entry.checkpoint?.status === 'complete').length;
+      const totalUnits = Math.max(job.progress_total_units ?? 1, 1);
+      await updateJobState({
+        env,
+        persistence,
+        job,
+        newState: 'checkpointed',
+        now,
+        auditEventType: `${job.job_type}.checkpointed`,
+        auditDetails: {
+          queue_name: queueName,
+          shard_type: checkpointShardType,
+          shard_key: checkpointShardKey,
+          continuation_queued: true,
+        },
+        requestContext: asyncContext,
+        checkpointState: {
+          ...(job.checkpoint_state ?? {}),
+          queue_name: queueName,
+          ...rebuildResult.checkpointState,
+        },
+        progress: {
+          completed_units: completedUnits,
+          total_units: totalUnits,
+          unit_name: 'shard',
+        },
+      });
+      asyncContext.logger.info('jobs.queue.processed', {
+        queue_name: queueName,
+        job_id: job.job_id,
+        shard_type: checkpointShardType,
+        shard_key: checkpointShardKey,
+        continuation_queued: true,
+      });
+      return {
+        acknowledged: true,
+        reason: 'rebuild_continuation_queued',
+      };
+    }
     resultSummary = {
       rebuild_target: messageBody.rebuild_target,
-      ...rebuildSummary,
+      ...rebuildResult,
+    };
+    completedCheckpoint = {
+      ...completedCheckpoint,
+      rebuild_progress: rebuildResult.rebuild_progress ?? null,
     };
   } else if (queueName === QUEUE_NAMES.repair) {
     const repairSummary = await executeRepairAction({
@@ -928,8 +1178,15 @@ async function processQueueMessage({
     },
     requestContext: asyncContext,
     checkpointState: {
+      ...(job.checkpoint_state ?? {}),
       last_completed_checkpoint_id: checkpointId,
       queue_name: queueName,
+      ...(queueName === QUEUE_NAMES.rebuild
+        ? buildRebuildCheckpointState(resultSummary?.rebuild_progress ?? {}, {
+          shardType: checkpointShardType,
+          shardKey: checkpointShardKey,
+        })
+        : {}),
     },
     progress: {
       completed_units: completedUnits,

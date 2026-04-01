@@ -601,6 +601,8 @@ export function buildRebuildShardJob({
   rebuildTarget,
   shardType,
   shardKey,
+  chunkCursor = null,
+  chunkLimit = null,
   attempt = 0,
 }) {
   return {
@@ -609,6 +611,13 @@ export function buildRebuildShardJob({
     rebuild_target: normalizeEnum(rebuildTarget, 'rebuild_target', REBUILD_TARGETS),
     shard_type: normalizeString(shardType, 'shard_type'),
     shard_key: normalizeString(shardKey, 'shard_key'),
+    chunk_cursor: chunkCursor == null ? null : {
+      max_room_pos: normalizeInteger(chunkCursor.max_room_pos, 'chunk_cursor.max_room_pos', { min: 0 }),
+      search_row_offset: normalizeInteger(chunkCursor.search_row_offset ?? 0, 'chunk_cursor.search_row_offset', { min: 0 }),
+    },
+    chunk_limit: chunkLimit == null
+      ? null
+      : normalizeInteger(chunkLimit, 'chunk_limit', { min: 1, allowNull: true }),
     attempt: normalizeInteger(attempt, 'attempt', { min: 0 }),
   };
 }
@@ -674,6 +683,8 @@ export function normalizeQueuePayload(queueName, value) {
       rebuildTarget: value.rebuild_target,
       shardType: value.shard_type,
       shardKey: value.shard_key,
+      chunkCursor: value.chunk_cursor,
+      chunkLimit: value.chunk_limit,
       attempt: value.attempt,
     });
   }

@@ -6621,8 +6621,28 @@ export class RoomDO extends BaseDurableObject {
     await this.ensureSchema();
     const [request = {}] = arguments;
     const updatedAt = request?.updated_at ?? new Date().toISOString();
+    const includeSearchIndexRows = request?.include_search_index_rows !== false;
+    const includePublicRoomDirectoryEntry = request?.include_public_room_directory_entry !== false;
+    const requestedMaxRoomPos = request?.max_room_pos == null
+      ? null
+      : normalizeInteger(request.max_room_pos, 'request.max_room_pos', { min: 0 });
+    const requestedSearchRowOffset = request?.search_row_offset == null
+      ? 0
+      : normalizeInteger(request.search_row_offset, 'request.search_row_offset', { min: 0 });
+    const requestedSearchLimit = request?.search_limit == null
+      ? null
+      : normalizeInteger(request.search_limit, 'request.search_limit', { min: 1 });
+    const visibleTimeline = this.listVisibleTimelineMetadata({ maxRoomPos: requestedMaxRoomPos });
+    const effectiveMaxRoomPos = requestedMaxRoomPos ?? (visibleTimeline.at(-1)?.room_pos ?? 0);
+    const selectedMetadata = includeSearchIndexRows
+      ? (
+        requestedSearchLimit == null
+          ? visibleTimeline.slice(requestedSearchRowOffset)
+          : visibleTimeline.slice(requestedSearchRowOffset, requestedSearchRowOffset + requestedSearchLimit)
+      )
+      : [];
     const searchIndexRows = [];
-    for (const metadata of this.listVisibleTimelineMetadata()) {
+    for (const metadata of selectedMetadata) {
       const loaded = await this.loadRoomEventForRebuild(metadata.event_id);
       searchIndexRows.push({
         event_id: metadata.event_id,
@@ -6641,10 +6661,22 @@ export class RoomDO extends BaseDurableObject {
         },
       });
     }
+    const nextSearchRowOffset = includeSearchIndexRows
+      && requestedSearchLimit != null
+      && requestedSearchRowOffset + searchIndexRows.length < visibleTimeline.length
+      ? requestedSearchRowOffset + searchIndexRows.length
+      : null;
     return createSuccessResult({
       room_id: this.persistence.getRuntimeState()?.room_id ?? null,
+      max_room_pos: effectiveMaxRoomPos,
+      search_row_offset: requestedSearchRowOffset,
+      next_search_row_offset: nextSearchRowOffset,
+      total_search_index_rows: includeSearchIndexRows ? visibleTimeline.length : 0,
+      has_more_search_index_rows: nextSearchRowOffset != null,
       search_index_rows: searchIndexRows,
-      public_room_directory_entry: buildRoomDirectoryProjection(this, { updatedAt }),
+      public_room_directory_entry: includePublicRoomDirectoryEntry
+        ? buildRoomDirectoryProjection(this, { updatedAt })
+        : null,
     });
   }
 
