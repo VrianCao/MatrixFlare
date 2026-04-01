@@ -12,6 +12,7 @@ import {
   buildNonProductionSecretBundle,
   buildRemoteHarnessEnvironmentVariables,
   buildRemoteHarnessEnvironmentVariablesFromDeployment,
+  buildWranglerDeployArguments,
   buildRuntimeWorkerVersionTag,
   buildWorkerScriptName,
   createEnvironmentWranglerConfig,
@@ -141,6 +142,23 @@ test('wrangler deploy version tags stay deterministic, worker-specific, and with
   assert.equal(jobsDeployTag.length <= 25, true);
   assert.notEqual(gatewayDeployTag, gatewayBootstrapTag);
   assert.notEqual(gatewayDeployTag, jobsDeployTag);
+});
+
+test('wrangler deploy arguments rely on --env without overriding the environment-specific worker name', () => {
+  const args = buildWranglerDeployArguments({
+    workerName: 'gateway-worker',
+    environmentName: 'ci-integration',
+    configPath: '/tmp/gateway-worker.wrangler.json',
+    secretsPath: '/tmp/gateway-worker.secrets.json',
+    deploymentId: 'gha-ci-integration-20260401T132930Z-23851114355-1',
+    gatewayBootstrapMode: true,
+  });
+
+  assert.equal(args.includes('--name'), false);
+  assert.equal(args.includes('--env'), true);
+  assert.equal(args[args.indexOf('--env') + 1], 'ci-integration');
+  assert.equal(args[args.indexOf('--message') + 1], 'gha-ci-integration-20260401T132930Z-23851114355-1:gateway-worker:bootstrap');
+  assert.equal(args[args.indexOf('--tag') + 1].length <= 25, true);
 });
 
 test('remote harness env vars and GitHub run URLs derive deterministically from the environment plan', () => {

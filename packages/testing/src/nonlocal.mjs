@@ -1268,6 +1268,31 @@ export function buildRuntimeWorkerVersionTag(deploymentId, workerName, {
   return tag;
 }
 
+export function buildWranglerDeployArguments({
+  workerName,
+  environmentName,
+  configPath,
+  secretsPath,
+  deploymentId,
+  gatewayBootstrapMode = false,
+}) {
+  return [
+    'deploy',
+    '--config',
+    configPath,
+    '--env',
+    assertNonLocalEnvironmentName(environmentName),
+    '--message',
+    `${deploymentId}:${workerName}${gatewayBootstrapMode ? ':bootstrap' : ':deploy'}`,
+    '--tag',
+    buildRuntimeWorkerVersionTag(deploymentId, workerName, {
+      gatewayBootstrapMode,
+    }),
+    '--secrets-file',
+    secretsPath,
+  ];
+}
+
 export async function ensureNonLocalEnvironmentResources(environmentName, {
   repoRoot = process.cwd(),
   outputPath = null,
@@ -1545,23 +1570,14 @@ async function deployWorker(workerName, provisionedEnvironment, {
     apiToken,
   });
   await writeWorkerSecretsFile(workerName, secretBundle, secretsPath);
-  await runWrangler([
-    'deploy',
-    '--config',
+  await runWrangler(buildWranglerDeployArguments({
+    workerName,
+    environmentName: provisionedEnvironment.environment_name,
     configPath,
-    '--env',
-    provisionedEnvironment.environment_name,
-    '--name',
-    buildWorkerScriptBaseName(workerName),
-    '--message',
-    `${deploymentId}:${workerName}${gatewayBootstrapMode ? ':bootstrap' : ':deploy'}`,
-    '--tag',
-    buildRuntimeWorkerVersionTag(deploymentId, workerName, {
-      gatewayBootstrapMode,
-    }),
-    '--secrets-file',
     secretsPath,
-  ], {
+    deploymentId,
+    gatewayBootstrapMode,
+  }), {
     repoRoot,
     accountId,
   });
