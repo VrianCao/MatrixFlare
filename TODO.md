@@ -629,19 +629,23 @@
 
 ### 07.06 实现 rebuild 能力
 
-- [ ] 支持从 truth + archive 重建 search/user_directory/public_rooms。
+- [x] 支持从 truth + archive 重建 search/user_directory/public_rooms。
   Spec refs: `34` 3.4, `42` 10, `25` `FLOW-REPLAY-REBUILD`
   产出:
   rebuild job、checkpoint、重放逻辑。
   完成标准:
   D1 派生表可完全从数据面真相重建。
+  当前状态:
+  `jobs-worker` 的 rebuild 队列现已通过 `RoomDO.exportDerivedShard()` 与 `UserDO.getUserDirectoryEntry()` 从 truth + archive 重放 `search_index`、`user_directory`、`public_room_directory`，`tests/local/client-identity/phase-07.test.mjs` 已覆盖 archive-backed rebuild、`publicRooms` 等价 query semantics，以及 rebuild 后 D1 派生面与 truth 的一致性。
 
-- [ ] 为 `RoomDO` 的大 shard rebuild 实现 checkpointed 分批重放，跨多次 queue invocation 满足 D1 单 invocation 预算。
+- [x] 为 `RoomDO` 的大 shard rebuild 实现 checkpointed 分批重放，跨多次 queue invocation 满足 D1 单 invocation 预算。
   Spec refs: `34` 3.4, `42` 10, `25` `STATE-REBUILD-JOB`
   产出:
   per-shard chunk cursor、幂等 clear/apply 语义、跨 invocation checkpoint 进度推进。
   完成标准:
   单 shard `search_index_rows` 超过单 invocation D1 budget 时仍可完成 rebuild，且不违反 `CF-D1-007` 到 `CF-D1-011`。
+  当前状态:
+  `buildRebuildShardJob()` / `jobs-handler` 现已为 `RoomDO` rebuild 记录 per-shard chunk cursor 与 checkpoint progress，并在单 shard 超过一次 D1 invocation 预算时自动拆成多次 `matrix-rebuild-shard-job` queue invocation；旧 chunk 的重复投递会按 checkpoint cursor fail-closed 为 stale，不会再次清空已推进的 shard。`tests/local/client-identity/phase-07.test.mjs` 已验证 `11,000` search rows 的 room shard 会分两次 queue invocation 完成 rebuild，并在 stale retry 下保持幂等 clear/apply 语义。
 
 ## Phase 08: L1 Security, Observability, Compatibility, And Release Gate
 
@@ -680,27 +684,38 @@
   当前状态:
   `packages/runtime-core/src/deployment-records.mjs`、runtime manifest 与 worker env 已记录 `worker_version_id`、`deployment_id`、`compatibility_date`、`cpu_limit_class`、`startup_time_ms`、`deployment_composition`、`feature_gates` 与 `secret_versions`；`ops-worker` health 响应与 `spec/framework/26-wire-schema-catalog.md` 已同步扩展。Phase 08 版本偏斜测试已验证 `new Worker -> old DO` / `old Worker -> new DO` 的基础兼容路径。
 
+### 08.04A 收敛 non-local evidence provenance contract
+
+- [x] 通过 `DEC-0002` 固化 non-local evidence attestation contract，并关闭 `OQ-0003`。
+  Spec refs: `26` 5.15-5.21, `43` 5, 11, `44` 2, 6, `DEC-0002`, `OQ-0003`
+  产出:
+  `EnvironmentRunAttestation` / `ProdCostSnapshotAttestation` schema、evidence CLI/manual-artifact fail-closed 校验、control documents 同步更新。
+  完成标准:
+  release gate 不再接受自由形状 non-local run report / prod snapshot JSON；attestation 至少要求 run identity、deployment identity、artifact store immutable reference、artifact digest 与 review record reference。
+  当前状态:
+  `spec/framework/26-wire-schema-catalog.md` 已登记 attestation bundle contract，`43/44` 已改为以 attestation 作为 non-local evidence 唯一入口，`spec/open-questions/OQ-0003.md` 已由 `DEC-0002` 关闭；`packages/testing/src/evidence.mjs` / `packages/testing/src/cli.mjs` 已转为按 attestation bundle 校验 provenance，而不是直接信任原始 report/snapshot JSON。validator 现会拒绝占位 / 非外部 URI 的 provenance locator，包括裸 `urn:` 与旧 `--*-report` / `--prod-cost-snapshot` CLI 别名，并在 `manual-artifacts.json` 中保留完整 attestation provenance snapshot 供审计回链。
+
 ### 08.04 完成 L1 测试
 
 - [ ] 落地 `TEST-GOV-001`,`TEST-CS-001`,`TEST-CS-002`,`TEST-CS-003`,`TEST-CS-004`,`TEST-ROOM-001`,`TEST-ROOM-002`,`TEST-MEDIA-001`,`TEST-DER-001`,`TEST-SEC-001`,`TEST-OPS-001`,`TEST-COST-001`。
-  Spec refs: `43` 3, 9
+  Spec refs: `43` 3, 5, 9
   产出:
-  local / CI / staging 测试套件。
+  local / CI / staging / pre-release dedicated 测试套件。
   完成标准:
-  `L1` mandatory tests 全部可运行。
+  `L1` mandatory tests 全部可运行，且所有 non-local gate 项都由 dedicated environment-backed `ci-integration` / `staging` / `pre-release` harness 直接驱动，而不是薄 local shim。
   当前状态:
-  `tests/shared/l1-mandatory-suite.mjs` 已汇总 L1 mandatory suites，且 `npm run test:all` 现可作为本地组合回归运行（local + `ci-integration` + `staging` + `pre-release` 全部 exit `0`；`npm run governance:check` 对应 `TEST-GOV-001` 也为 `PASS`）。但 `tests/integration/`、`tests/staging/`、`tests/pre-release/` 当前仍只是导入共享本地套件的薄入口，尚未满足 `spec/framework/43-testing-and-compliance.md` 第 5 节要求的近真实 Cloudflare 拓扑验证；在接通真实 CI/staging/pre-release harness 与对应运行工件之前，本项保持未完成。
+  `tests/shared/l1-mandatory-suite.mjs` 已汇总 L1 mandatory suites，且 `npm run test:all` 现可作为本地组合回归运行（local + `ci-integration` + `staging` + `pre-release` 全部 exit `0`；`npm run governance:check` 对应 `TEST-GOV-001` 也为 `PASS`）。但 `tests/integration/`、`tests/staging/`、`tests/pre-release/` 当前仍只是导入共享本地套件的薄入口，尚未满足 `spec/framework/43-testing-and-compliance.md` 第 5 节要求的近真实 Cloudflare 拓扑验证；`evidence/common/_test-runs/20260401T060511Z/{ci-integration,staging,pre-release}.json` 也已实证这些入口仍扩展 `tests/local/*`。`DEC-0002` 只是收敛了未来 non-local 运行工件必须如何 attested，并没有把这些薄入口变成真实 harness。在接通真实 CI/staging/pre-release harness 与对应 attestation bundle 之前，本项保持未完成。
 
 ### 08.05 完成 L1 证据
 
 - [ ] 生成 `EVID-GOV-001`,`EVID-CS-001`,`EVID-CS-002`,`EVID-CS-003`,`EVID-CS-004`,`EVID-ROOM-001`,`EVID-ROOM-002`,`EVID-MEDIA-001`,`EVID-DER-001`,`EVID-SEC-001`,`EVID-OPS-001`,`EVID-COST-001`。
-  Spec refs: `44` 3, 4
+  Spec refs: `44` 2.4, 3, 4, 6
   产出:
-  对应 `evidence/L1/` 与 `evidence/common/` 证据包。
+  对应 `evidence/L1/` 与 `evidence/common/` 证据包，以及可审计的 non-local attestation provenance snapshot。
   完成标准:
   可以诚实声称达到 `L1 Local-Core`。
   当前状态:
-  `npm run evidence:l1 -- --timestamp <ts>` 现会同轮生成 `EVID-GOV-001`，并按 bundle 校验 `TEST-ID` 对应的 canonical test file 已被目标环境测试入口覆盖；同时它还要求按 bundle 提供 `--ci-integration-report <path>` / `--staging-report <path>` / `--pre-release-report <path>` 等非本地环境运行工件，而 `EVID-COST-001` 还必须额外提供 `--prod-cost-snapshot <path>`。同一 `run_timestamp` 若已有任何证据输出则会 fail-closed，且 `evidence/common/_test-runs/<ts>/*.json` 这类本地共享运行工件或仍扩展 `tests/local/` 的薄 non-local harness 报告不再可充作 manual artifact；新增的 `OQ-0003` 继续跟踪“未来真实 non-local harness 接通后，如何把导入工件绑定到可信执行来源”的 attestation trust model。历史 `20260331T130238Z` 证据包需按当前门禁重新生成后才可继续引用；在补齐同轮真实环境工件与 production monthly cost snapshot 之前，本项保持未完成。
+  `npm run evidence:l1 -- --timestamp <ts>` 现会同轮生成 `EVID-GOV-001`，并按 bundle 校验 `TEST-ID` 对应的 canonical test file 已被目标环境测试入口覆盖；对 non-local evidence，它现在要求提供 `--ci-integration-attestation <path>` / `--staging-attestation <path>` / `--pre-release-attestation <path>`，且 `EVID-COST-001` 还必须额外提供 `--prod-cost-attestation <path>`。这些路径必须是同轮 run 的 `EnvironmentRunAttestation` / `ProdCostSnapshotAttestation`，而不是原始 report/snapshot JSON；其中 provenance locator 还必须是可解析的绝对外部 URI / locator，且 evidence 包必须保留完整 provenance snapshot。相同 `run_timestamp` 的 evidence 输出目录现在必须原子 fail-closed，不得并发复用；`evidence/common/_test-runs/<ts>/*.json` 这类本地共享运行工件或仍扩展 `tests/local/` 的薄 non-local harness 报告也不再可充作 evidence 输入。`npm run evidence:l1 -- --timestamp 20260401T060511Z` 已实测 exit `1`，且只有 `EVID-GOV-001` 为 `pass`。`OQ-0003` 已由 `DEC-0002` 关闭，但当前仓库仍缺真实 CI/staging/pre-release harness、对应外部 attestation bundle 与 production monthly cost snapshot，因此本项保持未完成，且现在仍不能诚实宣称 `L1 Local-Core` 已达成。
 
 ## Phase 09: Federation Core And L2 Gate
 

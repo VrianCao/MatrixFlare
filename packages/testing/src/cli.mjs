@@ -12,6 +12,13 @@ import {
 } from './bootstrap.mjs';
 import { writeL1Evidence } from './evidence.mjs';
 
+const EVIDENCE_L1_MANUAL_ARTIFACT_FLAGS = Object.freeze({
+  '--ci-integration-attestation': 'ci_integration_run_report',
+  '--staging-attestation': 'staging_run_report',
+  '--pre-release-attestation': 'pre_release_run_report',
+  '--prod-cost-attestation': 'prod_cost_snapshot',
+});
+
 async function runEnvironment(environmentName) {
   const repoRoot = process.cwd();
   let files;
@@ -39,13 +46,48 @@ async function runEnvironment(environmentName) {
   });
 }
 
+function parseEvidenceL1Options(argv) {
+  const parsed = {
+    timestamp: null,
+    manualArtifacts: {},
+  };
+
+  for (let index = 3; index < argv.length; index += 1) {
+    const current = argv[index];
+    if (current === '--timestamp') {
+      const timestamp = argv[index + 1] ?? null;
+      if (timestamp == null || timestamp.startsWith('--')) {
+        throw new RangeError('--timestamp requires a value');
+      }
+      parsed.timestamp = timestamp;
+      index += 1;
+      continue;
+    }
+
+    const artifactId = EVIDENCE_L1_MANUAL_ARTIFACT_FLAGS[current] ?? null;
+    if (artifactId != null) {
+      const artifactPath = argv[index + 1] ?? null;
+      if (artifactPath == null || artifactPath.startsWith('--')) {
+        throw new RangeError(`${current} requires a value`);
+      }
+      parsed.manualArtifacts[artifactId] = artifactPath;
+      index += 1;
+      continue;
+    }
+
+    throw new RangeError(`Unknown evidence-l1 option "${current}"`);
+  }
+
+  return parsed;
+}
+
 async function main() {
   const requestedEnvironment = process.argv[2] ?? 'local';
   if (requestedEnvironment === 'evidence-l1') {
-    const timestampFlagIndex = process.argv.indexOf('--timestamp');
-    const timestamp = timestampFlagIndex === -1 ? null : (process.argv[timestampFlagIndex + 1] ?? null);
+    const { timestamp, manualArtifacts } = parseEvidenceL1Options(process.argv);
     const result = await writeL1Evidence(process.cwd(), {
       timestamp,
+      manualArtifacts,
     });
     console.log(`Wrote L1 evidence bundles for run ${result.run_timestamp}`);
     console.log(`Shared test-run artifacts: ${path.relative(process.cwd(), result.shared_run_root)}`);

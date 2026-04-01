@@ -8,7 +8,7 @@
 ## 1. 文档职责
 
 * 为 [23-interface-contract-catalog.md](./23-interface-contract-catalog.md) 中出现的本地逻辑契约名提供唯一 wire schema 真相。
-* 规定本地控制面、内部 RPC、队列负载与固定错误体的字段、枚举、版本与演进规则。
+* 规定本地控制面、内部 RPC、队列负载、release-gate evidence attestation bundle 与固定错误体的字段、枚举、版本与演进规则。
 * 防止“接口表里只有类型名，没有 payload shape”的灰区继续存在。
 
 明确不包含：
@@ -153,7 +153,7 @@
 * 若 [23-interface-contract-catalog.md](./23-interface-contract-catalog.md) 中 `Error Model` 使用 `A / B` 这类复合写法，则允许的 `code` 集合是各分量标签映射结果的并集。
 * 裸写的 `idempotency conflict` 只允许 `idempotency_conflict`。
 
-## 5. 控制面 HTTP Payload
+## 5. 控制面与验证 Artifact Payload
 
 ### 5.1 共享类型
 
@@ -356,6 +356,126 @@
 | `appservice` | `AppserviceDescriptor` or null | 单项读取/写入返回 |
 | `appservices` | array or null | 列表读取返回 `AppserviceDescriptor[]` |
 | `next_cursor` | string or null | 列表分页游标 |
+
+以下 `5.15-5.21` 不是公开 Matrix route 或 `/_ops` HTTP body，而是 release-gate evidence import 时允许出现的本地 machine-readable artifact contract。它们仍属于本分册 authority，避免 provenance 语义散落在自由 JSON 中。
+
+### 5.15 `CloudflareResourceSnapshot`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `workers` | array | 非空字符串数组；至少标识 active Worker version / deployment composition |
+| `durable_objects` | array | 非空字符串数组 |
+| `d1_databases` | array | 非空字符串数组 |
+| `r2_buckets` | array | 非空字符串数组 |
+| `kv_namespaces` | array | 非空字符串数组 |
+| `queues` | array | 非空字符串数组 |
+
+适用面：
+
+* `EnvironmentRunReport`
+* `ProdCostSnapshot`
+
+### 5.16 `EnvironmentRunReport`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `environment_name` | string | `ci-integration`,`staging`,`pre-release` 之一 |
+| `run_timestamp` | string | evidence run timestamp，格式见 `44` |
+| `status` | string | release-gate 证据只允许 `pass` |
+| `exit_code` | integer | release-gate 证据只允许 `0` |
+| `started_at` | string | RFC 3339 UTC |
+| `completed_at` | string | RFC 3339 UTC |
+| `duration_ms` | integer | 非负 |
+| `command` | string | 非空；执行命令审计快照 |
+| `test_directory` | string | 必须与环境目录一致，例如 `tests/staging` |
+| `test_file_count` | integer | 正整数 |
+| `test_files` | array | 相对仓库路径；长度必须与 `test_file_count` 一致 |
+| `expanded_test_file_count` | integer | 正整数 |
+| `expanded_test_files` | array | 相对仓库路径；长度必须与 `expanded_test_file_count` 一致，且 release-gate 证据不得包含 `tests/local/*` |
+| `output_sha256` | string | 64 字符小写 hex；对应本次执行组合输出摘要 |
+| `error_message` | string or null | `pass` 时必须为 `null` |
+| `log_artifact` | string | 非空；外部日志工件定位符 |
+| `executed_by` | string | 非空执行者标识 |
+| `reviewed_by` | string | 非空审查者标识 |
+| `source_run_uri` | string | 绝对外部 URI / locator；必须具 authority，或使用格式完整的 `urn:<nid>:<nss>`；不得为裸 `urn:`，且不得为 `about:` / `blob:` / `file:` / `data:` / `javascript:` |
+| `topology_kind` | string | 非本地拓扑标识；不得为 `local` |
+| `cloudflare_resources` | `CloudflareResourceSnapshot` | 本次执行所绑定资源快照 |
+
+### 5.17 `ProdCostSnapshot`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `artifact_id` | string | 固定为 `prod_cost_snapshot` |
+| `source_environment` | string | 固定为 `prod` |
+| `run_timestamp` | string | evidence run timestamp |
+| `captured_at` | string | RFC 3339 UTC |
+| `captured_by` | string | 非空执行者标识 |
+| `reviewed_by` | string | 非空审查者标识 |
+| `source_dashboard_uri` | string | 绝对外部 URI / locator；必须具 authority，或使用格式完整的 `urn:<nid>:<nss>`；不得为裸 `urn:`，且不得为 `about:` / `blob:` / `file:` / `data:` / `javascript:` |
+| `topology_kind` | string | 非本地拓扑标识；不得为 `local` |
+| `cloudflare_resources` | `CloudflareResourceSnapshot` | 生产资源快照 |
+| `billing_period` | object | 必须包含 `start`,`end` RFC 3339 UTC，且 `start <= end` |
+| `cost_surfaces` | object | 至少包含 `workers`,`durable_objects`,`d1`,`r2`,`kv`,`queues`，每个子对象字段见 `44` 对应成本门禁语义 |
+| `model_comparison` | object | 至少包含 `status`,`summary`,`actual_total_usd`,`modeled_total_usd`,`drift_ratio` |
+
+### 5.18 `EvidenceDeploymentIdentity`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `environment_id` | string | 非空；目标环境的稳定标识 |
+| `deployment_ids` | array | 非空字符串数组；必须能回链到该次执行或采样时有效的 deployment 记录 |
+| `worker_version_ids` | array | 非空字符串数组；必须能回链到 active Worker version 记录 |
+
+### 5.19 `EvidenceProvenance`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `origin_system` | string | 非空；产出 attestation 的 workflow / capture system 名称 |
+| `origin_run_id` | string | 非空；workflow / capture run ID |
+| `origin_run_attempt` | integer | 正整数；同一 run 的重试序号 |
+| `origin_run_uri` | string | 绝对外部 URI / locator；必须具 authority，或使用格式完整的 `urn:<nid>:<nss>`；不得为裸 `urn:`，且不得为 `about:` / `blob:` / `file:` / `data:` / `javascript:` |
+| `artifact_store_uri` | string | 绝对外部 URI / locator；必须具 authority，或使用格式完整的 `urn:<nid>:<nss>`；不得为裸 `urn:`，且不得为 `about:` / `blob:` / `file:` / `data:` / `javascript:` |
+| `artifact_store_key` | string | 非空；对象键或等价 immutable locator |
+| `artifact_sha256` | string | 64 字符小写 hex；对应外部原始工件摘要 |
+| `review_record_uri` | string | 绝对外部 URI / locator；必须具 authority，或使用格式完整的 `urn:<nid>:<nss>`；不得为裸 `urn:`，且不得为 `about:` / `blob:` / `file:` / `data:` / `javascript:` |
+| `topology_kind` | string | 非本地拓扑标识；不得为 `local` |
+| `deployment_identity` | `EvidenceDeploymentIdentity` | 该次执行或采样对应的 deployment 身份 |
+
+### 5.20 `EnvironmentRunAttestation`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `schema_version` | integer | 固定为 `1` |
+| `artifact_id` | string | `ci_integration_run_report`,`staging_run_report`,`pre_release_run_report` 之一 |
+| `attestation_kind` | string | 固定为 `environment_run` |
+| `source_environment` | string | `ci-integration`,`staging`,`pre-release` 之一，且必须与 `artifact_id` 一致 |
+| `run_timestamp` | string | 必须与 `payload.run_timestamp` 一致 |
+| `attested_at` | string | RFC 3339 UTC |
+| `provenance` | `EvidenceProvenance` | 不得省略 |
+| `payload` | `EnvironmentRunReport` | 不得省略；`payload.environment_name` 与 `source_environment` 必须一致，`payload.source_run_uri` 必须与 `provenance.origin_run_uri` 一致，`payload.topology_kind` 必须与 `provenance.topology_kind` 一致 |
+
+附加规则：
+
+* release-gate evidence 只接受 `EnvironmentRunAttestation`，不得直接接受裸 `EnvironmentRunReport`。
+* 若 `payload.expanded_test_files` 触及 `tests/local/*`、存在 repo boundary escape、或存在 unresolved dynamic import，consumer 必须 fail-closed。
+
+### 5.21 `ProdCostSnapshotAttestation`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `schema_version` | integer | 固定为 `1` |
+| `artifact_id` | string | 固定为 `prod_cost_snapshot` |
+| `attestation_kind` | string | 固定为 `prod_cost_snapshot` |
+| `source_environment` | string | 固定为 `prod` |
+| `run_timestamp` | string | 必须与 `payload.run_timestamp` 一致 |
+| `attested_at` | string | RFC 3339 UTC |
+| `provenance` | `EvidenceProvenance` | 不得省略 |
+| `payload` | `ProdCostSnapshot` | 不得省略；`payload.topology_kind` 必须与 `provenance.topology_kind` 一致 |
+
+附加规则：
+
+* release-gate evidence 只接受 `ProdCostSnapshotAttestation`，不得直接接受裸 `ProdCostSnapshot`。
+* 若 attestation 缺少 audited artifact reference、review record 或 deployment identity，consumer 必须 fail-closed。
 
 ## 6. 内部 RPC 与异步作业 Payload
 

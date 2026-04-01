@@ -75,6 +75,8 @@
 
 * 必须在接近 Cloudflare 真实拓扑的环境中验证 Worker、DO、R2、D1、KV、Queues。
 * 任何只在内存 mock 上通过的结论，不得作为发布门禁证据。
+* `ci-integration`、`staging`、`pre-release` 的 release-gate 运行，必须由各自环境目录中的 dedicated harness 直接驱动；仅导入 `tests/local/*` 或共享本地 mandatory suite 的薄入口，不构成 environment-backed validation。
+* 任何导入到 release gate 的 non-local 运行结果，都必须使用 [26-wire-schema-catalog.md](/root/Matrix/spec/framework/26-wire-schema-catalog.md) 中的 `EnvironmentRunAttestation`；production monthly cost snapshot 必须使用 `ProdCostSnapshotAttestation`。裸 run report / prod snapshot JSON 不得直接作为发布证据入口。
 * staging 必须至少包含：
   * Worker versions/deployments
   * 真正的 DO namespace
@@ -133,6 +135,7 @@
 
 * 测试定义在本分册。
 * 具体证据工件、位置、频率与保留策略登记在 [44-verification-and-evidence-register.md](/root/Matrix/spec/framework/44-verification-and-evidence-register.md)。
+* 对任何依赖 non-local harness 或 production snapshot 的 `EVID-ID`，handoff 给 `44` 的不是自由 JSON report，而是 attestation bundle + immutable provenance reference。
 * 没有对应 `EVID-ID` 的测试通过结果，不能作为发布门禁成立依据。
 
 ## 12. 完成标准

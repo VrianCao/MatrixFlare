@@ -23,6 +23,7 @@ import {
   getL1EvidenceDefinition,
   getRequiredTestImplementationFiles,
   listL1EvidenceBundleIds,
+  validateEvidenceAttestationBundle,
   validateManualArtifactPayload,
   writeL1Evidence,
 } from '../../../packages/testing/src/evidence.mjs';
@@ -33,6 +34,11 @@ import {
 
 const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../../..');
 const execFileAsync = promisify(execFile);
+const ENVIRONMENT_MANUAL_ARTIFACT_IDS = Object.freeze({
+  'ci-integration': 'ci_integration_run_report',
+  staging: 'staging_run_report',
+  'pre-release': 'pre_release_run_report',
+});
 
 function buildValidEnvironmentReport(environmentName, runTimestamp, overrides = {}) {
   const directory = getTestEnvironmentDefinition(environmentName).directory;
@@ -54,7 +60,7 @@ function buildValidEnvironmentReport(environmentName, runTimestamp, overrides = 
     ],
     output_sha256: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
     error_message: null,
-    log_artifact: `external/${environmentName}/${runTimestamp}/log.txt`,
+    log_artifact: `https://example.invalid/logs/${environmentName}/${runTimestamp}.txt`,
     executed_by: 'ci-runner',
     reviewed_by: 'release-reviewer',
     source_run_uri: `https://example.invalid/runs/${environmentName}/${runTimestamp}`,
@@ -111,6 +117,95 @@ function buildValidProdCostSnapshot(runTimestamp, overrides = {}) {
     },
     run_timestamp: runTimestamp,
     ...overrides,
+  };
+}
+
+function buildValidEnvironmentAttestation(environmentName, runTimestamp, reportOverrides = {}, attestationOverrides = {}) {
+  const topologyKind = `cloudflare-${environmentName}`;
+  const originRunUri = `https://example.invalid/runs/${environmentName}/${runTimestamp}`;
+  const artifactId = ENVIRONMENT_MANUAL_ARTIFACT_IDS[environmentName];
+  const baseProvenance = {
+    origin_system: 'github-actions',
+    origin_run_id: `${environmentName}-run-${runTimestamp}`,
+    origin_run_attempt: 1,
+    origin_run_uri: originRunUri,
+    artifact_store_uri: `https://example.invalid/artifacts/${environmentName}/${runTimestamp}/attestation.json`,
+    artifact_store_key: `${environmentName}/${runTimestamp}/attestation.json`,
+    artifact_sha256: 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789',
+    review_record_uri: `https://example.invalid/reviews/${environmentName}/${runTimestamp}`,
+    topology_kind: topologyKind,
+    deployment_identity: {
+      environment_id: `${environmentName}-env`,
+      deployment_ids: [`${environmentName}-deployment-001`],
+      worker_version_ids: [`gateway@${environmentName}-v1`, `jobs@${environmentName}-v1`, `ops@${environmentName}-v1`],
+    },
+  };
+  const attestationProvenanceOverrides = attestationOverrides.provenance ?? {};
+
+  return {
+    schema_version: 1,
+    artifact_id: artifactId,
+    attestation_kind: 'environment_run',
+    source_environment: environmentName,
+    run_timestamp: runTimestamp,
+    attested_at: '2026-03-31T14:06:00.000Z',
+    ...attestationOverrides,
+    provenance: {
+      ...baseProvenance,
+      ...attestationProvenanceOverrides,
+      deployment_identity: {
+        ...baseProvenance.deployment_identity,
+        ...(attestationProvenanceOverrides.deployment_identity ?? {}),
+      },
+    },
+    payload: buildValidEnvironmentReport(environmentName, runTimestamp, {
+      source_run_uri: originRunUri,
+      topology_kind: topologyKind,
+      ...reportOverrides,
+    }),
+  };
+}
+
+function buildValidProdCostSnapshotAttestation(runTimestamp, payloadOverrides = {}, attestationOverrides = {}) {
+  const topologyKind = 'cloudflare-prod';
+  const baseProvenance = {
+    origin_system: 'cost-audit',
+    origin_run_id: `prod-cost-${runTimestamp}`,
+    origin_run_attempt: 1,
+    origin_run_uri: `https://example.invalid/cost-runs/${runTimestamp}`,
+    artifact_store_uri: `https://example.invalid/artifacts/prod/${runTimestamp}/cost-snapshot.json`,
+    artifact_store_key: `prod/${runTimestamp}/cost-snapshot.json`,
+    artifact_sha256: 'fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210',
+    review_record_uri: `https://example.invalid/reviews/prod/${runTimestamp}`,
+    topology_kind: topologyKind,
+    deployment_identity: {
+      environment_id: 'prod',
+      deployment_ids: ['prod-deployment-001'],
+      worker_version_ids: ['gateway@prod-v1', 'jobs@prod-v1', 'ops@prod-v1'],
+    },
+  };
+  const attestationProvenanceOverrides = attestationOverrides.provenance ?? {};
+
+  return {
+    schema_version: 1,
+    artifact_id: 'prod_cost_snapshot',
+    attestation_kind: 'prod_cost_snapshot',
+    source_environment: 'prod',
+    run_timestamp: runTimestamp,
+    attested_at: '2026-03-31T14:06:00.000Z',
+    ...attestationOverrides,
+    provenance: {
+      ...baseProvenance,
+      ...attestationProvenanceOverrides,
+      deployment_identity: {
+        ...baseProvenance.deployment_identity,
+        ...(attestationProvenanceOverrides.deployment_identity ?? {}),
+      },
+    },
+    payload: buildValidProdCostSnapshot(runTimestamp, {
+      topology_kind: topologyKind,
+      ...payloadOverrides,
+    }),
   };
 }
 
@@ -241,24 +336,18 @@ async function createEnvironmentBackedManualArtifacts(fixtureRoot, runTimestamp,
   await fs.mkdir(externalRoot, { recursive: true });
 
   const manualArtifacts = {};
-  const environmentArtifactIds = {
-    'ci-integration': 'ci_integration_run_report',
-    staging: 'staging_run_report',
-    'pre-release': 'pre_release_run_report',
-  };
-
-  for (const [environmentName, artifactId] of Object.entries(environmentArtifactIds)) {
+  for (const [environmentName, artifactId] of Object.entries(ENVIRONMENT_MANUAL_ARTIFACT_IDS)) {
     const artifactPath = path.join(externalRoot, `${environmentName}.json`);
     const environmentTestDirectory = path.dirname(environmentTestFiles[environmentName]).replaceAll(path.sep, '/');
     await fs.writeFile(
       artifactPath,
-      JSON.stringify(buildValidEnvironmentReport(environmentName, runTimestamp, {
+      JSON.stringify(buildValidEnvironmentAttestation(environmentName, runTimestamp, {
         test_directory: environmentTestDirectory,
         test_files: [environmentTestFiles[environmentName]],
         test_file_count: 1,
         expanded_test_files: [environmentTestFiles[environmentName], sharedProofFile],
         expanded_test_file_count: 2,
-        log_artifact: `external/${runTimestamp}/${environmentName}.log`,
+        log_artifact: `https://example.invalid/logs/fixture/${runTimestamp}/${environmentName}.log`,
       }), null, 2),
     );
     manualArtifacts[artifactId] = path.relative(fixtureRoot, artifactPath);
@@ -267,7 +356,7 @@ async function createEnvironmentBackedManualArtifacts(fixtureRoot, runTimestamp,
   const prodCostSnapshotPath = path.join(externalRoot, 'prod-cost-snapshot.json');
   await fs.writeFile(
     prodCostSnapshotPath,
-    JSON.stringify(buildValidProdCostSnapshot(runTimestamp), null, 2),
+    JSON.stringify(buildValidProdCostSnapshotAttestation(runTimestamp), null, 2),
   );
   manualArtifacts.prod_cost_snapshot = path.relative(fixtureRoot, prodCostSnapshotPath);
 
@@ -329,6 +418,57 @@ test('cost evidence keeps the production snapshot requirement alongside pre-rele
   assert.deepEqual(
     requirements.map((requirement) => requirement.artifact_id),
     ['pre_release_run_report', 'prod_cost_snapshot'],
+  );
+});
+
+test('L1 evidence definitions keep attested generation methods in sync with the evidence register', () => {
+  assert.equal(
+    getL1EvidenceDefinition('EVID-CS-001').generation_method,
+    'client-core CI + staging attestation bundle',
+  );
+  assert.equal(
+    getL1EvidenceDefinition('EVID-CS-002').generation_method,
+    '/sync conformance attested staging report',
+  );
+  assert.equal(
+    getL1EvidenceDefinition('EVID-CS-003').generation_method,
+    'devices/E2EE transport attested staging report',
+  );
+  assert.equal(
+    getL1EvidenceDefinition('EVID-CS-004').generation_method,
+    'stub-only/unsupported route guard attested CI + staging report',
+  );
+  assert.equal(
+    getL1EvidenceDefinition('EVID-ROOM-001').generation_method,
+    'room-core attested CI + staging report',
+  );
+  assert.equal(
+    getL1EvidenceDefinition('EVID-ROOM-002').generation_method,
+    'room-version attested CI + staging report',
+  );
+  assert.equal(
+    getL1EvidenceDefinition('EVID-MEDIA-001').generation_method,
+    'media pipeline attested staging + pre-release report',
+  );
+  assert.equal(
+    getL1EvidenceDefinition('EVID-DER-001').generation_method,
+    'derived-data attested staging + pre-release report',
+  );
+  assert.equal(
+    getL1EvidenceDefinition('EVID-SEC-001').generation_method,
+    'security attested staging + pre-release bundle',
+  );
+  assert.equal(
+    getL1EvidenceDefinition('EVID-OPS-001').generation_method,
+    'rollout compatibility attested pre-release report',
+  );
+  assert.equal(
+    getL1EvidenceDefinition('EVID-COST-001').generation_method,
+    'attested monthly dashboard snapshot + model comparison',
+  );
+  assert.equal(
+    buildRequiredManualArtifactDefinitions(getL1EvidenceDefinition('EVID-COST-001'))[1].description,
+    'Production monthly dashboard snapshot attestation for the same evidence run.',
   );
 });
 
@@ -420,6 +560,19 @@ test('manual artifact payload validation requires structured non-local reports a
   assert.deepEqual(
     validateManualArtifactPayload('staging_run_report', {
       ...validStagingReport,
+      started_at: '2026-03-31T14:00:00+02:00',
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'environment run report must include RFC 3339 UTC started_at and completed_at timestamps',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('staging_run_report', {
+      ...validStagingReport,
       test_file_count: 2,
     }, {
       runTimestamp,
@@ -459,13 +612,65 @@ test('manual artifact payload validation requires structured non-local reports a
   assert.deepEqual(
     validateManualArtifactPayload('staging_run_report', {
       ...validStagingReport,
+      log_artifact: './local.log',
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'environment run report must include an absolute external log_artifact',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('staging_run_report', {
+      ...validStagingReport,
       source_run_uri: '',
     }, {
       runTimestamp,
     }),
     {
       valid: false,
-      error: 'environment run report must include source_run_uri',
+      error: 'environment run report must include an absolute external source_run_uri',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('staging_run_report', {
+      ...validStagingReport,
+      source_run_uri: 'about:blank',
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'environment run report must include an absolute external source_run_uri',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('staging_run_report', {
+      ...validStagingReport,
+      source_run_uri: 'urn:',
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'environment run report must include an absolute external source_run_uri',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('staging_run_report', {
+      ...validStagingReport,
+      source_run_uri: 'urn:matrix:evidence:run:123',
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: true,
+      error: null,
     },
   );
 
@@ -607,6 +812,35 @@ test('manual artifact payload validation requires structured non-local reports a
   assert.deepEqual(
     validateManualArtifactPayload('prod_cost_snapshot', {
       ...validProdCostSnapshot,
+      captured_at: '2026-03-31T14:00:00+02:00',
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'prod_cost_snapshot captured_at must be an RFC 3339 UTC timestamp',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('prod_cost_snapshot', {
+      ...validProdCostSnapshot,
+      billing_period: {
+        start: '2026-03-31T00:00:00+02:00',
+        end: '2026-03-31T23:59:59.000Z',
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'prod_cost_snapshot billing_period must include RFC 3339 UTC start and end timestamps',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('prod_cost_snapshot', {
+      ...validProdCostSnapshot,
       billing_period: {
         start: '2026-03-31T00:00:00.000Z',
         end: '2026-03-01T00:00:00.000Z',
@@ -690,7 +924,7 @@ test('manual artifact payload validation requires structured non-local reports a
     }),
     {
       valid: false,
-      error: 'prod_cost_snapshot must include source_dashboard_uri',
+      error: 'prod_cost_snapshot must include an absolute external source_dashboard_uri',
     },
   );
 
@@ -763,6 +997,248 @@ test('manual artifact payload validation requires structured non-local reports a
   );
 });
 
+test('manual artifact attestation validation requires immutable provenance plus typed payloads', () => {
+  const runTimestamp = '20260331T140000Z';
+  const validStagingAttestation = buildValidEnvironmentAttestation('staging', runTimestamp);
+  const validProdCostAttestation = buildValidProdCostSnapshotAttestation(runTimestamp);
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('staging_run_report', validStagingAttestation, { runTimestamp }),
+    {
+      valid: true,
+      error: null,
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('staging_run_report', {
+      ...validStagingAttestation,
+      schema_version: 2,
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'attestation bundle schema_version must be 1',
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('staging_run_report', {
+      ...validStagingAttestation,
+      attested_at: '2026-03-31T14:06:00+02:00',
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'attestation bundle must include RFC 3339 UTC attested_at',
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('staging_run_report', {
+      ...validStagingAttestation,
+      provenance: {
+        ...validStagingAttestation.provenance,
+        origin_run_id: '',
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'attestation bundle provenance.origin_run_id must be non-empty',
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('staging_run_report', {
+      ...validStagingAttestation,
+      provenance: {
+        ...validStagingAttestation.provenance,
+        origin_run_uri: 'not-a-uri',
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'attestation bundle provenance.origin_run_uri must be an absolute external URI',
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('staging_run_report', {
+      ...validStagingAttestation,
+      provenance: {
+        ...validStagingAttestation.provenance,
+        origin_run_uri: 'urn:',
+      },
+      payload: {
+        ...validStagingAttestation.payload,
+        source_run_uri: 'urn:',
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'attestation bundle provenance.origin_run_uri must be an absolute external URI',
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('staging_run_report', {
+      ...validStagingAttestation,
+      provenance: {
+        ...validStagingAttestation.provenance,
+        origin_run_uri: 'urn:matrix:evidence:run:123',
+        artifact_store_uri: 'urn:matrix:evidence:artifact:123',
+        review_record_uri: 'urn:matrix:evidence:review:123',
+      },
+      payload: {
+        ...validStagingAttestation.payload,
+        source_run_uri: 'urn:matrix:evidence:run:123',
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: true,
+      error: null,
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('staging_run_report', {
+      ...validStagingAttestation,
+      provenance: {
+        ...validStagingAttestation.provenance,
+        artifact_store_uri: 'still-not-a-uri',
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'attestation bundle provenance.artifact_store_uri must be an absolute external URI',
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('staging_run_report', {
+      ...validStagingAttestation,
+      provenance: {
+        ...validStagingAttestation.provenance,
+        origin_run_uri: 'about:blank',
+      },
+      payload: {
+        ...validStagingAttestation.payload,
+        source_run_uri: 'about:blank',
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'attestation bundle provenance.origin_run_uri must be an absolute external URI',
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('staging_run_report', {
+      ...validStagingAttestation,
+      provenance: {
+        ...validStagingAttestation.provenance,
+        topology_kind: 'local',
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'attestation bundle provenance.topology_kind must be non-local',
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('staging_run_report', {
+      ...validStagingAttestation,
+      payload: {
+        ...validStagingAttestation.payload,
+        source_run_uri: 'https://example.invalid/runs/staging/other',
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'attestation bundle payload source_run_uri must equal provenance.origin_run_uri',
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('staging_run_report', {
+      ...validStagingAttestation,
+      payload: {
+        ...validStagingAttestation.payload,
+        expanded_test_files: [
+          'tests/staging/l1-mandatory.test.mjs',
+          'tests/local/client-identity/phase-04.test.mjs',
+        ],
+        expanded_test_file_count: 2,
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'attested payload invalid: environment run report must not expand local test implementations',
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('prod_cost_snapshot', validProdCostAttestation, { runTimestamp }),
+    {
+      valid: true,
+      error: null,
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('prod_cost_snapshot', {
+      ...validProdCostAttestation,
+      provenance: {
+        ...validProdCostAttestation.provenance,
+        artifact_sha256: 'bad',
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'attestation bundle provenance.artifact_sha256 must be a 64-character hex digest',
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('prod_cost_snapshot', {
+      ...validProdCostAttestation,
+      payload: {
+        ...validProdCostAttestation.payload,
+        topology_kind: 'cloudflare-staging',
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'attestation bundle payload topology_kind must equal provenance.topology_kind',
+    },
+  );
+});
+
 test('current non-local harness readiness fails closed while staging and pre-release still import local tests', async () => {
   const integrationReadiness = await assessNonLocalEnvironmentHarnessReadiness('ci-integration', repoRoot);
   assert.equal(integrationReadiness.ready, false);
@@ -793,6 +1269,20 @@ test('non-local harness readiness follows dynamic import edges when a staging te
   const readiness = await assessNonLocalEnvironmentHarnessReadiness('staging', tempRoot);
   assert.equal(readiness.ready, false);
   assert.ok(readiness.local_test_expansions.includes('tests/local/probe.test.mjs'));
+});
+
+test('non-local harness readiness fails closed on missing static imports', async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-testing-harness-missing-static-import-'));
+  await fs.mkdir(path.join(tempRoot, 'tests', 'staging'), { recursive: true });
+  await fs.writeFile(
+    path.join(tempRoot, 'tests', 'staging', 'probe.test.mjs'),
+    "import './missing.mjs';\n",
+  );
+
+  const readiness = await assessNonLocalEnvironmentHarnessReadiness('staging', tempRoot);
+  assert.equal(readiness.ready, false);
+  assert.match(readiness.reason ?? '', /unresolved or non-literal dynamic imports or unsupported static module specifiers/);
+  assert.ok(readiness.unresolved_dynamic_imports.includes('tests/staging/probe.test.mjs -> ./missing.mjs'));
 });
 
 test('non-local harness readiness follows side-effect static imports without from clauses', async () => {
@@ -2608,6 +3098,39 @@ test('non-local harness readiness follows escaped static imports into local test
   assert.ok(readiness.local_test_expansions.includes('tests/local/probe.test.mjs'));
 });
 
+test('non-local harness readiness fails closed on package-import aliases that can hide local test shims', async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-testing-harness-package-import-'));
+  await fs.mkdir(path.join(tempRoot, 'tests', 'staging'), { recursive: true });
+  await fs.mkdir(path.join(tempRoot, 'tests', 'local'), { recursive: true });
+  await fs.writeFile(
+    path.join(tempRoot, 'package.json'),
+    JSON.stringify({
+      name: 'matrix-testing-harness-package-import',
+      type: 'module',
+      imports: {
+        '#local-probe': './tests/local/probe.test.mjs',
+      },
+    }, null, 2),
+  );
+  await fs.writeFile(
+    path.join(tempRoot, 'tests', 'staging', 'bootstrap.test.mjs'),
+    "import '#local-probe';\n",
+  );
+  await fs.writeFile(
+    path.join(tempRoot, 'tests', 'staging', 'l1-mandatory.test.mjs'),
+    'export const marker = true;\n',
+  );
+  await fs.writeFile(
+    path.join(tempRoot, 'tests', 'local', 'probe.test.mjs'),
+    'export const marker = true;\n',
+  );
+
+  const readiness = await assessNonLocalEnvironmentHarnessReadiness('staging', tempRoot);
+  assert.equal(readiness.ready, false);
+  assert.match(readiness.reason, /non-literal dynamic imports/);
+  assert.ok(readiness.unresolved_dynamic_imports.includes('tests/staging/bootstrap.test.mjs'));
+});
+
 test('non-local harness readiness allows node builtin imports while tracking repo-owned shared proofs', async () => {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-testing-harness-node-builtin-'));
   await fs.mkdir(path.join(tempRoot, 'tests', 'staging'), { recursive: true });
@@ -2762,7 +3285,7 @@ test('manual artifact collection rejects _test-runs paths even when payload stru
   await fs.mkdir(path.dirname(reportPath), { recursive: true });
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('pre-release', runTimestamp), null, 2),
+    JSON.stringify(buildValidEnvironmentAttestation('pre-release', runTimestamp), null, 2),
   );
 
   const results = await collectManualArtifactResults(
@@ -2793,7 +3316,7 @@ test('manual artifact collection rejects symlinked _test-runs reports even when 
   await fs.writeFile(testFile, 'export const remote = true;\n');
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('pre-release', runTimestamp), null, 2),
+    JSON.stringify(buildValidEnvironmentAttestation('pre-release', runTimestamp), null, 2),
   );
   await fs.symlink(reportPath, symlinkPath);
 
@@ -2825,7 +3348,7 @@ test('manual artifact collection rejects hard-linked _test-runs reports even whe
   await fs.writeFile(testFile, 'export const remote = true;\n');
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('pre-release', runTimestamp), null, 2),
+    JSON.stringify(buildValidEnvironmentAttestation('pre-release', runTimestamp), null, 2),
   );
   await fs.link(reportPath, linkedPath);
 
@@ -2858,7 +3381,7 @@ test('manual artifact collection rejects hard-linked _test-runs reports from oth
   await fs.writeFile(testFile, 'export const remote = true;\n');
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('pre-release', runTimestamp), null, 2),
+    JSON.stringify(buildValidEnvironmentAttestation('pre-release', runTimestamp), null, 2),
   );
   await fs.link(reportPath, linkedPath);
 
@@ -2890,7 +3413,7 @@ test('manual artifact collection rejects hard-linked _test-runs artifacts even w
   await fs.writeFile(testFile, 'export const remote = true;\n');
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('pre-release', runTimestamp), null, 2),
+    JSON.stringify(buildValidEnvironmentAttestation('pre-release', runTimestamp), null, 2),
   );
   await fs.link(reportPath, linkedPath);
 
@@ -2922,11 +3445,11 @@ test('manual artifact collection rejects prod cost snapshots from _test-runs eve
   await fs.writeFile(testFile, 'export const remote = true;\n');
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('pre-release', runTimestamp), null, 2),
+    JSON.stringify(buildValidEnvironmentAttestation('pre-release', runTimestamp), null, 2),
   );
   await fs.writeFile(
     prodCostSnapshotPath,
-    JSON.stringify(buildValidProdCostSnapshot(runTimestamp), null, 2),
+    JSON.stringify(buildValidProdCostSnapshotAttestation(runTimestamp), null, 2),
   );
 
   const results = await collectManualArtifactResults(
@@ -2962,11 +3485,11 @@ test('manual artifact collection rejects hard-linked prod cost snapshots from _t
   await fs.writeFile(testFile, 'export const remote = true;\n');
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('pre-release', runTimestamp), null, 2),
+    JSON.stringify(buildValidEnvironmentAttestation('pre-release', runTimestamp), null, 2),
   );
   await fs.writeFile(
     sharedProdCostSnapshotPath,
-    JSON.stringify(buildValidProdCostSnapshot(runTimestamp), null, 2),
+    JSON.stringify(buildValidProdCostSnapshotAttestation(runTimestamp), null, 2),
   );
   await fs.link(sharedProdCostSnapshotPath, linkedProdCostSnapshotPath);
 
@@ -2993,7 +3516,7 @@ test('manual artifact collection rejects otherwise valid external reports when t
   const reportPath = path.join(os.tmpdir(), `matrix-pre-release-report-${runTimestamp}.json`);
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('pre-release', runTimestamp), null, 2),
+    JSON.stringify(buildValidEnvironmentAttestation('pre-release', runTimestamp), null, 2),
   );
 
   try {
@@ -3025,7 +3548,7 @@ test('manual artifact collection accepts valid external reports when the harness
   await fs.writeFile(testFile, 'export const remote = true;\n');
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -3048,6 +3571,65 @@ test('manual artifact collection accepts valid external reports when the harness
   assert.equal(results[0].validation_error, null);
 });
 
+test('manual artifact collection rejects raw run reports even when the harness is environment-backed', async () => {
+  const runTimestamp = '20260331T141725Z';
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-testing-harness-manual-raw-report-'));
+  const testFile = path.join(tempRoot, 'tests', 'staging', 'remote.test.mjs');
+  const reportPath = path.join(tempRoot, 'external', 'staging.json');
+
+  await fs.mkdir(path.dirname(testFile), { recursive: true });
+  await fs.mkdir(path.dirname(reportPath), { recursive: true });
+  await fs.writeFile(testFile, 'export const remote = true;\n');
+  await fs.writeFile(
+    reportPath,
+    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+      test_files: ['tests/staging/remote.test.mjs'],
+      test_file_count: 1,
+      expanded_test_files: ['tests/staging/remote.test.mjs'],
+      expanded_test_file_count: 1,
+    }), null, 2),
+  );
+
+  const results = await collectManualArtifactResults(
+    getL1EvidenceDefinition('EVID-CS-002'),
+    tempRoot,
+    {
+      staging_run_report: reportPath,
+    },
+    runTimestamp,
+  );
+
+  assert.equal(results.length, 1);
+  assert.equal(results[0].valid, false);
+  assert.equal(results[0].environment_harness_ready, true);
+  assert.equal(results[0].validation_error, 'attestation bundle schema_version must be 1');
+});
+
+test('manual artifact collection preserves read failures as explicit invalid results instead of swallowing them as missing', async () => {
+  const runTimestamp = '20260331T141726Z';
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-testing-harness-manual-read-failure-'));
+  const testFile = path.join(tempRoot, 'tests', 'staging', 'remote.test.mjs');
+  const reportPath = path.join(tempRoot, 'external', 'staging-directory');
+
+  await fs.mkdir(path.dirname(testFile), { recursive: true });
+  await fs.mkdir(reportPath, { recursive: true });
+  await fs.writeFile(testFile, 'export const remote = true;\n');
+
+  const results = await collectManualArtifactResults(
+    getL1EvidenceDefinition('EVID-CS-002'),
+    tempRoot,
+    {
+      staging_run_report: reportPath,
+    },
+    runTimestamp,
+  );
+
+  assert.equal(results.length, 1);
+  assert.equal(results[0].exists, true);
+  assert.equal(results[0].valid, false);
+  assert.match(results[0].validation_error ?? '', /failed to read staging_run_report:/);
+});
+
 test('manual artifact collection rejects getter-based Reflect.get object members that only look environment-backed on the report surface', async () => {
   const runTimestamp = '20260331T141726Z';
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-testing-harness-manual-reflect-get-getter-object-member-alias-'));
@@ -3067,7 +3649,7 @@ test('manual artifact collection rejects getter-based Reflect.get object members
   );
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -3109,7 +3691,7 @@ test('manual artifact collection rejects method-based Reflect.get object members
   );
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -3151,7 +3733,7 @@ test('manual artifact collection rejects parenthesized reassigned getter-based R
   );
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -3193,7 +3775,7 @@ test('manual artifact collection rejects aliased createRequire harnesses that on
   );
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -3235,7 +3817,7 @@ test('manual artifact collection rejects parenthesized reassigned createRequire 
   );
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -3277,7 +3859,7 @@ test('manual artifact collection rejects namespace-aliased createRequire harness
   );
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -3319,7 +3901,7 @@ test('manual artifact collection rejects parenthesized namespace-member createRe
   );
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -3361,7 +3943,7 @@ test('manual artifact collection rejects optional-chained createRequire harnesse
   );
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -3403,7 +3985,7 @@ test('manual artifact collection rejects escaped createRequire harnesses that on
   );
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -3445,7 +4027,7 @@ test('manual artifact collection rejects destructuring-reassigned createRequire 
   );
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -3487,7 +4069,7 @@ test('manual artifact collection rejects spread-backed destructuring-reassigned 
   );
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -3529,7 +4111,7 @@ test('manual artifact collection rejects spread-sourced destructuring-reassigned
   );
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -3571,7 +4153,7 @@ test('manual artifact collection rejects expression-built spread-sourced destruc
   );
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -3613,7 +4195,7 @@ test('manual artifact collection rejects spread-sourced object-member createRequ
   );
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -3655,7 +4237,7 @@ test('manual artifact collection rejects expression-built spread-sourced object-
   );
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -3697,7 +4279,7 @@ test('manual artifact collection rejects object-member createRequire harnesses t
   );
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -3739,7 +4321,7 @@ test('manual artifact collection rejects parenthesized object-member createRequi
   );
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -3781,7 +4363,7 @@ test('manual artifact collection rejects static bracket createRequire harnesses 
   );
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -3823,7 +4405,7 @@ test('manual artifact collection rejects createRequire.call harnesses that only 
   );
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -3865,7 +4447,7 @@ test('manual artifact collection rejects aliased createRequire.bind harnesses th
   );
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -3907,7 +4489,7 @@ test('manual artifact collection rejects inline object-literal receiver createRe
   );
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -3949,7 +4531,7 @@ test('manual artifact collection rejects numeric bracket createRequire object-me
   );
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -3991,7 +4573,7 @@ test('manual artifact collection rejects numeric bracket inline object-literal r
   );
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -4033,7 +4615,7 @@ test('manual artifact collection rejects computed numeric bracket createRequire 
   );
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -4075,7 +4657,7 @@ test('manual artifact collection rejects computed numeric bracket inline object-
   );
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -4117,7 +4699,7 @@ test('manual artifact collection rejects extracted computed numeric bracket crea
   );
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -4159,7 +4741,7 @@ test('manual artifact collection rejects extracted inline object-literal createR
   );
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -4201,7 +4783,7 @@ test('manual artifact collection rejects non-finite computed numeric bracket cre
   );
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -4243,7 +4825,7 @@ test('manual artifact collection rejects non-finite computed numeric bracket inl
   );
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -4285,7 +4867,7 @@ test('manual artifact collection rejects extracted non-finite computed numeric b
   );
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -4327,7 +4909,7 @@ test('manual artifact collection rejects extracted non-finite inline object-lite
   );
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -4369,7 +4951,7 @@ test('manual artifact collection rejects aliased constructor.call harnesses that
   );
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -4411,7 +4993,7 @@ test('manual artifact collection rejects escaped constructor property aliases th
   );
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -4453,7 +5035,7 @@ test('manual artifact collection rejects destructuring-reassigned constructor pr
   );
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -4495,7 +5077,7 @@ test('manual artifact collection rejects computed-key destructuring-reassigned c
   );
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -4537,7 +5119,7 @@ test('manual artifact collection rejects spread-sourced destructuring-reassigned
   );
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -4579,7 +5161,7 @@ test('manual artifact collection rejects spread-sourced object-member constructo
   );
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -4621,7 +5203,7 @@ test('manual artifact collection rejects object-member constructor aliases that 
   );
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -4663,7 +5245,7 @@ test('manual artifact collection rejects parenthesized object-member constructor
   );
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -4705,7 +5287,7 @@ test('manual artifact collection rejects reassigned constructor.call harnesses t
   );
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -4747,7 +5329,7 @@ test('manual artifact collection rejects parenthesized reassigned constructor ha
   );
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -4789,7 +5371,7 @@ test('non-local harness readiness is recomputed after files change and manual ar
   await fs.writeFile(path.join(stagingDir, 'remote.test.mjs'), "await import('../local/probe.test.mjs');\n");
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentReport('staging', runTimestamp, {
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
       test_files: ['tests/staging/remote.test.mjs'],
       test_file_count: 1,
       expanded_test_files: ['tests/staging/remote.test.mjs'],
@@ -4854,6 +5436,17 @@ test('writeL1Evidence keeps end-to-end bundle gating fail-closed without manual 
 
     assert.equal(passResult.ok, true);
     assert.ok(passResult.bundles.every((bundle) => bundle.status === 'pass'));
+    const passCs001Root = passResult.bundles.find((bundle) => bundle.evid_id === 'EVID-CS-001')?.evidence_root;
+    const passManualArtifacts = JSON.parse(
+      await fs.readFile(path.join(passCs001Root, 'artifacts', 'manual-artifacts.json'), 'utf8'),
+    );
+    const stagingArtifact = passManualArtifacts.find((artifact) => artifact.artifact_id === 'staging_run_report');
+    assert.equal(stagingArtifact?.attestation_origin_run_attempt, 1);
+    assert.equal(stagingArtifact?.attestation_origin_run_uri, `https://example.invalid/runs/staging/${passTimestamp}`);
+    assert.equal(stagingArtifact?.attestation_artifact_store_key, `staging/${passTimestamp}/attestation.json`);
+    assert.equal(stagingArtifact?.attestation_artifact_sha256, 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789');
+    assert.equal(stagingArtifact?.attestation_deployment_identity?.environment_id, 'staging-env');
+    assert.equal(stagingArtifact?.attestation_provenance?.review_record_uri, `https://example.invalid/reviews/staging/${passTimestamp}`);
   } finally {
     await fs.rm(fixtureParent, { recursive: true, force: true });
   }
@@ -4906,6 +5499,28 @@ test('evidence output paths are immutable once a run timestamp already exists', 
   );
 });
 
+test('concurrent governance evidence writes fail closed on the same run timestamp', async () => {
+  const timestamp = '20991231T235957Z';
+  const fixtureRoot = await createIsolatedRepoFixture('matrix-governance-race-fixture-');
+  const fixtureParent = path.dirname(fixtureRoot);
+
+  try {
+    const attempts = await Promise.allSettled(
+      Array.from({ length: 8 }, () => writeGovernanceEvidence(fixtureRoot, { timestamp })),
+    );
+    const succeeded = attempts.filter((result) => result.status === 'fulfilled');
+    const failed = attempts.filter((result) => result.status === 'rejected');
+
+    assert.equal(succeeded.length, 1);
+    assert.equal(failed.length, 7);
+    for (const result of failed) {
+      assert.match(result.reason?.message ?? String(result.reason), /immutable|already exist/);
+    }
+  } finally {
+    await fs.rm(fixtureParent, { recursive: true, force: true });
+  }
+});
+
 test('CLI failure paths surface immutability errors and exit with code 1', async () => {
   const testingTimestamp = '20991231T235957Z';
   const governanceTimestamp = '20991231T235956Z';
@@ -4951,4 +5566,74 @@ test('CLI failure paths surface immutability errors and exit with code 1', async
   } finally {
     await fs.rm(fixtureParent, { recursive: true, force: true });
   }
+});
+
+test('CLI evidence-l1 forwards attestation paths into the evidence writer', async () => {
+  const {
+    fixtureRoot,
+    sharedProofFile,
+    environmentTestFiles,
+  } = await createEnvironmentBackedEvidenceFixture();
+  const fixtureParent = path.dirname(fixtureRoot);
+
+  try {
+    const runTimestamp = '20260401T010203Z';
+    const manualArtifacts = await createEnvironmentBackedManualArtifacts(fixtureRoot, runTimestamp, {
+      sharedProofFile,
+      environmentTestFiles,
+    });
+
+    const { stdout } = await execFileAsync(process.execPath, [
+      'packages/testing/src/cli.mjs',
+      'evidence-l1',
+      '--timestamp',
+      runTimestamp,
+      '--ci-integration-attestation',
+      manualArtifacts.ci_integration_run_report,
+      '--staging-attestation',
+      manualArtifacts.staging_run_report,
+      '--pre-release-attestation',
+      manualArtifacts.pre_release_run_report,
+      '--prod-cost-attestation',
+      manualArtifacts.prod_cost_snapshot,
+    ], {
+      cwd: fixtureRoot,
+    });
+
+    assert.match(stdout, /Wrote L1 evidence bundles/);
+    assert.match(stdout, /EVID-CS-001: pass/);
+    assert.match(stdout, /EVID-COST-001: pass/);
+  } finally {
+    await fs.rm(fixtureParent, { recursive: true, force: true });
+  }
+});
+
+test('CLI evidence-l1 rejects legacy report and snapshot flags after the attestation cutover', async () => {
+  await assert.rejects(
+    execFileAsync(process.execPath, [
+      'packages/testing/src/cli.mjs',
+      'evidence-l1',
+      '--timestamp',
+      '20260401T010203Z',
+      '--staging-report',
+      'external/staging.json',
+    ], {
+      cwd: repoRoot,
+    }),
+    /Unknown evidence-l1 option "--staging-report"/,
+  );
+
+  await assert.rejects(
+    execFileAsync(process.execPath, [
+      'packages/testing/src/cli.mjs',
+      'evidence-l1',
+      '--timestamp',
+      '20260401T010203Z',
+      '--prod-cost-snapshot',
+      'external/prod.json',
+    ], {
+      cwd: repoRoot,
+    }),
+    /Unknown evidence-l1 option "--prod-cost-snapshot"/,
+  );
 });

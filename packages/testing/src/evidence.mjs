@@ -43,7 +43,33 @@ const NON_LOCAL_ENVIRONMENT_ARTIFACT_REQUIREMENTS = Object.freeze({
   }),
 });
 
+const ATTESTATION_SCHEMA_VERSION = 1;
+
+const MANUAL_ARTIFACT_ATTESTATION_REQUIREMENTS = Object.freeze({
+  ci_integration_run_report: Object.freeze({
+    attestation_kind: 'environment_run',
+    source_environment: 'ci-integration',
+    payload_label: 'environment run report',
+  }),
+  staging_run_report: Object.freeze({
+    attestation_kind: 'environment_run',
+    source_environment: 'staging',
+    payload_label: 'environment run report',
+  }),
+  pre_release_run_report: Object.freeze({
+    attestation_kind: 'environment_run',
+    source_environment: 'pre-release',
+    payload_label: 'environment run report',
+  }),
+  prod_cost_snapshot: Object.freeze({
+    attestation_kind: 'prod_cost_snapshot',
+    source_environment: 'prod',
+    payload_label: 'prod_cost_snapshot',
+  }),
+});
+
 const SHA256_HEX_RE = /^[a-f0-9]{64}$/;
+const WELL_FORMED_URN_RE = /^urn:[a-z0-9][a-z0-9-]{0,31}:.+/i;
 const L1_SHARED_TEST_RUN_ROOT = 'evidence/common/_test-runs';
 
 const L1_TEST_IMPLEMENTATION_FILES = Object.freeze({
@@ -72,7 +98,7 @@ const L1_EVIDENCE_DEFINITIONS = Object.freeze([
     scope: 'L1',
     test_ids: ['TEST-CS-001'],
     evidence_type: 'integration/protocol',
-    generation_method: 'client-core CI + staging report',
+    generation_method: 'client-core CI + staging attestation bundle',
     required_environments: ['ci-integration', 'staging'],
     declared_source_ids: ['MX-CS-001', 'MX-CS-002', 'MX-CS-003', 'MX-CS-005', 'MX-CS-006', 'MX-CS-019', 'MX-CS-024', 'MX-CS-026'],
     pass_criteria: 'Client discovery, capabilities, registration, login, password/UIA, deactivation, refresh, logout, profile fields, and propagation must pass in CI integration and staging.',
@@ -82,7 +108,7 @@ const L1_EVIDENCE_DEFINITIONS = Object.freeze([
     scope: 'L1',
     test_ids: ['TEST-CS-002'],
     evidence_type: 'protocol',
-    generation_method: '/sync conformance report',
+    generation_method: '/sync conformance attested staging report',
     required_environments: ['staging'],
     declared_source_ids: ['MX-CS-004', 'MX-CS-006', 'MX-CS-007', 'MX-CS-010', 'MX-CS-015'],
     pass_criteria: 'Filter lifecycle, sync modes, include_leave, lazy-load members, push rules, and notification counts must pass in staging.',
@@ -92,7 +118,7 @@ const L1_EVIDENCE_DEFINITIONS = Object.freeze([
     scope: 'L1',
     test_ids: ['TEST-CS-003'],
     evidence_type: 'protocol',
-    generation_method: 'devices/E2EE transport report',
+    generation_method: 'devices/E2EE transport attested staging report',
     required_environments: ['staging'],
     declared_source_ids: ['MX-CS-013', 'MX-CS-014'],
     pass_criteria: 'Devices, to-device transport, and one-time key at-most-once behavior must pass in staging.',
@@ -102,7 +128,7 @@ const L1_EVIDENCE_DEFINITIONS = Object.freeze([
     scope: 'L1',
     test_ids: ['TEST-CS-004'],
     evidence_type: 'protocol/governance',
-    generation_method: 'stub-only/unsupported route guard report',
+    generation_method: 'stub-only/unsupported route guard attested CI + staging report',
     required_environments: ['ci-integration', 'staging'],
     declared_source_ids: ['MX-CS-003', 'MX-CS-005', 'MX-CS-012', 'MX-CS-016', 'MX-CS-018', 'MX-CS-020', 'MX-CS-021', 'MX-CS-022', 'MX-CS-023', 'MX-CS-025', 'MX-CS-027', 'MX-CS-028', 'MX-CS-029'],
     pass_criteria: 'Stub-only and unsupported client routes must return deterministic wire behavior without truth writes or discoverability drift in CI integration and staging.',
@@ -112,7 +138,7 @@ const L1_EVIDENCE_DEFINITIONS = Object.freeze([
     scope: 'L1',
     test_ids: ['TEST-ROOM-001'],
     evidence_type: 'property/integration',
-    generation_method: 'room-core report',
+    generation_method: 'room-core attested CI + staging report',
     required_environments: ['ci-integration', 'staging'],
     declared_source_ids: ['MX-CS-008', 'MX-CS-009', 'MX-CS-010'],
     pass_criteria: 'Room creation, membership, event send, fanout, receipts, and typing must pass in CI integration and staging.',
@@ -122,7 +148,7 @@ const L1_EVIDENCE_DEFINITIONS = Object.freeze([
     scope: 'L1',
     test_ids: ['TEST-ROOM-002'],
     evidence_type: 'protocol/property',
-    generation_method: 'room-version report',
+    generation_method: 'room-version attested CI + staging report',
     required_environments: ['ci-integration', 'staging'],
     declared_source_ids: ['MX-RV-011', 'MX-RV-012'],
     l1_excluded_source_ids: ['MX-RV-011'],
@@ -133,7 +159,7 @@ const L1_EVIDENCE_DEFINITIONS = Object.freeze([
     scope: 'L1',
     test_ids: ['TEST-MEDIA-001'],
     evidence_type: 'integration/load',
-    generation_method: 'media pipeline report',
+    generation_method: 'media pipeline attested staging + pre-release report',
     required_environments: ['staging', 'pre-release'],
     declared_source_ids: ['MX-CS-011', 'MX-FED-008'],
     l1_excluded_source_ids: ['MX-FED-008'],
@@ -144,7 +170,7 @@ const L1_EVIDENCE_DEFINITIONS = Object.freeze([
     scope: 'L1',
     test_ids: ['TEST-DER-001'],
     evidence_type: 'integration/rebuild',
-    generation_method: 'derived-data report',
+    generation_method: 'derived-data attested staging + pre-release report',
     required_environments: ['staging', 'pre-release'],
     declared_source_ids: ['MX-CS-017', 'MX-FED-006'],
     l1_excluded_source_ids: ['MX-FED-006'],
@@ -155,7 +181,7 @@ const L1_EVIDENCE_DEFINITIONS = Object.freeze([
     scope: 'common',
     test_ids: ['TEST-SEC-001'],
     evidence_type: 'security',
-    generation_method: 'security verification bundle',
+    generation_method: 'security attested staging + pre-release bundle',
     required_environments: ['staging', 'pre-release'],
     declared_source_ids: ['REQ-SEC-*', 'MX-CS-002', 'MX-CS-003', 'MX-CS-005', 'MX-CS-016', 'MX-CS-024', 'MX-CS-025', 'MX-CS-026', 'MX-CS-028', 'MX-FED-002'],
     l1_excluded_source_ids: ['REQ-SEC-005', 'MX-FED-002'],
@@ -166,7 +192,7 @@ const L1_EVIDENCE_DEFINITIONS = Object.freeze([
     scope: 'common',
     test_ids: ['TEST-OPS-001'],
     evidence_type: 'deploy',
-    generation_method: 'rollout compatibility report',
+    generation_method: 'rollout compatibility attested pre-release report',
     required_environments: ['pre-release'],
     declared_source_ids: ['REQ-OPS-010', 'REQ-OPS-011', 'REQ-OPS-012'],
     pass_criteria: 'Worker/authority version skew paths must pass in pre-release.',
@@ -176,13 +202,13 @@ const L1_EVIDENCE_DEFINITIONS = Object.freeze([
     scope: 'common',
     test_ids: ['TEST-COST-001'],
     evidence_type: 'cost',
-    generation_method: 'monthly dashboard snapshot + model comparison',
+    generation_method: 'attested monthly dashboard snapshot + model comparison',
     required_environments: ['pre-release'],
     declared_source_ids: ['REQ-OPS-003', 'CF-WKR-015', 'CF-WKR-016', 'CF-WKR-017', 'CF-WKR-018', 'CF-WKR-019', 'CF-DO-011', 'CF-DO-012', 'CF-DO-013', 'CF-D1-006', 'CF-KV-003', 'CF-R2-005', 'CF-QUE-001'],
     required_manual_artifacts: [
       Object.freeze({
         artifact_id: 'prod_cost_snapshot',
-        description: 'Production monthly dashboard snapshot + model comparison artifact for the same evidence run.',
+        description: 'Production monthly dashboard snapshot attestation for the same evidence run.',
       }),
     ],
     pass_criteria: 'Metrics and cost-attribution surfaces must produce stable pre-release evidence without budget-model drift signals, and the same bundle must include the corresponding production monthly dashboard snapshot/model comparison artifact.',
@@ -245,8 +271,12 @@ function isNonEmptyString(value) {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
-function isIsoTimestamp(value) {
-  return isNonEmptyString(value) && Number.isFinite(Date.parse(value));
+const RFC3339_UTC_TIMESTAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
+
+function isRfc3339UtcTimestamp(value) {
+  return isNonEmptyString(value)
+    && RFC3339_UTC_TIMESTAMP_RE.test(value)
+    && Number.isFinite(Date.parse(value));
 }
 
 function isNonNegativeInteger(value) {
@@ -264,6 +294,24 @@ function isNonEmptyStringArray(value) {
 
 function isNonNegativeNumber(value) {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+}
+
+function isAbsoluteExternalUri(value) {
+  if (!isNonEmptyString(value)) {
+    return false;
+  }
+  try {
+    const parsed = new URL(value);
+    if (['about:', 'blob:', 'data:', 'file:', 'javascript:'].includes(parsed.protocol)) {
+      return false;
+    }
+    if (parsed.protocol === 'urn:') {
+      return WELL_FORMED_URN_RE.test(value);
+    }
+    return parsed.host.length > 0;
+  } catch {
+    return false;
+  }
 }
 
 function objectHasRequiredNumericFields(value, fieldNames) {
@@ -2212,6 +2260,13 @@ function isTrackedModuleSpecifier(specifier) {
     );
 }
 
+function isOpaqueStaticModuleSpecifier(specifier) {
+  return typeof specifier === 'string'
+    && !isTrackedModuleSpecifier(specifier)
+    && !hasExplicitModuleScheme(specifier)
+    && !isSafeBuiltinModuleSpecifier(specifier);
+}
+
 function findStaticModuleSpecifier(sourceText, startIndex) {
   let cursor = skipTrivia(sourceText, startIndex);
   const directLiteral = parseQuotedStringLiteral(sourceText, cursor);
@@ -2500,6 +2555,8 @@ function collectRelativeModuleDependencies(sourceText) {
           hasUnresolvedDynamicImport = true;
         } else if (isTrackedModuleSpecifier(literalSpecifier)) {
           moduleSpecifiers.push(literalSpecifier);
+        } else if (isOpaqueStaticModuleSpecifier(literalSpecifier)) {
+          hasUnresolvedDynamicImport = true;
         } else if (hasExplicitModuleScheme(literalSpecifier) && !isSafeBuiltinModuleSpecifier(literalSpecifier)) {
           hasUnresolvedDynamicImport = true;
         }
@@ -2514,6 +2571,8 @@ function collectRelativeModuleDependencies(sourceText) {
       if (staticSpecifier != null) {
         if (isTrackedModuleSpecifier(staticSpecifier.specifier)) {
           moduleSpecifiers.push(staticSpecifier.specifier);
+        } else if (isOpaqueStaticModuleSpecifier(staticSpecifier.specifier)) {
+          hasUnresolvedDynamicImport = true;
         } else if (
           hasExplicitModuleScheme(staticSpecifier.specifier)
           && !isSafeBuiltinModuleSpecifier(staticSpecifier.specifier)
@@ -2531,6 +2590,8 @@ function collectRelativeModuleDependencies(sourceText) {
       if (staticSpecifier != null) {
         if (isTrackedModuleSpecifier(staticSpecifier.specifier)) {
           moduleSpecifiers.push(staticSpecifier.specifier);
+        } else if (isOpaqueStaticModuleSpecifier(staticSpecifier.specifier)) {
+          hasUnresolvedDynamicImport = true;
         } else if (
           hasExplicitModuleScheme(staticSpecifier.specifier)
           && !isSafeBuiltinModuleSpecifier(staticSpecifier.specifier)
@@ -2591,13 +2652,34 @@ async function resolveImportedModulePath(specifier, entryFile, repoRoot) {
   const candidatePaths = path.extname(basePath)
     ? [basePath]
     : [basePath, `${basePath}.mjs`];
+  let sawRepoOwnedCandidate = false;
   for (const candidatePath of candidatePaths) {
+    if (!pathIsWithinRoot(candidatePath, repoRoot)) {
+      continue;
+    }
+    sawRepoOwnedCandidate = true;
     const ownedPath = await resolveOwnedPath(candidatePath, repoRoot);
-    if (ownedPath != null) {
-      return ownedPath;
+    if (ownedPath == null) {
+      continue;
+    }
+    try {
+      const candidateStats = await fs.lstat(ownedPath);
+      if (candidateStats.isFile()) {
+        return {
+          resolvedPath: ownedPath,
+          resolution: 'ok',
+        };
+      }
+    } catch (error) {
+      if (!error || error.code !== 'ENOENT') {
+        throw error;
+      }
     }
   }
-  return null;
+  return {
+    resolvedPath: null,
+    resolution: sawRepoOwnedCandidate ? 'missing' : 'outside',
+  };
 }
 
 async function areSameFilesystemEntry(leftPath, rightPath) {
@@ -2762,10 +2844,10 @@ export function validateManualArtifactPayload(artifactId, payload, {
         error: 'environment run report must not expand local test implementations',
       };
     }
-    if (!isIsoTimestamp(payload.started_at) || !isIsoTimestamp(payload.completed_at)) {
+    if (!isRfc3339UtcTimestamp(payload.started_at) || !isRfc3339UtcTimestamp(payload.completed_at)) {
       return {
         valid: false,
-        error: 'environment run report must include parseable started_at and completed_at timestamps',
+        error: 'environment run report must include RFC 3339 UTC started_at and completed_at timestamps',
       };
     }
     if (!isNonNegativeInteger(payload.duration_ms)) {
@@ -2786,10 +2868,10 @@ export function validateManualArtifactPayload(artifactId, payload, {
         error: 'environment run report error_message must be null',
       };
     }
-    if (!isNonEmptyString(payload.log_artifact)) {
+    if (!isAbsoluteExternalUri(payload.log_artifact)) {
       return {
         valid: false,
-        error: 'environment run report must include a non-empty log_artifact',
+        error: 'environment run report must include an absolute external log_artifact',
       };
     }
     if (!isNonEmptyString(payload.executed_by)) {
@@ -2804,10 +2886,10 @@ export function validateManualArtifactPayload(artifactId, payload, {
         error: 'environment run report must include reviewed_by',
       };
     }
-    if (!isNonEmptyString(payload.source_run_uri)) {
+    if (!isAbsoluteExternalUri(payload.source_run_uri)) {
       return {
         valid: false,
-        error: 'environment run report must include source_run_uri',
+        error: 'environment run report must include an absolute external source_run_uri',
       };
     }
     if (!isNonEmptyString(payload.topology_kind) || payload.topology_kind === 'local') {
@@ -2855,10 +2937,10 @@ export function validateManualArtifactPayload(artifactId, payload, {
         error: 'prod_cost_snapshot captured_at must be a non-empty string',
       };
     }
-    if (!isIsoTimestamp(payload.captured_at)) {
+    if (!isRfc3339UtcTimestamp(payload.captured_at)) {
       return {
         valid: false,
-        error: 'prod_cost_snapshot captured_at must be a parseable timestamp',
+        error: 'prod_cost_snapshot captured_at must be an RFC 3339 UTC timestamp',
       };
     }
     if (runTimestamp != null && payload.run_timestamp !== runTimestamp) {
@@ -2879,10 +2961,10 @@ export function validateManualArtifactPayload(artifactId, payload, {
         error: 'prod_cost_snapshot must include reviewed_by',
       };
     }
-    if (!isNonEmptyString(payload.source_dashboard_uri)) {
+    if (!isAbsoluteExternalUri(payload.source_dashboard_uri)) {
       return {
         valid: false,
-        error: 'prod_cost_snapshot must include source_dashboard_uri',
+        error: 'prod_cost_snapshot must include an absolute external source_dashboard_uri',
       };
     }
     if (!isNonEmptyString(payload.topology_kind) || payload.topology_kind === 'local') {
@@ -2911,10 +2993,10 @@ export function validateManualArtifactPayload(artifactId, payload, {
         error: 'prod_cost_snapshot must include billing_period',
       };
     }
-    if (!isIsoTimestamp(payload.billing_period.start) || !isIsoTimestamp(payload.billing_period.end)) {
+    if (!isRfc3339UtcTimestamp(payload.billing_period.start) || !isRfc3339UtcTimestamp(payload.billing_period.end)) {
       return {
         valid: false,
-        error: 'prod_cost_snapshot billing_period must include parseable start and end timestamps',
+        error: 'prod_cost_snapshot billing_period must include RFC 3339 UTC start and end timestamps',
       };
     }
     if (Date.parse(payload.billing_period.start) > Date.parse(payload.billing_period.end)) {
@@ -3004,6 +3086,190 @@ export function validateManualArtifactPayload(artifactId, payload, {
   };
 }
 
+export function validateEvidenceAttestationBundle(artifactId, payload, {
+  runTimestamp = null,
+} = {}) {
+  if (!isPlainObject(payload)) {
+    return {
+      valid: false,
+      error: 'attestation bundle must be a JSON object',
+    };
+  }
+
+  const contract = MANUAL_ARTIFACT_ATTESTATION_REQUIREMENTS[artifactId];
+  if (!contract) {
+    return {
+      valid: false,
+      error: `unknown attestation contract for ${artifactId}`,
+    };
+  }
+
+  if (payload.schema_version !== ATTESTATION_SCHEMA_VERSION) {
+    return {
+      valid: false,
+      error: `attestation bundle schema_version must be ${ATTESTATION_SCHEMA_VERSION}`,
+    };
+  }
+  if (payload.artifact_id !== artifactId) {
+    return {
+      valid: false,
+      error: `attestation bundle artifact_id must be ${artifactId}`,
+    };
+  }
+  if (payload.attestation_kind !== contract.attestation_kind) {
+    return {
+      valid: false,
+      error: `attestation bundle attestation_kind must be ${contract.attestation_kind}`,
+    };
+  }
+  if (payload.source_environment !== contract.source_environment) {
+    return {
+      valid: false,
+      error: `attestation bundle source_environment must be ${contract.source_environment}`,
+    };
+  }
+  if (runTimestamp != null && payload.run_timestamp !== runTimestamp) {
+    return {
+      valid: false,
+      error: `attestation bundle must have run_timestamp ${runTimestamp}`,
+    };
+  }
+  if (!isRfc3339UtcTimestamp(payload.attested_at)) {
+    return {
+      valid: false,
+      error: 'attestation bundle must include RFC 3339 UTC attested_at',
+    };
+  }
+  if (!isPlainObject(payload.provenance)) {
+    return {
+      valid: false,
+      error: 'attestation bundle must include provenance',
+    };
+  }
+
+  const provenance = payload.provenance;
+  if (!isNonEmptyString(provenance.origin_system)) {
+    return {
+      valid: false,
+      error: 'attestation bundle provenance.origin_system must be non-empty',
+    };
+  }
+  if (!isNonEmptyString(provenance.origin_run_id)) {
+    return {
+      valid: false,
+      error: 'attestation bundle provenance.origin_run_id must be non-empty',
+    };
+  }
+  if (!Number.isInteger(provenance.origin_run_attempt) || provenance.origin_run_attempt <= 0) {
+    return {
+      valid: false,
+      error: 'attestation bundle provenance.origin_run_attempt must be a positive integer',
+    };
+  }
+  if (!isAbsoluteExternalUri(provenance.origin_run_uri)) {
+    return {
+      valid: false,
+      error: 'attestation bundle provenance.origin_run_uri must be an absolute external URI',
+    };
+  }
+  if (!isAbsoluteExternalUri(provenance.artifact_store_uri)) {
+    return {
+      valid: false,
+      error: 'attestation bundle provenance.artifact_store_uri must be an absolute external URI',
+    };
+  }
+  if (!isNonEmptyString(provenance.artifact_store_key)) {
+    return {
+      valid: false,
+      error: 'attestation bundle provenance.artifact_store_key must be non-empty',
+    };
+  }
+  if (!isNonEmptyString(provenance.artifact_sha256) || !SHA256_HEX_RE.test(provenance.artifact_sha256)) {
+    return {
+      valid: false,
+      error: 'attestation bundle provenance.artifact_sha256 must be a 64-character hex digest',
+    };
+  }
+  if (!isAbsoluteExternalUri(provenance.review_record_uri)) {
+    return {
+      valid: false,
+      error: 'attestation bundle provenance.review_record_uri must be an absolute external URI',
+    };
+  }
+  if (!isNonEmptyString(provenance.topology_kind) || provenance.topology_kind === 'local') {
+    return {
+      valid: false,
+      error: 'attestation bundle provenance.topology_kind must be non-local',
+    };
+  }
+  if (!isPlainObject(provenance.deployment_identity)) {
+    return {
+      valid: false,
+      error: 'attestation bundle provenance.deployment_identity must be an object',
+    };
+  }
+  if (!isNonEmptyString(provenance.deployment_identity.environment_id)) {
+    return {
+      valid: false,
+      error: 'attestation bundle provenance.deployment_identity.environment_id must be non-empty',
+    };
+  }
+  if (!isNonEmptyStringArray(provenance.deployment_identity.deployment_ids)) {
+    return {
+      valid: false,
+      error: 'attestation bundle provenance.deployment_identity.deployment_ids must be a non-empty string array',
+    };
+  }
+  if (!isNonEmptyStringArray(provenance.deployment_identity.worker_version_ids)) {
+    return {
+      valid: false,
+      error: 'attestation bundle provenance.deployment_identity.worker_version_ids must be a non-empty string array',
+    };
+  }
+  if (!isPlainObject(payload.payload)) {
+    return {
+      valid: false,
+      error: `attestation bundle must include ${contract.payload_label} payload`,
+    };
+  }
+
+  const payloadValidation = validateManualArtifactPayload(artifactId, payload.payload, {
+    runTimestamp,
+  });
+  if (!payloadValidation.valid) {
+    return {
+      valid: false,
+      error: `attested payload invalid: ${payloadValidation.error}`,
+    };
+  }
+  if (payload.payload.run_timestamp !== payload.run_timestamp) {
+    return {
+      valid: false,
+      error: 'attestation bundle payload.run_timestamp must equal attestation run_timestamp',
+    };
+  }
+  if (payload.payload.topology_kind !== provenance.topology_kind) {
+    return {
+      valid: false,
+      error: 'attestation bundle payload topology_kind must equal provenance.topology_kind',
+    };
+  }
+  if (
+    contract.attestation_kind === 'environment_run'
+    && payload.payload.source_run_uri !== provenance.origin_run_uri
+  ) {
+    return {
+      valid: false,
+      error: 'attestation bundle payload source_run_uri must equal provenance.origin_run_uri',
+    };
+  }
+
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
 async function collectTransitiveTestFiles(entryFile, repoRoot, visited = new Set()) {
   const ownedEntryFile = await resolveOwnedPath(entryFile, repoRoot);
   if (ownedEntryFile == null) {
@@ -3043,12 +3309,16 @@ async function collectTransitiveTestFiles(entryFile, repoRoot, visited = new Set
     unresolvedDynamicImports.push(normalizedEntryFile);
   }
   for (const specifier of dependencyScan.moduleSpecifiers) {
-    const ownedResolvedPath = await resolveImportedModulePath(specifier, entryFile, repoRoot);
-    if (ownedResolvedPath == null) {
+    const resolvedImport = await resolveImportedModulePath(specifier, entryFile, repoRoot);
+    if (resolvedImport.resolvedPath == null) {
+      if (resolvedImport.resolution === 'missing') {
+        unresolvedDynamicImports.push(`${normalizedEntryFile} -> ${specifier}`);
+        continue;
+      }
       repoBoundaryEscapes.push(`${normalizedEntryFile} -> ${specifier}`);
       continue;
     }
-    const nestedResult = await collectTransitiveTestFiles(ownedResolvedPath, repoRoot, visited);
+    const nestedResult = await collectTransitiveTestFiles(resolvedImport.resolvedPath, repoRoot, visited);
     for (const nestedFile of nestedResult.files) {
       transitiveFiles.add(nestedFile);
     }
@@ -3147,7 +3417,7 @@ export async function assessNonLocalEnvironmentHarnessReadiness(environmentName,
             }
         : {
             ready: false,
-            reason: `${environmentName} harness contains non-literal dynamic imports`,
+            reason: `${environmentName} harness contains unresolved or non-literal dynamic imports or unsupported static module specifiers`,
             test_files: relativeTestFiles,
             expanded_test_files: expandedTestFiles,
             local_test_expansions: [],
@@ -3362,6 +3632,18 @@ export async function collectManualArtifactResults(definition, repoRoot, manualA
     let validation_error = null;
     let resolvedRealPath = null;
     let sharedRunArtifactAlias = false;
+    let attestation_kind = null;
+    let attestation_origin_system = null;
+    let attestation_origin_run_id = null;
+    let attestation_origin_run_attempt = null;
+    let attestation_origin_run_uri = null;
+    let attestation_artifact_store_uri = null;
+    let attestation_artifact_store_key = null;
+    let attestation_artifact_sha256 = null;
+    let attestation_review_record_uri = null;
+    let attestation_topology_kind = null;
+    let attestation_deployment_identity = null;
+    let attestation_provenance = null;
     if (resolvedPath) {
       try {
         const fileContents = await fs.readFile(resolvedPath);
@@ -3380,11 +3662,27 @@ export async function collectManualArtifactResults(definition, repoRoot, manualA
         } catch {
           parsedPayload = null;
         }
-        const validation = validateManualArtifactPayload(artifactRequirement.artifact_id, parsedPayload, {
+        const validation = validateEvidenceAttestationBundle(artifactRequirement.artifact_id, parsedPayload, {
           runTimestamp,
         });
         valid = validation.valid;
         validation_error = validation.error;
+        if (valid) {
+          attestation_kind = parsedPayload.attestation_kind ?? null;
+          attestation_origin_system = parsedPayload.provenance?.origin_system ?? null;
+          attestation_origin_run_id = parsedPayload.provenance?.origin_run_id ?? null;
+          attestation_origin_run_attempt = parsedPayload.provenance?.origin_run_attempt ?? null;
+          attestation_origin_run_uri = parsedPayload.provenance?.origin_run_uri ?? null;
+          attestation_artifact_store_uri = parsedPayload.provenance?.artifact_store_uri ?? null;
+          attestation_artifact_store_key = parsedPayload.provenance?.artifact_store_key ?? null;
+          attestation_artifact_sha256 = parsedPayload.provenance?.artifact_sha256 ?? null;
+          attestation_review_record_uri = parsedPayload.provenance?.review_record_uri ?? null;
+          attestation_topology_kind = parsedPayload.provenance?.topology_kind ?? null;
+          attestation_deployment_identity = parsedPayload.provenance?.deployment_identity ?? null;
+        }
+        attestation_provenance = isPlainObject(parsedPayload?.provenance)
+          ? parsedPayload.provenance
+          : null;
         if (requiresExternalEvidence) {
           sharedRunArtifactAlias = await isAliasOfSharedRunArtifact(
             resolvedPath,
@@ -3407,8 +3705,14 @@ export async function collectManualArtifactResults(definition, repoRoot, manualA
           valid = false;
           validation_error = `${expectedEnvironmentName} harness is not environment-backed: ${harnessReadiness.reason}`;
         }
-      } catch {
-        exists = false;
+      } catch (error) {
+        if (error && error.code === 'ENOENT') {
+          exists = false;
+        } else {
+          exists = true;
+          valid = false;
+          validation_error = `failed to read ${artifactRequirement.artifact_id}: ${error instanceof Error ? error.message : String(error)}`;
+        }
       }
     }
     return {
@@ -3419,6 +3723,18 @@ export async function collectManualArtifactResults(definition, repoRoot, manualA
       valid,
       sha256,
       validation_error,
+      attestation_kind,
+      attestation_origin_system,
+      attestation_origin_run_id,
+      attestation_origin_run_attempt,
+      attestation_origin_run_uri,
+      attestation_artifact_store_uri,
+      attestation_artifact_store_key,
+      attestation_artifact_sha256,
+      attestation_review_record_uri,
+      attestation_topology_kind,
+      attestation_deployment_identity,
+      attestation_provenance,
       environment_harness_ready: harnessReadiness?.ready ?? null,
       environment_harness_reason: harnessReadiness?.reason ?? null,
     };
@@ -3593,6 +3909,9 @@ async function writeEvidenceBundle(repoRoot, {
         : (artifact.valid ? 'valid' : 'invalid');
       const reason = artifact.validation_error == null ? '' : `: ${artifact.validation_error}`;
       summaryLines.push(`- \`${artifact.artifact_id}\`: ${state}${artifact.provided_path == null ? '' : ` (\`${artifact.provided_path}\`)`}${reason}`);
+      if (artifact.attestation_provenance != null) {
+        summaryLines.push(`  provenance: origin_run_uri=\`${artifact.attestation_origin_run_uri}\`, artifact_store_uri=\`${artifact.attestation_artifact_store_uri}\`, review_record_uri=\`${artifact.attestation_review_record_uri}\``);
+      }
     }
   }
   summaryLines.push('');

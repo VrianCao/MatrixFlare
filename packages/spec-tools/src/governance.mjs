@@ -147,6 +147,51 @@ function stableJson(value) {
   return JSON.stringify(value, null, 2) + '\n';
 }
 
+export function resolveEvidenceRunTimestamp(candidate = null) {
+  if (candidate == null) {
+    return slugifyTimestamp();
+  }
+  if (typeof candidate !== 'string' || !/^\d{8}T\d{6}Z$/.test(candidate)) {
+    throw new RangeError('timestamp must match ^\\d{8}T\\d{6}Z$');
+  }
+  return candidate;
+}
+
+export async function assertPathsDoNotExist(paths, {
+  label = 'output paths',
+} = {}) {
+  const existingPaths = [];
+  for (const candidatePath of paths) {
+    try {
+      await fs.lstat(candidatePath);
+      existingPaths.push(candidatePath);
+    } catch (error) {
+      if (!error || error.code !== 'ENOENT') {
+        throw error;
+      }
+    }
+  }
+
+  if (existingPaths.length > 0) {
+    throw new Error(`${label} must be immutable; already exist: ${existingPaths.map((candidatePath) => normalizePath(candidatePath)).join(', ')}`);
+  }
+}
+
+export async function reserveFreshOutputPaths(paths, options = {}) {
+  const label = options.label ?? 'output paths';
+  for (const candidatePath of paths) {
+    await fs.mkdir(path.dirname(candidatePath), { recursive: true });
+    try {
+      await fs.mkdir(candidatePath);
+    } catch (error) {
+      if (error && error.code === 'EEXIST') {
+        throw new Error(`${label} must be immutable; already exist: ${normalizePath(candidatePath)}`);
+      }
+      throw error;
+    }
+  }
+}
+
 function sha256Hex(value) {
   return createHash('sha256').update(value).digest('hex');
 }
@@ -1518,13 +1563,16 @@ function collectDataVersionContext(analysis) {
 
 export async function writeGovernanceEvidence(repoRoot = getRepoRoot(), options = {}) {
   const analysis = await analyzeRepository(repoRoot);
-  const runTimestamp = options.timestamp ?? slugifyTimestamp();
+  const runTimestamp = resolveEvidenceRunTimestamp(options.timestamp ?? null);
   const evidenceRoot = path.join(repoRoot, 'evidence/common/EVID-GOV-001', runTimestamp);
   const artifactsDir = path.join(evidenceRoot, 'artifacts');
   const generatedAt = new Date().toISOString();
   const codeVersion = await collectCodeVersionContext(repoRoot);
   const dataVersion = collectDataVersionContext(analysis);
 
+  await reserveFreshOutputPaths([evidenceRoot], {
+    label: `Governance evidence output paths for run ${runTimestamp}`,
+  });
   await fs.mkdir(artifactsDir, { recursive: true });
 
   const requirementRegisterCsvRows = analysis.requirementRegister.map((row) => ({
