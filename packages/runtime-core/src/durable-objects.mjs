@@ -7,7 +7,12 @@ import {
   ROOM_DO_SCHEMA_VERSION,
   createRoomDurableObjectPersistence,
 } from './room-persistence.mjs';
-import { normalizeInteger, normalizeString, withSqliteTransaction } from './persistence-common.mjs';
+import {
+  bindSqlStorageTransactionSync,
+  normalizeInteger,
+  normalizeString,
+  withSqliteTransaction,
+} from './persistence-common.mjs';
 import {
   DEFAULT_ROOM_VERSION,
   buildRoomStateTupleKey,
@@ -447,7 +452,7 @@ const MEDIA_CLEANUP_RETRY_MS = 60_000;
 
 async function ensureShardRegistrySchema(env) {
   const db = env?.MATRIX_CONTROL_D1;
-  if (!db || typeof db.prepare !== 'function' || typeof db.exec !== 'function') {
+  if (!db || typeof db.prepare !== 'function') {
     throw createInternalErrorEnvelope({
       code: 'internal',
       message: 'Missing MATRIX_CONTROL_D1 binding for shard registry barrier',
@@ -455,7 +460,22 @@ async function ensureShardRegistrySchema(env) {
     });
   }
   if (!env.__SHARD_REGISTRY_SCHEMA_READY__) {
-    env.__SHARD_REGISTRY_SCHEMA_READY__ = db.exec(SHARD_REGISTRY_SCHEMA_SQL);
+    // D1 prepared statements are the stable request-path API; `exec()` is documented as a less-safe
+    // maintenance/one-shot surface and local runtimes can diverge on its return-shape semantics.
+    const prepared = db.prepare(SHARD_REGISTRY_SCHEMA_SQL);
+    const runnable = typeof prepared?.run === 'function'
+      ? prepared
+      : typeof prepared?.bind === 'function'
+        ? prepared.bind()
+        : null;
+    if (!runnable || typeof runnable.run !== 'function') {
+      throw createInternalErrorEnvelope({
+        code: 'internal',
+        message: 'MATRIX_CONTROL_D1 prepare() must return a runnable prepared statement',
+        retryable: false,
+      });
+    }
+    env.__SHARD_REGISTRY_SCHEMA_READY__ = runnable.run();
   }
   await env.__SHARD_REGISTRY_SCHEMA_READY__;
   return db;
@@ -1452,10 +1472,34 @@ function mapInternalCodeToMatrixError(error) {
   };
 }
 
-export class BaseDurableObject {
+// Cloudflare DO method-call RPC only works when the target class inherits the runtime DurableObject base.
+let DurableObjectRuntimeBase = typeof globalThis.DurableObject === 'function'
+  ? globalThis.DurableObject
+  : null;
+if (typeof DurableObjectRuntimeBase !== 'function') {
+  try {
+    const cloudflareWorkersModule = await import('cloudflare:workers');
+    if (typeof cloudflareWorkersModule?.DurableObject === 'function') {
+      DurableObjectRuntimeBase = cloudflareWorkersModule.DurableObject;
+    }
+  } catch {
+    // Node test environments do not expose the Workers runtime module.
+  }
+}
+if (typeof DurableObjectRuntimeBase !== 'function') {
+  DurableObjectRuntimeBase = class DurableObjectFallback {
+    constructor(ctx, env) {
+      this.ctx = ctx;
+      this.env = env;
+    }
+  };
+}
+
+export class BaseDurableObject extends DurableObjectRuntimeBase {
   constructor(ctx, env, options) {
-    this.ctx = ctx;
-    this.env = env;
+    super(ctx, env);
+    this.ctx ??= ctx;
+    this.env ??= env;
     this.options = options;
   }
 
@@ -1522,9 +1566,13 @@ export class BaseDurableObject {
   }
 
   requireSqlStorage() {
-    const sql = this.ctx?.storage?.sql;
+    const storage = this.ctx?.storage;
+    const sql = storage?.sql;
     if (!sql || typeof sql.exec !== 'function') {
       throw new TypeError(`${this.options.className} requires SQLite-backed Durable Object storage`);
+    }
+    if (typeof storage?.transactionSync === 'function') {
+      bindSqlStorageTransactionSync(sql, storage.transactionSync.bind(storage));
     }
     return sql;
   }

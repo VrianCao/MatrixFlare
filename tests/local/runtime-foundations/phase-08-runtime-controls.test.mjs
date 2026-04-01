@@ -366,6 +366,113 @@ test('Phase 08 telemetry records deployment, binding, derived-lag, and cost attr
   assert.equal(gatewayRecord.feature_gates.otel_persist, true);
 });
 
+test('Phase 08 D1 telemetry wrapper preserves the full D1PreparedStatement surface after bind()', async () => {
+  class FakePreparedStatement {
+    constructor(sql, values = []) {
+      this.sql = sql;
+      this.values = values;
+      this.extra_marker = 'prepared-surface';
+    }
+
+    bind(...values) {
+      return new FakePreparedStatement(this.sql, values);
+    }
+
+    async run() {
+      return {
+        success: true,
+        meta: {
+          duration: 1,
+          rows_read: 0,
+          rows_written: 0,
+        },
+        results: [{ sql: this.sql, values: this.values }],
+      };
+    }
+
+    async first() {
+      return {
+        sql: this.sql,
+        first: this.values[0] ?? null,
+      };
+    }
+
+    async all() {
+      return {
+        success: true,
+        meta: {
+          duration: 1,
+          rows_read: 1,
+          rows_written: 0,
+        },
+        results: [{ values: this.values }],
+      };
+    }
+
+    async raw(options = {}) {
+      return options.columnNames
+        ? [['value'], [this.values[0] ?? null]]
+        : [[this.values[0] ?? null]];
+    }
+  }
+
+  const env = {
+    MATRIX_CONTROL_D1: {
+      prepare(sql) {
+        return new FakePreparedStatement(sql);
+      },
+    },
+    MATRIX_MEDIA_BUCKET: null,
+    MATRIX_ARCHIVE_BUCKET: null,
+    MATRIX_EDGE_CACHE: null,
+    SEARCH_INDEX_QUEUE: null,
+    MEDIA_THUMBNAIL_QUEUE: null,
+    APPSERVICE_TXN_QUEUE: null,
+    REBUILD_SHARD_QUEUE: null,
+    EXPORT_SHARD_QUEUE: null,
+    RESTORE_SHARD_QUEUE: null,
+    REPAIR_SHARD_QUEUE: null,
+  };
+
+  instrumentEnvironmentBindings(env);
+  const rebound = env.MATRIX_CONTROL_D1.prepare('SELECT ?').bind(1).bind(2);
+
+  assert.equal(typeof rebound.bind, 'function');
+  assert.equal(typeof rebound.run, 'function');
+  assert.equal(typeof rebound.first, 'function');
+  assert.equal(typeof rebound.all, 'function');
+  assert.equal(typeof rebound.raw, 'function');
+  assert.equal(rebound.extra_marker, 'prepared-surface');
+
+  const rawResult = await rebound.raw({ columnNames: true });
+  assert.deepEqual(rawResult, [['value'], [2]]);
+  const runResult = await rebound.run();
+  assert.equal(runResult.meta.duration, 1);
+
+  const snapshot = snapshotTelemetry(env);
+  assertMetric(snapshot, 'd1.query.count', (dimensions) => dimensions.method === 'raw');
+  assertMetric(snapshot, 'd1.query.count', (dimensions) => dimensions.method === 'run');
+});
+
+test('Phase 08 shard registry bootstrap avoids D1 exec() so register stays alive when exec return-shape is broken', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const originalD1 = rig.env.MATRIX_CONTROL_D1;
+  rig.env.MATRIX_CONTROL_D1 = {
+    ...originalD1,
+    async exec() {
+      throw new Error('Cannot read properties of undefined (reading \'duration\')');
+    },
+    prepare(sql) {
+      return originalD1.prepare(sql);
+    },
+  };
+
+  const alice = await registerUser(rig, { username: 'phase08-d1-exec-broken-alice' });
+  assert.equal(alice.user_id, '@phase08-d1-exec-broken-alice:matrix.example.test');
+});
+
 test('Phase 08 request contracts stay functional under worker and authority version skew', async (t) => {
   async function exerciseSkew({ workerVersion, authorityVersion }) {
     const rig = createGatewayVersionSkewRig({

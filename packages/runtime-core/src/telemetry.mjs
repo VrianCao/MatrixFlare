@@ -240,6 +240,56 @@ function wrapD1Binding(env, binding, databaseName) {
   if (!binding || binding[TELEMETRY_BINDINGS_INSTRUMENTED]) {
     return binding;
   }
+
+  function wrapPreparedStatement(prepared, operation) {
+    if (!prepared || (typeof prepared !== 'object' && typeof prepared !== 'function')) {
+      return prepared;
+    }
+    return new Proxy(prepared, {
+      get(target, property, receiver) {
+        if (property === 'bind') {
+          const bindMethod = Reflect.get(target, property, receiver);
+          if (typeof bindMethod !== 'function') {
+            return bindMethod;
+          }
+          return (...bindings) => wrapPreparedStatement(bindMethod.apply(target, bindings), operation);
+        }
+        if (['run', 'first', 'all', 'raw'].includes(String(property))) {
+          const method = Reflect.get(target, property, receiver);
+          if (typeof method !== 'function') {
+            return method;
+          }
+          return async (...args) => {
+            incrementMetric(env, 'd1.query.count', 1, {
+              database: databaseName,
+              operation,
+              method: String(property),
+            });
+            recordCostAttribution(env, {
+              surface: 'd1.query',
+              quantity: 1,
+              dimensions: {
+                database: databaseName,
+                operation,
+                method: String(property),
+              },
+            });
+            return measureAsync(env, {
+              metricName: 'd1.query.latency_ms',
+              dimensions: {
+                database: databaseName,
+                operation,
+                method: String(property),
+              },
+            })(() => method.apply(target, args));
+          };
+        }
+        const value = Reflect.get(target, property, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+  }
+
   const proxy = new Proxy(binding, {
     get(target, property, receiver) {
       if (property === TELEMETRY_BINDINGS_INSTRUMENTED) {
@@ -268,49 +318,7 @@ function wrapD1Binding(env, binding, databaseName) {
         return (sql) => {
           const operation = classifySqlOperation(sql);
           const prepared = prepareMethod.call(target, sql);
-          if (!prepared || typeof prepared.bind !== 'function') {
-            return prepared;
-          }
-          return {
-            bind(...bindings) {
-              const bound = prepared.bind(...bindings);
-              const wrapStatementMethod = (methodName) => {
-                const method = bound?.[methodName];
-                if (typeof method !== 'function') {
-                  return method;
-                }
-                return async (...args) => {
-                  incrementMetric(env, 'd1.query.count', 1, {
-                    database: databaseName,
-                    operation,
-                    method: methodName,
-                  });
-                  recordCostAttribution(env, {
-                    surface: 'd1.query',
-                    quantity: 1,
-                    dimensions: {
-                      database: databaseName,
-                      operation,
-                      method: methodName,
-                    },
-                  });
-                  return measureAsync(env, {
-                    metricName: 'd1.query.latency_ms',
-                    dimensions: {
-                      database: databaseName,
-                      operation,
-                      method: methodName,
-                    },
-                  })(() => method.call(bound, ...args));
-                };
-              };
-              return {
-                run: wrapStatementMethod('run'),
-                first: wrapStatementMethod('first'),
-                all: wrapStatementMethod('all'),
-              };
-            },
-          };
+          return wrapPreparedStatement(prepared, operation);
         };
       }
       const value = Reflect.get(target, property, receiver);
