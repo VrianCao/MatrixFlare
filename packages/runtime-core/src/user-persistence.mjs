@@ -843,21 +843,21 @@ export function createUserDurableObjectPersistence(sqlStorage) {
       });
     },
     claimOneTimeKey({ device_id, algorithm, key_id, claimed_at = new Date().toISOString(), claim_context = null } = {}) {
-      return withSqliteTransaction(sql, () => {
-        const existing = oneTimeKeys.get({ device_id, algorithm, key_id });
-        if (!existing || existing.claimed_at) {
-          return null;
-        }
-        oneTimeKeys.put({
-          device_id,
-          algorithm,
-          key_id,
-          published_at: existing.published_at,
-          claimed_at: normalizeString(claimed_at, 'claimed_at'),
-          claim_context_json: claim_context,
-          record_json: existing.record ?? {},
-        });
-        return oneTimeKeys.get({ device_id, algorithm, key_id });
+      return withSqliteTransaction(sql, () => claimOneTimeKeyRecord({
+        device_id,
+        algorithm,
+        key_id,
+        claimed_at,
+        claim_context,
+      }));
+    },
+    claimOneTimeKeyWithinTransaction({ device_id, algorithm, key_id, claimed_at = new Date().toISOString(), claim_context = null } = {}) {
+      return claimOneTimeKeyRecord({
+        device_id,
+        algorithm,
+        key_id,
+        claimed_at,
+        claim_context,
       });
     },
     userPrincipal,
@@ -878,4 +878,21 @@ export function createUserDurableObjectPersistence(sqlStorage) {
     pendingUploadGrants,
     toDeviceTxnDedupe,
   });
+
+  function claimOneTimeKeyRecord({ device_id, algorithm, key_id, claimed_at, claim_context }) {
+    const existing = oneTimeKeys.get({ device_id, algorithm, key_id });
+    if (!existing || existing.claimed_at) {
+      return null;
+    }
+    oneTimeKeys.put({
+      device_id,
+      algorithm,
+      key_id,
+      published_at: existing.published_at,
+      claimed_at: normalizeString(claimed_at, 'claimed_at'),
+      claim_context_json: claim_context,
+      record_json: existing.record ?? {},
+    });
+    return oneTimeKeys.get({ device_id, algorithm, key_id });
+  }
 }

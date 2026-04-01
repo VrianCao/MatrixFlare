@@ -585,9 +585,9 @@ function getOptionalUiaLocalpart(auth, serverName) {
   return null;
 }
 
-function buildRequestFingerprint(routeTemplate, principalId, body) {
+function buildRequestFingerprint(routeTemplate, principalId, body, method = 'POST') {
   return createRequestFingerprint({
-    method: 'POST',
+    method,
     routeTemplate,
     principalId,
     body,
@@ -669,6 +669,18 @@ function normalizePathUserId(pathValue, env) {
   }
   try {
     const localpart = normalizeLocalUserIdentifier(decoded, env.MATRIX_SERVER_NAME);
+    return buildLocalUserId(localpart, env.MATRIX_SERVER_NAME);
+  } catch {
+    return null;
+  }
+}
+
+function normalizeRequestUserId(value, env) {
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    return null;
+  }
+  try {
+    const localpart = normalizeLocalUserIdentifier(value, env.MATRIX_SERVER_NAME);
     return buildLocalUserId(localpart, env.MATRIX_SERVER_NAME);
   } catch {
     return null;
@@ -1016,11 +1028,11 @@ async function assembleSyncResponse(env, batch, {
   const response = {
     next_batch: batch.next_batch,
     device_lists: {
-      changed: [],
-      left: [],
+      changed: structuredClone(batch.device_lists_changed ?? []),
+      left: structuredClone(batch.device_lists_left ?? []),
     },
-    device_one_time_keys_count: {},
-    device_unused_fallback_key_types: [],
+    device_one_time_keys_count: structuredClone(batch.device_one_time_keys_count ?? {}),
+    device_unused_fallback_key_types: structuredClone(batch.device_unused_fallback_key_types ?? []),
   };
 
   if (batch.account_data_events.length > 0) {
@@ -1225,12 +1237,13 @@ function resolvePasswordUiaContext({
   auth,
   accessSession,
   hintedLocalpart,
+  method = 'POST',
 }) {
   if (!auth || auth.type !== 'm.login.password' || typeof auth.session !== 'string') {
     return { ok: false, reason: 'challenge' };
   }
 
-  const payload = verifyRouteBoundUia(env, auth.session, auth.route_family, 'POST');
+  const payload = verifyRouteBoundUia(env, auth.session, auth.route_family, method);
   if (!payload) {
     return { ok: false, reason: 'challenge' };
   }
@@ -1269,6 +1282,35 @@ function resolvePasswordUiaContext({
     user_do: getUserDoStub(env, expectedUserId),
     payload,
   };
+}
+
+function crossSigningUploadRequiresUia(currentSnapshot, requestBody) {
+  const currentMaster = currentSnapshot?.master_keys && typeof currentSnapshot.master_keys === 'object'
+    ? Object.values(currentSnapshot.master_keys)[0] ?? null
+    : null;
+  if (!currentMaster) {
+    return false;
+  }
+  const requestedMaster = requestBody?.master_key ?? null;
+  if (!requestedMaster) {
+    return true;
+  }
+  if (canonicalJsonHash(currentMaster) !== canonicalJsonHash(requestedMaster)) {
+    return true;
+  }
+  const currentSelf = currentSnapshot?.self_signing_keys && typeof currentSnapshot.self_signing_keys === 'object'
+    ? Object.values(currentSnapshot.self_signing_keys)[0] ?? null
+    : null;
+  const currentUser = currentSnapshot?.user_signing_keys && typeof currentSnapshot.user_signing_keys === 'object'
+    ? Object.values(currentSnapshot.user_signing_keys)[0] ?? null
+    : null;
+  if (requestBody?.self_signing_key && canonicalJsonHash(currentSelf ?? null) !== canonicalJsonHash(requestBody.self_signing_key)) {
+    return true;
+  }
+  if (requestBody?.user_signing_key && canonicalJsonHash(currentUser ?? null) !== canonicalJsonHash(requestBody.user_signing_key)) {
+    return true;
+  }
+  return false;
 }
 
 async function handleWellKnownClient(url, env) {
@@ -2960,6 +3002,683 @@ async function handleSendToDevice(request, env, eventType, txnId) {
   return jsonResponse({});
 }
 
+function mergeKeyQueryMaps(target, source) {
+  if (!source || typeof source !== 'object') {
+    return target;
+  }
+  for (const [outerKey, innerValue] of Object.entries(source)) {
+    if (isObjectRecord(innerValue) && isObjectRecord(target[outerKey])) {
+      target[outerKey] = {
+        ...target[outerKey],
+        ...structuredClone(innerValue),
+      };
+      continue;
+    }
+    target[outerKey] = structuredClone(innerValue);
+  }
+  return target;
+}
+
+async function handleListDevices(request, env) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const result = await access.user_do.listDevices({
+    user_id: access.session.user_id,
+  });
+  if (!result.ok) {
+    return jsonResponse(result.matrix_error.body, result.matrix_error.status);
+  }
+  return jsonResponse(result.response);
+}
+
+async function handleGetDevice(request, env, deviceId) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const decodedDeviceId = decodePathComponent(deviceId);
+  if (!decodedDeviceId) {
+    return matrixErrorResponse(400, 'M_INVALID_PARAM', 'Invalid device path');
+  }
+  const result = await access.user_do.getDevice({
+    user_id: access.session.user_id,
+    device_id: decodedDeviceId,
+  });
+  if (!result.ok) {
+    return jsonResponse(result.matrix_error.body, result.matrix_error.status);
+  }
+  return jsonResponse(result.response);
+}
+
+async function handleUpdateDevice(request, env, deviceId) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const decodedDeviceId = decodePathComponent(deviceId);
+  if (!decodedDeviceId) {
+    return matrixErrorResponse(400, 'M_INVALID_PARAM', 'Invalid device path');
+  }
+  const body = await readJsonObject(request);
+  if (body instanceof Response) {
+    return body;
+  }
+  if (body.display_name != null && typeof body.display_name !== 'string') {
+    return matrixErrorResponse(400, 'M_BAD_JSON', 'display_name must be a string when present');
+  }
+  const result = await access.user_do.updateDevice({
+    user_id: access.session.user_id,
+    device_id: decodedDeviceId,
+    display_name: body.display_name ?? null,
+  });
+  if (!result.ok) {
+    return jsonResponse(result.matrix_error.body, result.matrix_error.status);
+  }
+  return jsonResponse(result.response);
+}
+
+async function handleDeleteDevice(request, env, deviceId) {
+  const accessToken = getBearerToken(request);
+  let accessSession = null;
+  let accessFailureResponse = null;
+  const decodedDeviceId = decodePathComponent(deviceId);
+  if (!decodedDeviceId) {
+    return matrixErrorResponse(400, 'M_INVALID_PARAM', 'Invalid device path');
+  }
+  const body = await readJsonObject(request);
+  if (body instanceof Response) {
+    return body;
+  }
+  if (accessToken) {
+    const access = await requireAccessSession(request, env);
+    if (access.ok) {
+      accessSession = access;
+    } else {
+      accessFailureResponse = access.response;
+    }
+  } else {
+    accessFailureResponse = matrixErrorResponse(401, 'M_MISSING_TOKEN', 'Missing access token');
+  }
+  const auth = isObjectRecord(body.auth)
+    ? { ...body.auth, route_family: 'devices/delete' }
+    : null;
+  const hintedLocalpart = getOptionalUiaLocalpart(auth, env.MATRIX_SERVER_NAME);
+  const authSubjectHint = accessSession?.session.user_id ?? (
+    hintedLocalpart ? buildLocalUserId(hintedLocalpart, env.MATRIX_SERVER_NAME) : null
+  );
+  if (!auth || auth.type !== 'm.login.password' || typeof auth.session !== 'string') {
+    if (!accessSession) {
+      return accessFailureResponse;
+    }
+    return buildUiaChallengeResponse(env, 'devices/delete', 'DELETE', authSubjectHint);
+  }
+  const stage = resolvePasswordUiaContext({
+    env,
+    auth,
+    accessSession: accessSession?.session ?? null,
+    hintedLocalpart,
+    method: 'DELETE',
+  });
+  if (!stage.ok) {
+    if (!accessSession) {
+      return accessFailureResponse;
+    }
+    return stage.response ?? buildUiaChallengeResponse(env, 'devices/delete', 'DELETE', authSubjectHint);
+  }
+  if (!accessToken) {
+    return accessFailureResponse;
+  }
+  if (!accessSession) {
+    return accessFailureResponse;
+  }
+  const requestFingerprint = buildRequestFingerprint(
+    '/_matrix/client/v3/devices/{deviceId}',
+    stage.user_id,
+    { device_ids: [decodedDeviceId] },
+    'DELETE',
+  );
+  const replay = await stage.user_do.resolvePhase05DeviceDeleteReplay({
+    user_id: stage.user_id,
+    request_fingerprint: requestFingerprint,
+    uia_nonce: stage.payload.nonce,
+    access_token_hash: accessSession ? null : hashOpaqueToken(accessToken),
+  });
+  if (!replay.ok) {
+    return jsonResponse(replay.matrix_error.body, replay.matrix_error.status);
+  }
+  if (replay.handled) {
+    return jsonResponse(replay.response);
+  }
+  const verification = await stage.user_do.verifyPasswordAuth({
+    localpart: stage.localpart,
+    password: auth.password ?? '',
+  });
+  if (!verification.ok) {
+    return jsonResponse(verification.matrix_error.body, verification.matrix_error.status);
+  }
+  const result = await stage.user_do.deleteDevices({
+    user_id: stage.user_id,
+    device_ids: [decodedDeviceId],
+    request_fingerprint: requestFingerprint,
+    uia_nonce: stage.payload.nonce,
+    access_token_hash: hashOpaqueToken(accessToken),
+  });
+  if (!result.ok) {
+    return jsonResponse(result.matrix_error.body, result.matrix_error.status);
+  }
+  return jsonResponse(result.response);
+}
+
+async function handleDeleteDevices(request, env) {
+  const accessToken = getBearerToken(request);
+  let accessSession = null;
+  let accessFailureResponse = null;
+  const body = await readJsonObject(request);
+  if (body instanceof Response) {
+    return body;
+  }
+  if (accessToken) {
+    const access = await requireAccessSession(request, env);
+    if (access.ok) {
+      accessSession = access;
+    } else {
+      accessFailureResponse = access.response;
+    }
+  } else {
+    accessFailureResponse = matrixErrorResponse(401, 'M_MISSING_TOKEN', 'Missing access token');
+  }
+  const auth = isObjectRecord(body.auth)
+    ? { ...body.auth, route_family: 'delete_devices' }
+    : null;
+  const hintedLocalpart = getOptionalUiaLocalpart(auth, env.MATRIX_SERVER_NAME);
+  const authSubjectHint = accessSession?.session.user_id ?? (
+    hintedLocalpart ? buildLocalUserId(hintedLocalpart, env.MATRIX_SERVER_NAME) : null
+  );
+  if (!auth || auth.type !== 'm.login.password' || typeof auth.session !== 'string') {
+    if (!accessSession) {
+      return accessFailureResponse;
+    }
+    return buildUiaChallengeResponse(env, 'delete_devices', 'POST', authSubjectHint);
+  }
+  if (!Array.isArray(body.devices)) {
+    return matrixErrorResponse(400, 'M_MISSING_PARAM', 'devices is required');
+  }
+  const normalizedDeviceIds = [];
+  for (const deviceId of body.devices) {
+    const normalizedDeviceId = decodePathComponent(String(deviceId));
+    if (!normalizedDeviceId) {
+      return matrixErrorResponse(400, 'M_INVALID_PARAM', 'devices must contain valid device IDs');
+    }
+    normalizedDeviceIds.push(normalizedDeviceId);
+  }
+  const stage = resolvePasswordUiaContext({
+    env,
+    auth,
+    accessSession: accessSession?.session ?? null,
+    hintedLocalpart,
+    method: 'POST',
+  });
+  if (!stage.ok) {
+    if (!accessSession) {
+      return accessFailureResponse;
+    }
+    return stage.response ?? buildUiaChallengeResponse(env, 'delete_devices', 'POST', authSubjectHint);
+  }
+  if (!accessToken) {
+    return accessFailureResponse;
+  }
+  if (!accessSession) {
+    return accessFailureResponse;
+  }
+  const requestFingerprint = buildRequestFingerprint(
+    '/_matrix/client/v3/delete_devices',
+    stage.user_id,
+    { device_ids: normalizedDeviceIds },
+    'POST',
+  );
+  const replay = await stage.user_do.resolvePhase05DeviceDeleteReplay({
+    user_id: stage.user_id,
+    request_fingerprint: requestFingerprint,
+    uia_nonce: stage.payload.nonce,
+    access_token_hash: accessSession ? null : hashOpaqueToken(accessToken),
+  });
+  if (!replay.ok) {
+    return jsonResponse(replay.matrix_error.body, replay.matrix_error.status);
+  }
+  if (replay.handled) {
+    return jsonResponse(replay.response);
+  }
+  const verification = await stage.user_do.verifyPasswordAuth({
+    localpart: stage.localpart,
+    password: auth.password ?? '',
+  });
+  if (!verification.ok) {
+    return jsonResponse(verification.matrix_error.body, verification.matrix_error.status);
+  }
+  const result = await stage.user_do.deleteDevices({
+    user_id: stage.user_id,
+    device_ids: normalizedDeviceIds,
+    request_fingerprint: requestFingerprint,
+    uia_nonce: stage.payload.nonce,
+    access_token_hash: hashOpaqueToken(accessToken),
+  });
+  if (!result.ok) {
+    return jsonResponse(result.matrix_error.body, result.matrix_error.status);
+  }
+  return jsonResponse(result.response);
+}
+
+async function handleKeysUpload(request, env) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const body = await readJsonObject(request);
+  if (body instanceof Response) {
+    return body;
+  }
+  const result = await access.user_do.uploadKeys({
+    user_id: access.session.user_id,
+    device_id: access.session.device_id,
+    device_keys: body.device_keys ?? null,
+    one_time_keys: body.one_time_keys ?? null,
+    fallback_keys: body.fallback_keys ?? null,
+  });
+  if (!result.ok) {
+    return jsonResponse(result.matrix_error.body, result.matrix_error.status);
+  }
+  return jsonResponse(result.response);
+}
+
+async function handleKeysQuery(request, env) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const body = await readJsonObject(request);
+  if (body instanceof Response) {
+    return body;
+  }
+  if (!isObjectRecord(body.device_keys)) {
+    return matrixErrorResponse(400, 'M_MISSING_PARAM', 'device_keys is required');
+  }
+  const response = {
+    device_keys: {},
+    master_keys: {},
+    self_signing_keys: {},
+    user_signing_keys: {},
+  };
+  for (const [rawUserId, deviceIds] of Object.entries(body.device_keys)) {
+    if (!Array.isArray(deviceIds)) {
+      return matrixErrorResponse(400, 'M_BAD_JSON', `device_keys.${rawUserId} must be an array`);
+    }
+    const targetUserId = normalizeRequestUserId(rawUserId, env);
+    if (!targetUserId) {
+      continue;
+    }
+    const result = await getUserDoStub(env, targetUserId).queryDeviceKeys({
+      user_id: targetUserId,
+      requester_user_id: access.session.user_id,
+      device_ids: deviceIds,
+    });
+    if (!result.ok) {
+      return jsonResponse(result.matrix_error.body, result.matrix_error.status);
+    }
+    mergeKeyQueryMaps(response.device_keys, result.response.device_keys);
+    mergeKeyQueryMaps(response.master_keys, result.response.master_keys);
+    mergeKeyQueryMaps(response.self_signing_keys, result.response.self_signing_keys);
+    mergeKeyQueryMaps(response.user_signing_keys, result.response.user_signing_keys);
+  }
+  return jsonResponse(response);
+}
+
+async function handleKeysClaim(request, env) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const body = await readJsonObject(request);
+  if (body instanceof Response) {
+    return body;
+  }
+  if (!isObjectRecord(body.one_time_keys)) {
+    return matrixErrorResponse(400, 'M_MISSING_PARAM', 'one_time_keys is required');
+  }
+  const response = {
+    one_time_keys: {},
+  };
+  for (const [rawUserId, deviceRequests] of Object.entries(body.one_time_keys)) {
+    if (!isObjectRecord(deviceRequests)) {
+      return matrixErrorResponse(400, 'M_BAD_JSON', `one_time_keys.${rawUserId} must be an object`);
+    }
+    const targetUserId = normalizeRequestUserId(rawUserId, env);
+    if (!targetUserId) {
+      continue;
+    }
+    const result = await getUserDoStub(env, targetUserId).claimOneTimeKeys({
+      user_id: targetUserId,
+      requester_user_id: access.session.user_id,
+      device_requests: deviceRequests,
+    });
+    if (!result.ok) {
+      return jsonResponse(result.matrix_error.body, result.matrix_error.status);
+    }
+    mergeKeyQueryMaps(response.one_time_keys, result.response.one_time_keys);
+  }
+  return jsonResponse(response);
+}
+
+async function handleCrossSigningUpload(request, env) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const body = await readJsonObject(request);
+  if (body instanceof Response) {
+    return body;
+  }
+  const requestFingerprint = buildRequestFingerprint(
+    '/_matrix/client/v3/keys/device_signing/upload',
+    access.session.user_id,
+    {
+      master_key: body.master_key ?? null,
+      self_signing_key: body.self_signing_key ?? null,
+      user_signing_key: body.user_signing_key ?? null,
+    },
+    'POST',
+  );
+  const currentSnapshot = await access.user_do.queryDeviceKeys({
+    user_id: access.session.user_id,
+    requester_user_id: access.session.user_id,
+    device_ids: [],
+  });
+  if (!currentSnapshot.ok) {
+    return jsonResponse(currentSnapshot.matrix_error.body, currentSnapshot.matrix_error.status);
+  }
+  if (crossSigningUploadRequiresUia(currentSnapshot.response, body)) {
+    const auth = isObjectRecord(body.auth)
+      ? { ...body.auth, route_family: 'keys/device_signing/upload' }
+      : null;
+    if (!auth || auth.type !== 'm.login.password' || typeof auth.session !== 'string') {
+      return buildUiaChallengeResponse(env, 'keys/device_signing/upload', 'POST', access.session.user_id);
+    }
+    const stage = resolvePasswordUiaContext({
+      env,
+      auth,
+      accessSession: access.session,
+      hintedLocalpart: null,
+      method: 'POST',
+    });
+    if (!stage.ok) {
+      return stage.response ?? buildUiaChallengeResponse(env, 'keys/device_signing/upload', 'POST', access.session.user_id);
+    }
+    const replay = await stage.user_do.resolvePhase05CrossSigningReplay({
+      user_id: stage.user_id,
+      request_fingerprint: requestFingerprint,
+      uia_nonce: stage.payload.nonce,
+    });
+    if (!replay.ok) {
+      return jsonResponse(replay.matrix_error.body, replay.matrix_error.status);
+    }
+    if (replay.handled) {
+      return jsonResponse(replay.response);
+    }
+    const verification = await stage.user_do.verifyPasswordAuth({
+      localpart: stage.localpart,
+      password: auth.password ?? '',
+    });
+    if (!verification.ok) {
+      return jsonResponse(verification.matrix_error.body, verification.matrix_error.status);
+    }
+    const result = await stage.user_do.uploadCrossSigningKeys({
+      user_id: stage.user_id,
+      request_fingerprint: requestFingerprint,
+      uia_nonce: stage.payload.nonce,
+      master_key: body.master_key ?? null,
+      self_signing_key: body.self_signing_key ?? null,
+      user_signing_key: body.user_signing_key ?? null,
+    });
+    if (!result.ok) {
+      return jsonResponse(result.matrix_error.body, result.matrix_error.status);
+    }
+    return jsonResponse(result.response);
+  }
+  const result = await access.user_do.uploadCrossSigningKeys({
+    user_id: access.session.user_id,
+    master_key: body.master_key ?? null,
+    self_signing_key: body.self_signing_key ?? null,
+    user_signing_key: body.user_signing_key ?? null,
+  });
+  if (!result.ok) {
+    return jsonResponse(result.matrix_error.body, result.matrix_error.status);
+  }
+  return jsonResponse(result.response);
+}
+
+async function handleCrossSigningSignaturesUpload(request, env) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const body = await readJsonObject(request);
+  if (body instanceof Response) {
+    return body;
+  }
+  const failures = {};
+  for (const [rawUserId, signedObjects] of Object.entries(body)) {
+    if (!isObjectRecord(signedObjects)) {
+      return matrixErrorResponse(400, 'M_BAD_JSON', `signatures.${rawUserId} must be an object`);
+    }
+    const targetUserId = normalizeRequestUserId(rawUserId, env);
+    if (!targetUserId) {
+      continue;
+    }
+    const result = await getUserDoStub(env, targetUserId).uploadCrossSigningSignatures({
+      user_id: targetUserId,
+      requester_user_id: access.session.user_id,
+      signed_objects: signedObjects,
+    });
+    if (!result.ok) {
+      return jsonResponse(result.matrix_error.body, result.matrix_error.status);
+    }
+    mergeKeyQueryMaps(failures, result.response.failures);
+  }
+  return jsonResponse({ failures });
+}
+
+async function handleCreateRoomKeyBackupVersion(request, env) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const body = await readJsonObject(request);
+  if (body instanceof Response) {
+    return body;
+  }
+  const result = await access.user_do.createRoomKeyBackupVersion({
+    user_id: access.session.user_id,
+    algorithm: body.algorithm,
+    auth_data: body.auth_data ?? {},
+  });
+  if (!result.ok) {
+    return jsonResponse(result.matrix_error.body, result.matrix_error.status);
+  }
+  return jsonResponse(result.response);
+}
+
+async function handleGetCurrentRoomKeyBackupVersion(request, env) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const result = await access.user_do.getCurrentRoomKeyBackupVersion({
+    user_id: access.session.user_id,
+  });
+  if (!result.ok) {
+    return jsonResponse(result.matrix_error.body, result.matrix_error.status);
+  }
+  return jsonResponse(result.response);
+}
+
+async function handleGetRoomKeyBackupVersion(request, env, version) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const decodedVersion = decodePathComponent(version);
+  if (!decodedVersion) {
+    return matrixErrorResponse(400, 'M_INVALID_PARAM', 'Invalid backup version path');
+  }
+  const result = await access.user_do.getRoomKeyBackupVersion({
+    user_id: access.session.user_id,
+    backup_version: decodedVersion,
+  });
+  if (!result.ok) {
+    return jsonResponse(result.matrix_error.body, result.matrix_error.status);
+  }
+  return jsonResponse(result.response);
+}
+
+async function handleUpdateRoomKeyBackupVersion(request, env, version) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const decodedVersion = decodePathComponent(version);
+  if (!decodedVersion) {
+    return matrixErrorResponse(400, 'M_INVALID_PARAM', 'Invalid backup version path');
+  }
+  const body = await readJsonObject(request);
+  if (body instanceof Response) {
+    return body;
+  }
+  const result = await access.user_do.updateRoomKeyBackupVersion({
+    user_id: access.session.user_id,
+    backup_version: decodedVersion,
+    algorithm: body.algorithm,
+    auth_data: body.auth_data ?? {},
+  });
+  if (!result.ok) {
+    return jsonResponse(result.matrix_error.body, result.matrix_error.status);
+  }
+  return jsonResponse(result.response);
+}
+
+async function handleDeleteRoomKeyBackupVersion(request, env, version) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const decodedVersion = decodePathComponent(version);
+  if (!decodedVersion) {
+    return matrixErrorResponse(400, 'M_INVALID_PARAM', 'Invalid backup version path');
+  }
+  const result = await access.user_do.deleteRoomKeyBackupVersion({
+    user_id: access.session.user_id,
+    backup_version: decodedVersion,
+  });
+  if (!result.ok) {
+    return result.error
+      ? mapInternalErrorToResponse(result.error)
+      : jsonResponse(result.matrix_error.body, result.matrix_error.status);
+  }
+  return jsonResponse(result.response);
+}
+
+async function handlePutRoomKeyBackupData(request, env, {
+  version,
+  roomId = null,
+  sessionId = null,
+} = {}) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const decodedVersion = decodePathComponent(version);
+  const decodedRoomId = roomId == null ? null : decodePathComponent(roomId);
+  const decodedSessionId = sessionId == null ? null : decodePathComponent(sessionId);
+  if (!decodedVersion || (roomId != null && !decodedRoomId) || (sessionId != null && !decodedSessionId)) {
+    return matrixErrorResponse(400, 'M_INVALID_PARAM', 'Invalid backup data path');
+  }
+  const body = await readJsonObject(request);
+  if (body instanceof Response) {
+    return body;
+  }
+  const result = await access.user_do.putRoomKeyBackupData({
+    user_id: access.session.user_id,
+    backup_version: decodedVersion,
+    room_id: decodedRoomId,
+    session_id: decodedSessionId,
+    backup_data: body,
+  });
+  if (!result.ok) {
+    return result.error
+      ? mapInternalErrorToResponse(result.error)
+      : jsonResponse(result.matrix_error.body, result.matrix_error.status);
+  }
+  return jsonResponse(result.response);
+}
+
+async function handleGetRoomKeyBackupData(request, env, {
+  version,
+  roomId = null,
+  sessionId = null,
+} = {}) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const decodedVersion = decodePathComponent(version);
+  const decodedRoomId = roomId == null ? null : decodePathComponent(roomId);
+  const decodedSessionId = sessionId == null ? null : decodePathComponent(sessionId);
+  if (!decodedVersion || (roomId != null && !decodedRoomId) || (sessionId != null && !decodedSessionId)) {
+    return matrixErrorResponse(400, 'M_INVALID_PARAM', 'Invalid backup data path');
+  }
+  const result = await access.user_do.getRoomKeyBackupData({
+    user_id: access.session.user_id,
+    backup_version: decodedVersion,
+    room_id: decodedRoomId,
+    session_id: decodedSessionId,
+  });
+  if (!result.ok) {
+    return result.error
+      ? mapInternalErrorToResponse(result.error)
+      : jsonResponse(result.matrix_error.body, result.matrix_error.status);
+  }
+  return jsonResponse(result.response);
+}
+
+async function handleDeleteRoomKeyBackupData(request, env, {
+  version,
+  roomId = null,
+  sessionId = null,
+} = {}) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const decodedVersion = decodePathComponent(version);
+  const decodedRoomId = roomId == null ? null : decodePathComponent(roomId);
+  const decodedSessionId = sessionId == null ? null : decodePathComponent(sessionId);
+  if (!decodedVersion || (roomId != null && !decodedRoomId) || (sessionId != null && !decodedSessionId)) {
+    return matrixErrorResponse(400, 'M_INVALID_PARAM', 'Invalid backup data path');
+  }
+  const result = await access.user_do.deleteRoomKeyBackupData({
+    user_id: access.session.user_id,
+    backup_version: decodedVersion,
+    room_id: decodedRoomId,
+    session_id: decodedSessionId,
+  });
+  if (!result.ok) {
+    return result.error
+      ? mapInternalErrorToResponse(result.error)
+      : jsonResponse(result.matrix_error.body, result.matrix_error.status);
+  }
+  return jsonResponse(result.response);
+}
+
 async function admitRoomClientEvent(roomDo, {
   roomId,
   roomVersion = null,
@@ -4246,6 +4965,112 @@ async function handleRequest(request, env) {
       const roomReceiptMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/receipt\/([^/]+)\/([^/]+)$/.exec(pathname);
       if (roomReceiptMatch && method === 'POST') {
         return handleRoomReceipt(request, env, roomReceiptMatch[1], roomReceiptMatch[2], roomReceiptMatch[3]);
+      }
+
+      if (pathname === '/_matrix/client/v3/devices' && method === 'GET') {
+        return handleListDevices(request, env);
+      }
+      const deviceMatch = /^\/_matrix\/client\/v3\/devices\/([^/]+)$/.exec(pathname);
+      if (deviceMatch && method === 'GET') {
+        return handleGetDevice(request, env, deviceMatch[1]);
+      }
+      if (deviceMatch && method === 'PUT') {
+        return handleUpdateDevice(request, env, deviceMatch[1]);
+      }
+      if (deviceMatch && method === 'DELETE') {
+        return handleDeleteDevice(request, env, deviceMatch[1]);
+      }
+      if (pathname === '/_matrix/client/v3/delete_devices' && method === 'POST') {
+        return handleDeleteDevices(request, env);
+      }
+
+      if (pathname === '/_matrix/client/v3/keys/upload' && method === 'POST') {
+        return handleKeysUpload(request, env);
+      }
+      if (pathname === '/_matrix/client/v3/keys/query' && method === 'POST') {
+        return handleKeysQuery(request, env);
+      }
+      if (pathname === '/_matrix/client/v3/keys/claim' && method === 'POST') {
+        return handleKeysClaim(request, env);
+      }
+      if (pathname === '/_matrix/client/v3/keys/device_signing/upload' && method === 'POST') {
+        return handleCrossSigningUpload(request, env);
+      }
+      if (pathname === '/_matrix/client/v3/keys/signatures/upload' && method === 'POST') {
+        return handleCrossSigningSignaturesUpload(request, env);
+      }
+
+      if (pathname === '/_matrix/client/v3/room_keys/version' && method === 'POST') {
+        return handleCreateRoomKeyBackupVersion(request, env);
+      }
+      if (pathname === '/_matrix/client/v3/room_keys/version' && method === 'GET') {
+        return handleGetCurrentRoomKeyBackupVersion(request, env);
+      }
+      const roomKeyVersionMatch = /^\/_matrix\/client\/v3\/room_keys\/version\/([^/]+)$/.exec(pathname);
+      if (roomKeyVersionMatch && method === 'GET') {
+        return handleGetRoomKeyBackupVersion(request, env, roomKeyVersionMatch[1]);
+      }
+      if (roomKeyVersionMatch && method === 'PUT') {
+        return handleUpdateRoomKeyBackupVersion(request, env, roomKeyVersionMatch[1]);
+      }
+      if (roomKeyVersionMatch && method === 'DELETE') {
+        return handleDeleteRoomKeyBackupVersion(request, env, roomKeyVersionMatch[1]);
+      }
+      const roomKeySessionMatch = /^\/_matrix\/client\/v3\/room_keys\/keys\/([^/]+)\/([^/]+)$/.exec(pathname);
+      if (roomKeySessionMatch && method === 'GET') {
+        return handleGetRoomKeyBackupData(request, env, {
+          version: url.searchParams.get('version'),
+          roomId: roomKeySessionMatch[1],
+          sessionId: roomKeySessionMatch[2],
+        });
+      }
+      if (roomKeySessionMatch && method === 'PUT') {
+        return handlePutRoomKeyBackupData(request, env, {
+          version: url.searchParams.get('version'),
+          roomId: roomKeySessionMatch[1],
+          sessionId: roomKeySessionMatch[2],
+        });
+      }
+      if (roomKeySessionMatch && method === 'DELETE') {
+        return handleDeleteRoomKeyBackupData(request, env, {
+          version: url.searchParams.get('version'),
+          roomId: roomKeySessionMatch[1],
+          sessionId: roomKeySessionMatch[2],
+        });
+      }
+      const roomKeyRoomMatch = /^\/_matrix\/client\/v3\/room_keys\/keys\/([^/]+)$/.exec(pathname);
+      if (roomKeyRoomMatch && method === 'GET') {
+        return handleGetRoomKeyBackupData(request, env, {
+          version: url.searchParams.get('version'),
+          roomId: roomKeyRoomMatch[1],
+        });
+      }
+      if (roomKeyRoomMatch && method === 'PUT') {
+        return handlePutRoomKeyBackupData(request, env, {
+          version: url.searchParams.get('version'),
+          roomId: roomKeyRoomMatch[1],
+        });
+      }
+      if (roomKeyRoomMatch && method === 'DELETE') {
+        return handleDeleteRoomKeyBackupData(request, env, {
+          version: url.searchParams.get('version'),
+          roomId: roomKeyRoomMatch[1],
+        });
+      }
+      if (pathname === '/_matrix/client/v3/room_keys/keys' && method === 'GET') {
+        return handleGetRoomKeyBackupData(request, env, {
+          version: url.searchParams.get('version'),
+        });
+      }
+      if (pathname === '/_matrix/client/v3/room_keys/keys' && method === 'PUT') {
+        return handlePutRoomKeyBackupData(request, env, {
+          version: url.searchParams.get('version'),
+        });
+      }
+      if (pathname === '/_matrix/client/v3/room_keys/keys' && method === 'DELETE') {
+        return handleDeleteRoomKeyBackupData(request, env, {
+          version: url.searchParams.get('version'),
+        });
       }
 
       const sendToDeviceMatch = /^\/_matrix\/client\/v3\/sendToDevice\/([^/]+)\/([^/]+)$/.exec(pathname);

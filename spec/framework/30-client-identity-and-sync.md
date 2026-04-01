@@ -97,7 +97,7 @@
 
 ### 4.1 共享 UIA Challenge 模型
 
-* 当前 profile 下所有启用的 UIA 路由族至少包括 `POST /register`、`POST /account/password` 与 `POST /account/deactivate`。
+* 当前 profile 下所有启用的 UIA 路由族至少包括 `POST /register`、`POST /account/password`、`POST /account/deactivate`、`DELETE /devices/{deviceId}` 与 `POST /delete_devices`。
 * `gateway-worker` 必须为 UIA 发行 `DATA-ID-006` 短时 challenge token，而不是依赖本地内存态；token 必须签名、opaque、route-bound，并绑定：
   * 目标 route family 与 HTTP method
   * `issued_at` / `expires_at`
@@ -172,7 +172,7 @@
 * `logout/all` 撤销全部 session，并强制后续 access token 失效。
 * 注销不删除 device；设备删除是单独操作。
 
-## 5. 能力声明、Profile、账号数据、Push Rules、To-Device 与 Presence
+## 5. 能力声明、Device Management、Profile、账号数据、Push Rules、To-Device 与 Presence
 
 ### 5.1 Capabilities and Filters
 
@@ -260,6 +260,20 @@
 * profile `displayname` / `avatar_url` 变更触发的自动 presence refresh 也必须走同一线性化路径。
 * presence 传播是最终一致 fanout，但本用户的当前值读取必须强一致。
 
+### 5.7 Device Management
+
+* device metadata 的权威表是 `DATA-USER-002`；只有 `deleted_at = null` 的设备才属于当前可见 device list truth。
+* `GET /_matrix/client/*/devices` 与 `GET /_matrix/client/*/devices/{deviceId}` 只允许读取当前认证用户自己的 active devices；已删除设备必须表现为不存在。
+* 在当前 profile 下，`PUT /_matrix/client/*/devices/{deviceId}` 仅允许普通客户端更新现有 device 的 metadata；Matrix `v1.17` 中 application service 可创建新 device 的分支不在当前产品边界内，不得对普通客户端误开放。
+* `PUT /_matrix/client/*/devices/{deviceId}` 当前只允许修改 `display_name`；若请求体缺省该字段，则必须保持现有 display name 不变。
+* `DELETE /_matrix/client/*/devices/{deviceId}` 与 `POST /_matrix/client/*/delete_devices` 必须使用 route-bound UIA challenge；当请求携带 access token 时，UIA 主体必须与当前 session 的 `user_id` 完全一致。
+* 删除 device 成功时，`UserDO` 必须在同一原子提交中：
+  * 使目标 `DATA-USER-002` device 进入 deleted truth；
+  * 撤销所有绑定到这些 devices 的 access/refresh sessions；
+  * 使对应的 device keys、one-time keys、fallback keys 与 to-device pending delivery 不再对外可见；
+  * 对任何受影响的 device key / cross-signing 观察者生成后续 `/sync` 所需的 device-state 增量。
+* device delete 必须保持幂等：已删除 device 再次删除时返回成功；同一 UIA challenge 若被重放到不同 device set，则必须 deterministic conflict，而不是部分复用旧裁决。
+
 ## 6. E2EE 传输边界
 
 ### 6.1 本分册负责的内容
@@ -268,7 +282,7 @@
 
 * device keys 上传与查询
 * one-time / fallback keys claim
-* cross-signing key material的上传与读取
+* cross-signing key material 与 cross-signing signatures 的上传与读取
 * room key backup 元数据与密文备份对象
 * to-device 加密负载投递
 * `/sync` 中 `device_lists`、`device_one_time_keys_count`、`device_unused_fallback_key_types`
@@ -283,6 +297,8 @@
 
 * `/keys/claim` 必须保证 one-time key 至多返回一次。引用：`REQ-ARCH-011`,`DATA-USER-004`。
 * fallback key 可以重复返回直至被替换或按协议标记失效，但它的使用状态必须进入 `/sync`。
+* `POST /_matrix/client/*/keys/device_signing/upload` 对普通 client 必须遵循 Matrix `v1.17` 的 conditional UIA 语义：首次 master key 上传可免 UIA，完全等价的 key-set 重放可免 UIA，其余 regular-client key-set 变更必须走 route-bound UIA。
+* `POST /_matrix/client/*/keys/signatures/upload` 只允许向当前 homeserver 已知的 device key / cross-signing object 追加与该 object 主体一致的 signatures；任何 signed JSON object 若与既有主体不匹配，必须返回 deterministic per-key failure，不得 silent overwrite。
 * 任何设备 key 或 cross-signing 变更都必须生成 `device_lists` 增量。
 * room key backup 的版本元数据由 `DATA-USER-011` 持有；大体量密文分片可写入 `DATA-R2-006`，服务端只保证完整性和版本隔离，不解释密钥明文。
 
@@ -466,7 +482,7 @@ membership 到 `/sync` bucket 的映射必须固定为：
 | push rules | `IF-CS-018` | none | `DATA-USER-013` |
 | presence | `IF-CS-016` | `IF-INT-USER-002` | `DATA-USER-009`,`DATA-USER-010` |
 | to-device | `IF-CS-041` | `IF-INT-USER-005` | `DATA-USER-008`,`DATA-USER-010`,`DATA-USER-016` |
-| keys / cross-signing / backup | `IF-CS-042`,`IF-CS-043`,`IF-CS-044`,`IF-CS-045` | `IF-INT-USER-004` | `DATA-USER-003`,`DATA-USER-004`,`DATA-USER-005`,`DATA-USER-011`,`DATA-R2-006` |
+| keys / cross-signing / backup | `IF-CS-042`,`IF-CS-043`,`IF-CS-044`,`IF-CS-045`,`IF-CS-046`,`IF-CS-047` | `IF-INT-USER-004` | `DATA-USER-003`,`DATA-USER-004`,`DATA-USER-005`,`DATA-USER-011`,`DATA-R2-006` |
 | `/sync` | `IF-CS-020` | `IF-INT-USER-002`,`IF-INT-USER-007`,`IF-INT-ROOM-002` | `DATA-ID-001`,`DATA-USER-009`,`DATA-USER-010` |
 
 ## 12. 完成标准

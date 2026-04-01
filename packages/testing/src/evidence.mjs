@@ -109,7 +109,10 @@ const L1_TEST_IMPLEMENTATION_FILES = Object.freeze({
     local: Object.freeze(['tests/local/client-identity/phase-05.test.mjs']),
   }),
   'TEST-CS-003': Object.freeze({
-    local: Object.freeze(['tests/local/client-identity/phase-05.test.mjs']),
+    local: Object.freeze([
+      'tests/local/client-identity/phase-05.test.mjs',
+      'tests/local/client-identity/phase-05a.test.mjs',
+    ]),
   }),
   'TEST-CS-004': Object.freeze({
     local: Object.freeze(['tests/local/client-identity/phase-04.test.mjs']),
@@ -172,7 +175,7 @@ const L1_EVIDENCE_DEFINITIONS = Object.freeze([
     generation_method: 'devices/E2EE transport attested staging report',
     required_environments: ['staging'],
     declared_source_ids: ['MX-CS-013', 'MX-CS-014'],
-    pass_criteria: 'Devices, to-device transport, and one-time key at-most-once behavior must pass in staging.',
+    pass_criteria: 'Device CRUD/delete UIA, to-device transport, one-time key at-most-once, cross-signing upload/signature handling, /sync device_lists increments, /sync device_one_time_keys_count and device_unused_fallback_key_types truth, and backup metadata/object handling must pass in staging.',
   }),
   Object.freeze({
     id: 'EVID-CS-004',
