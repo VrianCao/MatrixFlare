@@ -107,6 +107,7 @@
 | `CF-D1-010` | D1 | limits | d1-limits | Paid | 最大 string/BLOB/table row size 为 `2 MB`。 | 索引文档、审计 payload 与派生投影不得塞进单行；必要时拆分记录或外置到 R2，只在 D1 存 locator。 | `21`,`34`,`42` |
 | `CF-D1-011` | D1 | limits | d1-limits | Paid | 最大 SQL statement length `100 KB`；每 query 最大 bound parameters `100`。 | backfill/upsert/batch 必须按 statement 与 parameters 上限分批，禁止生成巨型 SQL 或超长 `IN`/`VALUES` 列表。 | `34`,`42` |
 | `CF-D1-012` | D1 | recovery | d1-limits | Paid | D1 Time Travel restore operations 受每数据库 `10 restores / 10 minutes` 速率限制。 | DR、repair 与演练 runbook 必须序列化或退避 D1 restores；不得把 Time Travel restore 写成无界重试循环。 | `42` |
+| `CF-D1-013` | D1 Worker Binding | execution semantics | d1-database, prepared-statements | Paid | `exec()` 只适合 maintenance / one-shot tasks，且输入按 `\n` 分隔一个或多个 query；常规 request-path 查询与 schema bootstrap 应优先使用 `prepare()` / `batch()`。 | 任何 D1 request-path 初始化、目录/搜索 query 或 non-local harness 热路径都不得把多行 schema literal 直接喂给 `exec()`；如需批量 schema bootstrap，必须先拆成完整 statement 再以 prepared statement 执行。 | `21`,`23`,`34`,`42` |
 
 ## 6. KV 约束
 

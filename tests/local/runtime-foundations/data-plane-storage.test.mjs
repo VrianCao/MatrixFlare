@@ -839,6 +839,24 @@ test('derived D1 persistence lands DATA-D1-001 through DATA-D1-004 and composes 
   d1.close();
 });
 
+test('derived D1 schema bootstrap avoids exec() so non-local publicRooms does not fail on newline-delimited D1 exec semantics', async () => {
+  const d1 = createFakeD1Database();
+  let execCalls = 0;
+  d1.exec = async () => {
+    execCalls += 1;
+    throw new Error('D1_EXEC_ERROR: Error in line 1: CREATE TABLE IF NOT EXISTS derived_schema_state (: incomplete input: SQLITE_ERROR');
+  };
+
+  const derived = createD1DerivedDataPersistence(d1);
+  await derived.ensureSchema('2026-04-01T15:00:00.000Z');
+
+  assert.equal(execCalls, 0);
+  assert.equal(await derived.isSchemaReady(), true);
+  const schemaState = await derived.getSchemaState();
+  assert.equal(schemaState.schema_version, DERIVED_DATA_SCHEMA_VERSION);
+  d1.close();
+});
+
 test('R2 and KV keyspace builders plus wrappers cover DATA-R2-001 through DATA-R2-006 and DATA-KV-001 through DATA-KV-002', async () => {
   const bucket = new FakeR2Bucket();
   const kv = new FakeKvNamespace({ pageSize: 1 });
