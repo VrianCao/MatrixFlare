@@ -287,7 +287,56 @@ export function getRequiredTestImplementationFiles(testId, environmentName = 'lo
   if (!Array.isArray(files) || files.length === 0) {
     throw new RangeError(`Missing L1 test implementation mapping for "${testId}" in environment "${environmentName}"`);
   }
+  validateRequiredTestImplementationFiles(testId, environmentName, files);
   return [...files];
+}
+
+function validateRequiredTestImplementationFiles(testId, environmentName, files) {
+  if (environmentName === 'local') {
+    return;
+  }
+  const environmentDirectory = normalizeRepoRelativePath(getTestEnvironmentDefinition(environmentName).directory);
+  if (environmentDirectory == null) {
+    throw new RangeError(`Unknown non-local test environment directory for "${environmentName}"`);
+  }
+  const normalizedFiles = files.map((file) => normalizeRepoRelativePath(file));
+  const invalidDirectoryFile = normalizedFiles.find((file) => file == null || !pathUsesPrefix(file, environmentDirectory));
+  if (invalidDirectoryFile != null) {
+    throw new RangeError(
+      `Non-local L1 test implementation mapping for "${testId}" in environment "${environmentName}" must stay within dedicated environment directory "${environmentDirectory}"`,
+    );
+  }
+  const invalidNonTestFile = normalizedFiles.find((file) => !file.endsWith('.test.mjs'));
+  if (invalidNonTestFile != null) {
+    throw new RangeError(
+      `Non-local L1 test implementation mapping for "${testId}" in environment "${environmentName}" must use dedicated .test.mjs files`,
+    );
+  }
+  const invalidGenericEntrypoint = normalizedFiles.find((file) => {
+    const basename = path.posix.basename(file);
+    return basename === 'bootstrap.test.mjs' || basename === 'l1-mandatory.test.mjs';
+  });
+  if (invalidGenericEntrypoint != null) {
+    throw new RangeError(
+      `Non-local L1 test implementation mapping for "${testId}" in environment "${environmentName}" cannot point at generic entrypoint "${invalidGenericEntrypoint}"`,
+    );
+  }
+  const invalidDedicatedSuiteName = normalizedFiles.find((file) => !matchesDedicatedNonLocalTestImplementationFileName(testId, file));
+  if (invalidDedicatedSuiteName != null) {
+    throw new RangeError(
+      `Non-local L1 test implementation mapping for "${testId}" in environment "${environmentName}" must use dedicated .test.mjs files whose basename is anchored by "${testId.toLowerCase()}"`,
+    );
+  }
+}
+
+function matchesDedicatedNonLocalTestImplementationFileName(testId, file) {
+  const basename = path.posix.basename(file);
+  const escapedTestId = escapeRegularExpression(String(testId).trim().toLowerCase());
+  return new RegExp(`^${escapedTestId}(?:[.-][a-z0-9-]+)?\\.test\\.mjs$`, 'u').test(basename);
+}
+
+function escapeRegularExpression(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function listL1EnvironmentImplementationFiles(environmentName = 'local') {
@@ -613,6 +662,14 @@ function pathIsWithinRoot(targetPath, rootPath) {
   const absoluteRootPath = path.resolve(rootPath);
   const relative = path.relative(absoluteRootPath, absoluteTargetPath);
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function describeRepoBoundaryEscapePath(candidatePath, repoRoot) {
+  const absoluteCandidatePath = path.resolve(candidatePath);
+  if (pathIsWithinRoot(absoluteCandidatePath, repoRoot)) {
+    return normalizePathForMarkdown(path.relative(repoRoot, absoluteCandidatePath));
+  }
+  return normalizePathForMarkdown(absoluteCandidatePath);
 }
 
 function isIdentifierBoundaryCharacter(value) {
@@ -3790,7 +3847,8 @@ async function collectTransitiveTestFiles(entryFile, repoRoot, visited = new Set
   if (ownedEntryFile == null) {
     return {
       files: [],
-      repo_boundary_escapes: [],
+      missing_files: [],
+      repo_boundary_escapes: [describeRepoBoundaryEscapePath(entryFile, repoRoot)],
       unresolved_dynamic_imports: [],
     };
   }
@@ -3799,6 +3857,7 @@ async function collectTransitiveTestFiles(entryFile, repoRoot, visited = new Set
   if (visited.has(normalizedEntryFile)) {
     return {
       files: [],
+      missing_files: [],
       repo_boundary_escapes: [],
       unresolved_dynamic_imports: [],
     };
@@ -3811,12 +3870,14 @@ async function collectTransitiveTestFiles(entryFile, repoRoot, visited = new Set
   } catch {
     return {
       files: [normalizedEntryFile],
+      missing_files: [normalizedEntryFile],
       repo_boundary_escapes: [],
       unresolved_dynamic_imports: [],
     };
   }
 
   const transitiveFiles = new Set([normalizedEntryFile]);
+  const missingFiles = [];
   const repoBoundaryEscapes = [];
   const unresolvedDynamicImports = [];
   const dependencyScan = collectRelativeModuleDependencies(sourceText);
@@ -3837,6 +3898,9 @@ async function collectTransitiveTestFiles(entryFile, repoRoot, visited = new Set
     for (const nestedFile of nestedResult.files) {
       transitiveFiles.add(nestedFile);
     }
+    for (const missingFile of nestedResult.missing_files) {
+      missingFiles.push(missingFile);
+    }
     for (const repoBoundaryEscape of nestedResult.repo_boundary_escapes) {
       repoBoundaryEscapes.push(repoBoundaryEscape);
     }
@@ -3846,6 +3910,7 @@ async function collectTransitiveTestFiles(entryFile, repoRoot, visited = new Set
   }
   return {
     files: [...transitiveFiles].sort(),
+    missing_files: [...new Set(missingFiles)].sort(),
     repo_boundary_escapes: [...new Set(repoBoundaryEscapes)].sort(),
     unresolved_dynamic_imports: [...new Set(unresolvedDynamicImports)].sort(),
   };
@@ -3853,6 +3918,7 @@ async function collectTransitiveTestFiles(entryFile, repoRoot, visited = new Set
 
 async function expandEnvironmentTestFiles(files, repoRoot) {
   const expanded = new Set();
+  const missingFiles = new Set();
   const repoBoundaryEscapes = new Set();
   const unresolvedDynamicImports = new Set();
   for (const file of files) {
@@ -3863,6 +3929,9 @@ async function expandEnvironmentTestFiles(files, repoRoot) {
     for (const expandedFile of expansionResult.files) {
       expanded.add(expandedFile);
     }
+    for (const missingFile of expansionResult.missing_files) {
+      missingFiles.add(missingFile);
+    }
     for (const repoBoundaryEscape of expansionResult.repo_boundary_escapes) {
       repoBoundaryEscapes.add(repoBoundaryEscape);
     }
@@ -3872,9 +3941,43 @@ async function expandEnvironmentTestFiles(files, repoRoot) {
   }
   return {
     expanded_test_files: [...expanded].sort(),
+    missing_files: [...missingFiles].sort(),
     repo_boundary_escapes: [...repoBoundaryEscapes].sort(),
     unresolved_dynamic_imports: [...unresolvedDynamicImports].sort(),
   };
+}
+
+async function validateNonLocalRequiredTestImplementationClosure(testId, environmentName, requiredFiles, repoRoot) {
+  if (environmentName === 'local') {
+    return null;
+  }
+  const environmentDirectory = normalizeRepoRelativePath(getTestEnvironmentDefinition(environmentName).directory);
+  if (environmentDirectory == null) {
+    return `Unknown non-local test environment directory for "${environmentName}"`;
+  }
+  const absoluteRequiredFiles = requiredFiles.map((file) => (path.isAbsolute(file) ? file : path.join(repoRoot, file)));
+  const expansionResult = await expandEnvironmentTestFiles(absoluteRequiredFiles, repoRoot);
+  if (expansionResult.missing_files.length > 0) {
+    return `Non-local L1 test implementation mapping for "${testId}" in environment "${environmentName}" must reference existing repo-owned .test.mjs files`;
+  }
+  if (expansionResult.repo_boundary_escapes.length > 0) {
+    return `Non-local L1 test implementation mapping for "${testId}" in environment "${environmentName}" escapes repo-owned dependencies`;
+  }
+  if (expansionResult.unresolved_dynamic_imports.length > 0) {
+    return `Non-local L1 test implementation mapping for "${testId}" in environment "${environmentName}" contains unresolved or non-literal dynamic imports`;
+  }
+  const escapedDependency = expansionResult.expanded_test_files.find((file) => !pathUsesPrefix(file, environmentDirectory));
+  if (escapedDependency != null) {
+    return `Non-local L1 test implementation mapping for "${testId}" in environment "${environmentName}" must keep its repo-owned dependency closure within dedicated environment directory "${environmentDirectory}"`;
+  }
+  const genericDependency = expansionResult.expanded_test_files.find((file) => {
+    const basename = path.posix.basename(file);
+    return basename === 'bootstrap.test.mjs' || basename === 'l1-mandatory.test.mjs';
+  });
+  if (genericDependency != null) {
+    return `Non-local L1 test implementation mapping for "${testId}" in environment "${environmentName}" cannot expand generic entrypoint "${genericDependency}"`;
+  }
+  return null;
 }
 
 function buildL1EvidenceOutputPaths(repoRoot, runTimestamp) {
@@ -4344,11 +4447,12 @@ function resolveEnvironmentRunSource(environmentName, environmentRuns, manualArt
   return buildAttestedEnvironmentRunSource(artifact);
 }
 
-export function collectTestCoverageResults(definition, environmentRuns) {
-  return definition.required_environments.flatMap((environmentName) => {
+export async function collectTestCoverageResults(definition, environmentRuns, repoRoot = process.cwd()) {
+  const results = [];
+  for (const environmentName of definition.required_environments) {
     const environmentRun = environmentRuns[environmentName] ?? null;
     const executedFiles = new Set(environmentRun?.expanded_test_files ?? []);
-    return definition.test_ids.map((testId) => {
+    for (const testId of definition.test_ids) {
       let requiredFiles;
       let mapping_error = null;
       try {
@@ -4357,9 +4461,17 @@ export function collectTestCoverageResults(definition, environmentRuns) {
         requiredFiles = [];
         mapping_error = error instanceof Error ? error.message : String(error);
       }
+      if (mapping_error == null) {
+        mapping_error = await validateNonLocalRequiredTestImplementationClosure(
+          testId,
+          environmentName,
+          requiredFiles,
+          repoRoot,
+        );
+      }
       const matchedFiles = requiredFiles.filter((file) => executedFiles.has(file));
       const missingFiles = requiredFiles.filter((file) => !executedFiles.has(file));
-      return {
+      results.push({
         environment_name: environmentName,
         test_id: testId,
         required_files: requiredFiles,
@@ -4367,9 +4479,10 @@ export function collectTestCoverageResults(definition, environmentRuns) {
         missing_files: missingFiles,
         mapping_error,
         satisfied: mapping_error == null && missingFiles.length === 0,
-      };
-    });
-  });
+      });
+    }
+  }
+  return results;
 }
 
 function createMissingEnvironmentRunSource(environmentName, reason) {
@@ -4471,7 +4584,7 @@ async function writeEvidenceBundle(repoRoot, {
     && !definition.required_environments.includes('local')
     ? [coverageEnvironmentRuns.local]
     : [];
-  const testCoverageResults = collectTestCoverageResults(definition, coverageEnvironmentRuns);
+  const testCoverageResults = await collectTestCoverageResults(definition, coverageEnvironmentRuns, repoRoot);
   const localEnvironmentRun = coverageEnvironmentRuns.local ?? null;
   const status = analysis.valid
     && localEnvironmentRun?.exit_code === 0

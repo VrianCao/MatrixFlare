@@ -53,6 +53,7 @@
 * 所有 provenance / payload 中以 `_uri` 结尾的 locator 字段，都必须是可解析的绝对外部 URI / locator，且需具 authority，或使用格式完整的 `urn:<nid>:<nss>`；裸 `urn:`、占位字符串、`about:`、`blob:`、`file:`、`data:`、`javascript:` 等本地或不可审计引用必须 fail-closed。
 * `summary.md` 或并列机器工件必须保留 attestation provenance snapshot，足以让审计者回链到外部 workflow / deployment / artifact store / review record。
 * 若 non-local harness 需要 deploy 后 readiness gate，则 raw bundle / `summary.md` / 并列机器工件还必须保留 readiness snapshot，至少包含探测目标、尝试次数、最终通过时间或最后失败原因；不得只保留最终 suite 结果而抹去 readiness 等待事实。
+* 用于证明某个 `TEST-ID` 已被 non-local gate 覆盖的 canonical implementation files，必须是对应环境目录中专门维护的 dedicated `.test.mjs` suite files；它们必须留在对应环境目录内，不得回指 `tests/shared/*` 支撑模块，也不得使用 `bootstrap.test.mjs`、`l1-mandatory.test.mjs` 这类 generic bootstrap/smoke entrypoint 充作 coverage proof。为保持 fail-closed，它们的 basename 还必须以对应 `TEST-ID` 的小写形式起始，并只允许在该前缀后追加 `.` / `-` 分隔的限定词再接 `.test.mjs`；consumer 还必须验证这些 canonical files 在仓库内真实存在，缺失 file path 必须直接判为 `mapping_error`；同时，consumer 还必须验证这些 canonical files 的 repo-owned transitive dependency closure 仍留在同一环境目录内，否则该 `TEST-ID` mapping 必须直接判为 `mapping_error`。
 * 任何来自 `evidence/common/_test-runs/` 的本地产物、或仍扩展 `tests/local/*` 的薄 harness 结果，都不得被提升为 non-local release evidence。
 
 ## 3. Evidence Catalog

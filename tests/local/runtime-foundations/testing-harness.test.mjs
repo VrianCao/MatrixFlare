@@ -355,10 +355,43 @@ async function createEnvironmentBackedEvidenceFixture() {
   const fixtureRoot = await createIsolatedRepoFixture('matrix-testing-harness-env-backed-repo-');
   const sharedProofFile = 'tests/shared/all-bundles-proof.mjs';
   const environmentTestFiles = {
-    local: 'tests/local-env-backed/environment-backed.test.mjs',
-    'ci-integration': 'tests/integration-env-backed/environment-backed.test.mjs',
-    staging: 'tests/staging-env-backed/environment-backed.test.mjs',
-    'pre-release': 'tests/pre-release-env-backed/environment-backed.test.mjs',
+    local: {
+      'TEST-CS-001': 'tests/local-env-backed/environment-backed.test.mjs',
+      'TEST-CS-002': 'tests/local-env-backed/environment-backed.test.mjs',
+      'TEST-CS-003': 'tests/local-env-backed/environment-backed.test.mjs',
+      'TEST-CS-004': 'tests/local-env-backed/environment-backed.test.mjs',
+      'TEST-ROOM-001': 'tests/local-env-backed/environment-backed.test.mjs',
+      'TEST-ROOM-002': 'tests/local-env-backed/environment-backed.test.mjs',
+      'TEST-MEDIA-001': 'tests/local-env-backed/environment-backed.test.mjs',
+      'TEST-DER-001': 'tests/local-env-backed/environment-backed.test.mjs',
+      'TEST-SEC-001': 'tests/local-env-backed/environment-backed.test.mjs',
+      'TEST-OPS-001': 'tests/local-env-backed/environment-backed.test.mjs',
+      'TEST-COST-001': 'tests/local-env-backed/environment-backed.test.mjs',
+    },
+    'ci-integration': {
+      'TEST-CS-001': 'tests/integration-env-backed/test-cs-001.test.mjs',
+      'TEST-CS-004': 'tests/integration-env-backed/test-cs-004.test.mjs',
+      'TEST-ROOM-001': 'tests/integration-env-backed/test-room-001.test.mjs',
+      'TEST-ROOM-002': 'tests/integration-env-backed/test-room-002.test.mjs',
+    },
+    staging: {
+      'TEST-CS-001': 'tests/staging-env-backed/test-cs-001.test.mjs',
+      'TEST-CS-002': 'tests/staging-env-backed/test-cs-002.test.mjs',
+      'TEST-CS-003': 'tests/staging-env-backed/test-cs-003.test.mjs',
+      'TEST-CS-004': 'tests/staging-env-backed/test-cs-004.test.mjs',
+      'TEST-ROOM-001': 'tests/staging-env-backed/test-room-001.test.mjs',
+      'TEST-ROOM-002': 'tests/staging-env-backed/test-room-002.test.mjs',
+      'TEST-MEDIA-001': 'tests/staging-env-backed/test-media-001.test.mjs',
+      'TEST-DER-001': 'tests/staging-env-backed/test-der-001.test.mjs',
+      'TEST-SEC-001': 'tests/staging-env-backed/test-sec-001.test.mjs',
+    },
+    'pre-release': {
+      'TEST-MEDIA-001': 'tests/pre-release-env-backed/test-media-001.test.mjs',
+      'TEST-DER-001': 'tests/pre-release-env-backed/test-der-001.test.mjs',
+      'TEST-SEC-001': 'tests/pre-release-env-backed/test-sec-001.test.mjs',
+      'TEST-OPS-001': 'tests/pre-release-env-backed/test-ops-001.test.mjs',
+      'TEST-COST-001': 'tests/pre-release-env-backed/test-cost-001.test.mjs',
+    },
   };
 
   await Promise.all([
@@ -380,14 +413,16 @@ async function createEnvironmentBackedEvidenceFixture() {
   const environmentTestSource = [
     "import assert from 'node:assert/strict';",
     "import test from 'node:test';",
-    "import { proof } from '../shared/all-bundles-proof.mjs';",
     '',
     "test('environment-backed proof', () => {",
-    '  assert.equal(proof, true);',
+    '  assert.equal(1, 1);',
     '});',
     '',
   ].join('\n');
-  for (const testFile of Object.values(environmentTestFiles)) {
+  const writtenEnvironmentTestFiles = new Set(
+    Object.values(environmentTestFiles).flatMap((mapping) => Object.values(mapping)),
+  );
+  for (const testFile of writtenEnvironmentTestFiles) {
     await fs.writeFile(path.join(fixtureRoot, testFile), environmentTestSource);
   }
 
@@ -412,17 +447,17 @@ async function createEnvironmentBackedEvidenceFixture() {
 
   const minimalMappingBlock = [
     'const L1_TEST_IMPLEMENTATION_FILES = Object.freeze({',
-    "  'TEST-CS-001': Object.freeze({ local: Object.freeze(['tests/shared/all-bundles-proof.mjs']), 'ci-integration': Object.freeze(['tests/shared/all-bundles-proof.mjs']), staging: Object.freeze(['tests/shared/all-bundles-proof.mjs']) }),",
-    "  'TEST-CS-002': Object.freeze({ local: Object.freeze(['tests/shared/all-bundles-proof.mjs']), staging: Object.freeze(['tests/shared/all-bundles-proof.mjs']) }),",
-    "  'TEST-CS-003': Object.freeze({ local: Object.freeze(['tests/shared/all-bundles-proof.mjs']), staging: Object.freeze(['tests/shared/all-bundles-proof.mjs']) }),",
-    "  'TEST-CS-004': Object.freeze({ local: Object.freeze(['tests/shared/all-bundles-proof.mjs']), 'ci-integration': Object.freeze(['tests/shared/all-bundles-proof.mjs']), staging: Object.freeze(['tests/shared/all-bundles-proof.mjs']) }),",
-    "  'TEST-ROOM-001': Object.freeze({ local: Object.freeze(['tests/shared/all-bundles-proof.mjs']), 'ci-integration': Object.freeze(['tests/shared/all-bundles-proof.mjs']), staging: Object.freeze(['tests/shared/all-bundles-proof.mjs']) }),",
-    "  'TEST-ROOM-002': Object.freeze({ local: Object.freeze(['tests/shared/all-bundles-proof.mjs']), 'ci-integration': Object.freeze(['tests/shared/all-bundles-proof.mjs']), staging: Object.freeze(['tests/shared/all-bundles-proof.mjs']) }),",
-    "  'TEST-MEDIA-001': Object.freeze({ local: Object.freeze(['tests/shared/all-bundles-proof.mjs']), staging: Object.freeze(['tests/shared/all-bundles-proof.mjs']), 'pre-release': Object.freeze(['tests/shared/all-bundles-proof.mjs']) }),",
-    "  'TEST-DER-001': Object.freeze({ local: Object.freeze(['tests/shared/all-bundles-proof.mjs']), staging: Object.freeze(['tests/shared/all-bundles-proof.mjs']), 'pre-release': Object.freeze(['tests/shared/all-bundles-proof.mjs']) }),",
-    "  'TEST-SEC-001': Object.freeze({ local: Object.freeze(['tests/shared/all-bundles-proof.mjs']), staging: Object.freeze(['tests/shared/all-bundles-proof.mjs']), 'pre-release': Object.freeze(['tests/shared/all-bundles-proof.mjs']) }),",
-    "  'TEST-OPS-001': Object.freeze({ local: Object.freeze(['tests/shared/all-bundles-proof.mjs']), 'pre-release': Object.freeze(['tests/shared/all-bundles-proof.mjs']) }),",
-    "  'TEST-COST-001': Object.freeze({ local: Object.freeze(['tests/shared/all-bundles-proof.mjs']), 'pre-release': Object.freeze(['tests/shared/all-bundles-proof.mjs']) }),",
+    `  'TEST-CS-001': Object.freeze({ local: Object.freeze(['${sharedProofFile}']), 'ci-integration': Object.freeze(['${environmentTestFiles['ci-integration']['TEST-CS-001']}']), staging: Object.freeze(['${environmentTestFiles.staging['TEST-CS-001']}']) }),`,
+    `  'TEST-CS-002': Object.freeze({ local: Object.freeze(['${sharedProofFile}']), staging: Object.freeze(['${environmentTestFiles.staging['TEST-CS-002']}']) }),`,
+    `  'TEST-CS-003': Object.freeze({ local: Object.freeze(['${sharedProofFile}']), staging: Object.freeze(['${environmentTestFiles.staging['TEST-CS-003']}']) }),`,
+    `  'TEST-CS-004': Object.freeze({ local: Object.freeze(['${sharedProofFile}']), 'ci-integration': Object.freeze(['${environmentTestFiles['ci-integration']['TEST-CS-004']}']), staging: Object.freeze(['${environmentTestFiles.staging['TEST-CS-004']}']) }),`,
+    `  'TEST-ROOM-001': Object.freeze({ local: Object.freeze(['${sharedProofFile}']), 'ci-integration': Object.freeze(['${environmentTestFiles['ci-integration']['TEST-ROOM-001']}']), staging: Object.freeze(['${environmentTestFiles.staging['TEST-ROOM-001']}']) }),`,
+    `  'TEST-ROOM-002': Object.freeze({ local: Object.freeze(['${sharedProofFile}']), 'ci-integration': Object.freeze(['${environmentTestFiles['ci-integration']['TEST-ROOM-002']}']), staging: Object.freeze(['${environmentTestFiles.staging['TEST-ROOM-002']}']) }),`,
+    `  'TEST-MEDIA-001': Object.freeze({ local: Object.freeze(['${sharedProofFile}']), staging: Object.freeze(['${environmentTestFiles.staging['TEST-MEDIA-001']}']), 'pre-release': Object.freeze(['${environmentTestFiles['pre-release']['TEST-MEDIA-001']}']) }),`,
+    `  'TEST-DER-001': Object.freeze({ local: Object.freeze(['${sharedProofFile}']), staging: Object.freeze(['${environmentTestFiles.staging['TEST-DER-001']}']), 'pre-release': Object.freeze(['${environmentTestFiles['pre-release']['TEST-DER-001']}']) }),`,
+    `  'TEST-SEC-001': Object.freeze({ local: Object.freeze(['${sharedProofFile}']), staging: Object.freeze(['${environmentTestFiles.staging['TEST-SEC-001']}']), 'pre-release': Object.freeze(['${environmentTestFiles['pre-release']['TEST-SEC-001']}']) }),`,
+    `  'TEST-OPS-001': Object.freeze({ local: Object.freeze(['${sharedProofFile}']), 'pre-release': Object.freeze(['${environmentTestFiles['pre-release']['TEST-OPS-001']}']) }),`,
+    `  'TEST-COST-001': Object.freeze({ local: Object.freeze(['${sharedProofFile}']), 'pre-release': Object.freeze(['${environmentTestFiles['pre-release']['TEST-COST-001']}']) }),`,
     '});',
     '',
   ].join('\n');
@@ -448,15 +483,17 @@ async function createEnvironmentBackedManualArtifacts(fixtureRoot, runTimestamp,
   const manualArtifacts = {};
   for (const [environmentName, artifactId] of Object.entries(ENVIRONMENT_MANUAL_ARTIFACT_IDS)) {
     const artifactPath = path.join(externalRoot, `${environmentName}.json`);
-    const environmentTestDirectory = path.dirname(environmentTestFiles[environmentName]).replaceAll(path.sep, '/');
+    const environmentTopLevelTestFiles = [...new Set(Object.values(environmentTestFiles[environmentName]))].sort();
+    const environmentTestDirectory = path.dirname(environmentTopLevelTestFiles[0]).replaceAll(path.sep, '/');
+    const expandedTestFiles = [...environmentTopLevelTestFiles];
     await fs.writeFile(
       artifactPath,
       JSON.stringify(buildValidEnvironmentAttestation(environmentName, runTimestamp, {
         test_directory: environmentTestDirectory,
-        test_files: [environmentTestFiles[environmentName]],
-        test_file_count: 1,
-        expanded_test_files: [environmentTestFiles[environmentName], sharedProofFile],
-        expanded_test_file_count: 2,
+        test_files: environmentTopLevelTestFiles,
+        test_file_count: environmentTopLevelTestFiles.length,
+        expanded_test_files: expandedTestFiles,
+        expanded_test_file_count: expandedTestFiles.length,
         log_artifact: `https://example.invalid/logs/fixture/${runTimestamp}/${environmentName}.log`,
       }), null, 2),
     );
@@ -597,8 +634,8 @@ test('L1 evidence bundle set includes governance and canonical test implementati
   );
 });
 
-test('non-local coverage fails closed when a required environment has no canonical implementation mapping yet', () => {
-  const results = collectTestCoverageResults(
+test('non-local coverage fails closed when a required environment has no canonical implementation mapping yet', async () => {
+  const results = await collectTestCoverageResults(
     getL1EvidenceDefinition('EVID-OPS-001'),
     {
       'pre-release': {
@@ -612,6 +649,181 @@ test('non-local coverage fails closed when a required environment has no canonic
   assert.equal(results.length, 1);
   assert.equal(results[0].satisfied, false);
   assert.match(results[0].mapping_error ?? '', /Missing L1 test implementation mapping/);
+});
+
+test('non-local coverage fails closed when a required environment mapping points at generic or shared non-local files', async () => {
+  const fixtureRoot = await createIsolatedRepoFixture('matrix-testing-harness-smoke-mapping-repo-');
+  const fixtureParent = path.dirname(fixtureRoot);
+
+  try {
+    const evidenceFile = path.join(fixtureRoot, 'packages/testing/src/evidence.mjs');
+    const evidenceSource = await fs.readFile(evidenceFile, 'utf8');
+    const mappingStart = evidenceSource.indexOf('const L1_TEST_IMPLEMENTATION_FILES = Object.freeze({');
+    const mappingEnd = evidenceSource.indexOf('const L1_EVIDENCE_DEFINITIONS =');
+    assert.notEqual(mappingStart, -1);
+    assert.notEqual(mappingEnd, -1);
+
+    const invalidCases = [
+      {
+        mappedFile: 'tests/staging/l1-mandatory.test.mjs',
+        expectedError: /generic entrypoint/,
+      },
+      {
+        mappedFile: 'tests/staging/bootstrap.test.mjs',
+        expectedError: /generic entrypoint/,
+      },
+      {
+        mappedFile: 'tests/shared/nonlocal/support.mjs',
+        expectedError: /dedicated environment directory/,
+      },
+      {
+        mappedFile: 'tests/staging/generic-shim.test.mjs',
+        expectedError: /basename is anchored by "test-cs-002"/,
+      },
+      {
+        mappedFile: 'tests/staging/test-cs-002.test.mjs',
+        expectedError: /must reference existing repo-owned \.test\.mjs files/,
+      },
+    ];
+
+    for (const { mappedFile, expectedError } of invalidCases) {
+      const smokeMappingBlock = [
+        'const L1_TEST_IMPLEMENTATION_FILES = Object.freeze({',
+        `  'TEST-CS-002': Object.freeze({ staging: Object.freeze(['${mappedFile}']) }),`,
+        '});',
+        '',
+      ].join('\n');
+      await fs.writeFile(
+        evidenceFile,
+        `${evidenceSource.slice(0, mappingStart)}${smokeMappingBlock}${evidenceSource.slice(mappingEnd)}`,
+      );
+
+      const fixtureEvidenceModule = await loadFixtureEvidenceModule(fixtureRoot);
+      const results = await fixtureEvidenceModule.collectTestCoverageResults(
+        fixtureEvidenceModule.getL1EvidenceDefinition('EVID-CS-002'),
+        {
+          staging: {
+            expanded_test_files: [mappedFile],
+          },
+        },
+        fixtureRoot,
+      );
+
+      assert.equal(results.length, 1);
+      assert.equal(results[0].satisfied, false);
+      assert.match(results[0].mapping_error ?? '', expectedError);
+    }
+  } finally {
+    await fs.rm(fixtureParent, { recursive: true, force: true });
+  }
+});
+
+test('non-local coverage fails closed when a prefixed wrapper expands generic or shared non-local files', async () => {
+  const fixtureRoot = await createIsolatedRepoFixture('matrix-testing-harness-wrapper-mapping-repo-');
+  const fixtureParent = path.dirname(fixtureRoot);
+
+  try {
+    const evidenceFile = path.join(fixtureRoot, 'packages/testing/src/evidence.mjs');
+    const evidenceSource = await fs.readFile(evidenceFile, 'utf8');
+    const mappingStart = evidenceSource.indexOf('const L1_TEST_IMPLEMENTATION_FILES = Object.freeze({');
+    const mappingEnd = evidenceSource.indexOf('const L1_EVIDENCE_DEFINITIONS =');
+    assert.notEqual(mappingStart, -1);
+    assert.notEqual(mappingEnd, -1);
+
+    await fs.mkdir(path.join(fixtureRoot, 'tests', 'staging'), { recursive: true });
+    await fs.mkdir(path.join(fixtureRoot, 'tests', 'shared', 'nonlocal'), { recursive: true });
+    await fs.writeFile(path.join(fixtureRoot, 'tests', 'shared', 'nonlocal', 'support.mjs'), 'export const support = true;\n');
+
+    const invalidCases = [
+      {
+        wrapperImport: "await import('./l1-mandatory.test.mjs');\n",
+        expectedError: /dependency closure within dedicated environment directory|cannot expand generic entrypoint/,
+      },
+      {
+        wrapperImport: "await import('../shared/nonlocal/support.mjs');\n",
+        expectedError: /dependency closure within dedicated environment directory/,
+      },
+    ];
+
+    for (const { wrapperImport, expectedError } of invalidCases) {
+      await fs.writeFile(path.join(fixtureRoot, 'tests', 'staging', 'test-cs-002-wrapper.test.mjs'), wrapperImport);
+      const smokeMappingBlock = [
+        'const L1_TEST_IMPLEMENTATION_FILES = Object.freeze({',
+        "  'TEST-CS-002': Object.freeze({ staging: Object.freeze(['tests/staging/test-cs-002-wrapper.test.mjs']) }),",
+        '});',
+        '',
+      ].join('\n');
+      await fs.writeFile(
+        evidenceFile,
+        `${evidenceSource.slice(0, mappingStart)}${smokeMappingBlock}${evidenceSource.slice(mappingEnd)}`,
+      );
+
+      const fixtureEvidenceModule = await loadFixtureEvidenceModule(fixtureRoot);
+      const results = await fixtureEvidenceModule.collectTestCoverageResults(
+        fixtureEvidenceModule.getL1EvidenceDefinition('EVID-CS-002'),
+        {
+          staging: {
+            expanded_test_files: ['tests/staging/test-cs-002-wrapper.test.mjs'],
+          },
+        },
+        fixtureRoot,
+      );
+
+      assert.equal(results.length, 1);
+      assert.equal(results[0].satisfied, false);
+      assert.match(results[0].mapping_error ?? '', expectedError);
+    }
+  } finally {
+    await fs.rm(fixtureParent, { recursive: true, force: true });
+  }
+});
+
+test('non-local coverage fails closed when a canonical suite symlink escapes repo ownership', async () => {
+  const fixtureRoot = await createIsolatedRepoFixture('matrix-testing-harness-symlink-mapping-repo-');
+  const fixtureParent = path.dirname(fixtureRoot);
+
+  try {
+    const evidenceFile = path.join(fixtureRoot, 'packages/testing/src/evidence.mjs');
+    const evidenceSource = await fs.readFile(evidenceFile, 'utf8');
+    const mappingStart = evidenceSource.indexOf('const L1_TEST_IMPLEMENTATION_FILES = Object.freeze({');
+    const mappingEnd = evidenceSource.indexOf('const L1_EVIDENCE_DEFINITIONS =');
+    assert.notEqual(mappingStart, -1);
+    assert.notEqual(mappingEnd, -1);
+
+    await fs.mkdir(path.join(fixtureRoot, 'tests', 'staging'), { recursive: true });
+    const mappedFile = 'tests/staging/test-cs-002.test.mjs';
+    const externalProofFile = path.join(fixtureParent, 'external-proof.test.mjs');
+    await fs.writeFile(externalProofFile, "export const proof = true;\n");
+    await fs.symlink(externalProofFile, path.join(fixtureRoot, mappedFile));
+
+    const smokeMappingBlock = [
+      'const L1_TEST_IMPLEMENTATION_FILES = Object.freeze({',
+      `  'TEST-CS-002': Object.freeze({ staging: Object.freeze(['${mappedFile}']) }),`,
+      '});',
+      '',
+    ].join('\n');
+    await fs.writeFile(
+      evidenceFile,
+      `${evidenceSource.slice(0, mappingStart)}${smokeMappingBlock}${evidenceSource.slice(mappingEnd)}`,
+    );
+
+    const fixtureEvidenceModule = await loadFixtureEvidenceModule(fixtureRoot);
+    const results = await fixtureEvidenceModule.collectTestCoverageResults(
+      fixtureEvidenceModule.getL1EvidenceDefinition('EVID-CS-002'),
+      {
+        staging: {
+          expanded_test_files: [mappedFile],
+        },
+      },
+      fixtureRoot,
+    );
+
+    assert.equal(results.length, 1);
+    assert.equal(results[0].satisfied, false);
+    assert.match(results[0].mapping_error ?? '', /escapes repo-owned dependencies/);
+  } finally {
+    await fs.rm(fixtureParent, { recursive: true, force: true });
+  }
 });
 
 test('manual artifact payload validation requires structured non-local reports and typed prod snapshots', () => {
