@@ -682,25 +682,25 @@
 
 ### 08.04 完成 L1 测试
 
-- [x] 落地 `TEST-CS-001`,`TEST-CS-002`,`TEST-CS-003`,`TEST-CS-004`,`TEST-ROOM-001`,`TEST-ROOM-002`,`TEST-MEDIA-001`,`TEST-DER-001`,`TEST-SEC-001`,`TEST-OPS-001`,`TEST-COST-001`。
+- [ ] 落地 `TEST-GOV-001`,`TEST-CS-001`,`TEST-CS-002`,`TEST-CS-003`,`TEST-CS-004`,`TEST-ROOM-001`,`TEST-ROOM-002`,`TEST-MEDIA-001`,`TEST-DER-001`,`TEST-SEC-001`,`TEST-OPS-001`,`TEST-COST-001`。
   Spec refs: `43` 3, 9
   产出:
   local / CI / staging 测试套件。
   完成标准:
   `L1` mandatory tests 全部可运行。
   当前状态:
-  `tests/shared/l1-mandatory-suite.mjs` 已汇总 L1 mandatory suites，`tests/integration/`、`tests/staging/`、`tests/pre-release/` 均已落环境入口；新增 Phase 08 runtime/ops 测试与版本偏斜 rig。最终验证已通过 `npm run test:all`（local + `ci-integration` + `staging` + `pre-release` 全部 exit `0`）。
+  `tests/shared/l1-mandatory-suite.mjs` 已汇总 L1 mandatory suites，且 `npm run test:all` 现可作为本地组合回归运行（local + `ci-integration` + `staging` + `pre-release` 全部 exit `0`；`npm run governance:check` 对应 `TEST-GOV-001` 也为 `PASS`）。但 `tests/integration/`、`tests/staging/`、`tests/pre-release/` 当前仍只是导入共享本地套件的薄入口，尚未满足 `spec/framework/43-testing-and-compliance.md` 第 5 节要求的近真实 Cloudflare 拓扑验证；在接通真实 CI/staging/pre-release harness 与对应运行工件之前，本项保持未完成。
 
 ### 08.05 完成 L1 证据
 
-- [x] 生成 `EVID-CS-001`,`EVID-CS-002`,`EVID-CS-003`,`EVID-CS-004`,`EVID-ROOM-001`,`EVID-ROOM-002`,`EVID-MEDIA-001`,`EVID-DER-001`,`EVID-SEC-001`,`EVID-OPS-001`,`EVID-COST-001`。
+- [ ] 生成 `EVID-GOV-001`,`EVID-CS-001`,`EVID-CS-002`,`EVID-CS-003`,`EVID-CS-004`,`EVID-ROOM-001`,`EVID-ROOM-002`,`EVID-MEDIA-001`,`EVID-DER-001`,`EVID-SEC-001`,`EVID-OPS-001`,`EVID-COST-001`。
   Spec refs: `44` 3, 4
   产出:
   对应 `evidence/L1/` 与 `evidence/common/` 证据包。
   完成标准:
   可以诚实声称达到 `L1 Local-Core`。
   当前状态:
-  `npm run governance:evidence` 已生成 `evidence/common/EVID-GOV-001/20260331T130238Z/summary.md`；`npm run evidence:l1 -- --timestamp 20260331T130238Z` 已生成全部 `L1/common` Phase 08 证据包，shared run artifacts 位于 `evidence/common/_test-runs/20260331T130238Z/`。11 个目标 `EVID-*` bundle 均为 `pass`，且每个 bundle 都包含 `summary.md` 与 `artifacts/{context,source-ids,environment-results}.json`。
+  `npm run evidence:l1 -- --timestamp <ts>` 现会同轮生成 `EVID-GOV-001`，并按 bundle 校验 `TEST-ID` 对应的 canonical test file 已被目标环境测试入口覆盖；同时它还要求按 bundle 提供 `--ci-integration-report <path>` / `--staging-report <path>` / `--pre-release-report <path>` 等非本地环境运行工件，而 `EVID-COST-001` 还必须额外提供 `--prod-cost-snapshot <path>`。同一 `run_timestamp` 若已有任何证据输出则会 fail-closed，且 `evidence/common/_test-runs/<ts>/*.json` 这类本地共享运行工件或仍扩展 `tests/local/` 的薄 non-local harness 报告不再可充作 manual artifact；新增的 `OQ-0003` 继续跟踪“未来真实 non-local harness 接通后，如何把导入工件绑定到可信执行来源”的 attestation trust model。历史 `20260331T130238Z` 证据包需按当前门禁重新生成后才可继续引用；在补齐同轮真实环境工件与 production monthly cost snapshot 之前，本项保持未完成。
 
 ## Phase 09: Federation Core And L2 Gate
 

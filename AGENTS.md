@@ -54,6 +54,18 @@ Required behavior:
 * do not treat a terse prompt as permission to skip research, Spec mapping, verification, debugging, or required follow-up edits
 * if the requested work cannot be fully closed, continue until the exact blocker is identified, evidenced, and written down in the correct artifact instead of silently delivering an incomplete result
 
+## Wall-Clock And Honesty Discipline
+
+Elapsed time is not a completion criterion. Wall-clock pressure is never a reason to weaken gates, stop early, or preserve a convenient but unsupported claim of completion.
+
+Required behavior:
+
+* do not trade correctness, evidence honesty, or review depth for speed, convenience, or impatience
+* if a task takes many review/repair loops or many hours of wall-clock time, continue the loop anyway; a long honest closure is preferred over a fast dishonest merge
+* if later verification or review proves an earlier `pass`, `[x]`, release claim, or evidence bundle was unsound, immediately revert the claim to the truthful incomplete state and continue from there
+* for tests, release gates, and evidence gates, prefer fail-closed behavior; a temporary false negative is cheaper than a false positive that overstates project readiness
+* do not treat an earlier commit, green run, generated evidence bundle, or previously accepted TODO state as authority once new review evidence shows the gate was unsound
+
 ## Sub Agents Review Discipline
 
 For any task that implies completion, agents must add a `Sub Agents Review` pass after verification and before declaring the task done.
@@ -76,6 +88,7 @@ Repair rule:
 * if a finding is confirmed, fix it, rerun verification, and then rerun `Sub Agents Review`
 * if a finding exposes a missing prerequisite or Spec gap, update the Spec stack, `DEC-*` / `OQ-*`, and `TODO.md` before continuing implementation
 * if a finding is rejected, document the reason in the correct artifact or change record so the dismissal is auditable
+* if a finding proves that an earlier `pass`, `[x]`, release claim, or evidence bundle was overstated, immediately revert that claim in the correct artifact before continuing
 * do not declare completion while unresolved confirmed findings remain
 * if the execution environment cannot actually spawn Sub Agents, state that limitation explicitly and perform the closest adversarial self-review available, but treat that as a fallback rather than the default process
 
@@ -100,6 +113,7 @@ Do not skip the Spec step or the review step.
 * No silent divergence from `REQ-*`, `MX-*`, `CF-*`, `IF-*`, `DATA-*`, `FLOW-*`, `STATE-*`.
 * No full implementation of anything marked `Stub-Only`, `Deferred`, or `Unsupported`.
 * No claiming a release profile (`L1`/`L2`/`L3`) without the mapped tests and evidence.
+* No keeping a convenient `pass`, `[x]`, or "done" state after review evidence shows the gate is unsound.
 
 If the Spec is not ready, the correct action is to improve the Spec, open an `OQ-*`, or add a `DEC-*`, not to improvise in code.
 
@@ -478,6 +492,7 @@ A development task is not done when code compiles. It is done when:
 * unsupported/stub-only boundaries remain correct
 * any newly discovered ambiguity is captured as `DEC-*` or `OQ-*`
 * any claimed profile impact is honest
+* any earlier overstated `pass`, `[x]`, release claim, or evidence bundle uncovered during the work has been reverted or corrected before closure
 
 ## Code Intelligence And Large-Repo Navigation
 
