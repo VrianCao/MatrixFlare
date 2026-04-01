@@ -83,6 +83,10 @@ const CLOUDFLARE_WORKER_TAG_MAX_LENGTH = 25;
 const GITHUB_ACTIONS_OIDC_ISSUER = 'https://token.actions.githubusercontent.com';
 const GITHUB_ACTIONS_OIDC_JWKS_URI = 'https://token.actions.githubusercontent.com/.well-known/jwks';
 const GITHUB_ACTIONS_OIDC_AUDIENCE = 'matrix-phase08-nonlocal';
+const NON_LOCAL_READINESS_MAX_ATTEMPTS = 7;
+const NON_LOCAL_READINESS_INITIAL_DELAY_MS = 2_000;
+const NON_LOCAL_READINESS_MAX_DELAY_MS = 15_000;
+const NON_LOCAL_READINESS_REQUEST_TIMEOUT_MS = 10_000;
 
 let githubActionsOidcIdentityPromise = null;
 let githubActionsJwksPromise = null;
@@ -1235,6 +1239,51 @@ export function validateLatestActiveCloudflareWorkerIdentity(workerName, workerS
   }
 }
 
+export async function validateDeploymentSummaryAgainstCurrentCloudflareState(deploymentSummary, {
+  accountId,
+  apiToken,
+  fetchWorkerDeploymentStateImpl = fetchWorkerDeploymentState,
+} = {}) {
+  if (!isPlainObject(deploymentSummary)) {
+    throw new TypeError('deployment summary must be an object');
+  }
+  if (!isNonEmptyString(accountId)) {
+    throw new TypeError('accountId must be a non-empty string');
+  }
+  if (!isNonEmptyString(apiToken)) {
+    throw new TypeError('apiToken must be a non-empty string');
+  }
+  if (typeof fetchWorkerDeploymentStateImpl !== 'function') {
+    throw new TypeError('fetchWorkerDeploymentStateImpl must be a function');
+  }
+  if (!isPlainObject(deploymentSummary.workers)) {
+    throw new TypeError('deployment summary workers must be an object');
+  }
+
+  const workers = {};
+  for (const workerName of WORKER_DEPLOYMENT_ORDER) {
+    const workerSummary = deploymentSummary.workers?.[workerName];
+    const currentDeploymentState = await fetchWorkerDeploymentStateImpl({
+      accountId,
+      apiToken,
+      scriptName: workerSummary?.script_name,
+    });
+    validateLatestActiveCloudflareWorkerIdentity(workerName, workerSummary, currentDeploymentState);
+    workers[workerName] = Object.freeze({
+      script_name: workerSummary.script_name,
+      latest_active_deployment_id: currentDeploymentState.latest_active_deployment_id,
+      active_worker_version_ids: Object.freeze([
+        ...currentDeploymentState.active_worker_version_ids,
+      ]),
+    });
+  }
+
+  return Object.freeze({
+    validated_at: new Date().toISOString(),
+    workers: Object.freeze(workers),
+  });
+}
+
 function buildWorkerSecretPayload(workerName, secretBundle) {
   if (workerName === 'gateway-worker') {
     return secretBundle.gateway;
@@ -1430,6 +1479,408 @@ function validateNonLocalDeploymentWorker(workerName, environmentName, workerSum
     worker_version_id: workerSummary.worker_version_id,
     url: parsedWorkerUrl.toString().replace(/\/$/, ''),
   });
+}
+
+async function requestRemoteHarnessJson(remoteHarnessEnv, pathname, {
+  method = 'GET',
+  headers = {},
+  json = null,
+  body = null,
+  fetchImpl = globalThis.fetch,
+  timeoutMs = NON_LOCAL_READINESS_REQUEST_TIMEOUT_MS,
+} = {}) {
+  const requestHeaders = new Headers(headers);
+  if (json != null && !requestHeaders.has('content-type')) {
+    requestHeaders.set('content-type', 'application/json; charset=utf-8');
+  }
+  const response = await fetchImpl(`${remoteHarnessEnv.MATRIX_REMOTE_BASE_URL}${pathname}`, {
+    method,
+    headers: requestHeaders,
+    body: json == null ? body : JSON.stringify(json),
+    signal: typeof AbortSignal?.timeout === 'function'
+      ? AbortSignal.timeout(timeoutMs)
+      : undefined,
+  });
+  const contentType = response.headers.get('content-type') ?? '';
+  const payload = contentType.includes('application/json')
+    ? await response.json()
+    : await response.text();
+  return {
+    response,
+    payload,
+  };
+}
+
+function summarizeReadinessProbeStepDetail(stepName, payload) {
+  if (stepName === 'versions') {
+    return {
+      versions_count: Array.isArray(payload?.versions) ? payload.versions.length : 0,
+    };
+  }
+  if (stepName === 'public_rooms') {
+    return {
+      chunk_length: Array.isArray(payload?.chunk) ? payload.chunk.length : null,
+    };
+  }
+  if (stepName === 'login_reuse') {
+    return {
+      user_id_present: typeof payload?.user_id === 'string',
+      access_token_present: typeof payload?.access_token === 'string',
+      reused_existing_account: payload?.reused_existing_account === true,
+    };
+  }
+  if (stepName === 'register_challenge') {
+    return {
+      session_present: typeof payload?.session === 'string',
+      flows_count: Array.isArray(payload?.flows) ? payload.flows.length : 0,
+    };
+  }
+  if (stepName === 'register_complete') {
+    return {
+      user_id_present: typeof payload?.user_id === 'string',
+      access_token_present: typeof payload?.access_token === 'string',
+    };
+  }
+  if (stepName === 'sync') {
+    return {
+      next_batch_present: typeof payload?.next_batch === 'string',
+    };
+  }
+  if (stepName === 'media_create') {
+    return {
+      content_uri_present: typeof payload?.content_uri === 'string',
+    };
+  }
+  return null;
+}
+
+function summarizeReadinessProbeFailureDetail(response, payload) {
+  const detail = {
+    status: response?.status ?? null,
+  };
+  if (typeof payload === 'string' && payload.length > 0) {
+    detail.error = payload.slice(0, 256);
+    return detail;
+  }
+  if (isPlainObject(payload)) {
+    if (typeof payload.errcode === 'string') {
+      detail.errcode = payload.errcode;
+    }
+    if (typeof payload.error === 'string') {
+      detail.error = payload.error.slice(0, 256);
+    }
+    if (typeof payload.message === 'string') {
+      detail.message = payload.message.slice(0, 256);
+    }
+  }
+  return detail;
+}
+
+function buildReadinessProbeRunSeed(environmentName) {
+  return [
+    environmentName,
+    process.env.GITHUB_RUN_ID ?? '',
+    process.env.GITHUB_RUN_ATTEMPT ?? '',
+    process.env.GITHUB_JOB ?? '',
+    process.env.GITHUB_SHA ?? '',
+    Date.now().toString(36),
+    Math.random().toString(36).slice(2, 10),
+  ].join(':');
+}
+
+function buildReadinessProbeCredentials(environmentName, {
+  attemptIndex,
+  probeRunSeed = null,
+} = {}) {
+  if (!Number.isInteger(attemptIndex) || attemptIndex <= 0) {
+    throw new RangeError('attemptIndex must be a positive integer');
+  }
+  const runSeed = probeRunSeed ?? buildReadinessProbeRunSeed(environmentName);
+  const digest = createHash('sha256').update(`${runSeed}:${attemptIndex}`).digest('hex');
+  return Object.freeze({
+    username: `readiness-${slugifyLabel(environmentName)}-${attemptIndex.toString(36)}-${digest.slice(0, 16)}`,
+    password: `phase08-nonlocal-readiness-${digest.slice(0, 32)}`,
+    device_id: `RDY${digest.slice(0, 7).toUpperCase()}`,
+  });
+}
+
+function createReadinessProbeStep(stepName, ok, detail) {
+  return {
+    step: stepName,
+    ok,
+    detail,
+  };
+}
+
+function createReadinessProbeFailure(stepName, detail) {
+  return {
+    step_name: stepName,
+    detail,
+  };
+}
+
+async function runNonLocalReadinessProbeAttempt(environmentName, remoteHarnessEnv, attemptIndex, {
+  fetchImpl = globalThis.fetch,
+  probeCredentials = null,
+  probeRunSeed = null,
+} = {}) {
+  const steps = [];
+  const readinessProbeCredentials = isPlainObject(probeCredentials)
+    ? probeCredentials
+    : buildReadinessProbeCredentials(environmentName, {
+      attemptIndex,
+      probeRunSeed,
+    });
+  const recordSuccess = (stepName, payload) => {
+    steps.push(createReadinessProbeStep(
+      stepName,
+      true,
+      summarizeReadinessProbeStepDetail(stepName, payload),
+    ));
+  };
+  const recordFailure = (stepName, response, payload) => {
+    const detail = summarizeReadinessProbeFailureDetail(response, payload);
+    steps.push(createReadinessProbeStep(stepName, false, detail));
+    return createReadinessProbeFailure(stepName, detail);
+  };
+
+  try {
+    const versions = await requestRemoteHarnessJson(remoteHarnessEnv, '/_matrix/client/versions', {
+      fetchImpl,
+    });
+    if (versions.response.status !== 200 || !Array.isArray(versions.payload?.versions)) {
+      return {
+        ok: false,
+        steps,
+        failure: recordFailure('versions', versions.response, versions.payload),
+      };
+    }
+    recordSuccess('versions', versions.payload);
+
+    const publicRooms = await requestRemoteHarnessJson(remoteHarnessEnv, '/_matrix/client/v3/publicRooms?limit=1', {
+      fetchImpl,
+    });
+    if (publicRooms.response.status !== 200 || !Array.isArray(publicRooms.payload?.chunk)) {
+      return {
+        ok: false,
+        steps,
+        failure: recordFailure('public_rooms', publicRooms.response, publicRooms.payload),
+      };
+    }
+    recordSuccess('public_rooms', publicRooms.payload);
+
+    const registerChallenge = await requestRemoteHarnessJson(remoteHarnessEnv, '/_matrix/client/v3/register', {
+      method: 'POST',
+      json: {
+        username: readinessProbeCredentials.username,
+        password: readinessProbeCredentials.password,
+        device_id: readinessProbeCredentials.device_id,
+      },
+      fetchImpl,
+    });
+    if (registerChallenge.response.status !== 401 || typeof registerChallenge.payload?.session !== 'string') {
+      return {
+        ok: false,
+        steps,
+        failure: recordFailure('register_challenge', registerChallenge.response, registerChallenge.payload),
+      };
+    }
+    recordSuccess('register_challenge', registerChallenge.payload);
+
+    const registerComplete = await requestRemoteHarnessJson(remoteHarnessEnv, '/_matrix/client/v3/register', {
+      method: 'POST',
+      json: {
+        username: readinessProbeCredentials.username,
+        password: readinessProbeCredentials.password,
+        device_id: readinessProbeCredentials.device_id,
+        auth: {
+          type: 'm.login.dummy',
+          session: registerChallenge.payload.session,
+        },
+      },
+      fetchImpl,
+    });
+    if (
+      registerComplete.response.status !== 200
+      || typeof registerComplete.payload?.access_token !== 'string'
+      || typeof registerComplete.payload?.user_id !== 'string'
+    ) {
+      return {
+        ok: false,
+        steps,
+        failure: recordFailure('register_complete', registerComplete.response, registerComplete.payload),
+      };
+    }
+    recordSuccess('register_complete', registerComplete.payload);
+    const accessToken = registerComplete.payload.access_token;
+    if (!isNonEmptyString(accessToken)) {
+      return {
+        ok: false,
+        steps,
+        failure: createReadinessProbeFailure('register_complete', {
+          error: 'readiness probe did not obtain an access token',
+        }),
+      };
+    }
+    const authHeaders = {
+      authorization: `Bearer ${accessToken}`,
+    };
+
+    const sync = await requestRemoteHarnessJson(remoteHarnessEnv, '/_matrix/client/v3/sync?timeout=0&set_presence=offline', {
+      headers: authHeaders,
+      fetchImpl,
+    });
+    if (sync.response.status !== 200 || typeof sync.payload?.next_batch !== 'string') {
+      return {
+        ok: false,
+        steps,
+        failure: recordFailure('sync', sync.response, sync.payload),
+      };
+    }
+    recordSuccess('sync', sync.payload);
+
+    const mediaCreate = await requestRemoteHarnessJson(remoteHarnessEnv, '/_matrix/media/v3/create', {
+      method: 'POST',
+      headers: authHeaders,
+      fetchImpl,
+    });
+    if (mediaCreate.response.status !== 200 || typeof mediaCreate.payload?.content_uri !== 'string') {
+      return {
+        ok: false,
+        steps,
+        failure: recordFailure('media_create', mediaCreate.response, mediaCreate.payload),
+      };
+    }
+    recordSuccess('media_create', mediaCreate.payload);
+
+    return {
+      ok: true,
+      steps,
+      failure: null,
+    };
+  } catch (error) {
+    const detail = {
+      message: error instanceof Error ? error.message : String(error),
+    };
+    steps.push(createReadinessProbeStep('exception', false, detail));
+    return {
+      ok: false,
+      steps,
+      failure: createReadinessProbeFailure('exception', detail),
+    };
+  }
+}
+
+function buildReadinessProbeDelayMs(attemptIndex, {
+  initialDelayMs,
+  maxDelayMs,
+} = {}) {
+  return Math.min(maxDelayMs, initialDelayMs * (2 ** Math.max(attemptIndex - 1, 0)));
+}
+
+function sleepForReadinessProbe(delayMs, {
+  sleepImpl = null,
+} = {}) {
+  if (typeof sleepImpl === 'function') {
+    return sleepImpl(delayMs);
+  }
+  return new Promise((resolve) => {
+    setTimeout(resolve, delayMs);
+  });
+}
+
+export async function waitForNonLocalDeploymentReadiness(environmentName, remoteHarnessEnv, {
+  fetchImpl = globalThis.fetch,
+  maxAttempts = NON_LOCAL_READINESS_MAX_ATTEMPTS,
+  initialDelayMs = NON_LOCAL_READINESS_INITIAL_DELAY_MS,
+  maxDelayMs = NON_LOCAL_READINESS_MAX_DELAY_MS,
+  sleepImpl = null,
+} = {}) {
+  const normalizedEnvironmentName = assertNonLocalEnvironmentName(environmentName);
+  const validatedRemoteHarnessEnv = validateRemoteHarnessEnvironmentVariables(remoteHarnessEnv);
+  if (!Number.isInteger(maxAttempts) || maxAttempts <= 0) {
+    throw new RangeError('maxAttempts must be a positive integer');
+  }
+  if (!Number.isInteger(initialDelayMs) || initialDelayMs < 0) {
+    throw new RangeError('initialDelayMs must be a non-negative integer');
+  }
+  if (!Number.isInteger(maxDelayMs) || maxDelayMs < initialDelayMs) {
+    throw new RangeError('maxDelayMs must be an integer greater than or equal to initialDelayMs');
+  }
+
+  const startedAt = new Date().toISOString();
+  const startedMs = Date.now();
+  const attempts = [];
+  const probeRunSeed = buildReadinessProbeRunSeed(normalizedEnvironmentName);
+
+  for (let attemptIndex = 1; attemptIndex <= maxAttempts; attemptIndex += 1) {
+    const attemptStartedAt = new Date().toISOString();
+    const attemptStartedMs = Date.now();
+    const attemptResult = await runNonLocalReadinessProbeAttempt(
+      normalizedEnvironmentName,
+      validatedRemoteHarnessEnv,
+      attemptIndex,
+      {
+        fetchImpl,
+        probeRunSeed,
+      },
+    );
+    const delayBeforeNextAttemptMs = attemptResult.ok || attemptIndex === maxAttempts
+      ? null
+      : buildReadinessProbeDelayMs(attemptIndex, {
+        initialDelayMs,
+        maxDelayMs,
+      });
+    attempts.push({
+      attempt: attemptIndex,
+      started_at: attemptStartedAt,
+      completed_at: new Date().toISOString(),
+      duration_ms: Date.now() - attemptStartedMs,
+      ok: attemptResult.ok,
+      steps: attemptResult.steps,
+      failure: attemptResult.failure,
+      delay_before_next_attempt_ms: delayBeforeNextAttemptMs,
+    });
+    if (attemptResult.ok) {
+      return {
+        ready: true,
+        environment_name: normalizedEnvironmentName,
+        started_at: startedAt,
+        completed_at: new Date().toISOString(),
+        duration_ms: Date.now() - startedMs,
+        attempt_count: attemptIndex,
+        last_error: null,
+        attempts,
+      };
+    }
+    if (delayBeforeNextAttemptMs != null) {
+      await sleepForReadinessProbe(delayBeforeNextAttemptMs, {
+        sleepImpl,
+      });
+    }
+  }
+
+  const lastFailure = attempts.at(-1)?.failure ?? null;
+  const lastError = lastFailure == null
+    ? 'non-local deployment readiness probe failed without a recorded cause'
+    : `${lastFailure.step_name}: ${JSON.stringify(lastFailure.detail)}`;
+  return {
+    ready: false,
+    environment_name: normalizedEnvironmentName,
+    started_at: startedAt,
+    completed_at: new Date().toISOString(),
+    duration_ms: Date.now() - startedMs,
+    attempt_count: attempts.length,
+    last_error: lastError,
+    attempts,
+  };
+}
+
+function formatNonLocalReadinessProbeLog(readinessProbe) {
+  return [
+    '# Non-local deployment readiness probe',
+    stableJson(readinessProbe).trimEnd(),
+  ].join('\n');
 }
 
 export function buildRemoteHarnessEnvironmentVariablesFromDeployment(environmentName, deploymentSummary, {
@@ -1815,17 +2266,26 @@ export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
   reviewedBy,
   topologyKind,
   deploymentSummary,
+} = {}, {
+  requireGitHubActionsExecutionImpl = requireGitHubActionsExecution,
+  assessNonLocalEnvironmentHarnessReadinessImpl = assessNonLocalEnvironmentHarnessReadiness,
+  requireCloudflareCredentialsImpl = requireCloudflareCredentials,
+  readWorkersSubdomainImpl = readWorkersSubdomain,
+  validateDeploymentSummaryAgainstCurrentCloudflareStateImpl = validateDeploymentSummaryAgainstCurrentCloudflareState,
+  getRequiredTestFilesImpl = getRequiredTestFiles,
+  waitForNonLocalDeploymentReadinessImpl = waitForNonLocalDeploymentReadiness,
+  spawnImpl = spawn,
 } = {}) {
   const normalizedEnvironmentName = assertNonLocalEnvironmentName(environmentName);
-  await requireGitHubActionsExecution('runEnvironmentBackedSuite', {
+  await requireGitHubActionsExecutionImpl('runEnvironmentBackedSuite', {
     expectedEnvironmentName: normalizedEnvironmentName,
   });
-  const readiness = await assessNonLocalEnvironmentHarnessReadiness(normalizedEnvironmentName, repoRoot);
+  const readiness = await assessNonLocalEnvironmentHarnessReadinessImpl(normalizedEnvironmentName, repoRoot);
   if (readiness.ready !== true) {
     throw new Error(`${normalizedEnvironmentName} harness is not environment-backed: ${readiness.reason}`);
   }
-  const { accountId, apiToken } = requireCloudflareCredentials();
-  const workersSubdomain = await readWorkersSubdomain({
+  const { accountId, apiToken } = requireCloudflareCredentialsImpl();
+  const workersSubdomain = await readWorkersSubdomainImpl({
     accountId,
     apiToken,
   });
@@ -1849,42 +2309,52 @@ export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
       workersSubdomain,
     }),
   );
-  for (const workerName of WORKER_DEPLOYMENT_ORDER) {
-    const workerSummary = deploymentSummary.workers?.[workerName];
-    const currentDeploymentState = await fetchWorkerDeploymentState({
+  const deploymentIdentityValidation = {
+    before_readiness: await validateDeploymentSummaryAgainstCurrentCloudflareStateImpl(deploymentSummary, {
       accountId,
       apiToken,
-      scriptName: workerSummary?.script_name,
-    });
-    validateLatestActiveCloudflareWorkerIdentity(workerName, workerSummary, currentDeploymentState);
-  }
+    }),
+    before_suite: null,
+  };
   const cloudflareResources = deploymentSummary?.cloudflare_resources ?? null;
   if (!isPlainObject(cloudflareResources)) {
     throw new TypeError('deployment summary cloudflare_resources must be an object');
   }
-  const files = await getRequiredTestFiles(normalizedEnvironmentName, repoRoot);
+  const files = await getRequiredTestFilesImpl(normalizedEnvironmentName, repoRoot);
   const startedAt = new Date().toISOString();
   const startedMs = Date.now();
   const commandArgs = ['--test', ...files];
-  const combinedChunks = [];
-  const exitCode = await new Promise((resolve) => {
-    const child = spawn(process.execPath, commandArgs, {
-      cwd: repoRoot,
-      env: {
-        ...process.env,
-        ...remoteHarnessEnv,
-        MATRIX_TEST_ENVIRONMENT: normalizedEnvironmentName,
-      },
-      stdio: ['ignore', 'pipe', 'pipe'],
+  const readinessProbe = await waitForNonLocalDeploymentReadinessImpl(
+    normalizedEnvironmentName,
+    remoteHarnessEnv,
+  );
+  const readinessLogText = formatNonLocalReadinessProbeLog(readinessProbe);
+  const combinedChunks = [Buffer.from(`${readinessLogText}\n`, 'utf8')];
+  let exitCode = 1;
+  if (readinessProbe.ready) {
+    deploymentIdentityValidation.before_suite = await validateDeploymentSummaryAgainstCurrentCloudflareStateImpl(deploymentSummary, {
+      accountId,
+      apiToken,
     });
-    child.stdout.on('data', (chunk) => combinedChunks.push(Buffer.from(chunk)));
-    child.stderr.on('data', (chunk) => combinedChunks.push(Buffer.from(chunk)));
-    child.on('error', (error) => {
-      combinedChunks.push(Buffer.from(`${error.message}\n`, 'utf8'));
-      resolve(1);
+    exitCode = await new Promise((resolve) => {
+      const child = spawnImpl(process.execPath, commandArgs, {
+        cwd: repoRoot,
+        env: {
+          ...process.env,
+          ...remoteHarnessEnv,
+          MATRIX_TEST_ENVIRONMENT: normalizedEnvironmentName,
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      child.stdout.on('data', (chunk) => combinedChunks.push(Buffer.from(chunk)));
+      child.stderr.on('data', (chunk) => combinedChunks.push(Buffer.from(chunk)));
+      child.on('error', (error) => {
+        combinedChunks.push(Buffer.from(`${error.message}\n`, 'utf8'));
+        resolve(1);
+      });
+      child.on('close', (code) => resolve(code ?? 1));
     });
-    child.on('close', (code) => resolve(code ?? 1));
-  });
+  }
   const completedAt = new Date().toISOString();
   const durationMs = Date.now() - startedMs;
   const logText = Buffer.concat(combinedChunks).toString('utf8');
@@ -1906,14 +2376,20 @@ export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
     test_files: files.map((file) => normalizePathForMarkdown(path.relative(repoRoot, file))),
     expanded_test_file_count: readiness.expanded_test_files.length,
     expanded_test_files: readiness.expanded_test_files,
+    readiness_probe: readinessProbe,
     output_sha256: sha256Hex(logText),
-    error_message: exitCode === 0 ? null : `Environment suite exited with ${exitCode}`,
+    error_message: exitCode === 0
+      ? null
+      : (readinessProbe.ready
+        ? `Environment suite exited with ${exitCode}`
+        : `Environment readiness probe failed: ${readinessProbe.last_error}`),
     log_artifact: logArtifact,
     executed_by: executedBy,
     reviewed_by: reviewedBy,
     source_run_uri: sourceRunUri,
     topology_kind: topologyKind,
     cloudflare_resources: cloudflareResources,
+    deployment_identity_validation: deploymentIdentityValidation,
     run_timestamp: runTimestamp,
   };
   await fs.mkdir(outputDirectory, { recursive: true });

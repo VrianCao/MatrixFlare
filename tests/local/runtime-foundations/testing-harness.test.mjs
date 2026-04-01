@@ -120,6 +120,73 @@ function buildValidEnvironmentReport(environmentName, runTimestamp, overrides = 
     source_run_uri: `https://example.invalid/runs/${environmentName}/${runTimestamp}`,
     topology_kind: `cloudflare-${environmentName}`,
     cloudflare_resources: buildExpectedCloudflareResources(environmentName),
+    readiness_probe: {
+      ready: true,
+      environment_name: environmentName,
+      started_at: '2026-03-31T13:59:00.000Z',
+      completed_at: '2026-03-31T13:59:30.000Z',
+      duration_ms: 30000,
+      attempt_count: 1,
+      last_error: null,
+      attempts: [
+        {
+          attempt: 1,
+          started_at: '2026-03-31T13:59:00.000Z',
+          completed_at: '2026-03-31T13:59:30.000Z',
+          duration_ms: 30000,
+          ok: true,
+          steps: [
+            { step: 'versions', ok: true, detail: { versions_count: 1 } },
+            { step: 'public_rooms', ok: true, detail: { chunk_length: 0 } },
+            { step: 'media_create', ok: true, detail: { content_uri_present: true } },
+          ],
+          failure: null,
+          delay_before_next_attempt_ms: null,
+        },
+      ],
+    },
+    deployment_identity_validation: {
+      before_readiness: {
+        validated_at: '2026-03-31T13:58:30.000Z',
+        workers: {
+          'jobs-worker': {
+            script_name: `matrix-jobs-worker-${environmentName}`,
+            latest_active_deployment_id: `${environmentName}-jobs-deployment`,
+            active_worker_version_ids: [`jobs@${environmentName}-v1`],
+          },
+          'ops-worker': {
+            script_name: `matrix-ops-worker-${environmentName}`,
+            latest_active_deployment_id: `${environmentName}-ops-deployment`,
+            active_worker_version_ids: [`ops@${environmentName}-v1`],
+          },
+          'gateway-worker': {
+            script_name: `matrix-gateway-worker-${environmentName}`,
+            latest_active_deployment_id: `${environmentName}-gateway-deployment`,
+            active_worker_version_ids: [`gateway@${environmentName}-v1`],
+          },
+        },
+      },
+      before_suite: {
+        validated_at: '2026-03-31T13:59:31.000Z',
+        workers: {
+          'jobs-worker': {
+            script_name: `matrix-jobs-worker-${environmentName}`,
+            latest_active_deployment_id: `${environmentName}-jobs-deployment`,
+            active_worker_version_ids: [`jobs@${environmentName}-v1`],
+          },
+          'ops-worker': {
+            script_name: `matrix-ops-worker-${environmentName}`,
+            latest_active_deployment_id: `${environmentName}-ops-deployment`,
+            active_worker_version_ids: [`ops@${environmentName}-v1`],
+          },
+          'gateway-worker': {
+            script_name: `matrix-gateway-worker-${environmentName}`,
+            latest_active_deployment_id: `${environmentName}-gateway-deployment`,
+            active_worker_version_ids: [`gateway@${environmentName}-v1`],
+          },
+        },
+      },
+    },
     run_timestamp: runTimestamp,
     ...overrides,
   };
@@ -752,6 +819,46 @@ test('manual artifact payload validation requires structured non-local reports a
     {
       valid: false,
       error: 'environment run report must include cloudflare_resources',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('staging_run_report', {
+      ...validStagingReport,
+      readiness_probe: null,
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'environment run report must include readiness_probe',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('staging_run_report', {
+      ...validStagingReport,
+      readiness_probe: {
+        ...validStagingReport.readiness_probe,
+        attempts: [
+          {
+            ...validStagingReport.readiness_probe.attempts[0],
+            ok: false,
+            failure: {
+              step_name: 'media_create',
+              detail: {
+                status: 500,
+              },
+            },
+          },
+        ],
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'environment run report readiness_probe must include a successful final attempt',
     },
   );
 
@@ -1479,6 +1586,52 @@ test('manual artifact attestation validation requires immutable provenance plus 
     {
       valid: false,
       error: 'attestation bundle payload source_run_uri must equal provenance.origin_run_uri',
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('staging_run_report', {
+      ...validStagingAttestation,
+      payload: {
+        ...validStagingAttestation.payload,
+        readiness_probe: null,
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'attested payload invalid: environment run report must include readiness_probe',
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('staging_run_report', {
+      ...validStagingAttestation,
+      payload: {
+        ...validStagingAttestation.payload,
+        readiness_probe: {
+          ...validStagingAttestation.payload.readiness_probe,
+          attempts: [
+            {
+              ...validStagingAttestation.payload.readiness_probe.attempts[0],
+              ok: false,
+              failure: {
+                step_name: 'media_create',
+                detail: {
+                  status: 500,
+                },
+              },
+            },
+          ],
+        },
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'attested payload invalid: environment run report readiness_probe must include a successful final attempt',
     },
   );
 
@@ -5788,6 +5941,10 @@ test('writeL1Evidence keeps end-to-end bundle gating fail-closed without manual 
     const passManualArtifacts = JSON.parse(
       await fs.readFile(path.join(passCs001Root, 'artifacts', 'manual-artifacts.json'), 'utf8'),
     );
+    const passEnvironmentResults = JSON.parse(
+      await fs.readFile(path.join(passCs001Root, 'artifacts', 'environment-results.json'), 'utf8'),
+    );
+    const passSummary = await fs.readFile(path.join(passCs001Root, 'summary.md'), 'utf8');
     const stagingArtifact = passManualArtifacts.find((artifact) => artifact.artifact_id === 'staging_run_report');
     assert.equal(stagingArtifact?.attestation_origin_run_attempt, 1);
     assert.equal(stagingArtifact?.attestation_origin_run_uri, buildGitHubRunUri('staging', passTimestamp));
@@ -5795,6 +5952,11 @@ test('writeL1Evidence keeps end-to-end bundle gating fail-closed without manual 
     assert.equal(stagingArtifact?.attestation_artifact_sha256, 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789');
     assert.equal(stagingArtifact?.attestation_deployment_identity?.environment_id, 'staging');
     assert.equal(stagingArtifact?.attestation_provenance?.review_record_uri, buildGitHubRunUri('staging', passTimestamp));
+    const stagingEnvironmentResult = passEnvironmentResults.required_results.find((entry) => entry.environment_name === 'staging');
+    assert.equal(stagingEnvironmentResult?.readiness_probe?.ready, true);
+    assert.equal(stagingEnvironmentResult?.readiness_probe?.attempt_count, 1);
+    assert.equal(stagingEnvironmentResult?.deployment_identity_validation?.before_suite?.workers?.['gateway-worker']?.script_name, 'matrix-gateway-worker-staging');
+    assert.match(passSummary, /readiness: ready=true, attempts=1/);
   } finally {
     await fs.rm(fixtureParent, { recursive: true, force: true });
   }

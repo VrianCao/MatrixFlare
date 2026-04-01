@@ -19,12 +19,131 @@ import {
   fetchWorkerDeploymentState,
   resolveFreshCloudflareIdentity,
   resolvePreDeployWorkerDeploymentState,
+  runEnvironmentBackedSuite,
   summarizeWorkerDeploymentState,
+  validateDeploymentSummaryAgainstCurrentCloudflareState,
   validateLatestActiveCloudflareWorkerIdentity,
   validateRemoteHarnessEnvironmentVariables,
+  waitForNonLocalDeploymentReadiness,
   writeEnvironmentWranglerConfig,
   writeEnvironmentRunProvenance,
 } from '../../../packages/testing/src/nonlocal.mjs';
+
+function buildDeploymentSummaryFixture(environmentName) {
+  const plan = buildNonLocalEnvironmentPlan(environmentName, {
+    workersSubdomain: 'matrixflare',
+  });
+  return {
+    environment_name: environmentName,
+    account_id: 'cf-account',
+    workers_subdomain: 'matrixflare',
+    cloudflare_resources: plan.cloudflare_resources,
+    deployment_identity: {
+      environment_id: environmentName,
+      deployment_ids: ['dep-jobs', 'dep-ops', 'dep-gateway'],
+      worker_version_ids: ['ver-jobs', 'ver-ops', 'ver-gateway'],
+    },
+    workers: {
+      'gateway-worker': {
+        worker_name: 'gateway-worker',
+        deployment_id: 'dep-gateway',
+        worker_version_id: 'ver-gateway',
+        script_name: plan.worker_scripts['gateway-worker'],
+        url: plan.worker_urls['gateway-worker'],
+      },
+      'jobs-worker': {
+        worker_name: 'jobs-worker',
+        deployment_id: 'dep-jobs',
+        worker_version_id: 'ver-jobs',
+        script_name: plan.worker_scripts['jobs-worker'],
+        url: plan.worker_urls['jobs-worker'],
+      },
+      'ops-worker': {
+        worker_name: 'ops-worker',
+        deployment_id: 'dep-ops',
+        worker_version_id: 'ver-ops',
+        script_name: plan.worker_scripts['ops-worker'],
+        url: plan.worker_urls['ops-worker'],
+      },
+    },
+  };
+}
+
+function buildDeploymentIdentityValidationFixture(environmentName) {
+  return {
+    validated_at: '2026-04-01T16:00:00.000Z',
+    workers: {
+      'jobs-worker': {
+        script_name: buildWorkerScriptName('jobs-worker', environmentName),
+        latest_active_deployment_id: 'dep-jobs',
+        active_worker_version_ids: ['ver-jobs'],
+      },
+      'ops-worker': {
+        script_name: buildWorkerScriptName('ops-worker', environmentName),
+        latest_active_deployment_id: 'dep-ops',
+        active_worker_version_ids: ['ver-ops'],
+      },
+      'gateway-worker': {
+        script_name: buildWorkerScriptName('gateway-worker', environmentName),
+        latest_active_deployment_id: 'dep-gateway',
+        active_worker_version_ids: ['ver-gateway'],
+      },
+    },
+  };
+}
+
+function buildReadinessProbeFixture(environmentName, {
+  ready = true,
+  lastError = null,
+  failureStepName = 'register_complete',
+  failureDetail = { status: 500, error: 'transient deploy window' },
+} = {}) {
+  const attempts = ready
+    ? [{
+      attempt: 1,
+      started_at: '2026-04-01T16:00:00.000Z',
+      completed_at: '2026-04-01T16:00:03.000Z',
+      duration_ms: 3000,
+      ok: true,
+      steps: [
+        { step: 'versions', ok: true, detail: { versions_count: 1 } },
+        { step: 'public_rooms', ok: true, detail: { chunk_length: 0 } },
+        { step: 'register_challenge', ok: true, detail: { session_present: true, flows_count: 1 } },
+        { step: 'register_complete', ok: true, detail: { user_id_present: true, access_token_present: true } },
+        { step: 'sync', ok: true, detail: { next_batch_present: true } },
+        { step: 'media_create', ok: true, detail: { content_uri_present: true } },
+      ],
+      failure: null,
+      delay_before_next_attempt_ms: null,
+    }]
+    : [{
+      attempt: 1,
+      started_at: '2026-04-01T16:00:00.000Z',
+      completed_at: '2026-04-01T16:00:02.000Z',
+      duration_ms: 2000,
+      ok: false,
+      steps: [
+        { step: 'versions', ok: true, detail: { versions_count: 1 } },
+        { step: 'public_rooms', ok: true, detail: { chunk_length: 0 } },
+        { step: failureStepName, ok: false, detail: failureDetail },
+      ],
+      failure: {
+        step_name: failureStepName,
+        detail: failureDetail,
+      },
+      delay_before_next_attempt_ms: null,
+    }];
+  return {
+    ready,
+    environment_name: environmentName,
+    started_at: '2026-04-01T16:00:00.000Z',
+    completed_at: '2026-04-01T16:00:03.000Z',
+    duration_ms: ready ? 3000 : 2000,
+    attempt_count: attempts.length,
+    last_error: ready ? null : lastError,
+    attempts,
+  };
+}
 
 test('non-local environment plan derives deterministic workers.dev scripts and resource names', () => {
   const plan = buildNonLocalEnvironmentPlan('staging', {
@@ -324,6 +443,51 @@ test('worker deployment state summary keeps only the latest active deployment ve
   assert.deepEqual(summary.worker_version_ids, ['ver-current', 'ver-old', 'ver-archived']);
 });
 
+test('deployment summary Cloudflare revalidation checks every worker against the latest active identity', async () => {
+  const deploymentSummary = {
+    workers: {
+      'jobs-worker': {
+        script_name: 'matrix-jobs-worker-staging',
+        deployment_id: 'dep-jobs',
+        worker_version_id: 'ver-jobs',
+      },
+      'ops-worker': {
+        script_name: 'matrix-ops-worker-staging',
+        deployment_id: 'dep-ops',
+        worker_version_id: 'ver-ops',
+      },
+      'gateway-worker': {
+        script_name: 'matrix-gateway-worker-staging',
+        deployment_id: 'dep-gateway',
+        worker_version_id: 'ver-gateway',
+      },
+    },
+  };
+  const observedScripts = [];
+
+  const validation = await validateDeploymentSummaryAgainstCurrentCloudflareState(deploymentSummary, {
+    accountId: 'cf-account',
+    apiToken: 'cf-token',
+    fetchWorkerDeploymentStateImpl: async ({ accountId, apiToken, scriptName }) => {
+      observedScripts.push({ accountId, apiToken, scriptName });
+      const workerAlias = scriptName.split('-')[1];
+      return {
+        latest_active_deployment_id: `dep-${workerAlias}`,
+        active_worker_version_ids: [`ver-${workerAlias}`, 'ver-older'],
+      };
+    },
+  });
+
+  assert.deepEqual(observedScripts, [
+    { accountId: 'cf-account', apiToken: 'cf-token', scriptName: 'matrix-jobs-worker-staging' },
+    { accountId: 'cf-account', apiToken: 'cf-token', scriptName: 'matrix-ops-worker-staging' },
+    { accountId: 'cf-account', apiToken: 'cf-token', scriptName: 'matrix-gateway-worker-staging' },
+  ]);
+  assert.equal(validation.workers['jobs-worker'].latest_active_deployment_id, 'dep-jobs');
+  assert.deepEqual(validation.workers['gateway-worker'].active_worker_version_ids, ['ver-gateway', 'ver-older']);
+  assert.match(validation.validated_at, /^\d{4}-\d{2}-\d{2}T/);
+});
+
 test('pre-deploy worker deployment state only treats fully missing script observations as an empty bootstrap state', () => {
   const scriptName = 'matrix-gateway-worker-staging';
 
@@ -517,6 +681,229 @@ test('latest active Cloudflare deployment identity validation rejects stale or m
     }, currentDeploymentState),
     /deployment workers\.gateway-worker\.worker_version_id is not part of the latest active Cloudflare deployment/,
   );
+});
+
+test('non-local deployment readiness retries with fresh per-attempt registration identities', async () => {
+  const remoteHarnessEnv = {
+    MATRIX_REMOTE_BASE_URL: 'https://matrix-gateway-worker-staging.matrixflare.workers.dev',
+    MATRIX_REMOTE_SERVER_NAME: 'matrix-gateway-worker-staging.matrixflare.workers.dev',
+    MATRIX_REMOTE_OPS_BASE_URL: 'https://matrix-ops-worker-staging.matrixflare.workers.dev',
+  };
+  const expectedPaths = [
+    '/_matrix/client/versions',
+    '/_matrix/client/v3/publicRooms?limit=1',
+    '/_matrix/client/v3/register',
+    '/_matrix/client/v3/register',
+    '/_matrix/client/versions',
+    '/_matrix/client/v3/publicRooms?limit=1',
+    '/_matrix/client/v3/register',
+    '/_matrix/client/v3/register',
+    '/_matrix/client/v3/sync?timeout=0&set_presence=offline',
+    '/_matrix/media/v3/create',
+  ];
+  const responses = [
+    new Response(JSON.stringify({ versions: ['v1.17'] }), { status: 200, headers: { 'content-type': 'application/json' } }),
+    new Response(JSON.stringify({ chunk: [] }), { status: 200, headers: { 'content-type': 'application/json' } }),
+    new Response(JSON.stringify({ flows: [{ stages: ['m.login.dummy'] }], session: 'uia-1' }), { status: 401, headers: { 'content-type': 'application/json' } }),
+    new Response(JSON.stringify({ errcode: 'M_UNKNOWN', error: 'transient deploy window' }), { status: 500, headers: { 'content-type': 'application/json' } }),
+    new Response(JSON.stringify({ versions: ['v1.17'] }), { status: 200, headers: { 'content-type': 'application/json' } }),
+    new Response(JSON.stringify({ chunk: [] }), { status: 200, headers: { 'content-type': 'application/json' } }),
+    new Response(JSON.stringify({ flows: [{ stages: ['m.login.dummy'] }], session: 'uia-2' }), { status: 401, headers: { 'content-type': 'application/json' } }),
+    new Response(JSON.stringify({ user_id: '@ready:example.test', access_token: 'atk.ready' }), { status: 200, headers: { 'content-type': 'application/json' } }),
+    new Response(JSON.stringify({ next_batch: 's1' }), { status: 200, headers: { 'content-type': 'application/json' } }),
+    new Response(JSON.stringify({ content_uri: 'mxc://example.test/media' }), { status: 200, headers: { 'content-type': 'application/json' } }),
+  ];
+  const delayCalls = [];
+  const observedCredentials = [];
+  let responseIndex = 0;
+
+  const readiness = await waitForNonLocalDeploymentReadiness('staging', remoteHarnessEnv, {
+    maxAttempts: 2,
+    initialDelayMs: 250,
+    maxDelayMs: 250,
+    sleepImpl: async (delayMs) => {
+      delayCalls.push(delayMs);
+    },
+    fetchImpl: async (url, options = {}) => {
+      const expectedPath = expectedPaths[responseIndex];
+      assert.ok(expectedPath, `unexpected fetch #${responseIndex + 1}`);
+      const requestUrl = new URL(String(url));
+      assert.equal(`${requestUrl.pathname}${requestUrl.search}`, expectedPath);
+      if (expectedPath === '/_matrix/client/v3/register') {
+        assert.equal(options.method, 'POST');
+        const body = JSON.parse(String(options.body));
+        observedCredentials.push({
+          step: body.auth == null ? 'register_challenge' : 'register_complete',
+          username: body.username,
+          password: body.password,
+          deviceId: body.device_id,
+        });
+      }
+      const response = responses[responseIndex];
+      responseIndex += 1;
+      return response;
+    },
+  });
+
+  assert.equal(readiness.ready, true);
+  assert.equal(readiness.attempt_count, 2);
+  assert.equal(delayCalls.length, 1);
+  assert.deepEqual(delayCalls, [250]);
+  assert.equal(readiness.attempts[0].ok, false);
+  assert.equal(readiness.attempts[0].failure.step_name, 'register_complete');
+  assert.equal(readiness.attempts[1].ok, true);
+  assert.equal(readiness.attempts[0].steps[2].step, 'register_challenge');
+  assert.equal(readiness.attempts[1].steps[2].step, 'register_challenge');
+  assert.deepEqual(
+    observedCredentials.map(({ step }) => step),
+    ['register_challenge', 'register_complete', 'register_challenge', 'register_complete'],
+  );
+  assert.equal(observedCredentials[0].username, observedCredentials[1].username);
+  assert.equal(observedCredentials[0].password, observedCredentials[1].password);
+  assert.equal(observedCredentials[0].deviceId, observedCredentials[1].deviceId);
+  assert.equal(observedCredentials[2].username, observedCredentials[3].username);
+  assert.equal(observedCredentials[2].password, observedCredentials[3].password);
+  assert.equal(observedCredentials[2].deviceId, observedCredentials[3].deviceId);
+  assert.notEqual(observedCredentials[0].username, observedCredentials[2].username);
+  assert.notEqual(observedCredentials[0].password, observedCredentials[2].password);
+  assert.notEqual(observedCredentials[0].deviceId, observedCredentials[2].deviceId);
+});
+
+test('non-local deployment readiness fails closed when representative HTTP paths stay unhealthy', async () => {
+  const remoteHarnessEnv = {
+    MATRIX_REMOTE_BASE_URL: 'https://matrix-gateway-worker-pre-release.matrixflare.workers.dev',
+    MATRIX_REMOTE_SERVER_NAME: 'matrix-gateway-worker-pre-release.matrixflare.workers.dev',
+    MATRIX_REMOTE_OPS_BASE_URL: 'https://matrix-ops-worker-pre-release.matrixflare.workers.dev',
+  };
+  const delayCalls = [];
+
+  const readiness = await waitForNonLocalDeploymentReadiness('pre-release', remoteHarnessEnv, {
+    maxAttempts: 1,
+    sleepImpl: async (delayMs) => {
+      delayCalls.push(delayMs);
+    },
+    fetchImpl: async (url) => {
+      const requestUrl = new URL(String(url));
+      assert.equal(`${requestUrl.pathname}${requestUrl.search}`, '/_matrix/client/versions');
+      return new Response(JSON.stringify({
+        errcode: 'M_UNKNOWN',
+        error: 'gateway not ready',
+      }), {
+        status: 503,
+        headers: {
+          'content-type': 'application/json',
+        },
+      });
+    },
+  });
+
+  assert.equal(readiness.ready, false);
+  assert.equal(readiness.attempt_count, 1);
+  assert.equal(readiness.attempts[0].failure.step_name, 'versions');
+  assert.match(readiness.last_error, /versions/);
+  assert.deepEqual(delayCalls, []);
+});
+
+test('runEnvironmentBackedSuite does not spawn the suite when readiness fails', async () => {
+  const repoRoot = path.resolve('.');
+  const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-nonlocal-suite-readiness-fail-'));
+  const deploymentSummary = buildDeploymentSummaryFixture('staging');
+  let spawnCalls = 0;
+
+  try {
+    const result = await runEnvironmentBackedSuite('staging', repoRoot, {
+      runTimestamp: '20260401T163500Z',
+      outputRoot,
+      sourceRunUri: 'https://github.com/example/matrix/actions/runs/12345',
+      logArtifact: 'https://github.com/example/matrix/actions/runs/12345/artifacts/1',
+      executedBy: 'gha://example/matrix/nonlocal/staging',
+      reviewedBy: 'gha://example/matrix/nonlocal/staging',
+      topologyKind: 'cloudflare-staging',
+      deploymentSummary,
+    }, {
+      requireGitHubActionsExecutionImpl: async () => ({ environment: 'staging' }),
+      assessNonLocalEnvironmentHarnessReadinessImpl: async () => ({
+        ready: true,
+        reason: null,
+        expanded_test_files: ['tests/staging/l1-mandatory.test.mjs'],
+      }),
+      requireCloudflareCredentialsImpl: () => ({ accountId: 'cf-account', apiToken: 'cf-token' }),
+      readWorkersSubdomainImpl: async () => 'matrixflare',
+      validateDeploymentSummaryAgainstCurrentCloudflareStateImpl: async () => (
+        buildDeploymentIdentityValidationFixture('staging')
+      ),
+      getRequiredTestFilesImpl: async () => [path.join(repoRoot, 'tests/staging/l1-mandatory.test.mjs')],
+      waitForNonLocalDeploymentReadinessImpl: async () => buildReadinessProbeFixture('staging', {
+        ready: false,
+        lastError: 'register_complete: {"status":500,"error":"transient deploy window"}',
+      }),
+      spawnImpl: () => {
+        spawnCalls += 1;
+        throw new Error('suite must not spawn when readiness fails');
+      },
+    });
+
+    assert.equal(spawnCalls, 0);
+    assert.equal(result.ok, false);
+    assert.equal(result.validation_error, 'environment run report must have status "pass"');
+    assert.equal(result.report.status, 'fail');
+    assert.equal(result.report.error_message, 'Environment readiness probe failed: register_complete: {"status":500,"error":"transient deploy window"}');
+    assert.equal(result.report.deployment_identity_validation.before_suite, null);
+    assert.equal(result.report.readiness_probe.ready, false);
+  } finally {
+    await fs.rm(outputRoot, { recursive: true, force: true });
+  }
+});
+
+test('runEnvironmentBackedSuite revalidates deployment identity after readiness before spawning the suite', async () => {
+  const repoRoot = path.resolve('.');
+  const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-nonlocal-suite-identity-'));
+  const deploymentSummary = buildDeploymentSummaryFixture('staging');
+  let spawnCalls = 0;
+  let validationCalls = 0;
+
+  try {
+    await assert.rejects(
+      () => runEnvironmentBackedSuite('staging', repoRoot, {
+        runTimestamp: '20260401T163600Z',
+        outputRoot,
+        sourceRunUri: 'https://github.com/example/matrix/actions/runs/12345',
+        logArtifact: 'https://github.com/example/matrix/actions/runs/12345/artifacts/1',
+        executedBy: 'gha://example/matrix/nonlocal/staging',
+        reviewedBy: 'gha://example/matrix/nonlocal/staging',
+        topologyKind: 'cloudflare-staging',
+        deploymentSummary,
+      }, {
+        requireGitHubActionsExecutionImpl: async () => ({ environment: 'staging' }),
+        assessNonLocalEnvironmentHarnessReadinessImpl: async () => ({
+          ready: true,
+          reason: null,
+          expanded_test_files: ['tests/staging/l1-mandatory.test.mjs'],
+        }),
+        requireCloudflareCredentialsImpl: () => ({ accountId: 'cf-account', apiToken: 'cf-token' }),
+        readWorkersSubdomainImpl: async () => 'matrixflare',
+        validateDeploymentSummaryAgainstCurrentCloudflareStateImpl: async () => {
+          validationCalls += 1;
+          if (validationCalls === 1) {
+            return buildDeploymentIdentityValidationFixture('staging');
+          }
+          throw new Error('stale gateway deployment identity');
+        },
+        getRequiredTestFilesImpl: async () => [path.join(repoRoot, 'tests/staging/l1-mandatory.test.mjs')],
+        waitForNonLocalDeploymentReadinessImpl: async () => buildReadinessProbeFixture('staging'),
+        spawnImpl: () => {
+          spawnCalls += 1;
+          throw new Error('suite must not spawn after stale deployment identity');
+        },
+      }),
+      /stale gateway deployment identity/,
+    );
+
+    assert.equal(validationCalls, 2);
+    assert.equal(spawnCalls, 0);
+  } finally {
+    await fs.rm(outputRoot, { recursive: true, force: true });
+  }
 });
 
 test('remote harness env vars must target an external HTTPS deployment and match the remote server host', () => {

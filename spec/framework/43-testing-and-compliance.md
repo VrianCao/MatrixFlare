@@ -78,6 +78,7 @@
 * `ci-integration`、`staging`、`pre-release` 的 release-gate 运行，必须由各自环境目录中的 dedicated harness 直接驱动；仅导入 `tests/local/*` 或共享本地 mandatory suite 的薄入口，不构成 environment-backed validation。
 * GitHub Actions 是 `ci-integration`、`staging`、`pre-release` non-local harness 的唯一触发入口；本地 `npm run test:all` 只可证明目录分层、skip-path 与本地组合回归仍然可执行，不得被描述成 non-local gate 已完成。
 * non-local harness 必须通过真实部署后的 HTTP / RPC / Worker entrypoint 与其绑定资源驱动，不得把 `_test-runs` 本地产物、共享 local suite 结果、或结构合法但来源不可审计的 JSON 当作近真实拓扑验证。
+* release-gate non-local suite 不得在 deploy 完成后立即盲跑；在开始 suite 前，必须先经过 bounded post-deploy readiness probe，并用真实请求路径证明“当前 deployment identity 已经对外稳定可服务”。该 probe 必须记录尝试次数、最终通过时间与探测目标，并随 raw bundle 一起保留。
 * 任何导入到 release gate 的 non-local 运行结果，都必须使用 [26-wire-schema-catalog.md](/root/Matrix/spec/framework/26-wire-schema-catalog.md) 中的 `EnvironmentRunAttestation`；production monthly cost snapshot 必须使用 `ProdCostSnapshotAttestation`。裸 run report / prod snapshot JSON 不得直接作为发布证据入口。
 * staging 必须至少包含：
   * Worker versions/deployments

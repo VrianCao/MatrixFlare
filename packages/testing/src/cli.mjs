@@ -250,6 +250,8 @@ async function main() {
       report_path: path.relative(process.cwd(), result.report_path),
       log_path: path.relative(process.cwd(), result.log_path),
       status: result.report.status,
+      readiness_probe_ready: result.report.readiness_probe?.ready ?? null,
+      readiness_probe_attempt_count: result.report.readiness_probe?.attempt_count ?? null,
       validation_error: result.validation_error,
     }, null, 2)}\n`);
     if (!result.ok) {

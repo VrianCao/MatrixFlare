@@ -3118,6 +3118,103 @@ function requiresExternalManualArtifactEvidence(artifactId) {
   return resolveEnvironmentNameForArtifactId(artifactId) != null || artifactId === 'prod_cost_snapshot';
 }
 
+function validateEnvironmentRunReadinessProbe(reportLabel, readinessProbe, expectedEnvironmentName) {
+  if (!isPlainObject(readinessProbe)) {
+    return {
+      valid: false,
+      error: `${reportLabel} must include readiness_probe`,
+    };
+  }
+  if (readinessProbe.environment_name !== expectedEnvironmentName) {
+    return {
+      valid: false,
+      error: `${reportLabel} readiness_probe.environment_name must be ${expectedEnvironmentName}`,
+    };
+  }
+  if (readinessProbe.ready !== true) {
+    return {
+      valid: false,
+      error: `${reportLabel} readiness_probe.ready must be true`,
+    };
+  }
+  if (!isRfc3339UtcTimestamp(readinessProbe.started_at) || !isRfc3339UtcTimestamp(readinessProbe.completed_at)) {
+    return {
+      valid: false,
+      error: `${reportLabel} readiness_probe must include RFC 3339 UTC started_at and completed_at timestamps`,
+    };
+  }
+  if (!isNonNegativeInteger(readinessProbe.duration_ms)) {
+    return {
+      valid: false,
+      error: `${reportLabel} readiness_probe must include a non-negative duration_ms`,
+    };
+  }
+  if (!isNonNegativeInteger(readinessProbe.attempt_count) || readinessProbe.attempt_count === 0) {
+    return {
+      valid: false,
+      error: `${reportLabel} readiness_probe must include a positive attempt_count`,
+    };
+  }
+  if (!Array.isArray(readinessProbe.attempts) || readinessProbe.attempts.length !== readinessProbe.attempt_count) {
+    return {
+      valid: false,
+      error: `${reportLabel} readiness_probe must include attempts matching attempt_count`,
+    };
+  }
+  const invalidAttempt = readinessProbe.attempts.find((attempt, index) => {
+    if (!isPlainObject(attempt)) {
+      return true;
+    }
+    if (attempt.attempt !== index + 1) {
+      return true;
+    }
+    if (!isRfc3339UtcTimestamp(attempt.started_at) || !isRfc3339UtcTimestamp(attempt.completed_at)) {
+      return true;
+    }
+    if (!isNonNegativeInteger(attempt.duration_ms)) {
+      return true;
+    }
+    if (typeof attempt.ok !== 'boolean') {
+      return true;
+    }
+    if (!Array.isArray(attempt.steps) || attempt.steps.length === 0) {
+      return true;
+    }
+    if (attempt.steps.some((step) => !isPlainObject(step) || !isNonEmptyString(step.step) || typeof step.ok !== 'boolean' || !('detail' in step))) {
+      return true;
+    }
+    if (attempt.delay_before_next_attempt_ms !== null && !isNonNegativeInteger(attempt.delay_before_next_attempt_ms)) {
+      return true;
+    }
+    if (attempt.ok) {
+      return attempt.failure !== null;
+    }
+    return !isPlainObject(attempt.failure) || !isNonEmptyString(attempt.failure.step_name) || !isPlainObject(attempt.failure.detail);
+  });
+  if (invalidAttempt) {
+    return {
+      valid: false,
+      error: `${reportLabel} readiness_probe must include structured attempts and steps`,
+    };
+  }
+  if (!readinessProbe.attempts.some((attempt) => attempt.ok === true) || readinessProbe.attempts.at(-1)?.ok !== true) {
+    return {
+      valid: false,
+      error: `${reportLabel} readiness_probe must include a successful final attempt`,
+    };
+  }
+  if (readinessProbe.last_error !== null) {
+    return {
+      valid: false,
+      error: `${reportLabel} readiness_probe.last_error must be null for a passing report`,
+    };
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
 export function validateManualArtifactPayload(artifactId, payload, {
   runTimestamp = null,
 } = {}) {
@@ -3270,6 +3367,14 @@ export function validateManualArtifactPayload(artifactId, payload, {
     );
     if (!resourceValidation.valid) {
       return resourceValidation;
+    }
+    const readinessProbeValidation = validateEnvironmentRunReadinessProbe(
+      'environment run report',
+      payload.readiness_probe,
+      expectedEnvironmentName,
+    );
+    if (!readinessProbeValidation.valid) {
+      return readinessProbeValidation;
     }
     return {
       valid: true,
@@ -4191,6 +4296,8 @@ function buildAttestedEnvironmentRunSource(artifactResult) {
     source_run_uri: payload.source_run_uri,
     topology_kind: payload.topology_kind,
     cloudflare_resources: payload.cloudflare_resources,
+    readiness_probe: payload.readiness_probe,
+    deployment_identity_validation: payload.deployment_identity_validation ?? null,
     attestation_path: artifactResult.provided_path,
     attestation_origin_run_id: artifactResult.attestation_origin_run_id,
     attestation_origin_run_attempt: artifactResult.attestation_origin_run_attempt,
@@ -4316,6 +4423,8 @@ function serializeEnvironmentRunSource(environmentRun, evidenceRoot) {
       source_run_uri: environmentRun.source_run_uri,
       topology_kind: environmentRun.topology_kind,
       cloudflare_resources: environmentRun.cloudflare_resources,
+      readiness_probe: environmentRun.readiness_probe ?? null,
+      deployment_identity_validation: environmentRun.deployment_identity_validation ?? null,
       artifact_store_uri: environmentRun.attestation_artifact_store_uri,
       artifact_store_key: environmentRun.attestation_artifact_store_key,
       artifact_sha256: environmentRun.attestation_artifact_sha256,
@@ -4455,6 +4564,12 @@ async function writeEvidenceBundle(repoRoot, {
     } else if (environmentRun.source_kind === 'attestation') {
       summaryLines.push(`  attestation: \`${environmentRun.attestation_path}\``);
       summaryLines.push(`  provenance: origin_run_uri=\`${environmentRun.attestation_origin_run_uri}\`, artifact_store_uri=\`${environmentRun.attestation_artifact_store_uri}\`, review_record_uri=\`${environmentRun.attestation_review_record_uri}\``);
+      if (isPlainObject(environmentRun.readiness_probe)) {
+        summaryLines.push(`  readiness: ready=${String(environmentRun.readiness_probe.ready)}, attempts=${environmentRun.readiness_probe.attempt_count}, completed_at=\`${environmentRun.readiness_probe.completed_at}\``);
+      }
+      if (isPlainObject(environmentRun.deployment_identity_validation)) {
+        summaryLines.push(`  deployment_identity_validation: before_readiness=${environmentRun.deployment_identity_validation.before_readiness == null ? 'absent' : 'present'}, before_suite=${environmentRun.deployment_identity_validation.before_suite == null ? 'absent' : 'present'}`);
+      }
     } else {
       summaryLines.push(`  reason: ${environmentRun.missing_reason ?? 'missing environment evidence'}`);
     }

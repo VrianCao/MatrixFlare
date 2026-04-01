@@ -47,6 +47,7 @@
 * dedicated non-local environment 的 workflow 锁必须按环境全局串行，而不是按 branch/ref 局部串行；不同 ref / commit 不得并发写同一 `ci-integration`、`staging` 或 `pre-release` 资源，否则会污染 deployment identity 与 attestation provenance。
 * 新环境或空环境的 bootstrap 顺序固定为：先部署不含 jobs service binding 的 `gateway-worker`，再部署 `jobs-worker`、`ops-worker`，最后重新部署带完整 bindings 的 `gateway-worker`；任一步失败都必须停止，不得继续假设拓扑已完整。
 * non-local workflow 必须先确保或复用环境专属 D1/KV/R2/Queues，再执行 deploy、suite、artifact upload 与 attestation；资源存在性检查、更新策略和运行 identity 必须写入 workflow 工件，避免把旧部署误认成新运行。若 deploy 后无法从 Cloudflare 观察到 fresh deployment/version IDs，则必须 fail-closed，不得回退复用旧 identity；suite/attestation 阶段也必须回读 Cloudflare 当前 active deployment/version identity，拒绝 stale 或篡改过的 deployment summary。
+* deploy 后即使已经回读到 fresh deployment/version IDs，也不得直接把环境视为 ready。基于 `CF-WKR-012` 与 `CF-DO-005`，workflow 在启动 non-local suite 前还必须执行 bounded post-deploy readiness gate：至少用真实 HTTP surface 探测一个公开只读路径与一个关键写路径，并记录尝试次数、最终通过时间与探测目标；若在门限内仍未稳定通过，则必须 fail-closed，不得把 suite failure 混同为已验证完成。
 * 每次 non-local run 都必须记录 GitHub run identity、Cloudflare deployment identity（每个 Worker 的 deployment/version IDs）以及不可变 artifact object locator；GitHub workflow artifact 只作为补充审计链，不替代对象存储中的 immutable locator。
 * non-local suite 在消费 deployment summary 时，必须用当前目标 Cloudflare account 的真实 `workers.dev` subdomain 复核 Worker URL，不得只凭 `*.workers.dev` host 形状信任 deployment 文件。
 
