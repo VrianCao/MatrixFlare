@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
+import { isIP } from 'node:net';
 import path from 'node:path';
 import process from 'node:process';
 import { execFile } from 'node:child_process';
@@ -70,26 +71,76 @@ const MANUAL_ARTIFACT_ATTESTATION_REQUIREMENTS = Object.freeze({
 
 const SHA256_HEX_RE = /^[a-f0-9]{64}$/;
 const WELL_FORMED_URN_RE = /^urn:[a-z0-9][a-z0-9-]{0,31}:.+/i;
+const RUN_TIMESTAMP_RE = /^\d{8}T\d{6}Z$/;
 const L1_SHARED_TEST_RUN_ROOT = 'evidence/common/_test-runs';
+const CLOUDFLARE_RESOURCE_NAMES = Object.freeze([
+  'workers',
+  'durable_objects',
+  'd1_databases',
+  'r2_buckets',
+  'kv_namespaces',
+  'queues',
+]);
+const EXPECTED_CLOUDFLARE_QUEUE_BASE_NAMES = Object.freeze([
+  'matrix-search-index-job',
+  'matrix-media-thumbnail-job',
+  'matrix-appservice-txn-job',
+  'matrix-rebuild-shard-job',
+  'matrix-export-shard-job',
+  'matrix-restore-shard-job',
+  'matrix-repair-shard-job',
+]);
+const EXPECTED_DURABLE_OBJECT_NAMES = Object.freeze([
+  'RemoteServerDO',
+  'RoomDO',
+  'UserDO',
+]);
+const EXPECTED_WORKER_BASE_NAMES = Object.freeze([
+  'gateway-worker',
+  'jobs-worker',
+  'ops-worker',
+]);
 
 const L1_TEST_IMPLEMENTATION_FILES = Object.freeze({
-  'TEST-CS-001': Object.freeze(['tests/local/client-identity/phase-04.test.mjs']),
-  'TEST-CS-002': Object.freeze(['tests/local/client-identity/phase-05.test.mjs']),
-  'TEST-CS-003': Object.freeze(['tests/local/client-identity/phase-05.test.mjs']),
-  'TEST-CS-004': Object.freeze(['tests/local/client-identity/phase-04.test.mjs']),
-  'TEST-ROOM-001': Object.freeze(['tests/local/client-identity/phase-06.test.mjs']),
-  'TEST-ROOM-002': Object.freeze(['tests/local/client-identity/phase-06.test.mjs']),
-  'TEST-MEDIA-001': Object.freeze(['tests/local/client-identity/phase-07.test.mjs']),
-  'TEST-DER-001': Object.freeze(['tests/local/client-identity/phase-07.test.mjs']),
-  'TEST-SEC-001': Object.freeze([
-    'tests/local/client-identity/phase-04.test.mjs',
-    'tests/local/runtime-foundations/phase-08-runtime-controls.test.mjs',
-  ]),
-  'TEST-OPS-001': Object.freeze([
-    'tests/local/runtime-foundations/phase-08-runtime-controls.test.mjs',
-    'tests/local/control-plane/phase-08-ops.test.mjs',
-  ]),
-  'TEST-COST-001': Object.freeze(['tests/local/runtime-foundations/phase-08-runtime-controls.test.mjs']),
+  'TEST-CS-001': Object.freeze({
+    local: Object.freeze(['tests/local/client-identity/phase-04.test.mjs']),
+  }),
+  'TEST-CS-002': Object.freeze({
+    local: Object.freeze(['tests/local/client-identity/phase-05.test.mjs']),
+  }),
+  'TEST-CS-003': Object.freeze({
+    local: Object.freeze(['tests/local/client-identity/phase-05.test.mjs']),
+  }),
+  'TEST-CS-004': Object.freeze({
+    local: Object.freeze(['tests/local/client-identity/phase-04.test.mjs']),
+  }),
+  'TEST-ROOM-001': Object.freeze({
+    local: Object.freeze(['tests/local/client-identity/phase-06.test.mjs']),
+  }),
+  'TEST-ROOM-002': Object.freeze({
+    local: Object.freeze(['tests/local/client-identity/phase-06.test.mjs']),
+  }),
+  'TEST-MEDIA-001': Object.freeze({
+    local: Object.freeze(['tests/local/client-identity/phase-07.test.mjs']),
+  }),
+  'TEST-DER-001': Object.freeze({
+    local: Object.freeze(['tests/local/client-identity/phase-07.test.mjs']),
+  }),
+  'TEST-SEC-001': Object.freeze({
+    local: Object.freeze([
+      'tests/local/client-identity/phase-04.test.mjs',
+      'tests/local/runtime-foundations/phase-08-runtime-controls.test.mjs',
+    ]),
+  }),
+  'TEST-OPS-001': Object.freeze({
+    local: Object.freeze([
+      'tests/local/runtime-foundations/phase-08-runtime-controls.test.mjs',
+      'tests/local/control-plane/phase-08-ops.test.mjs',
+    ]),
+  }),
+  'TEST-COST-001': Object.freeze({
+    local: Object.freeze(['tests/local/runtime-foundations/phase-08-runtime-controls.test.mjs']),
+  }),
 });
 
 const L1_EVIDENCE_DEFINITIONS = Object.freeze([
@@ -227,12 +278,27 @@ export function listL1EvidenceBundleIds() {
   return ['EVID-GOV-001', ...L1_EVIDENCE_DEFINITIONS.map((definition) => definition.id)];
 }
 
-export function getRequiredTestImplementationFiles(testId) {
-  const files = L1_TEST_IMPLEMENTATION_FILES[testId];
-  if (!Array.isArray(files) || files.length === 0) {
+export function getRequiredTestImplementationFiles(testId, environmentName = 'local') {
+  const mapping = L1_TEST_IMPLEMENTATION_FILES[testId];
+  if (!mapping || typeof mapping !== 'object' || Array.isArray(mapping)) {
     throw new RangeError(`Unknown L1 test implementation mapping for "${testId}"`);
   }
+  const files = mapping[environmentName] ?? mapping.default ?? null;
+  if (!Array.isArray(files) || files.length === 0) {
+    throw new RangeError(`Missing L1 test implementation mapping for "${testId}" in environment "${environmentName}"`);
+  }
   return [...files];
+}
+
+function listL1EnvironmentImplementationFiles(environmentName = 'local') {
+  const requiredFiles = new Set();
+  for (const mapping of Object.values(L1_TEST_IMPLEMENTATION_FILES)) {
+    const files = mapping[environmentName] ?? mapping.default ?? [];
+    for (const file of files) {
+      requiredFiles.add(file);
+    }
+  }
+  return [...requiredFiles].sort();
 }
 
 export function buildRequiredManualArtifactDefinitions(definition) {
@@ -292,8 +358,110 @@ function isNonEmptyStringArray(value) {
   return Array.isArray(value) && value.length > 0 && value.every((entry) => isNonEmptyString(entry));
 }
 
+function sortUniqueStringArray(value) {
+  return [...new Set(value.map((entry) => String(entry).trim()))].sort();
+}
+
+function buildExpectedCloudflareResources(environmentName, {
+  includeArtifactBucket = true,
+} = {}) {
+  return Object.freeze({
+    workers: Object.freeze(EXPECTED_WORKER_BASE_NAMES.map((workerName) => `matrix-${workerName}-${environmentName}`).sort()),
+    durable_objects: EXPECTED_DURABLE_OBJECT_NAMES,
+    d1_databases: Object.freeze([`matrix-control-and-derived-${environmentName}`]),
+    r2_buckets: Object.freeze(sortUniqueStringArray([
+      `matrix-media-${environmentName}`,
+      `matrix-archive-${environmentName}`,
+      ...(includeArtifactBucket ? [`matrix-evidence-${environmentName}`] : []),
+    ])),
+    kv_namespaces: Object.freeze([`matrix-edge-cache-${environmentName}`]),
+    queues: Object.freeze(EXPECTED_CLOUDFLARE_QUEUE_BASE_NAMES.map((queueName) => `${queueName}-${environmentName}`).sort()),
+  });
+}
+
+function validateExpectedCloudflareResources(payloadLabel, environmentName, resources, {
+  includeArtifactBucket = true,
+} = {}) {
+  if (!isPlainObject(resources)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} must include cloudflare_resources`,
+    };
+  }
+  for (const resourceName of CLOUDFLARE_RESOURCE_NAMES) {
+    if (!isNonEmptyStringArray(resources[resourceName])) {
+      return {
+        valid: false,
+        error: `${payloadLabel} cloudflare_resources.${resourceName} must be a non-empty string array`,
+      };
+    }
+  }
+  const expectedResources = buildExpectedCloudflareResources(environmentName, {
+    includeArtifactBucket,
+  });
+  for (const resourceName of CLOUDFLARE_RESOURCE_NAMES) {
+    const actual = sortUniqueStringArray(resources[resourceName]);
+    const expected = expectedResources[resourceName];
+    if (actual.length !== expected.length || actual.some((entry, index) => entry !== expected[index])) {
+      return {
+        valid: false,
+        error: `${payloadLabel} cloudflare_resources.${resourceName} must match expected ${environmentName} resources`,
+      };
+    }
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
 function isNonNegativeNumber(value) {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+}
+
+function isDisallowedLocalHostname(hostname) {
+  if (!isNonEmptyString(hostname)) {
+    return true;
+  }
+  const normalized = hostname.trim().replace(/^\[|\]$/g, '').replace(/\.$/, '').toLowerCase();
+  const isPrivateOrLoopbackIpv4 = (value) => {
+    if (isIP(value) !== 4) {
+      return false;
+    }
+    const [firstOctet, secondOctet] = value.split('.').map(Number);
+    return firstOctet === 0
+      || firstOctet === 10
+      || firstOctet === 127
+      || (firstOctet === 169 && secondOctet === 254)
+      || (firstOctet === 172 && secondOctet >= 16 && secondOctet <= 31)
+      || (firstOctet === 192 && secondOctet === 168);
+  };
+  if (
+    normalized === 'localhost'
+    || normalized.endsWith('.localhost')
+    || normalized === 'local'
+    || normalized.endsWith('.local')
+    || normalized === '0.0.0.0'
+    || normalized === '::1'
+  ) {
+    return true;
+  }
+  if (isPrivateOrLoopbackIpv4(normalized)) {
+    return true;
+  }
+  if (isIP(normalized) === 6) {
+    if (normalized.startsWith('::ffff:') || normalized.startsWith('0:0:0:0:0:ffff:')) {
+      return true;
+    }
+    return normalized === '::1'
+      || normalized.startsWith('fc')
+      || normalized.startsWith('fd')
+      || normalized.startsWith('fe8')
+      || normalized.startsWith('fe9')
+      || normalized.startsWith('fea')
+      || normalized.startsWith('feb');
+  }
+  return false;
 }
 
 function isAbsoluteExternalUri(value) {
@@ -308,10 +476,112 @@ function isAbsoluteExternalUri(value) {
     if (parsed.protocol === 'urn:') {
       return WELL_FORMED_URN_RE.test(value);
     }
-    return parsed.host.length > 0;
+    return parsed.host.length > 0 && !isDisallowedLocalHostname(parsed.hostname);
   } catch {
     return false;
   }
+}
+
+function isGitHubActionsRunUri(value) {
+  if (!isAbsoluteExternalUri(value)) {
+    return false;
+  }
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== 'https:' || parsed.hostname.toLowerCase() !== 'github.com') {
+      return false;
+    }
+    return /^\/[^/]+\/[^/]+\/actions\/runs\/\d+\/?$/.test(parsed.pathname);
+  } catch {
+    return false;
+  }
+}
+
+function extractGitHubActionsRunId(value) {
+  if (!isGitHubActionsRunUri(value)) {
+    return null;
+  }
+  try {
+    const parsed = new URL(value);
+    const [, owner, repository, actionsLiteral, runsLiteral, runId] = parsed.pathname.split('/');
+    if (
+      !isNonEmptyString(owner)
+      || !isNonEmptyString(repository)
+      || actionsLiteral !== 'actions'
+      || runsLiteral !== 'runs'
+      || !isNonEmptyString(runId)
+    ) {
+      return null;
+    }
+    return runId;
+  } catch {
+    return null;
+  }
+}
+
+function parseR2ObjectLocator(value) {
+  if (!isNonEmptyString(value)) {
+    return null;
+  }
+  try {
+    const parsed = new URL(value);
+    if (
+      parsed.protocol !== 'r2:'
+      || parsed.host.length === 0
+      || parsed.username !== ''
+      || parsed.password !== ''
+      || parsed.search.length > 0
+      || parsed.hash.length > 0
+    ) {
+      return null;
+    }
+    const objectKey = parsed.pathname.startsWith('/')
+      ? parsed.pathname.slice(1)
+      : parsed.pathname;
+    if (!isNonEmptyString(objectKey)) {
+      return null;
+    }
+    return {
+      bucket: parsed.host,
+      objectKey,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function parsePhase08ArtifactStoreKey(value) {
+  if (!isNonEmptyString(value)) {
+    return null;
+  }
+  const segments = value.split('/');
+  if (segments.length < 6 || segments[0] !== 'gha') {
+    return null;
+  }
+  const [prefix, originRunId, originRunAttempt, sourceEnvironment, runTimestamp, ...artifactPath] = segments;
+  if (
+    prefix !== 'gha'
+    || !/^\d+$/.test(originRunId)
+    || !/^\d+$/.test(originRunAttempt)
+    || !isNonEmptyString(sourceEnvironment)
+    || !RUN_TIMESTAMP_RE.test(runTimestamp)
+    || artifactPath.length === 0
+    || artifactPath.some((segment) => !isNonEmptyString(segment))
+  ) {
+    return null;
+  }
+  return {
+    originRunId,
+    originRunAttempt: Number(originRunAttempt),
+    sourceEnvironment,
+    runTimestamp,
+  };
+}
+
+function expectedTopologyKindForSourceEnvironment(sourceEnvironment) {
+  return sourceEnvironment === 'prod'
+    ? 'cloudflare-prod'
+    : `cloudflare-${sourceEnvironment}`;
 }
 
 function objectHasRequiredNumericFields(value, fieldNames) {
@@ -1041,6 +1311,9 @@ const SIMPLE_MEMBER_ALIAS_RE = new RegExp(
 const SIMPLE_BRACKET_MEMBER_ALIAS_RE = new RegExp(
   String.raw`^(?:\(\s*)*([A-Za-z_$][\w$]*)(?:\s*\))*\s*(?:\?\.\s*)?\[\s*(${STRING_LITERAL_PATTERN})\s*\]\s*$`,
 );
+const SIMPLE_IDENTIFIER_BRACKET_MEMBER_ALIAS_RE = new RegExp(
+  String.raw`^(?:\(\s*)*([A-Za-z_$][\w$]*)(?:\s*\))*\s*(?:\?\.\s*)?\[\s*([A-Za-z_$][\w$]*)\s*\]\s*$`,
+);
 const TRAILING_BRACKET_PROPERTY_RE = new RegExp(
   String.raw`\[\s*(${STRING_LITERAL_PATTERN})\s*\]\s*$`,
 );
@@ -1749,6 +2022,30 @@ function classifyAliasExpression(expressionText, aliasState) {
     }
   }
 
+  const identifierBracketMemberAlias = SIMPLE_IDENTIFIER_BRACKET_MEMBER_ALIAS_RE.exec(trimmed);
+  if (identifierBracketMemberAlias != null) {
+    const [, receiverName, propertyIdentifier] = identifierBracketMemberAlias;
+    const propertyName = aliasState.stringLiteralAliases?.get(propertyIdentifier) ?? null;
+    if (propertyName != null) {
+      classification.opaqueCallable = classification.opaqueCallable || isStringEvaluatorName(propertyName);
+      classification.commonJsFactory = classification.commonJsFactory
+        || (aliasState.nodeModuleNamespaceAliases.has(receiverName) && propertyName === 'createRequire');
+      classification.unsafeConstructor = classification.unsafeConstructor
+        || propertyName === 'constructor'
+        || (aliasState.unsafeConstructorAliases.has(receiverName) && isUnsafeConstructorContinuationName(propertyName));
+      classification.unsafeReflectMethod = classification.unsafeReflectMethod
+        || (aliasState.reflectAliases.has(receiverName) && isUnsafeReflectMethodName(propertyName));
+      const objectPropertyClassification = getObjectPropertyAliasClassification(
+        aliasState.objectPropertyAliases,
+        receiverName,
+        propertyName,
+      );
+      if (objectPropertyClassification != null) {
+        mergeAliasClassification(classification, objectPropertyClassification);
+      }
+    }
+  }
+
   const trailingMemberAccess = findStaticTrailingMemberAccess(trimmed);
   if (trailingMemberAccess != null) {
     mergeReceiverPropertyAliasClassification(
@@ -1834,6 +2131,7 @@ function collectAliasState(sourceText) {
   const unsafeReflectMethodAliases = new Set();
   const opaqueCallableAliases = new Set();
   const objectPropertyAliases = new Map();
+  const stringLiteralAliases = new Map();
 
   for (const match of normalizedSourceText.matchAll(/\bimport\s*\{([^}]*)\}\s*from\s*(["'])node:module\2/g)) {
     for (const entry of parseNamedAliasEntries(match[1])) {
@@ -2166,6 +2464,11 @@ function collectAliasState(sourceText) {
     }
 
     for (const assignment of collectNamedExpressionAssignments(normalizedSourceText)) {
+      const stringLiteralValue = parseSingleStringLiteralExpression(assignment.expressionText);
+      if (typeof stringLiteralValue === 'string' && stringLiteralAliases.get(assignment.targetName) !== stringLiteralValue) {
+        stringLiteralAliases.set(assignment.targetName, stringLiteralValue);
+        changed = true;
+      }
       const classification = classifyAliasExpression(assignment.expressionText, {
         nodeModuleNamespaceAliases,
         commonJsFactoryAliases,
@@ -2175,6 +2478,7 @@ function collectAliasState(sourceText) {
         unsafeReflectMethodAliases,
         opaqueCallableAliases,
         objectPropertyAliases,
+        stringLiteralAliases,
       });
       changed = applyClassificationToAliasSets(classification, assignment.targetName, {
         nodeModuleNamespaceAliases,
@@ -2197,6 +2501,7 @@ function collectAliasState(sourceText) {
     unsafeReflectMethodAliases,
     opaqueCallableAliases,
     objectPropertyAliases,
+    stringLiteralAliases,
   };
 }
 
@@ -2316,11 +2621,51 @@ function findStaticModuleSpecifier(sourceText, startIndex) {
   return null;
 }
 
-function collectRelativeModuleDependencies(sourceText) {
+function scanTemplateLiteralDependencies(sourceText, index, aliasState) {
+  const moduleSpecifiers = [];
+  let hasUnresolvedDynamicImport = false;
+  let cursor = index + 1;
+  while (cursor < sourceText.length) {
+    const current = sourceText[cursor];
+    const next = sourceText[cursor + 1];
+    if (current === '\\') {
+      cursor += 2;
+      continue;
+    }
+    if (current === '`') {
+      return {
+        moduleSpecifiers,
+        hasUnresolvedDynamicImport,
+        nextIndex: cursor + 1,
+      };
+    }
+    if (current === '$' && next === '{') {
+      const expressionStartIndex = cursor + 2;
+      const expressionEndIndex = skipBalancedCode(sourceText, expressionStartIndex, '}');
+      const expressionText = sourceText.slice(
+        expressionStartIndex,
+        Math.max(expressionEndIndex - 1, expressionStartIndex),
+      );
+      const nestedScan = collectRelativeModuleDependencies(expressionText, aliasState);
+      moduleSpecifiers.push(...nestedScan.moduleSpecifiers);
+      hasUnresolvedDynamicImport = hasUnresolvedDynamicImport || nestedScan.hasUnresolvedDynamicImport;
+      cursor = expressionEndIndex;
+      continue;
+    }
+    cursor += 1;
+  }
+  return {
+    moduleSpecifiers,
+    hasUnresolvedDynamicImport,
+    nextIndex: sourceText.length,
+  };
+}
+
+function collectRelativeModuleDependencies(sourceText, inheritedAliasState = null) {
   const moduleSpecifiers = [];
   let hasUnresolvedDynamicImport = false;
   let cursor = 0;
-  const aliasState = collectAliasState(sourceText);
+  const aliasState = inheritedAliasState ?? collectAliasState(sourceText);
 
   while (cursor < sourceText.length) {
     const current = sourceText[cursor];
@@ -2336,6 +2681,17 @@ function collectRelativeModuleDependencies(sourceText) {
     }
     if (current === '/' && next === '*') {
       cursor = skipBlockComment(sourceText, cursor);
+      continue;
+    }
+    if (current === '\'' || current === '"') {
+      cursor = skipQuotedString(sourceText, cursor);
+      continue;
+    }
+    if (current === '`') {
+      const templateLiteralScan = scanTemplateLiteralDependencies(sourceText, cursor, aliasState);
+      moduleSpecifiers.push(...templateLiteralScan.moduleSpecifiers);
+      hasUnresolvedDynamicImport = hasUnresolvedDynamicImport || templateLiteralScan.hasUnresolvedDynamicImport;
+      cursor = templateLiteralScan.nextIndex;
       continue;
     }
     if (current === '.' || (current === '?' && next === '.')) {
@@ -2389,6 +2745,7 @@ function collectRelativeModuleDependencies(sourceText) {
       if (bracketProperty != null) {
         const staticBracketPropertyName = getStaticBracketPropertyName(bracketProperty);
         const bracketCallLike = isCallLikeExpressionAt(sourceText, bracketProperty.end);
+        const chainedProperty = readNextPropertyName(sourceText, bracketProperty.end);
         const callableContinuation = readCallableContinuationInvocationProperty(sourceText, bracketProperty.end);
         const inlineObjectPropertyClassification = staticBracketPropertyName == null
           ? null
@@ -2438,7 +2795,15 @@ function collectRelativeModuleDependencies(sourceText) {
             bracketCallLike
             || isUnsafeConstructorContinuationName(nextProperty?.name)
           ))
-          || (staticBracketPropertyName == null && !isSimpleNumericExpression(bracketProperty.expressionText))
+          || (
+            staticBracketPropertyName == null
+            && !isSimpleNumericExpression(bracketProperty.expressionText)
+            && (
+              bracketCallLike
+              || callableContinuation != null
+              || chainedProperty != null
+            )
+          )
         ) {
           hasUnresolvedDynamicImport = true;
         }
@@ -2898,19 +3263,13 @@ export function validateManualArtifactPayload(artifactId, payload, {
         error: 'environment run report must include a non-local topology_kind',
       };
     }
-    if (!isPlainObject(payload.cloudflare_resources)) {
-      return {
-        valid: false,
-        error: 'environment run report must include cloudflare_resources',
-      };
-    }
-    for (const resourceName of ['workers', 'durable_objects', 'd1_databases', 'r2_buckets', 'kv_namespaces', 'queues']) {
-      if (!isNonEmptyStringArray(payload.cloudflare_resources[resourceName])) {
-        return {
-          valid: false,
-          error: `environment run report cloudflare_resources.${resourceName} must be a non-empty string array`,
-        };
-      }
+    const resourceValidation = validateExpectedCloudflareResources(
+      'environment run report',
+      expectedEnvironmentName,
+      payload.cloudflare_resources,
+    );
+    if (!resourceValidation.valid) {
+      return resourceValidation;
     }
     return {
       valid: true,
@@ -2973,19 +3332,13 @@ export function validateManualArtifactPayload(artifactId, payload, {
         error: 'prod_cost_snapshot must include a non-local topology_kind',
       };
     }
-    if (!isPlainObject(payload.cloudflare_resources)) {
-      return {
-        valid: false,
-        error: 'prod_cost_snapshot must include cloudflare_resources',
-      };
-    }
-    for (const resourceName of ['workers', 'durable_objects', 'd1_databases', 'r2_buckets', 'kv_namespaces', 'queues']) {
-      if (!isNonEmptyStringArray(payload.cloudflare_resources[resourceName])) {
-        return {
-          valid: false,
-          error: `prod_cost_snapshot cloudflare_resources.${resourceName} must be a non-empty string array`,
-        };
-      }
+    const resourceValidation = validateExpectedCloudflareResources(
+      'prod_cost_snapshot',
+      'prod',
+      payload.cloudflare_resources,
+    );
+    if (!resourceValidation.valid) {
+      return resourceValidation;
     }
     if (!isPlainObject(payload.billing_period)) {
       return {
@@ -3148,10 +3501,11 @@ export function validateEvidenceAttestationBundle(artifactId, payload, {
   }
 
   const provenance = payload.provenance;
-  if (!isNonEmptyString(provenance.origin_system)) {
+  const expectedTopologyKind = expectedTopologyKindForSourceEnvironment(contract.source_environment);
+  if (provenance.origin_system !== 'github-actions') {
     return {
       valid: false,
-      error: 'attestation bundle provenance.origin_system must be non-empty',
+      error: 'attestation bundle provenance.origin_system must be github-actions',
     };
   }
   if (!isNonEmptyString(provenance.origin_run_id)) {
@@ -3166,22 +3520,66 @@ export function validateEvidenceAttestationBundle(artifactId, payload, {
       error: 'attestation bundle provenance.origin_run_attempt must be a positive integer',
     };
   }
-  if (!isAbsoluteExternalUri(provenance.origin_run_uri)) {
+  if (!isGitHubActionsRunUri(provenance.origin_run_uri)) {
     return {
       valid: false,
-      error: 'attestation bundle provenance.origin_run_uri must be an absolute external URI',
+      error: 'attestation bundle provenance.origin_run_uri must be a GitHub Actions run URL',
     };
   }
-  if (!isAbsoluteExternalUri(provenance.artifact_store_uri)) {
+  if (provenance.origin_run_id !== extractGitHubActionsRunId(provenance.origin_run_uri)) {
     return {
       valid: false,
-      error: 'attestation bundle provenance.artifact_store_uri must be an absolute external URI',
+      error: 'attestation bundle provenance.origin_run_id must match provenance.origin_run_uri',
+    };
+  }
+  const artifactStoreLocator = parseR2ObjectLocator(provenance.artifact_store_uri);
+  if (artifactStoreLocator == null) {
+    return {
+      valid: false,
+      error: 'attestation bundle provenance.artifact_store_uri must be an immutable R2 object locator',
     };
   }
   if (!isNonEmptyString(provenance.artifact_store_key)) {
     return {
       valid: false,
       error: 'attestation bundle provenance.artifact_store_key must be non-empty',
+    };
+  }
+  if (artifactStoreLocator.objectKey !== provenance.artifact_store_key) {
+    return {
+      valid: false,
+      error: 'attestation bundle provenance.artifact_store_key must match provenance.artifact_store_uri',
+    };
+  }
+  const phase08ArtifactStoreKey = parsePhase08ArtifactStoreKey(provenance.artifact_store_key);
+  if (phase08ArtifactStoreKey == null) {
+    return {
+      valid: false,
+      error: 'attestation bundle provenance.artifact_store_key must use gha/<run_id>/<run_attempt>/<source_environment>/<run_timestamp>/... naming',
+    };
+  }
+  if (phase08ArtifactStoreKey.originRunId !== provenance.origin_run_id) {
+    return {
+      valid: false,
+      error: 'attestation bundle provenance.artifact_store_key must encode provenance.origin_run_id',
+    };
+  }
+  if (phase08ArtifactStoreKey.originRunAttempt !== provenance.origin_run_attempt) {
+    return {
+      valid: false,
+      error: 'attestation bundle provenance.artifact_store_key must encode provenance.origin_run_attempt',
+    };
+  }
+  if (phase08ArtifactStoreKey.sourceEnvironment !== contract.source_environment) {
+    return {
+      valid: false,
+      error: 'attestation bundle provenance.artifact_store_key must encode source_environment',
+    };
+  }
+  if (phase08ArtifactStoreKey.runTimestamp !== payload.run_timestamp) {
+    return {
+      valid: false,
+      error: 'attestation bundle provenance.artifact_store_key must encode run_timestamp',
     };
   }
   if (!isNonEmptyString(provenance.artifact_sha256) || !SHA256_HEX_RE.test(provenance.artifact_sha256)) {
@@ -3196,10 +3594,10 @@ export function validateEvidenceAttestationBundle(artifactId, payload, {
       error: 'attestation bundle provenance.review_record_uri must be an absolute external URI',
     };
   }
-  if (!isNonEmptyString(provenance.topology_kind) || provenance.topology_kind === 'local') {
+  if (provenance.topology_kind !== expectedTopologyKind) {
     return {
       valid: false,
-      error: 'attestation bundle provenance.topology_kind must be non-local',
+      error: `attestation bundle provenance.topology_kind must be ${expectedTopologyKind}`,
     };
   }
   if (!isPlainObject(provenance.deployment_identity)) {
@@ -3212,6 +3610,12 @@ export function validateEvidenceAttestationBundle(artifactId, payload, {
     return {
       valid: false,
       error: 'attestation bundle provenance.deployment_identity.environment_id must be non-empty',
+    };
+  }
+  if (provenance.deployment_identity.environment_id !== contract.source_environment) {
+    return {
+      valid: false,
+      error: 'attestation bundle provenance.deployment_identity.environment_id must equal source_environment',
     };
   }
   if (!isNonEmptyStringArray(provenance.deployment_identity.deployment_ids)) {
@@ -3246,6 +3650,12 @@ export function validateEvidenceAttestationBundle(artifactId, payload, {
     return {
       valid: false,
       error: 'attestation bundle payload.run_timestamp must equal attestation run_timestamp',
+    };
+  }
+  if (payload.payload.topology_kind !== expectedTopologyKind) {
+    return {
+      valid: false,
+      error: `attestation bundle payload topology_kind must be ${expectedTopologyKind}`,
     };
   }
   if (payload.payload.topology_kind !== provenance.topology_kind) {
@@ -3507,18 +3917,26 @@ function quoteCommand(argumentsList) {
   return argumentsList.map((argument) => (/\s/.test(argument) ? JSON.stringify(argument) : argument)).join(' ');
 }
 
-async function runEnvironmentSuite(environmentName, repoRoot, sharedRunRoot, runTimestamp) {
+async function runEnvironmentSuite(environmentName, repoRoot, sharedRunRoot, runTimestamp, options = {}) {
   const startedAt = new Date().toISOString();
   let files;
   let errorMessage = null;
   try {
-    files = await getRequiredTestFiles(environmentName, repoRoot);
+    const requestedFiles = Array.isArray(options.testFiles) ? options.testFiles : null;
+    files = requestedFiles == null
+      ? await getRequiredTestFiles(environmentName, repoRoot)
+      : requestedFiles.map((file) => (path.isAbsolute(file) ? file : path.join(repoRoot, file)));
+    if (files.length === 0) {
+      throw new Error(`No ${environmentName} tests provided for evidence run`);
+    }
   } catch (error) {
     files = [];
     errorMessage = error.message;
   }
   const expandedTestFiles = errorMessage == null
-    ? (await expandEnvironmentTestFiles(files, repoRoot)).expanded_test_files
+    ? options.skipTransitiveExpansion === true
+      ? files.map((file) => normalizePathForMarkdown(path.relative(repoRoot, file)))
+      : (await expandEnvironmentTestFiles(files, repoRoot)).expanded_test_files
     : [];
 
   const commandArgs = errorMessage
@@ -3644,6 +4062,7 @@ export async function collectManualArtifactResults(definition, repoRoot, manualA
     let attestation_topology_kind = null;
     let attestation_deployment_identity = null;
     let attestation_provenance = null;
+    let attested_payload = null;
     if (resolvedPath) {
       try {
         const fileContents = await fs.readFile(resolvedPath);
@@ -3682,6 +4101,9 @@ export async function collectManualArtifactResults(definition, repoRoot, manualA
         }
         attestation_provenance = isPlainObject(parsedPayload?.provenance)
           ? parsedPayload.provenance
+          : null;
+        attested_payload = valid && isPlainObject(parsedPayload?.payload)
+          ? parsedPayload.payload
           : null;
         if (requiresExternalEvidence) {
           sharedRunArtifactAlias = await isAliasOfSharedRunArtifact(
@@ -3735,18 +4157,99 @@ export async function collectManualArtifactResults(definition, repoRoot, manualA
       attestation_topology_kind,
       attestation_deployment_identity,
       attestation_provenance,
+      attested_payload,
       environment_harness_ready: harnessReadiness?.ready ?? null,
       environment_harness_reason: harnessReadiness?.reason ?? null,
     };
   }));
 }
 
+function buildAttestedEnvironmentRunSource(artifactResult) {
+  const payload = artifactResult?.attested_payload;
+  if (
+    artifactResult?.valid !== true
+    || artifactResult?.attestation_kind !== 'environment_run'
+    || !isPlainObject(payload)
+  ) {
+    return null;
+  }
+  return {
+    source_kind: 'attestation',
+    environment_name: payload.environment_name,
+    status: payload.status,
+    exit_code: payload.exit_code,
+    duration_ms: payload.duration_ms,
+    command: payload.command,
+    test_directory: payload.test_directory,
+    test_file_count: payload.test_file_count,
+    test_files: payload.test_files,
+    expanded_test_file_count: payload.expanded_test_file_count,
+    expanded_test_files: payload.expanded_test_files,
+    started_at: payload.started_at,
+    completed_at: payload.completed_at,
+    log_artifact: payload.log_artifact,
+    source_run_uri: payload.source_run_uri,
+    topology_kind: payload.topology_kind,
+    cloudflare_resources: payload.cloudflare_resources,
+    attestation_path: artifactResult.provided_path,
+    attestation_origin_run_id: artifactResult.attestation_origin_run_id,
+    attestation_origin_run_attempt: artifactResult.attestation_origin_run_attempt,
+    attestation_origin_run_uri: artifactResult.attestation_origin_run_uri,
+    attestation_artifact_store_uri: artifactResult.attestation_artifact_store_uri,
+    attestation_artifact_store_key: artifactResult.attestation_artifact_store_key,
+    attestation_artifact_sha256: artifactResult.attestation_artifact_sha256,
+    attestation_review_record_uri: artifactResult.attestation_review_record_uri,
+    attestation_deployment_identity: artifactResult.attestation_deployment_identity,
+  };
+}
+
+function buildLocalEnvironmentRunSource(environmentRun) {
+  if (!environmentRun || typeof environmentRun !== 'object') {
+    return null;
+  }
+  return {
+    source_kind: 'local-execution',
+    environment_name: environmentRun.environment_name,
+    status: environmentRun.status,
+    exit_code: environmentRun.exit_code,
+    duration_ms: environmentRun.duration_ms,
+    command: environmentRun.command,
+    test_directory: environmentRun.test_directory,
+    test_file_count: environmentRun.test_file_count,
+    test_files: environmentRun.test_files,
+    expanded_test_file_count: environmentRun.expanded_test_file_count,
+    expanded_test_files: environmentRun.expanded_test_files,
+    started_at: environmentRun.started_at,
+    completed_at: environmentRun.completed_at,
+    log_file: environmentRun.log_file,
+    summary_file: environmentRun.summary_file,
+    log_artifact: environmentRun.log_artifact,
+  };
+}
+
+function resolveEnvironmentRunSource(environmentName, environmentRuns, manualArtifactResults) {
+  if (environmentName === 'local') {
+    return buildLocalEnvironmentRunSource(environmentRuns.local ?? null);
+  }
+  const artifact = manualArtifactResults.find((candidate) => candidate.attested_payload?.environment_name === environmentName)
+    ?? manualArtifactResults.find((candidate) => resolveEnvironmentNameForArtifactId(candidate.artifact_id) === environmentName)
+    ?? null;
+  return buildAttestedEnvironmentRunSource(artifact);
+}
+
 export function collectTestCoverageResults(definition, environmentRuns) {
   return definition.required_environments.flatMap((environmentName) => {
-    const environmentRun = environmentRuns[environmentName];
+    const environmentRun = environmentRuns[environmentName] ?? null;
     const executedFiles = new Set(environmentRun?.expanded_test_files ?? []);
     return definition.test_ids.map((testId) => {
-      const requiredFiles = getRequiredTestImplementationFiles(testId);
+      let requiredFiles;
+      let mapping_error = null;
+      try {
+        requiredFiles = getRequiredTestImplementationFiles(testId, environmentName);
+      } catch (error) {
+        requiredFiles = [];
+        mapping_error = error instanceof Error ? error.message : String(error);
+      }
       const matchedFiles = requiredFiles.filter((file) => executedFiles.has(file));
       const missingFiles = requiredFiles.filter((file) => !executedFiles.has(file));
       return {
@@ -3755,10 +4258,75 @@ export function collectTestCoverageResults(definition, environmentRuns) {
         required_files: requiredFiles,
         matched_files: matchedFiles,
         missing_files: missingFiles,
-        satisfied: missingFiles.length === 0,
+        mapping_error,
+        satisfied: mapping_error == null && missingFiles.length === 0,
       };
     });
   });
+}
+
+function createMissingEnvironmentRunSource(environmentName, reason) {
+  return {
+    source_kind: 'missing-attestation',
+    environment_name: environmentName,
+    status: 'fail',
+    exit_code: 1,
+    duration_ms: null,
+    command: null,
+    test_directory: null,
+    test_file_count: 0,
+    test_files: [],
+    expanded_test_file_count: 0,
+    expanded_test_files: [],
+    started_at: null,
+    completed_at: null,
+    log_artifact: null,
+    missing_reason: reason,
+  };
+}
+
+function serializeEnvironmentRunSource(environmentRun, evidenceRoot) {
+  const baseRecord = {
+    environment_name: environmentRun.environment_name,
+    source_kind: environmentRun.source_kind,
+    status: environmentRun.status,
+    exit_code: environmentRun.exit_code,
+    duration_ms: environmentRun.duration_ms,
+    command: environmentRun.command,
+    test_directory: environmentRun.test_directory,
+    test_file_count: environmentRun.test_file_count,
+    test_files: environmentRun.test_files,
+    expanded_test_file_count: environmentRun.expanded_test_file_count,
+    expanded_test_files: environmentRun.expanded_test_files,
+    started_at: environmentRun.started_at,
+    completed_at: environmentRun.completed_at,
+  };
+  if (environmentRun.source_kind === 'local-execution') {
+    return {
+      ...baseRecord,
+      log_artifact: normalizePathForMarkdown(path.relative(evidenceRoot, environmentRun.log_file)),
+      summary_artifact: normalizePathForMarkdown(path.relative(evidenceRoot, environmentRun.summary_file)),
+    };
+  }
+  if (environmentRun.source_kind === 'attestation') {
+    return {
+      ...baseRecord,
+      attestation_artifact: environmentRun.attestation_path,
+      external_log_artifact: environmentRun.log_artifact,
+      source_run_uri: environmentRun.source_run_uri,
+      topology_kind: environmentRun.topology_kind,
+      cloudflare_resources: environmentRun.cloudflare_resources,
+      artifact_store_uri: environmentRun.attestation_artifact_store_uri,
+      artifact_store_key: environmentRun.attestation_artifact_store_key,
+      artifact_sha256: environmentRun.attestation_artifact_sha256,
+      review_record_uri: environmentRun.attestation_review_record_uri,
+      deployment_identity: environmentRun.attestation_deployment_identity,
+    };
+  }
+  return {
+    ...baseRecord,
+    missing_reason: environmentRun.missing_reason ?? null,
+  };
 }
 
 async function writeEvidenceBundle(repoRoot, {
@@ -3776,13 +4344,29 @@ async function writeEvidenceBundle(repoRoot, {
   const artifactsDir = path.join(evidenceRoot, 'artifacts');
   const expandedSourceIds = expandDeclaredSourceIds(definition.declared_source_ids, analysis);
   const applicableSourceIds = buildApplicableSourceIds(definition, expandedSourceIds);
-  const requiredEnvironments = definition.required_environments.map((environmentName) => environmentRuns[environmentName]);
-  const supportingEnvironments = SHARED_RUN_ENVIRONMENTS
-    .filter((environmentName) => !definition.required_environments.includes(environmentName))
-    .map((environmentName) => environmentRuns[environmentName]);
   const manualArtifactResults = await collectManualArtifactResults(definition, repoRoot, manualArtifacts, runTimestamp);
-  const testCoverageResults = collectTestCoverageResults(definition, environmentRuns);
-  const status = analysis.valid && requiredEnvironments.every((environmentRun) => environmentRun.exit_code === 0)
+  const coverageEnvironmentRuns = {};
+  if (environmentRuns.local) {
+    coverageEnvironmentRuns.local = buildLocalEnvironmentRunSource(environmentRuns.local);
+  }
+  const requiredEnvironments = definition.required_environments.map((environmentName) => {
+    const source = resolveEnvironmentRunSource(environmentName, environmentRuns, manualArtifactResults)
+      ?? createMissingEnvironmentRunSource(
+        environmentName,
+        `Missing valid ${environmentName} attestation for ${definition.id}`,
+      );
+    coverageEnvironmentRuns[environmentName] = source;
+    return source;
+  });
+  const supportingEnvironments = coverageEnvironmentRuns.local != null
+    && !definition.required_environments.includes('local')
+    ? [coverageEnvironmentRuns.local]
+    : [];
+  const testCoverageResults = collectTestCoverageResults(definition, coverageEnvironmentRuns);
+  const localEnvironmentRun = coverageEnvironmentRuns.local ?? null;
+  const status = analysis.valid
+    && localEnvironmentRun?.exit_code === 0
+    && requiredEnvironments.every((environmentRun) => environmentRun.exit_code === 0)
     && testCoverageResults.every((result) => result.satisfied)
     && manualArtifactResults.every((artifact) => artifact.valid)
     ? 'pass'
@@ -3791,24 +4375,8 @@ async function writeEvidenceBundle(repoRoot, {
   const environmentResults = {
     required_environments: definition.required_environments,
     supporting_environments: supportingEnvironments.map((environmentRun) => environmentRun.environment_name),
-    required_results: requiredEnvironments.map((environmentRun) => ({
-      environment_name: environmentRun.environment_name,
-      status: environmentRun.status,
-      exit_code: environmentRun.exit_code,
-      duration_ms: environmentRun.duration_ms,
-      command: environmentRun.command,
-      log_artifact: normalizePathForMarkdown(path.relative(evidenceRoot, environmentRun.log_file)),
-      summary_artifact: normalizePathForMarkdown(path.relative(evidenceRoot, environmentRun.summary_file)),
-    })),
-    supporting_results: supportingEnvironments.map((environmentRun) => ({
-      environment_name: environmentRun.environment_name,
-      status: environmentRun.status,
-      exit_code: environmentRun.exit_code,
-      duration_ms: environmentRun.duration_ms,
-      command: environmentRun.command,
-      log_artifact: normalizePathForMarkdown(path.relative(evidenceRoot, environmentRun.log_file)),
-      summary_artifact: normalizePathForMarkdown(path.relative(evidenceRoot, environmentRun.summary_file)),
-    })),
+    required_results: requiredEnvironments.map((environmentRun) => serializeEnvironmentRunSource(environmentRun, evidenceRoot)),
+    supporting_results: supportingEnvironments.map((environmentRun) => serializeEnvironmentRunSource(environmentRun, evidenceRoot)),
     shared_run_root: normalizePathForMarkdown(path.relative(evidenceRoot, sharedRunRoot)),
     manual_requirements: manualArtifactResults,
   };
@@ -3881,12 +4449,21 @@ async function writeEvidenceBundle(repoRoot, {
   ];
 
   for (const environmentRun of requiredEnvironments) {
-    summaryLines.push(`- required \`${environmentRun.environment_name}\`: ${environmentRun.status} (exit=${environmentRun.exit_code}, duration_ms=${environmentRun.duration_ms})`);
-    summaryLines.push(`  artifacts: \`${normalizePathForMarkdown(path.relative(evidenceRoot, environmentRun.log_file))}\`, \`${normalizePathForMarkdown(path.relative(evidenceRoot, environmentRun.summary_file))}\``);
+    summaryLines.push(`- required \`${environmentRun.environment_name}\`: ${environmentRun.status} (exit=${environmentRun.exit_code}, duration_ms=${environmentRun.duration_ms ?? 'n/a'}, source=${environmentRun.source_kind})`);
+    if (environmentRun.source_kind === 'local-execution') {
+      summaryLines.push(`  artifacts: \`${normalizePathForMarkdown(path.relative(evidenceRoot, environmentRun.log_file))}\`, \`${normalizePathForMarkdown(path.relative(evidenceRoot, environmentRun.summary_file))}\``);
+    } else if (environmentRun.source_kind === 'attestation') {
+      summaryLines.push(`  attestation: \`${environmentRun.attestation_path}\``);
+      summaryLines.push(`  provenance: origin_run_uri=\`${environmentRun.attestation_origin_run_uri}\`, artifact_store_uri=\`${environmentRun.attestation_artifact_store_uri}\`, review_record_uri=\`${environmentRun.attestation_review_record_uri}\``);
+    } else {
+      summaryLines.push(`  reason: ${environmentRun.missing_reason ?? 'missing environment evidence'}`);
+    }
   }
   for (const environmentRun of supportingEnvironments) {
-    summaryLines.push(`- supporting \`${environmentRun.environment_name}\`: ${environmentRun.status} (exit=${environmentRun.exit_code}, duration_ms=${environmentRun.duration_ms})`);
-    summaryLines.push(`  artifacts: \`${normalizePathForMarkdown(path.relative(evidenceRoot, environmentRun.log_file))}\`, \`${normalizePathForMarkdown(path.relative(evidenceRoot, environmentRun.summary_file))}\``);
+    summaryLines.push(`- supporting \`${environmentRun.environment_name}\`: ${environmentRun.status} (exit=${environmentRun.exit_code}, duration_ms=${environmentRun.duration_ms ?? 'n/a'}, source=${environmentRun.source_kind})`);
+    if (environmentRun.source_kind === 'local-execution') {
+      summaryLines.push(`  artifacts: \`${normalizePathForMarkdown(path.relative(evidenceRoot, environmentRun.log_file))}\`, \`${normalizePathForMarkdown(path.relative(evidenceRoot, environmentRun.summary_file))}\``);
+    }
   }
 
   summaryLines.push('');
@@ -3898,6 +4475,9 @@ async function writeEvidenceBundle(repoRoot, {
   summaryLines.push('');
   for (const coverageResult of testCoverageResults) {
     summaryLines.push(`- \`${coverageResult.environment_name}\` / \`${coverageResult.test_id}\`: ${coverageResult.satisfied ? 'covered' : 'missing'} via ${coverageResult.required_files.map((file) => `\`${file}\``).join(', ')}`);
+    if (coverageResult.mapping_error != null) {
+      summaryLines.push(`  mapping_error: ${coverageResult.mapping_error}`);
+    }
   }
   if (manualArtifactResults.length > 0) {
     summaryLines.push('');
@@ -3949,9 +4529,10 @@ export async function writeL1Evidence(repoRoot = process.cwd(), options = {}) {
   await fs.mkdir(sharedRunRoot, { recursive: true });
 
   const environmentRuns = {};
-  for (const environmentName of SHARED_RUN_ENVIRONMENTS) {
-    environmentRuns[environmentName] = await runEnvironmentSuite(environmentName, repoRoot, sharedRunRoot, runTimestamp);
-  }
+  environmentRuns.local = await runEnvironmentSuite('local', repoRoot, sharedRunRoot, runTimestamp, {
+    testFiles: listL1EnvironmentImplementationFiles('local'),
+    skipTransitiveExpansion: true,
+  });
 
   const bundles = [];
   bundles.push({
@@ -3984,7 +4565,7 @@ export async function writeL1Evidence(repoRoot = process.cwd(), options = {}) {
     environment_runs: environmentRuns,
     bundles,
     ok: analysis.valid
-      && Object.values(environmentRuns).every((environmentRun) => environmentRun.exit_code === 0)
+      && environmentRuns.local?.exit_code === 0
       && bundles.every((bundle) => bundle.status === 'pass'),
   };
 }

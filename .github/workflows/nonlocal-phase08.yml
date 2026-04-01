@@ -1,0 +1,306 @@
+name: Nonlocal Phase 08
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nonlocal-phase08
+  cancel-in-progress: false
+
+jobs:
+  metadata:
+    runs-on: ubuntu-latest
+    outputs:
+      run_timestamp: ${{ steps.meta.outputs.run_timestamp }}
+      run_url: ${{ steps.meta.outputs.run_url }}
+    steps:
+      - id: meta
+        shell: bash
+        run: |
+          echo "run_timestamp=$(date -u +%Y%m%dT%H%M%SZ)" >> "$GITHUB_OUTPUT"
+          echo "run_url=https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> "$GITHUB_OUTPUT"
+
+  local-foundation:
+    needs: metadata
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Governance check
+        run: npm run governance:check
+
+      - name: Runtime harness parser tests
+        run: node --test tests/local/runtime-foundations/testing-harness.test.mjs
+
+      - name: Non-local tooling tests
+        run: node --test tests/local/runtime-foundations/nonlocal-tooling.test.mjs
+
+      - name: Local regression matrix (non-local suites expected to skip here)
+        run: npm run test:all
+
+  nonlocal:
+    needs:
+      - metadata
+      - local-foundation
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        environment:
+          - ci-integration
+          - staging
+          - pre-release
+    environment: ${{ matrix.environment }}
+    concurrency:
+      group: nonlocal-phase08-${{ matrix.environment }}
+      cancel-in-progress: false
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      MATRIX_PHASE08_RUN_TIMESTAMP: ${{ needs.metadata.outputs.run_timestamp }}
+      MATRIX_PHASE08_RUN_URL: ${{ needs.metadata.outputs.run_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Require Cloudflare credentials
+        shell: bash
+        run: |
+          test -n "$CLOUDFLARE_ACCOUNT_ID"
+          test -n "$CLOUDFLARE_API_TOKEN"
+
+      - name: Define environment paths
+        id: paths
+        shell: bash
+        run: |
+          state_root=".tmp/github/nonlocal/${{ matrix.environment }}/state"
+          artifact_root=".tmp/github/nonlocal/${{ matrix.environment }}/artifacts"
+          log_key="gha/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.environment }}/${MATRIX_PHASE08_RUN_TIMESTAMP}/suite.log"
+          bundle_key="gha/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.environment }}/${MATRIX_PHASE08_RUN_TIMESTAMP}/run-bundle.tgz"
+          raw_artifact_name="phase08-${{ matrix.environment }}-raw-${MATRIX_PHASE08_RUN_TIMESTAMP}-${{ github.run_id }}-${{ github.run_attempt }}"
+          attestation_artifact_name="phase08-${{ matrix.environment }}-attestation-${MATRIX_PHASE08_RUN_TIMESTAMP}-${{ github.run_id }}-${{ github.run_attempt }}"
+          echo "state_root=${state_root}" >> "$GITHUB_OUTPUT"
+          echo "artifact_root=${artifact_root}" >> "$GITHUB_OUTPUT"
+          echo "provisioning=${state_root}/provisioning.json" >> "$GITHUB_OUTPUT"
+          echo "deployment=${state_root}/deployment.json" >> "$GITHUB_OUTPUT"
+          echo "github_artifact=${state_root}/github-artifact.json" >> "$GITHUB_OUTPUT"
+          echo "log_upload=${state_root}/log-upload.json" >> "$GITHUB_OUTPUT"
+          echo "bundle_upload=${state_root}/bundle-upload.json" >> "$GITHUB_OUTPUT"
+          echo "provenance=${state_root}/provenance.json" >> "$GITHUB_OUTPUT"
+          echo "attestation=${state_root}/${{ matrix.environment }}-attestation.json" >> "$GITHUB_OUTPUT"
+          echo "log_key=${log_key}" >> "$GITHUB_OUTPUT"
+          echo "bundle_key=${bundle_key}" >> "$GITHUB_OUTPUT"
+          echo "raw_artifact_name=${raw_artifact_name}" >> "$GITHUB_OUTPUT"
+          echo "attestation_artifact_name=${attestation_artifact_name}" >> "$GITHUB_OUTPUT"
+          mkdir -p "$state_root" "$artifact_root"
+
+      - name: Ensure Cloudflare resources
+        run: |
+          node packages/testing/src/cli.mjs nonlocal-ensure \
+            --environment "${{ matrix.environment }}" \
+            --output "${{ steps.paths.outputs.provisioning }}"
+
+      - name: Deploy non-local environment
+        run: |
+          node packages/testing/src/cli.mjs nonlocal-deploy \
+            --environment "${{ matrix.environment }}" \
+            --provisioning "${{ steps.paths.outputs.provisioning }}" \
+            --working-root "${{ steps.paths.outputs.state_root }}/deploy" \
+            --output "${{ steps.paths.outputs.deployment }}" \
+            --deployment-id "gha-${{ matrix.environment }}-${MATRIX_PHASE08_RUN_TIMESTAMP}-${{ github.run_id }}-${{ github.run_attempt }}"
+
+      - name: Run environment-backed suite
+        id: suite
+        continue-on-error: true
+        run: |
+          node packages/testing/src/cli.mjs nonlocal-run \
+            --environment "${{ matrix.environment }}" \
+            --deployment "${{ steps.paths.outputs.deployment }}" \
+            --timestamp "${MATRIX_PHASE08_RUN_TIMESTAMP}" \
+            --output-root "${{ steps.paths.outputs.artifact_root }}" \
+            --source-run-uri "${MATRIX_PHASE08_RUN_URL}" \
+            --log-artifact "r2://matrix-evidence-${{ matrix.environment }}/${{ steps.paths.outputs.log_key }}" \
+            --executed-by "github-actions:${{ github.actor }}" \
+            --reviewed-by "github-actions-run:${{ github.run_id }}" \
+            --topology-kind "cloudflare-${{ matrix.environment }}"
+
+      - name: Bundle raw non-local artifacts
+        if: always()
+        shell: bash
+        run: |
+          tar -czf "${{ steps.paths.outputs.artifact_root }}/run-bundle.tgz" \
+            -C "${{ steps.paths.outputs.artifact_root }}" \
+            "${{ matrix.environment }}.json" \
+            "${{ matrix.environment }}.log"
+
+      - name: Upload raw workflow artifacts
+        if: always()
+        id: upload_raw
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.paths.outputs.raw_artifact_name }}
+          path: |
+            ${{ steps.paths.outputs.artifact_root }}/${{ matrix.environment }}.json
+            ${{ steps.paths.outputs.artifact_root }}/${{ matrix.environment }}.log
+            ${{ steps.paths.outputs.artifact_root }}/run-bundle.tgz
+            ${{ steps.paths.outputs.deployment }}
+            ${{ steps.paths.outputs.provisioning }}
+          if-no-files-found: error
+
+      - name: Record GitHub artifact metadata
+        if: always()
+        shell: bash
+        run: |
+          cat > "${{ steps.paths.outputs.github_artifact }}" <<'EOF'
+          {
+            "artifact_name": "${{ steps.paths.outputs.raw_artifact_name }}",
+            "artifact_id": "${{ steps.upload_raw.outputs.artifact-id }}",
+            "artifact_url": "${{ steps.upload_raw.outputs.artifact-url }}",
+            "artifact_digest": "${{ steps.upload_raw.outputs.artifact-digest }}"
+          }
+          EOF
+
+      - name: Upload suite log to R2
+        if: always()
+        run: |
+          node packages/testing/src/cli.mjs nonlocal-upload-r2 \
+            --bucket "matrix-evidence-${{ matrix.environment }}" \
+            --key "${{ steps.paths.outputs.log_key }}" \
+            --file "${{ steps.paths.outputs.artifact_root }}/${{ matrix.environment }}.log" \
+            --content-type "text/plain; charset=utf-8" \
+            --output "${{ steps.paths.outputs.log_upload }}"
+
+      - name: Upload raw bundle to R2
+        if: always()
+        run: |
+          node packages/testing/src/cli.mjs nonlocal-upload-r2 \
+            --bucket "matrix-evidence-${{ matrix.environment }}" \
+            --key "${{ steps.paths.outputs.bundle_key }}" \
+            --file "${{ steps.paths.outputs.artifact_root }}/run-bundle.tgz" \
+            --content-type "application/gzip" \
+            --output "${{ steps.paths.outputs.bundle_upload }}"
+
+      - name: Write attestation provenance
+        if: always()
+        run: |
+          node packages/testing/src/cli.mjs nonlocal-provenance \
+            --environment "${{ matrix.environment }}" \
+            --deployment "${{ steps.paths.outputs.deployment }}" \
+            --artifact-upload "${{ steps.paths.outputs.bundle_upload }}" \
+            --github-artifact "${{ steps.paths.outputs.github_artifact }}" \
+            --github-repository "${{ github.repository }}" \
+            --github-run-id "${{ github.run_id }}" \
+            --github-run-attempt "${{ github.run_attempt }}" \
+            --output "${{ steps.paths.outputs.provenance }}"
+
+      - name: Write environment attestation
+        if: always()
+        id: attest
+        continue-on-error: true
+        run: |
+          node packages/testing/src/cli.mjs nonlocal-attest \
+            --environment "${{ matrix.environment }}" \
+            --timestamp "${MATRIX_PHASE08_RUN_TIMESTAMP}" \
+            --report "${{ steps.paths.outputs.artifact_root }}/${{ matrix.environment }}.json" \
+            --provenance "${{ steps.paths.outputs.provenance }}" \
+            --output "${{ steps.paths.outputs.attestation }}"
+
+      - name: Upload attestation artifact
+        if: always() && steps.attest.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.paths.outputs.attestation_artifact_name }}
+          path: ${{ steps.paths.outputs.attestation }}
+          if-no-files-found: error
+
+      - name: Enforce environment gate
+        if: always()
+        shell: bash
+        run: |
+          if [ "${{ steps.suite.outcome }}" != "success" ]; then
+            echo "Environment-backed suite did not pass for ${{ matrix.environment }}" >&2
+            exit 1
+          fi
+          if [ "${{ steps.attest.outcome }}" != "success" ]; then
+            echo "Attestation generation did not pass for ${{ matrix.environment }}" >&2
+            exit 1
+          fi
+
+  evidence-l1:
+    needs:
+      - metadata
+      - local-foundation
+      - nonlocal
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Download attestation artifacts
+        id: download_attestations
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: phase08-*-attestation-${{ needs.metadata.outputs.run_timestamp }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/github/downloaded-attestations
+          merge-multiple: true
+
+      - name: Run L1 evidence gate
+        id: evidence
+        continue-on-error: true
+        shell: bash
+        run: |
+          args=(npm run evidence:l1 -- --timestamp "${{ needs.metadata.outputs.run_timestamp }}")
+          for environment in ci-integration staging pre-release; do
+            file=".tmp/github/downloaded-attestations/${environment}-attestation.json"
+            if [ -f "$file" ]; then
+              case "$environment" in
+                ci-integration) args+=(--ci-integration-attestation "$file") ;;
+                staging) args+=(--staging-attestation "$file") ;;
+                pre-release) args+=(--pre-release-attestation "$file") ;;
+              esac
+            fi
+          done
+          prod_cost_file=".tmp/github/downloaded-attestations/prod-cost-attestation.json"
+          if [ -f "$prod_cost_file" ]; then
+            args+=(--prod-cost-attestation "$prod_cost_file")
+          else
+            echo "prod-cost attestation missing; EVID-COST-001 remains fail-closed until OQ-0002 is resolved" >&2
+          fi
+          "${args[@]}"
+
+      - name: Upload L1 evidence artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase08-evidence-l1-${{ needs.metadata.outputs.run_timestamp }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            evidence/common
+            evidence/L1
+          if-no-files-found: error
+
+      - name: Enforce evidence gate
+        if: always()
+        shell: bash
+        run: |
+          if [ "${{ steps.evidence.outcome }}" != "success" ]; then
+            echo "L1 evidence gate did not pass" >&2
+            exit 1
+          fi

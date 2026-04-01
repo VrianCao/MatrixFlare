@@ -4,6 +4,7 @@ import test from 'node:test';
 import {
   listFeatureGateIds,
   loadWorkerRuntimeConfig,
+  resolveWorkerResourceBindingNames,
 } from '../../../packages/runtime-core/src/index.mjs';
 
 function makeGatewayEnv(overrides = {}) {
@@ -94,4 +95,15 @@ test('feature gate catalog stays non-empty and centrally enumerated', () => {
   assert.ok(ids.includes('sso_login'));
   assert.ok(ids.includes('appservice_api'));
   assert.ok(ids.includes('otel_export'));
+});
+
+test('resource binding names reject malformed JSON instead of silently falling back', () => {
+  assert.throws(
+    () => resolveWorkerResourceBindingNames({ RESOURCE_BINDING_NAMES_JSON: '{' }),
+    /RESOURCE_BINDING_NAMES_JSON must be valid JSON/,
+  );
+  assert.throws(
+    () => resolveWorkerResourceBindingNames({ RESOURCE_BINDING_NAMES_JSON: '[]' }),
+    /RESOURCE_BINDING_NAMES_JSON must decode to a JSON object/,
+  );
 });

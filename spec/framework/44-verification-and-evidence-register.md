@@ -48,6 +48,8 @@
 * 任何依赖 `ci-integration`、`staging`、`pre-release` 或 `prod` 外部工件的 `EVID-ID`，都必须导入 [26-wire-schema-catalog.md](/root/Matrix/spec/framework/26-wire-schema-catalog.md) 定义的 attestation bundle，而不是裸 run report / prod snapshot JSON。
 * `ci-integration`、`staging`、`pre-release` 环境必须使用 `EnvironmentRunAttestation`；production monthly cost snapshot 必须使用 `ProdCostSnapshotAttestation`。
 * attestation 至少必须保留：canonical payload、origin run identity、deployment identity、artifact store immutable reference、artifact digest、review record reference。
+* 对 Phase 08 non-local harness，acceptance provenance chain 固定为：GitHub Actions run URL / run ID / run attempt，外加 Cloudflare R2 immutable object locator（`r2://bucket/key` 或等价可审计外部 locator）与其 SHA-256 digest；GitHub artifact URL / digest 可以作为补充 provenance 保留，但不能替代 R2 object reference。
+* consumer 必须 fail-closed，除非 attestation provenance 同时满足：`origin_system == github-actions`、`origin_run_uri` 为 GitHub Actions run URL、`artifact_store_uri` 为 `r2://bucket/key` 形式的 immutable object locator、`artifact_store_key` 与该 locator 一致、`artifact_store_key` 还能一致编码 `origin_run_id` / `origin_run_attempt` / `source_environment` / `run_timestamp`、`deployment_identity.environment_id` 与 attestation `source_environment` 一致。
 * 所有 provenance / payload 中以 `_uri` 结尾的 locator 字段，都必须是可解析的绝对外部 URI / locator，且需具 authority，或使用格式完整的 `urn:<nid>:<nss>`；裸 `urn:`、占位字符串、`about:`、`blob:`、`file:`、`data:`、`javascript:` 等本地或不可审计引用必须 fail-closed。
 * `summary.md` 或并列机器工件必须保留 attestation provenance snapshot，足以让审计者回链到外部 workflow / deployment / artifact store / review record。
 * 任何来自 `evidence/common/_test-runs/` 的本地产物、或仍扩展 `tests/local/*` 的薄 harness 结果，都不得被提升为 non-local release evidence。

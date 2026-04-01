@@ -123,6 +123,7 @@ export {
   listFeatureGateIds,
   listWorkerNames,
   loadWorkerRuntimeConfig,
+  resolveWorkerResourceBindingNames,
 } from './runtime-manifest.mjs';
 export {
   incrementMetric,

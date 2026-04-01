@@ -30,10 +30,33 @@ const SHARED_TEXT_BINDINGS = Object.freeze({
   WORKER_VERSION_ID: { type: 'string', required: false, default: 'dev' },
   DEPLOYMENT_ID: { type: 'string', required: false, default: 'local-dev' },
   ACTIVE_DEPLOYMENT_COMPOSITION: { type: 'string', required: false, default: '' },
+  RESOURCE_BINDING_NAMES_JSON: { type: 'string', required: false, default: '' },
   LOG_LEVEL: { type: 'enum', required: false, values: LOG_LEVELS, default: 'info' },
   CPU_LIMIT_CLASS: { type: 'enum', required: false, values: CPU_LIMIT_CLASSES, default: 'default' },
   STARTUP_TIME_MS: { type: 'integer', required: false, default: 0, min: 0 },
   ABUSE_GUARD_POLICY_JSON: { type: 'string', required: false, default: '' },
+});
+
+const DEFAULT_RESOURCE_BINDING_NAMES = Object.freeze({
+  d1_databases: Object.freeze({
+    MATRIX_CONTROL_D1: 'matrix-control-and-derived',
+  }),
+  r2_buckets: Object.freeze({
+    MATRIX_MEDIA_BUCKET: 'matrix-media',
+    MATRIX_ARCHIVE_BUCKET: 'matrix-archive',
+  }),
+  kv_namespaces: Object.freeze({
+    MATRIX_EDGE_CACHE: 'matrix-edge-cache',
+  }),
+  queues: Object.freeze({
+    SEARCH_INDEX_QUEUE: 'matrix-search-index-job',
+    MEDIA_THUMBNAIL_QUEUE: 'matrix-media-thumbnail-job',
+    APPSERVICE_TXN_QUEUE: 'matrix-appservice-txn-job',
+    REBUILD_SHARD_QUEUE: 'matrix-rebuild-shard-job',
+    EXPORT_SHARD_QUEUE: 'matrix-export-shard-job',
+    RESTORE_SHARD_QUEUE: 'matrix-restore-shard-job',
+    REPAIR_SHARD_QUEUE: 'matrix-repair-shard-job',
+  }),
 });
 
 const WORKER_RUNTIME_MANIFEST = Object.freeze({
@@ -336,6 +359,45 @@ export function loadWorkerRuntimeConfig(workerName, env = {}) {
     logLevel: text.LOG_LEVEL,
     featureGates: parseFeatureGates(manifest.featureGates, env),
     secrets: createSecretAccessor(workerName, manifest.secrets, env),
+  });
+}
+
+function normalizeResourceBindingNameSection(value, fallback) {
+  const normalized = {};
+  if (value != null && typeof value === 'object' && !Array.isArray(value)) {
+    for (const [bindingName, resourceName] of Object.entries(value)) {
+      if (typeof bindingName === 'string' && typeof resourceName === 'string' && resourceName.length > 0) {
+        normalized[bindingName] = resourceName;
+      }
+    }
+  }
+  for (const [bindingName, resourceName] of Object.entries(fallback)) {
+    if (typeof normalized[bindingName] !== 'string' || normalized[bindingName].length === 0) {
+      normalized[bindingName] = resourceName;
+    }
+  }
+  return Object.freeze(normalized);
+}
+
+export function resolveWorkerResourceBindingNames(env = {}) {
+  let parsed = null;
+  if (typeof env.RESOURCE_BINDING_NAMES_JSON === 'string' && env.RESOURCE_BINDING_NAMES_JSON.trim().length > 0) {
+    let candidate = null;
+    try {
+      candidate = JSON.parse(env.RESOURCE_BINDING_NAMES_JSON);
+    } catch {
+      throw new TypeError('RESOURCE_BINDING_NAMES_JSON must be valid JSON');
+    }
+    if (candidate == null || typeof candidate !== 'object' || Array.isArray(candidate)) {
+      throw new TypeError('RESOURCE_BINDING_NAMES_JSON must decode to a JSON object');
+    }
+    parsed = candidate;
+  }
+  return Object.freeze({
+    d1_databases: normalizeResourceBindingNameSection(parsed?.d1_databases, DEFAULT_RESOURCE_BINDING_NAMES.d1_databases),
+    r2_buckets: normalizeResourceBindingNameSection(parsed?.r2_buckets, DEFAULT_RESOURCE_BINDING_NAMES.r2_buckets),
+    kv_namespaces: normalizeResourceBindingNameSection(parsed?.kv_namespaces, DEFAULT_RESOURCE_BINDING_NAMES.kv_namespaces),
+    queues: normalizeResourceBindingNameSection(parsed?.queues, DEFAULT_RESOURCE_BINDING_NAMES.queues),
   });
 }
 

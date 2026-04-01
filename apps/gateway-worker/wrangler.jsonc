@@ -13,6 +13,7 @@
     "WORKER_VERSION_ID": "dev",
     "DEPLOYMENT_ID": "local-dev",
     "ACTIVE_DEPLOYMENT_COMPOSITION": "",
+    "RESOURCE_BINDING_NAMES_JSON": "",
     "LOG_LEVEL": "info",
     "CPU_LIMIT_CLASS": "default",
     "STARTUP_TIME_MS": 0,

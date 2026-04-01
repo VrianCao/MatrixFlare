@@ -28,6 +28,9 @@ import {
   writeL1Evidence,
 } from '../../../packages/testing/src/evidence.mjs';
 import {
+  buildNonLocalEnvironmentPlan,
+} from '../../../packages/testing/src/nonlocal.mjs';
+import {
   assertPathsDoNotExist,
   writeGovernanceEvidence,
 } from '../../../packages/spec-tools/src/governance.mjs';
@@ -39,6 +42,57 @@ const ENVIRONMENT_MANUAL_ARTIFACT_IDS = Object.freeze({
   staging: 'staging_run_report',
   'pre-release': 'pre_release_run_report',
 });
+
+function buildExpectedCloudflareResources(environmentName) {
+  if (environmentName === 'prod') {
+    return {
+      workers: ['matrix-gateway-worker-prod', 'matrix-jobs-worker-prod', 'matrix-ops-worker-prod'],
+      durable_objects: ['RoomDO', 'RemoteServerDO', 'UserDO'],
+      d1_databases: ['matrix-control-and-derived-prod'],
+      r2_buckets: ['matrix-archive-prod', 'matrix-evidence-prod', 'matrix-media-prod'],
+      kv_namespaces: ['matrix-edge-cache-prod'],
+      queues: [
+        'matrix-appservice-txn-job-prod',
+        'matrix-export-shard-job-prod',
+        'matrix-media-thumbnail-job-prod',
+        'matrix-rebuild-shard-job-prod',
+        'matrix-repair-shard-job-prod',
+        'matrix-restore-shard-job-prod',
+        'matrix-search-index-job-prod',
+      ],
+    };
+  }
+  const plan = buildNonLocalEnvironmentPlan(environmentName, {
+    workersSubdomain: 'matrixflare',
+  });
+  return {
+    ...plan.cloudflare_resources,
+    r2_buckets: [...plan.cloudflare_resources.r2_buckets, plan.artifact_bucket_name].sort(),
+  };
+}
+
+function buildGitHubRunId(environmentName, runTimestamp) {
+  const environmentPrefixes = {
+    'ci-integration': '1',
+    staging: '2',
+    'pre-release': '3',
+    prod: '4',
+  };
+  const prefix = environmentPrefixes[environmentName] ?? '9';
+  return `${prefix}${runTimestamp.replace(/\D/g, '')}`;
+}
+
+function buildGitHubRunUri(environmentName, runTimestamp) {
+  return `https://github.com/example/matrix/actions/runs/${buildGitHubRunId(environmentName, runTimestamp)}`;
+}
+
+function buildPhase08ArtifactStoreKey(environmentName, runTimestamp, fileName) {
+  return `gha/${buildGitHubRunId(environmentName, runTimestamp)}/1/${environmentName}/${runTimestamp}/${fileName}`;
+}
+
+function buildPhase08ArtifactStoreUri(environmentName, runTimestamp, fileName) {
+  return `r2://matrix-evidence-${environmentName}/${buildPhase08ArtifactStoreKey(environmentName, runTimestamp, fileName)}`;
+}
 
 function buildValidEnvironmentReport(environmentName, runTimestamp, overrides = {}) {
   const directory = getTestEnvironmentDefinition(environmentName).directory;
@@ -65,14 +119,7 @@ function buildValidEnvironmentReport(environmentName, runTimestamp, overrides = 
     reviewed_by: 'release-reviewer',
     source_run_uri: `https://example.invalid/runs/${environmentName}/${runTimestamp}`,
     topology_kind: `cloudflare-${environmentName}`,
-    cloudflare_resources: {
-      workers: ['gateway-worker@v1', 'jobs-worker@v1', 'ops-worker@v1'],
-      durable_objects: ['UserDO', 'RoomDO', 'RemoteServerDO'],
-      d1_databases: [`matrix-${environmentName}-d1`],
-      r2_buckets: [`matrix-${environmentName}-r2`],
-      kv_namespaces: [`matrix-${environmentName}-kv`],
-      queues: [`matrix-${environmentName}-queue`],
-    },
+    cloudflare_resources: buildExpectedCloudflareResources(environmentName),
     run_timestamp: runTimestamp,
     ...overrides,
   };
@@ -87,14 +134,7 @@ function buildValidProdCostSnapshot(runTimestamp, overrides = {}) {
     reviewed_by: 'platform-reviewer',
     source_dashboard_uri: 'https://example.invalid/cost/2026-03',
     topology_kind: 'cloudflare-prod',
-    cloudflare_resources: {
-      workers: ['gateway-worker@prod', 'jobs-worker@prod', 'ops-worker@prod'],
-      durable_objects: ['UserDO', 'RoomDO', 'RemoteServerDO'],
-      d1_databases: ['matrix-prod-d1'],
-      r2_buckets: ['matrix-prod-r2'],
-      kv_namespaces: ['matrix-prod-kv'],
-      queues: ['matrix-prod-queue'],
-    },
+    cloudflare_resources: buildExpectedCloudflareResources('prod'),
     billing_period: {
       start: '2026-03-01T00:00:00.000Z',
       end: '2026-03-31T00:00:00.000Z',
@@ -122,20 +162,21 @@ function buildValidProdCostSnapshot(runTimestamp, overrides = {}) {
 
 function buildValidEnvironmentAttestation(environmentName, runTimestamp, reportOverrides = {}, attestationOverrides = {}) {
   const topologyKind = `cloudflare-${environmentName}`;
-  const originRunUri = `https://example.invalid/runs/${environmentName}/${runTimestamp}`;
+  const originRunId = buildGitHubRunId(environmentName, runTimestamp);
+  const originRunUri = buildGitHubRunUri(environmentName, runTimestamp);
   const artifactId = ENVIRONMENT_MANUAL_ARTIFACT_IDS[environmentName];
   const baseProvenance = {
     origin_system: 'github-actions',
-    origin_run_id: `${environmentName}-run-${runTimestamp}`,
+    origin_run_id: originRunId,
     origin_run_attempt: 1,
     origin_run_uri: originRunUri,
-    artifact_store_uri: `https://example.invalid/artifacts/${environmentName}/${runTimestamp}/attestation.json`,
-    artifact_store_key: `${environmentName}/${runTimestamp}/attestation.json`,
+    artifact_store_uri: buildPhase08ArtifactStoreUri(environmentName, runTimestamp, 'run-bundle.tgz'),
+    artifact_store_key: buildPhase08ArtifactStoreKey(environmentName, runTimestamp, 'run-bundle.tgz'),
     artifact_sha256: 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789',
-    review_record_uri: `https://example.invalid/reviews/${environmentName}/${runTimestamp}`,
+    review_record_uri: originRunUri,
     topology_kind: topologyKind,
     deployment_identity: {
-      environment_id: `${environmentName}-env`,
+      environment_id: environmentName,
       deployment_ids: [`${environmentName}-deployment-001`],
       worker_version_ids: [`gateway@${environmentName}-v1`, `jobs@${environmentName}-v1`, `ops@${environmentName}-v1`],
     },
@@ -168,15 +209,17 @@ function buildValidEnvironmentAttestation(environmentName, runTimestamp, reportO
 
 function buildValidProdCostSnapshotAttestation(runTimestamp, payloadOverrides = {}, attestationOverrides = {}) {
   const topologyKind = 'cloudflare-prod';
+  const originRunId = buildGitHubRunId('prod', runTimestamp);
+  const originRunUri = buildGitHubRunUri('prod', runTimestamp);
   const baseProvenance = {
-    origin_system: 'cost-audit',
-    origin_run_id: `prod-cost-${runTimestamp}`,
+    origin_system: 'github-actions',
+    origin_run_id: originRunId,
     origin_run_attempt: 1,
-    origin_run_uri: `https://example.invalid/cost-runs/${runTimestamp}`,
-    artifact_store_uri: `https://example.invalid/artifacts/prod/${runTimestamp}/cost-snapshot.json`,
-    artifact_store_key: `prod/${runTimestamp}/cost-snapshot.json`,
+    origin_run_uri: originRunUri,
+    artifact_store_uri: buildPhase08ArtifactStoreUri('prod', runTimestamp, 'cost-snapshot.json'),
+    artifact_store_key: buildPhase08ArtifactStoreKey('prod', runTimestamp, 'cost-snapshot.json'),
     artifact_sha256: 'fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210',
-    review_record_uri: `https://example.invalid/reviews/prod/${runTimestamp}`,
+    review_record_uri: originRunUri,
     topology_kind: topologyKind,
     deployment_identity: {
       environment_id: 'prod',
@@ -302,17 +345,17 @@ async function createEnvironmentBackedEvidenceFixture() {
 
   const minimalMappingBlock = [
     'const L1_TEST_IMPLEMENTATION_FILES = Object.freeze({',
-    "  'TEST-CS-001': Object.freeze(['tests/shared/all-bundles-proof.mjs']),",
-    "  'TEST-CS-002': Object.freeze(['tests/shared/all-bundles-proof.mjs']),",
-    "  'TEST-CS-003': Object.freeze(['tests/shared/all-bundles-proof.mjs']),",
-    "  'TEST-CS-004': Object.freeze(['tests/shared/all-bundles-proof.mjs']),",
-    "  'TEST-ROOM-001': Object.freeze(['tests/shared/all-bundles-proof.mjs']),",
-    "  'TEST-ROOM-002': Object.freeze(['tests/shared/all-bundles-proof.mjs']),",
-    "  'TEST-MEDIA-001': Object.freeze(['tests/shared/all-bundles-proof.mjs']),",
-    "  'TEST-DER-001': Object.freeze(['tests/shared/all-bundles-proof.mjs']),",
-    "  'TEST-SEC-001': Object.freeze(['tests/shared/all-bundles-proof.mjs']),",
-    "  'TEST-OPS-001': Object.freeze(['tests/shared/all-bundles-proof.mjs']),",
-    "  'TEST-COST-001': Object.freeze(['tests/shared/all-bundles-proof.mjs']),",
+    "  'TEST-CS-001': Object.freeze({ local: Object.freeze(['tests/shared/all-bundles-proof.mjs']), 'ci-integration': Object.freeze(['tests/shared/all-bundles-proof.mjs']), staging: Object.freeze(['tests/shared/all-bundles-proof.mjs']) }),",
+    "  'TEST-CS-002': Object.freeze({ local: Object.freeze(['tests/shared/all-bundles-proof.mjs']), staging: Object.freeze(['tests/shared/all-bundles-proof.mjs']) }),",
+    "  'TEST-CS-003': Object.freeze({ local: Object.freeze(['tests/shared/all-bundles-proof.mjs']), staging: Object.freeze(['tests/shared/all-bundles-proof.mjs']) }),",
+    "  'TEST-CS-004': Object.freeze({ local: Object.freeze(['tests/shared/all-bundles-proof.mjs']), 'ci-integration': Object.freeze(['tests/shared/all-bundles-proof.mjs']), staging: Object.freeze(['tests/shared/all-bundles-proof.mjs']) }),",
+    "  'TEST-ROOM-001': Object.freeze({ local: Object.freeze(['tests/shared/all-bundles-proof.mjs']), 'ci-integration': Object.freeze(['tests/shared/all-bundles-proof.mjs']), staging: Object.freeze(['tests/shared/all-bundles-proof.mjs']) }),",
+    "  'TEST-ROOM-002': Object.freeze({ local: Object.freeze(['tests/shared/all-bundles-proof.mjs']), 'ci-integration': Object.freeze(['tests/shared/all-bundles-proof.mjs']), staging: Object.freeze(['tests/shared/all-bundles-proof.mjs']) }),",
+    "  'TEST-MEDIA-001': Object.freeze({ local: Object.freeze(['tests/shared/all-bundles-proof.mjs']), staging: Object.freeze(['tests/shared/all-bundles-proof.mjs']), 'pre-release': Object.freeze(['tests/shared/all-bundles-proof.mjs']) }),",
+    "  'TEST-DER-001': Object.freeze({ local: Object.freeze(['tests/shared/all-bundles-proof.mjs']), staging: Object.freeze(['tests/shared/all-bundles-proof.mjs']), 'pre-release': Object.freeze(['tests/shared/all-bundles-proof.mjs']) }),",
+    "  'TEST-SEC-001': Object.freeze({ local: Object.freeze(['tests/shared/all-bundles-proof.mjs']), staging: Object.freeze(['tests/shared/all-bundles-proof.mjs']), 'pre-release': Object.freeze(['tests/shared/all-bundles-proof.mjs']) }),",
+    "  'TEST-OPS-001': Object.freeze({ local: Object.freeze(['tests/shared/all-bundles-proof.mjs']), 'pre-release': Object.freeze(['tests/shared/all-bundles-proof.mjs']) }),",
+    "  'TEST-COST-001': Object.freeze({ local: Object.freeze(['tests/shared/all-bundles-proof.mjs']), 'pre-release': Object.freeze(['tests/shared/all-bundles-proof.mjs']) }),",
     '});',
     '',
   ].join('\n');
@@ -487,7 +530,7 @@ test('L1 evidence bundle set includes governance and canonical test implementati
   );
 });
 
-test('split L1 TEST-ID coverage requires every canonical implementation file', () => {
+test('non-local coverage fails closed when a required environment has no canonical implementation mapping yet', () => {
   const results = collectTestCoverageResults(
     getL1EvidenceDefinition('EVID-OPS-001'),
     {
@@ -501,8 +544,7 @@ test('split L1 TEST-ID coverage requires every canonical implementation file', (
 
   assert.equal(results.length, 1);
   assert.equal(results[0].satisfied, false);
-  assert.deepEqual(results[0].matched_files, ['tests/local/control-plane/phase-08-ops.test.mjs']);
-  assert.deepEqual(results[0].missing_files, ['tests/local/runtime-foundations/phase-08-runtime-controls.test.mjs']);
+  assert.match(results[0].mapping_error ?? '', /Missing L1 test implementation mapping/);
 });
 
 test('manual artifact payload validation requires structured non-local reports and typed prod snapshots', () => {
@@ -748,6 +790,22 @@ test('manual artifact payload validation requires structured non-local reports a
   assert.deepEqual(
     validateManualArtifactPayload('staging_run_report', {
       ...validStagingReport,
+      cloudflare_resources: {
+        ...validStagingReport.cloudflare_resources,
+        workers: ['matrix-gateway-worker-staging', 'matrix-jobs-worker-staging', 'matrix-ops-worker-ci-integration'],
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'environment run report cloudflare_resources.workers must match expected staging resources',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('staging_run_report', {
+      ...validStagingReport,
       expanded_test_file_count: 2,
       expanded_test_files: [
         'tests/staging/l1-mandatory.test.mjs',
@@ -899,6 +957,22 @@ test('manual artifact payload validation requires structured non-local reports a
   assert.deepEqual(
     validateManualArtifactPayload('prod_cost_snapshot', {
       ...validProdCostSnapshot,
+      cloudflare_resources: {
+        ...validProdCostSnapshot.cloudflare_resources,
+        r2_buckets: ['matrix-archive-prod', 'matrix-media-prod'],
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'prod_cost_snapshot cloudflare_resources.r2_buckets must match expected prod resources',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('prod_cost_snapshot', {
+      ...validProdCostSnapshot,
       cost_surfaces: {
         ...validProdCostSnapshot.cost_surfaces,
         telemetry_export: {
@@ -919,6 +993,19 @@ test('manual artifact payload validation requires structured non-local reports a
     validateManualArtifactPayload('prod_cost_snapshot', {
       ...validProdCostSnapshot,
       source_dashboard_uri: '',
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'prod_cost_snapshot must include an absolute external source_dashboard_uri',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('prod_cost_snapshot', {
+      ...validProdCostSnapshot,
+      source_dashboard_uri: 'https://[::ffff:127.0.0.1]/billing',
     }, {
       runTimestamp,
     }),
@@ -1064,7 +1151,43 @@ test('manual artifact attestation validation requires immutable provenance plus 
     }),
     {
       valid: false,
-      error: 'attestation bundle provenance.origin_run_uri must be an absolute external URI',
+      error: 'attestation bundle provenance.origin_run_uri must be a GitHub Actions run URL',
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('staging_run_report', {
+      ...validStagingAttestation,
+      provenance: {
+        ...validStagingAttestation.provenance,
+        origin_run_uri: `${validStagingAttestation.provenance.origin_run_uri}/artifacts/123`,
+      },
+      payload: {
+        ...validStagingAttestation.payload,
+        source_run_uri: `${validStagingAttestation.payload.source_run_uri}/artifacts/123`,
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'attestation bundle provenance.origin_run_uri must be a GitHub Actions run URL',
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('staging_run_report', {
+      ...validStagingAttestation,
+      provenance: {
+        ...validStagingAttestation.provenance,
+        review_record_uri: 'https://[::ffff:127.0.0.1]/review',
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'attestation bundle provenance.review_record_uri must be an absolute external URI',
     },
   );
 
@@ -1084,7 +1207,39 @@ test('manual artifact attestation validation requires immutable provenance plus 
     }),
     {
       valid: false,
-      error: 'attestation bundle provenance.origin_run_uri must be an absolute external URI',
+      error: 'attestation bundle provenance.origin_run_uri must be a GitHub Actions run URL',
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('staging_run_report', {
+      ...validStagingAttestation,
+      provenance: {
+        ...validStagingAttestation.provenance,
+        origin_system: 'not-github-actions',
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'attestation bundle provenance.origin_system must be github-actions',
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('staging_run_report', {
+      ...validStagingAttestation,
+      provenance: {
+        ...validStagingAttestation.provenance,
+        origin_run_id: 'mismatched-run-id',
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'attestation bundle provenance.origin_run_id must match provenance.origin_run_uri',
     },
   );
 
@@ -1094,12 +1249,26 @@ test('manual artifact attestation validation requires immutable provenance plus 
       provenance: {
         ...validStagingAttestation.provenance,
         origin_run_uri: 'urn:matrix:evidence:run:123',
-        artifact_store_uri: 'urn:matrix:evidence:artifact:123',
-        review_record_uri: 'urn:matrix:evidence:review:123',
       },
       payload: {
         ...validStagingAttestation.payload,
         source_run_uri: 'urn:matrix:evidence:run:123',
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'attestation bundle provenance.origin_run_uri must be a GitHub Actions run URL',
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('staging_run_report', {
+      ...validStagingAttestation,
+      provenance: {
+        ...validStagingAttestation.provenance,
+        review_record_uri: 'urn:matrix:evidence:review:123',
       },
     }, {
       runTimestamp,
@@ -1122,7 +1291,7 @@ test('manual artifact attestation validation requires immutable provenance plus 
     }),
     {
       valid: false,
-      error: 'attestation bundle provenance.artifact_store_uri must be an absolute external URI',
+      error: 'attestation bundle provenance.artifact_store_uri must be an immutable R2 object locator',
     },
   );
 
@@ -1131,18 +1300,134 @@ test('manual artifact attestation validation requires immutable provenance plus 
       ...validStagingAttestation,
       provenance: {
         ...validStagingAttestation.provenance,
-        origin_run_uri: 'about:blank',
-      },
-      payload: {
-        ...validStagingAttestation.payload,
-        source_run_uri: 'about:blank',
+        artifact_store_uri: 'https://example.invalid/artifacts/staging/attestation.json',
       },
     }, {
       runTimestamp,
     }),
     {
       valid: false,
-      error: 'attestation bundle provenance.origin_run_uri must be an absolute external URI',
+      error: 'attestation bundle provenance.artifact_store_uri must be an immutable R2 object locator',
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('staging_run_report', {
+      ...validStagingAttestation,
+      provenance: {
+        ...validStagingAttestation.provenance,
+        artifact_store_uri: 'r2://matrix-evidence-staging/staging/20260331T140000Z/attestation.json?query=1',
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'attestation bundle provenance.artifact_store_uri must be an immutable R2 object locator',
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('staging_run_report', {
+      ...validStagingAttestation,
+      provenance: {
+        ...validStagingAttestation.provenance,
+        artifact_store_key: 'staging/20260331T140000Z/attestation.json',
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'attestation bundle provenance.artifact_store_key must match provenance.artifact_store_uri',
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('staging_run_report', {
+      ...validStagingAttestation,
+      provenance: {
+        ...validStagingAttestation.provenance,
+        artifact_store_uri: 'r2://matrix-evidence-staging/gha/99999/1/staging/20260331T140000Z/run-bundle.tgz',
+        artifact_store_key: 'gha/99999/1/staging/20260331T140000Z/run-bundle.tgz',
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'attestation bundle provenance.artifact_store_key must encode provenance.origin_run_id',
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('staging_run_report', {
+      ...validStagingAttestation,
+      provenance: {
+        ...validStagingAttestation.provenance,
+        artifact_store_uri: `r2://matrix-evidence-staging/${buildPhase08ArtifactStoreKey('staging', runTimestamp, 'run-bundle.tgz').replace('/1/', '/2/')}`,
+        artifact_store_key: buildPhase08ArtifactStoreKey('staging', runTimestamp, 'run-bundle.tgz').replace('/1/', '/2/'),
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'attestation bundle provenance.artifact_store_key must encode provenance.origin_run_attempt',
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('staging_run_report', {
+      ...validStagingAttestation,
+      provenance: {
+        ...validStagingAttestation.provenance,
+        artifact_store_uri: 'r2://matrix-evidence-staging/gha/220260331140000/1/pre-release/20260331T140000Z/run-bundle.tgz',
+        artifact_store_key: 'gha/220260331140000/1/pre-release/20260331T140000Z/run-bundle.tgz',
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'attestation bundle provenance.artifact_store_key must encode source_environment',
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('staging_run_report', {
+      ...validStagingAttestation,
+      provenance: {
+        ...validStagingAttestation.provenance,
+        artifact_store_uri: 'r2://matrix-evidence-staging/gha/220260331140000/1/staging/20260331T140001Z/run-bundle.tgz',
+        artifact_store_key: 'gha/220260331140000/1/staging/20260331T140001Z/run-bundle.tgz',
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'attestation bundle provenance.artifact_store_key must encode run_timestamp',
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('staging_run_report', {
+      ...validStagingAttestation,
+      provenance: {
+        ...validStagingAttestation.provenance,
+        origin_run_uri: 'http://localhost:8787/run',
+      },
+      payload: {
+        ...validStagingAttestation.payload,
+        source_run_uri: 'http://localhost:8787/run',
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'attestation bundle provenance.origin_run_uri must be a GitHub Actions run URL',
     },
   );
 
@@ -1158,7 +1443,26 @@ test('manual artifact attestation validation requires immutable provenance plus 
     }),
     {
       valid: false,
-      error: 'attestation bundle provenance.topology_kind must be non-local',
+      error: 'attestation bundle provenance.topology_kind must be cloudflare-staging',
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('staging_run_report', {
+      ...validStagingAttestation,
+      provenance: {
+        ...validStagingAttestation.provenance,
+        deployment_identity: {
+          ...validStagingAttestation.provenance.deployment_identity,
+          environment_id: 'pre-release',
+        },
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'attestation bundle provenance.deployment_identity.environment_id must equal source_environment',
     },
   );
 
@@ -1234,23 +1538,49 @@ test('manual artifact attestation validation requires immutable provenance plus 
     }),
     {
       valid: false,
-      error: 'attestation bundle payload topology_kind must equal provenance.topology_kind',
+      error: 'attestation bundle payload topology_kind must be cloudflare-prod',
     },
   );
 });
 
-test('current non-local harness readiness fails closed while staging and pre-release still import local tests', async () => {
+test('current non-local harness readiness reports environment-backed dedicated harnesses once local imports are removed', async () => {
   const integrationReadiness = await assessNonLocalEnvironmentHarnessReadiness('ci-integration', repoRoot);
-  assert.equal(integrationReadiness.ready, false);
-  assert.ok(integrationReadiness.local_test_expansions.some((file) => file.startsWith('tests/local/')));
+  assert.equal(integrationReadiness.ready, true);
+  assert.deepEqual(integrationReadiness.local_test_expansions, []);
 
   const stagingReadiness = await assessNonLocalEnvironmentHarnessReadiness('staging', repoRoot);
-  assert.equal(stagingReadiness.ready, false);
-  assert.ok(stagingReadiness.local_test_expansions.some((file) => file.startsWith('tests/local/')));
+  assert.equal(stagingReadiness.ready, true);
+  assert.deepEqual(stagingReadiness.local_test_expansions, []);
 
   const preReleaseReadiness = await assessNonLocalEnvironmentHarnessReadiness('pre-release', repoRoot);
-  assert.equal(preReleaseReadiness.ready, false);
-  assert.ok(preReleaseReadiness.local_test_expansions.some((file) => file.startsWith('tests/local/')));
+  assert.equal(preReleaseReadiness.ready, true);
+  assert.deepEqual(preReleaseReadiness.local_test_expansions, []);
+});
+
+test('non-local harness readiness does not treat exported object string literals as module imports', async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-testing-harness-export-strings-'));
+  await fs.mkdir(path.join(tempRoot, 'tests', 'staging'), { recursive: true });
+  await fs.mkdir(path.join(tempRoot, 'tests', 'shared'), { recursive: true });
+  await fs.writeFile(
+    path.join(tempRoot, 'tests', 'staging', 'export-strings.test.mjs'),
+    "import '../shared/bootstrap-like.mjs';\n",
+  );
+  await fs.writeFile(
+    path.join(tempRoot, 'tests', 'shared', 'bootstrap-like.mjs'),
+    [
+      'export const TEST_ENVIRONMENTS = Object.freeze({',
+      "  'ci-integration': Object.freeze({ directory: 'tests/integration' }),",
+      "  staging: Object.freeze({ directory: 'tests/staging' }),",
+      "  'pre-release': Object.freeze({ directory: 'tests/pre-release' }),",
+      '});',
+      '',
+    ].join('\n'),
+  );
+
+  const readiness = await assessNonLocalEnvironmentHarnessReadiness('staging', tempRoot);
+  assert.equal(readiness.ready, true);
+  assert.deepEqual(readiness.local_test_expansions, []);
+  assert.deepEqual(readiness.unresolved_dynamic_imports, []);
 });
 
 test('non-local harness readiness follows dynamic import edges when a staging test reaches tests/local', async () => {
@@ -3513,16 +3843,33 @@ test('manual artifact collection rejects hard-linked prod cost snapshots from _t
 
 test('manual artifact collection rejects otherwise valid external reports when the current harness is not environment-backed', async () => {
   const runTimestamp = '20260331T141700Z';
-  const reportPath = path.join(os.tmpdir(), `matrix-pre-release-report-${runTimestamp}.json`);
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-testing-harness-manual-invalid-'));
+  const reportPath = path.join(tempRoot, 'external', 'pre-release.json');
+  await fs.mkdir(path.join(tempRoot, 'tests', 'pre-release'), { recursive: true });
+  await fs.mkdir(path.join(tempRoot, 'tests', 'local'), { recursive: true });
+  await fs.mkdir(path.dirname(reportPath), { recursive: true });
+  await fs.writeFile(
+    path.join(tempRoot, 'tests', 'pre-release', 'bridge.test.mjs'),
+    "import '../local/probe.test.mjs';\n",
+  );
+  await fs.writeFile(
+    path.join(tempRoot, 'tests', 'local', 'probe.test.mjs'),
+    'export const probe = true;\n',
+  );
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentAttestation('pre-release', runTimestamp), null, 2),
+    JSON.stringify(buildValidEnvironmentAttestation('pre-release', runTimestamp, {
+      test_files: ['tests/pre-release/bridge.test.mjs'],
+      test_file_count: 1,
+      expanded_test_files: ['tests/pre-release/bridge.test.mjs'],
+      expanded_test_file_count: 1,
+    }), null, 2),
   );
 
   try {
     const results = await collectManualArtifactResults(
       getL1EvidenceDefinition('EVID-OPS-001'),
-      repoRoot,
+      tempRoot,
       {
         pre_release_run_report: reportPath,
       },
@@ -3533,7 +3880,7 @@ test('manual artifact collection rejects otherwise valid external reports when t
     assert.equal(results[0].valid, false);
     assert.match(results[0].validation_error, /harness is not environment-backed/);
   } finally {
-    await fs.rm(reportPath, { force: true });
+    await fs.rm(tempRoot, { recursive: true, force: true });
   }
 });
 
@@ -5413,6 +5760,7 @@ test('writeL1Evidence keeps end-to-end bundle gating fail-closed without manual 
     });
 
     assert.equal(failResult.ok, false);
+    assert.ok(!failResult.environment_runs.local.test_files.includes('tests/local/runtime-foundations/testing-harness.test.mjs'));
     assert.equal(
       failResult.bundles.find((bundle) => bundle.evid_id === 'EVID-CS-001')?.status,
       'fail',
@@ -5442,11 +5790,11 @@ test('writeL1Evidence keeps end-to-end bundle gating fail-closed without manual 
     );
     const stagingArtifact = passManualArtifacts.find((artifact) => artifact.artifact_id === 'staging_run_report');
     assert.equal(stagingArtifact?.attestation_origin_run_attempt, 1);
-    assert.equal(stagingArtifact?.attestation_origin_run_uri, `https://example.invalid/runs/staging/${passTimestamp}`);
-    assert.equal(stagingArtifact?.attestation_artifact_store_key, `staging/${passTimestamp}/attestation.json`);
+    assert.equal(stagingArtifact?.attestation_origin_run_uri, buildGitHubRunUri('staging', passTimestamp));
+    assert.equal(stagingArtifact?.attestation_artifact_store_key, buildPhase08ArtifactStoreKey('staging', passTimestamp, 'run-bundle.tgz'));
     assert.equal(stagingArtifact?.attestation_artifact_sha256, 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789');
-    assert.equal(stagingArtifact?.attestation_deployment_identity?.environment_id, 'staging-env');
-    assert.equal(stagingArtifact?.attestation_provenance?.review_record_uri, `https://example.invalid/reviews/staging/${passTimestamp}`);
+    assert.equal(stagingArtifact?.attestation_deployment_identity?.environment_id, 'staging');
+    assert.equal(stagingArtifact?.attestation_provenance?.review_record_uri, buildGitHubRunUri('staging', passTimestamp));
   } finally {
     await fs.rm(fixtureParent, { recursive: true, force: true });
   }

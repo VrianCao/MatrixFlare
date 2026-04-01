@@ -483,19 +483,36 @@ export function instrumentEnvironmentBindings(env) {
   if (!env || env.__MATRIX_TELEMETRY_BINDINGS_WRAPPED__ === true) {
     return env;
   }
-  env.MATRIX_CONTROL_D1 = wrapD1Binding(env, env.MATRIX_CONTROL_D1, 'matrix-control-and-derived');
-  env.MATRIX_MEDIA_BUCKET = wrapR2Bucket(env, env.MATRIX_MEDIA_BUCKET, 'matrix-media');
-  env.MATRIX_ARCHIVE_BUCKET = wrapR2Bucket(env, env.MATRIX_ARCHIVE_BUCKET, 'matrix-archive');
-  env.MATRIX_EDGE_CACHE = wrapKvNamespace(env, env.MATRIX_EDGE_CACHE, 'matrix-edge-cache');
+  const resourceNames = resolveWorkerResourceBindingNames(env);
+  env.MATRIX_CONTROL_D1 = wrapD1Binding(
+    env,
+    env.MATRIX_CONTROL_D1,
+    resourceNames.d1_databases.MATRIX_CONTROL_D1,
+  );
+  env.MATRIX_MEDIA_BUCKET = wrapR2Bucket(
+    env,
+    env.MATRIX_MEDIA_BUCKET,
+    resourceNames.r2_buckets.MATRIX_MEDIA_BUCKET,
+  );
+  env.MATRIX_ARCHIVE_BUCKET = wrapR2Bucket(
+    env,
+    env.MATRIX_ARCHIVE_BUCKET,
+    resourceNames.r2_buckets.MATRIX_ARCHIVE_BUCKET,
+  );
+  env.MATRIX_EDGE_CACHE = wrapKvNamespace(
+    env,
+    env.MATRIX_EDGE_CACHE,
+    resourceNames.kv_namespaces.MATRIX_EDGE_CACHE,
+  );
 
   const queueBindings = [
-    ['SEARCH_INDEX_QUEUE', 'matrix-search-index-job'],
-    ['MEDIA_THUMBNAIL_QUEUE', 'matrix-media-thumbnail-job'],
-    ['APPSERVICE_TXN_QUEUE', 'matrix-appservice-txn-job'],
-    ['REBUILD_SHARD_QUEUE', 'matrix-rebuild-shard-job'],
-    ['EXPORT_SHARD_QUEUE', 'matrix-export-shard-job'],
-    ['RESTORE_SHARD_QUEUE', 'matrix-restore-shard-job'],
-    ['REPAIR_SHARD_QUEUE', 'matrix-repair-shard-job'],
+    ['SEARCH_INDEX_QUEUE', resourceNames.queues.SEARCH_INDEX_QUEUE],
+    ['MEDIA_THUMBNAIL_QUEUE', resourceNames.queues.MEDIA_THUMBNAIL_QUEUE],
+    ['APPSERVICE_TXN_QUEUE', resourceNames.queues.APPSERVICE_TXN_QUEUE],
+    ['REBUILD_SHARD_QUEUE', resourceNames.queues.REBUILD_SHARD_QUEUE],
+    ['EXPORT_SHARD_QUEUE', resourceNames.queues.EXPORT_SHARD_QUEUE],
+    ['RESTORE_SHARD_QUEUE', resourceNames.queues.RESTORE_SHARD_QUEUE],
+    ['REPAIR_SHARD_QUEUE', resourceNames.queues.REPAIR_SHARD_QUEUE],
   ];
   for (const [bindingName, queueName] of queueBindings) {
     env[bindingName] = wrapQueueBinding(env, env[bindingName], queueName);
@@ -517,3 +534,4 @@ export function snapshotTelemetry(env) {
     })),
   };
 }
+import { resolveWorkerResourceBindingNames } from './runtime-manifest.mjs';
