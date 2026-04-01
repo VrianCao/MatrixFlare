@@ -412,7 +412,7 @@ export function startRequestMetrics(env, {
   routeFamily,
 }) {
   const startedAt = performance.now();
-  const cpuStartedAt = process.cpuUsage();
+  const cpuStartedAt = captureCpuUsageSnapshot();
   incrementMetric(env, 'worker.request.count', 1, {
     worker: workerName,
     route_family: routeFamily,
@@ -424,20 +424,21 @@ export function startRequestMetrics(env, {
       error = null,
     } = {}) {
       const wallMs = performance.now() - startedAt;
-      const cpuUsage = process.cpuUsage(cpuStartedAt);
-      const cpuMs = (cpuUsage.user + cpuUsage.system) / 1000;
+      const cpuMs = measureCpuMilliseconds(cpuStartedAt);
       observeMetric(env, 'worker.wall_ms', wallMs, {
         worker: workerName,
         route_family: routeFamily,
         status,
         version: workerVersion,
       });
-      observeMetric(env, 'worker.cpu_ms', cpuMs, {
-        worker: workerName,
-        route_family: routeFamily,
-        status,
-        version: workerVersion,
-      });
+      if (cpuMs != null) {
+        observeMetric(env, 'worker.cpu_ms', cpuMs, {
+          worker: workerName,
+          route_family: routeFamily,
+          status,
+          version: workerVersion,
+        });
+      }
       if (status >= 500 || error) {
         incrementMetric(env, 'worker.error.count', 1, {
           worker: workerName,
@@ -452,6 +453,29 @@ export function startRequestMetrics(env, {
       };
     },
   };
+}
+
+function captureCpuUsageSnapshot() {
+  if (typeof process?.cpuUsage !== 'function') {
+    return null;
+  }
+  try {
+    return process.cpuUsage();
+  } catch {
+    return null;
+  }
+}
+
+function measureCpuMilliseconds(cpuStartedAt) {
+  if (cpuStartedAt == null || typeof process?.cpuUsage !== 'function') {
+    return null;
+  }
+  try {
+    const cpuUsage = process.cpuUsage(cpuStartedAt);
+    return (cpuUsage.user + cpuUsage.system) / 1000;
+  } catch {
+    return null;
+  }
 }
 
 export function recordDeploymentRecord(env, record) {

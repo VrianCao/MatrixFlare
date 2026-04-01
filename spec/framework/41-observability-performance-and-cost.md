@@ -76,7 +76,7 @@
 | `remote_server` / `txn_id` | 联邦场景必备 |
 | `event_id` | 房间事件场景必备 |
 | `outcome` / `errcode` / `error_class` | 必备 |
-| `latency_ms` / `cpu_ms` | 必备 |
+| `latency_ms` / `cpu_ms` | `latency_ms` 必备；`cpu_ms` 在 runtime 能提供真实 request-scope CPU 计时时必备，否则必须显式记录 `cpu_ms_unavailable = true`，不得伪造 wall time 充作 CPU |
 | `cf_ray` | 如可得 |
 
 ### 4.2 日志约束
@@ -86,6 +86,7 @@
 * 禁止记录 secrets、token 明文和敏感密钥材料。
 * Workers Logs 只有 `7` 天保留期，只能作为短期运行遥测；控制面审计与恢复证据必须落到 `DATA-OPS-004` / `EVID-*`。引用：`CF-WKR-015`。
 * 单条 Workers Logs 事件必须受平台 `256 KB` 单事件大小限制约束；超限被截断时，必须以平台提供的 `$cloudflare.truncated = true` 为权威信号，并映射到内部日志 schema，避免把截断日志当作完整证据。引用：`CF-WKR-015`。
+* 当前 Workers `nodejs_compat` 只能保证一部分 Node.js API；若应用内 request telemetry 无法获取真实 request-scope CPU 计时，代码必须 fail-safe 并记录 `cpu_ms_unavailable = true`，而不是因 `process.*` helper 未实现把请求路径打成 `500`。引用：`CF-WKR-026`。
 
 ## 5. Traces and Correlation
 

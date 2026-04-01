@@ -3835,7 +3835,9 @@ async function handleRequest(request, env) {
       status: response.status,
       outcome,
       latency_ms: Math.round(completed.wall_ms),
-      cpu_ms: Math.round(completed.cpu_ms),
+      ...(completed.cpu_ms == null
+        ? { cpu_ms_unavailable: true }
+        : { cpu_ms: Math.round(completed.cpu_ms) }),
       ...(errorClass == null ? {} : { error_class: errorClass }),
     });
     return response;
@@ -4277,7 +4279,9 @@ async function handleRequest(request, env) {
       error_class: error?.code ?? error?.name ?? 'internal',
       error_message: error?.message ?? 'Unknown gateway failure',
       latency_ms: Math.round(completed.wall_ms),
-      cpu_ms: Math.round(completed.cpu_ms),
+      ...(completed.cpu_ms == null
+        ? { cpu_ms_unavailable: true }
+        : { cpu_ms: Math.round(completed.cpu_ms) }),
     });
     throw error;
   }

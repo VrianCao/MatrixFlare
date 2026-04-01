@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import process from 'node:process';
 import test from 'node:test';
 
 import {
@@ -131,6 +132,35 @@ test('Phase 08 gateway abuse guard classifies L1 surfaces and enforces IP limits
     assert.equal(body.errcode, 'M_LIMIT_EXCEEDED');
     assert.ok(body.error.includes(routeFamily));
   }
+});
+
+test('Phase 08 gateway telemetry does not crash when process.cpuUsage is unavailable in Workers runtime', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const originalCpuUsage = process.cpuUsage;
+  process.cpuUsage = () => {
+    throw new Error('The process.cpuUsage method is not implemented');
+  };
+  t.after(() => {
+    process.cpuUsage = originalCpuUsage;
+  });
+
+  const versionsResponse = await rig.gatewayFetch('/_matrix/client/versions');
+  assert.equal(versionsResponse.status, 200);
+  const versionsBody = await versionsResponse.json();
+  assert.deepEqual(versionsBody, {
+    versions: ['v1.17'],
+    unstable_features: {},
+  });
+
+  const snapshot = snapshotTelemetry(rig.env);
+  assertMetric(snapshot, 'worker.request.count', (dimensions) => dimensions.worker === 'gateway-worker');
+  assertMetric(snapshot, 'worker.wall_ms', (dimensions) => dimensions.worker === 'gateway-worker');
+  assert.equal(
+    snapshot.metrics.some((metric) => metric.name === 'worker.cpu_ms' && metric.dimensions.worker === 'gateway-worker'),
+    false,
+  );
 });
 
 test('Phase 08 semantic quotas remain application-visible for register/login/media/membership/send', async (t) => {
