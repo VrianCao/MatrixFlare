@@ -8,6 +8,7 @@ export const DEFAULT_MEDIA_ORPHAN_RETENTION_MS = 60 * 60 * 1000;
 export const DEFAULT_MEDIA_FETCH_TIMEOUT_MS = 20_000;
 export const MAX_MEDIA_FETCH_TIMEOUT_MS = 60_000;
 export const MEDIA_WRITE_BACKOFF_TTL_SECONDS = 60;
+export const CLOUDFLARE_KNOWN_LENGTH_STREAM = Symbol.for('matrix.cloudflare-known-length-stream');
 const ANIMATABLE_MEDIA_CONTENT_TYPES = new Set([
   'image/gif',
 ]);
@@ -182,12 +183,32 @@ export async function readReadableStreamDigest(stream, {
   };
 }
 
+export function markCloudflareKnownLengthStream(stream, streamKind = 'request-or-response-body') {
+  if (!stream || typeof stream.getReader !== 'function') {
+    return stream;
+  }
+  try {
+    Object.defineProperty(stream, CLOUDFLARE_KNOWN_LENGTH_STREAM, {
+      value: streamKind,
+      configurable: true,
+    });
+  } catch {
+    // Best-effort marker for local fail-closed fakes only.
+  }
+  return stream;
+}
+
 export function teeBodyStreamWithDigest(source, {
   maxBytes,
 } = {}) {
   if (!source?.body || typeof source.body.getReader !== 'function') {
     return null;
   }
+  const contentLengthHeader = source.headers?.get?.('content-length') ?? null;
+  if (!/^[0-9]+$/.test(contentLengthHeader ?? '')) {
+    return null;
+  }
+  const knownLength = Number.parseInt(contentLengthHeader, 10);
   const reader = source.body.getReader();
   const hash = createHash('sha256');
   let total = 0;
@@ -215,8 +236,39 @@ export function teeBodyStreamWithDigest(source, {
     resolveDigest = resolve;
     rejectDigest = reject;
   });
+  if (typeof FixedLengthStream === 'function') {
+    const fixedLength = new FixedLengthStream(knownLength);
+    const writer = fixedLength.writable.getWriter();
+    void (async () => {
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            settleDigestSuccess();
+            await writer.close();
+            return;
+          }
+          const chunk = Buffer.from(value);
+          total += chunk.byteLength;
+          if (Number.isInteger(maxBytes) && total > maxBytes) {
+            throw createContentTooLargeError(maxBytes);
+          }
+          hash.update(chunk);
+          await writer.write(chunk);
+        }
+      } catch (error) {
+        settleDigestError(error);
+        await reader.cancel(error).catch(() => {});
+        await writer.abort(error).catch(() => {});
+      }
+    })();
+    return {
+      upload_stream: markCloudflareKnownLengthStream(fixedLength.readable, 'fixed-length-stream'),
+      digest_promise: digestPromise,
+    };
+  }
   return {
-    upload_stream: new ReadableStream({
+    upload_stream: markCloudflareKnownLengthStream(new ReadableStream({
       async pull(controller) {
         try {
           const { done, value } = await reader.read();
@@ -249,7 +301,7 @@ export function teeBodyStreamWithDigest(source, {
         }
         settleDigestError(reason);
       },
-    }),
+    }), 'fixed-length-stream'),
     digest_promise: digestPromise,
   };
 }
@@ -286,11 +338,39 @@ function createContentTooLargeError(maxBytes) {
 
 function prependReadableStream(prefix, stream, {
   maxBytes,
+  knownLength = null,
 } = {}) {
   const reader = stream.getReader();
+  if (Number.isInteger(knownLength) && typeof FixedLengthStream === 'function') {
+    const fixedLength = new FixedLengthStream(knownLength);
+    const writer = fixedLength.writable.getWriter();
+    void (async () => {
+      let sourceBytesRead = 0;
+      try {
+        await writer.write(prefix);
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            await writer.close();
+            return;
+          }
+          const chunk = Buffer.from(value);
+          sourceBytesRead += chunk.byteLength;
+          if (Number.isInteger(maxBytes) && sourceBytesRead > maxBytes) {
+            throw createContentTooLargeError(maxBytes);
+          }
+          await writer.write(chunk);
+        }
+      } catch (error) {
+        await reader.cancel(error).catch(() => {});
+        await writer.abort(error).catch(() => {});
+      }
+    })();
+    return markCloudflareKnownLengthStream(fixedLength.readable, 'fixed-length-stream');
+  }
   let prefixSent = false;
   let sourceBytesRead = 0;
-  return new ReadableStream({
+  const readable = new ReadableStream({
     async pull(controller) {
       if (!prefixSent) {
         prefixSent = true;
@@ -324,6 +404,9 @@ function prependReadableStream(prefix, stream, {
       }
     },
   });
+  return Number.isInteger(knownLength)
+    ? markCloudflareKnownLengthStream(readable, 'fixed-length-stream')
+    : readable;
 }
 
 export async function createThumbnailBodyInput(source, variant, {
@@ -341,7 +424,14 @@ export async function createThumbnailBodyInput(source, variant, {
     throw createContentTooLargeError(maxBytes);
   }
   if (sourceStream) {
-    return prependReadableStream(prefix, sourceStream, { maxBytes });
+    if (Number.isInteger(sourceSize)) {
+      return prependReadableStream(prefix, sourceStream, {
+        maxBytes,
+        knownLength: prefix.byteLength + sourceSize,
+      });
+    }
+    const bodyInfo = await readReadableStreamWithDigest(sourceStream, { maxBytes });
+    return Buffer.concat([prefix, bodyInfo.bytes]);
   }
   if (Buffer.isBuffer(source?.body)) {
     if (Number.isInteger(maxBytes) && source.body.byteLength > maxBytes) {

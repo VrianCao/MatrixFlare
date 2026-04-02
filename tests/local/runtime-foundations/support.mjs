@@ -1,5 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 
+import { CLOUDFLARE_KNOWN_LENGTH_STREAM } from '../../../packages/runtime-core/src/media-domain.mjs';
+
 function detectStatementType(sql) {
   const trimmed = sql.trim().replace(/^\uFEFF/, '');
   const match = /^([A-Za-z]+)/.exec(trimmed);
@@ -90,6 +92,9 @@ export class FakeR2Bucket {
   }
 
   async put(key, value, options = {}) {
+    if (typeof value?.getReader === 'function' && !value[CLOUDFLARE_KNOWN_LENGTH_STREAM]) {
+      throw new Error('Provided readable stream must have a known length (request/response body or readable half of FixedLengthStream)');
+    }
     const body = await readInputToBuffer(value);
     this.objects.set(key, {
       body,

@@ -38,6 +38,7 @@ import {
   putWellKnownCacheEntry,
 } from '../../../packages/runtime-core/src/index.mjs';
 import { createD1ControlPlanePersistence } from '../../../packages/control-plane/src/index.mjs';
+import { markCloudflareKnownLengthStream } from '../../../packages/runtime-core/src/media-domain.mjs';
 import {
   FakeKvNamespace,
   FakeR2Bucket,
@@ -893,6 +894,32 @@ test('control-plane D1 schema bootstrap avoids exec() so non-local publicRooms d
   });
   assert.equal(activePolicies.length, 1);
   d1.close();
+});
+
+test('FakeR2Bucket fail-closes generic readable streams unless they model Cloudflare known-length bodies', async () => {
+  const bucket = new FakeR2Bucket();
+  const encoder = new TextEncoder();
+
+  await assert.rejects(
+    bucket.put('generic-stream', new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode('generic-stream'));
+        controller.close();
+      },
+    })),
+    /known length/u,
+  );
+
+  await bucket.put('marked-stream', markCloudflareKnownLengthStream(new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode('known-length-stream'));
+      controller.close();
+    },
+  })));
+
+  const stored = await bucket.get('marked-stream');
+  assert.ok(stored);
+  assert.equal(await stored.text(), 'known-length-stream');
 });
 
 test('R2 and KV keyspace builders plus wrappers cover DATA-R2-001 through DATA-R2-006 and DATA-KV-001 through DATA-KV-002', async () => {
