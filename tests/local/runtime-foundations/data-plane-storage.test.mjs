@@ -907,7 +907,7 @@ test('FakeR2Bucket fail-closes generic readable streams unless they model Cloudf
         controller.close();
       },
     })),
-    /known length/u,
+    /exact known byte length/u,
   );
 
   await bucket.put('marked-stream', markCloudflareKnownLengthStream(new ReadableStream({
@@ -915,11 +915,30 @@ test('FakeR2Bucket fail-closes generic readable streams unless they model Cloudf
       controller.enqueue(encoder.encode('known-length-stream'));
       controller.close();
     },
-  })));
+  }), 'fixed-length-stream', {
+    knownByteLength: Buffer.byteLength('known-length-stream'),
+  }));
 
   const stored = await bucket.get('marked-stream');
   assert.ok(stored);
+  assert.equal(typeof stored.body?.getReader, 'function');
   assert.equal(await stored.text(), 'known-length-stream');
+  assert.equal(
+    Buffer.from(await stored.arrayBuffer()).toString('utf8'),
+    'known-length-stream',
+  );
+
+  await assert.rejects(
+    bucket.put('mismatched-stream', markCloudflareKnownLengthStream(new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode('size-mismatch'));
+        controller.close();
+      },
+    }), 'fixed-length-stream', {
+      knownByteLength: Buffer.byteLength('size-mismatch') + 1,
+    })),
+    /declared 14 bytes but produced 13/u,
+  );
 });
 
 test('R2 and KV keyspace builders plus wrappers cover DATA-R2-001 through DATA-R2-006 and DATA-KV-001 through DATA-KV-002', async () => {

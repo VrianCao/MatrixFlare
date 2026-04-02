@@ -64,6 +64,7 @@ export {
   readReadableStreamWithDigest,
   resolveThumbnailAnimationPreference,
   teeBodyStreamWithDigest,
+  uploadStreamToR2MultipartWithDigest,
 } from './media-domain.mjs';
 export {
   buildNormalizedRequestObject,

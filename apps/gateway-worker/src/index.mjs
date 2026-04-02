@@ -38,6 +38,7 @@ import {
   resolveThumbnailAnimationPreference,
   startRequestMetrics,
   teeBodyStreamWithDigest,
+  uploadStreamToR2MultipartWithDigest,
   classifyGatewayRequest,
 } from '../../../packages/runtime-core/src/index.mjs';
 import {
@@ -506,6 +507,9 @@ function toResponseBody(body) {
   if (body == null) {
     return null;
   }
+  if (typeof body?.getReader === 'function') {
+    return body;
+  }
   if (typeof body === 'string' || body instanceof Uint8Array || Buffer.isBuffer(body)) {
     return body;
   }
@@ -530,6 +534,35 @@ function buildMediaResponse(object, {
     status: 200,
     headers,
   });
+}
+
+async function writeMediaObjectWithDigest(env, objectKey, source, putOptions, {
+  maxBytes,
+  lockObjectKey = true,
+} = {}) {
+  const runObjectWrite = (operation) => (
+    lockObjectKey
+      ? withMediaKeyBackoff(env, objectKey, operation)
+      : operation()
+  );
+  const streamedBody = teeBodyStreamWithDigest(source, { maxBytes });
+  if (streamedBody) {
+    const [, streamedInfo] = await Promise.all([
+      runObjectWrite(() => env.MATRIX_MEDIA_BUCKET.put(objectKey, streamedBody.upload_stream, putOptions)),
+      streamedBody.digest_promise,
+    ]);
+    return streamedInfo;
+  }
+  if (source?.body && typeof source.body.getReader === 'function' && typeof env.MATRIX_MEDIA_BUCKET.createMultipartUpload === 'function') {
+    return runObjectWrite(
+      () => uploadStreamToR2MultipartWithDigest(env.MATRIX_MEDIA_BUCKET, objectKey, source.body, putOptions, {
+        maxBytes,
+      }),
+    );
+  }
+  const bodyInfo = await readBodyWithDigest(source, { maxBytes });
+  await runObjectWrite(() => env.MATRIX_MEDIA_BUCKET.put(objectKey, bodyInfo.bytes, putOptions));
+  return bodyInfo;
 }
 
 async function withMediaKeyBackoff(env, objectKey, operation) {
@@ -2292,39 +2325,18 @@ async function commitLocalMediaUpload(request, env, access, {
   const legacyFlag = computeLegacyUnauthAccessFlag(uploadedAt, getMediaFreezePolicy(env));
   const objectKey = buildLocalMediaObjectKey(grant.media_id);
   try {
-    const streamedBody = teeBodyStreamWithDigest(request, {
+    bodyInfo = await writeMediaObjectWithDigest(env, objectKey, request, {
+      customMetadata: {
+        first_ingested_at: uploadedAt,
+        legacy_unauth_access_flag: legacyFlag ? 'true' : 'false',
+        content_type: contentType,
+      },
+      httpMetadata: {
+        contentType,
+      },
+    }, {
       maxBytes: grant.max_bytes,
     });
-    if (streamedBody) {
-      const [, streamedInfo] = await Promise.all([
-        withMediaKeyBackoff(env, objectKey, () => env.MATRIX_MEDIA_BUCKET.put(objectKey, streamedBody.upload_stream, {
-          customMetadata: {
-            first_ingested_at: uploadedAt,
-            legacy_unauth_access_flag: legacyFlag ? 'true' : 'false',
-            content_type: contentType,
-          },
-          httpMetadata: {
-            contentType,
-          },
-        })),
-        streamedBody.digest_promise,
-      ]);
-      bodyInfo = streamedInfo;
-    } else {
-      bodyInfo = await readBodyWithDigest(request, {
-        maxBytes: grant.max_bytes,
-      });
-      await withMediaKeyBackoff(env, objectKey, () => env.MATRIX_MEDIA_BUCKET.put(objectKey, bodyInfo.bytes, {
-        customMetadata: {
-          first_ingested_at: uploadedAt,
-          legacy_unauth_access_flag: legacyFlag ? 'true' : 'false',
-          content_type: contentType,
-        },
-        httpMetadata: {
-          contentType,
-        },
-      }));
-    }
   } catch (error) {
     const reverted = await deleteMediaObjectBestEffort(env, objectKey);
     await access.user_do.finalizeMediaUpload({
@@ -2478,41 +2490,20 @@ async function fetchRemoteMediaIntoCache(env, {
       const cachedAt = new Date().toISOString();
       const legacyFlag = computeLegacyUnauthAccessFlag(cachedAt, getMediaFreezePolicy(env));
       const contentType = response.headers.get('content-type') ?? 'application/octet-stream';
-      const streamedBody = teeBodyStreamWithDigest(response, {
+      bodyInfo = await writeMediaObjectWithDigest(env, objectKey, response, {
+        customMetadata: {
+          first_cached_at: cachedAt,
+          legacy_unauth_access_flag: legacyFlag ? 'true' : 'false',
+          origin_server_name: normalizedServerName,
+          content_type: contentType,
+        },
+        httpMetadata: {
+          contentType,
+        },
+      }, {
+        lockObjectKey: false,
         maxBytes: resolveConfiguredMaxUploadBytes(env),
       });
-      if (streamedBody) {
-        const [, streamedInfo] = await Promise.all([
-          env.MATRIX_MEDIA_BUCKET.put(objectKey, streamedBody.upload_stream, {
-            customMetadata: {
-              first_cached_at: cachedAt,
-              legacy_unauth_access_flag: legacyFlag ? 'true' : 'false',
-              origin_server_name: normalizedServerName,
-              content_type: contentType,
-            },
-            httpMetadata: {
-              contentType,
-            },
-          }),
-          streamedBody.digest_promise,
-        ]);
-        bodyInfo = streamedInfo;
-      } else {
-        bodyInfo = await readBodyWithDigest(response, {
-          maxBytes: resolveConfiguredMaxUploadBytes(env),
-        });
-        await env.MATRIX_MEDIA_BUCKET.put(objectKey, bodyInfo.bytes, {
-          customMetadata: {
-            first_cached_at: cachedAt,
-            legacy_unauth_access_flag: legacyFlag ? 'true' : 'false',
-            origin_server_name: normalizedServerName,
-            content_type: contentType,
-          },
-          httpMetadata: {
-            contentType,
-          },
-        });
-      }
       const cachedObject = await env.MATRIX_MEDIA_BUCKET.get(objectKey);
       await queueMediaDerivedWork(env, {
         mxcUri: buildMxcUri(normalizedServerName, mediaId),

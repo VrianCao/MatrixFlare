@@ -73,10 +73,14 @@ export async function request(harness, pathname, {
   if (json !== undefined && !requestHeaders.has('content-type')) {
     requestHeaders.set('content-type', 'application/json; charset=utf-8');
   }
+  const resolvedBody = json === undefined ? body : JSON.stringify(json);
   const response = await fetch(`${harness.baseUrl}${pathname}`, {
     method,
     headers: requestHeaders,
-    body: json === undefined ? body : JSON.stringify(json),
+    body: resolvedBody,
+    ...(resolvedBody && typeof resolvedBody.getReader === 'function'
+      ? { duplex: 'half' }
+      : {}),
   });
   const contentType = response.headers.get('content-type') ?? '';
   const payload = contentType.includes('application/json')

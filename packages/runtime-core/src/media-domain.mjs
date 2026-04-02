@@ -8,6 +8,7 @@ export const DEFAULT_MEDIA_ORPHAN_RETENTION_MS = 60 * 60 * 1000;
 export const DEFAULT_MEDIA_FETCH_TIMEOUT_MS = 20_000;
 export const MAX_MEDIA_FETCH_TIMEOUT_MS = 60_000;
 export const MEDIA_WRITE_BACKOFF_TTL_SECONDS = 60;
+export const R2_MULTIPART_MIN_PART_BYTES = 5 * 1024 * 1024;
 export const CLOUDFLARE_KNOWN_LENGTH_STREAM = Symbol.for('matrix.cloudflare-known-length-stream');
 const ANIMATABLE_MEDIA_CONTENT_TYPES = new Set([
   'image/gif',
@@ -183,13 +184,43 @@ export async function readReadableStreamDigest(stream, {
   };
 }
 
-export function markCloudflareKnownLengthStream(stream, streamKind = 'request-or-response-body') {
+export function readCloudflareKnownLengthStreamMetadata(stream) {
+  const rawMetadata = stream?.[CLOUDFLARE_KNOWN_LENGTH_STREAM];
+  if (rawMetadata == null) {
+    return null;
+  }
+  if (typeof rawMetadata === 'string') {
+    return Object.freeze({
+      stream_kind: rawMetadata,
+      byte_length: null,
+    });
+  }
+  if (typeof rawMetadata !== 'object') {
+    return null;
+  }
+  return Object.freeze({
+    stream_kind: normalizeString(rawMetadata.stream_kind ?? 'request-or-response-body', 'streamKind'),
+    byte_length: rawMetadata.byte_length == null
+      ? null
+      : normalizeInteger(rawMetadata.byte_length, 'knownByteLength', { min: 0 }),
+  });
+}
+
+export function markCloudflareKnownLengthStream(stream, streamKind = 'request-or-response-body', {
+  knownByteLength = null,
+} = {}) {
   if (!stream || typeof stream.getReader !== 'function') {
     return stream;
   }
+  const marker = Object.freeze({
+    stream_kind: normalizeString(streamKind, 'streamKind'),
+    byte_length: knownByteLength == null
+      ? null
+      : normalizeInteger(knownByteLength, 'knownByteLength', { min: 0 }),
+  });
   try {
     Object.defineProperty(stream, CLOUDFLARE_KNOWN_LENGTH_STREAM, {
-      value: streamKind,
+      value: marker,
       configurable: true,
     });
   } catch {
@@ -263,7 +294,9 @@ export function teeBodyStreamWithDigest(source, {
       }
     })();
     return {
-      upload_stream: markCloudflareKnownLengthStream(fixedLength.readable, 'fixed-length-stream'),
+      upload_stream: markCloudflareKnownLengthStream(fixedLength.readable, 'fixed-length-stream', {
+        knownByteLength: knownLength,
+      }),
       digest_promise: digestPromise,
     };
   }
@@ -301,9 +334,101 @@ export function teeBodyStreamWithDigest(source, {
         }
         settleDigestError(reason);
       },
-    }), 'fixed-length-stream'),
+    }), 'fixed-length-stream', {
+      knownByteLength: knownLength,
+    }),
     digest_promise: digestPromise,
   };
+}
+
+export async function uploadStreamToR2MultipartWithDigest(bucket, objectKey, stream, putOptions = {}, {
+  maxBytes,
+  partSizeBytes = R2_MULTIPART_MIN_PART_BYTES,
+} = {}) {
+  if (!stream || typeof stream.getReader !== 'function') {
+    throw new TypeError('stream must be a ReadableStream');
+  }
+  if (!bucket || typeof bucket.createMultipartUpload !== 'function') {
+    throw new TypeError('bucket must support createMultipartUpload');
+  }
+  const normalizedPartSize = normalizeInteger(partSizeBytes, 'partSizeBytes', {
+    min: R2_MULTIPART_MIN_PART_BYTES,
+  });
+  const reader = stream.getReader();
+  const hash = createHash('sha256');
+  const uploadedParts = [];
+  const partBuffers = [];
+  let multipartUpload = null;
+  let partBytes = 0;
+  let partNumber = 1;
+  let total = 0;
+  let completed = false;
+
+  const flushPart = async () => {
+    if (partBytes === 0) {
+      return;
+    }
+    if (multipartUpload == null) {
+      multipartUpload = await bucket.createMultipartUpload(objectKey, putOptions);
+    }
+    const partBody = partBuffers.length === 1
+      ? partBuffers[0]
+      : Buffer.concat(partBuffers, partBytes);
+    const uploadedPart = await multipartUpload.uploadPart(partNumber, partBody);
+    uploadedParts.push(uploadedPart);
+    partNumber += 1;
+    partBuffers.length = 0;
+    partBytes = 0;
+  };
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      const chunk = Buffer.from(value);
+      total += chunk.byteLength;
+      if (Number.isInteger(maxBytes) && total > maxBytes) {
+        throw createContentTooLargeError(maxBytes);
+      }
+      hash.update(chunk);
+      let offset = 0;
+      while (offset < chunk.byteLength) {
+        const remainingBytes = normalizedPartSize - partBytes;
+        const nextOffset = Math.min(offset + remainingBytes, chunk.byteLength);
+        const slice = chunk.subarray(offset, nextOffset);
+        partBuffers.push(slice);
+        partBytes += slice.byteLength;
+        offset = nextOffset;
+        if (partBytes === normalizedPartSize) {
+          await flushPart();
+        }
+      }
+    }
+
+    if (total === 0) {
+      await bucket.put(objectKey, Buffer.alloc(0), putOptions);
+      return {
+        byte_size: 0,
+        sha256: hash.digest('base64url'),
+      };
+    }
+
+    await flushPart();
+    await multipartUpload.complete(uploadedParts);
+    completed = true;
+    return {
+      byte_size: total,
+      sha256: hash.digest('base64url'),
+    };
+  } catch (error) {
+    await reader.cancel(error).catch(() => {});
+    if (multipartUpload && !completed) {
+      await multipartUpload.abort().catch(() => {});
+    }
+    throw error;
+  }
 }
 
 export async function readBodyWithDigest(source, {
@@ -366,7 +491,9 @@ function prependReadableStream(prefix, stream, {
         await writer.abort(error).catch(() => {});
       }
     })();
-    return markCloudflareKnownLengthStream(fixedLength.readable, 'fixed-length-stream');
+    return markCloudflareKnownLengthStream(fixedLength.readable, 'fixed-length-stream', {
+      knownByteLength: knownLength,
+    });
   }
   let prefixSent = false;
   let sourceBytesRead = 0;
@@ -405,7 +532,9 @@ function prependReadableStream(prefix, stream, {
     },
   });
   return Number.isInteger(knownLength)
-    ? markCloudflareKnownLengthStream(readable, 'fixed-length-stream')
+    ? markCloudflareKnownLengthStream(readable, 'fixed-length-stream', {
+      knownByteLength: knownLength,
+    })
     : readable;
 }
 

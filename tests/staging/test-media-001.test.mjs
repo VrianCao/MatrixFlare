@@ -47,6 +47,23 @@ test('TEST-MEDIA-001 staging covers current auth media, legacy unauth compatibil
   assert.equal(upload.response.status, 200);
   const uploaded = parseMxc(upload.payload?.content_uri);
 
+  const chunkedUpload = await request(harness, '/_matrix/media/v3/upload?filename=phase08-media-stream.gif', {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${alice.access_token}`,
+      'content-type': 'image/gif',
+    },
+    body: new ReadableStream({
+      start(controller) {
+        controller.enqueue(Buffer.from('GIF89a-phase08-stream-', 'utf8'));
+        controller.enqueue(Buffer.from('media-body', 'utf8'));
+        controller.close();
+      },
+    }),
+  });
+  assert.equal(chunkedUpload.response.status, 200);
+  const chunked = parseMxc(chunkedUpload.payload?.content_uri);
+
   const currentDownloadWithoutToken = await request(
     harness,
     `/_matrix/client/v1/media/download/${encodeURIComponent(uploaded.serverName)}/${encodeURIComponent(uploaded.mediaId)}/phase08-media.gif`,
@@ -64,6 +81,18 @@ test('TEST-MEDIA-001 staging covers current auth media, legacy unauth compatibil
   );
   assert.equal(currentDownload.response.status, 200);
   assert.equal(currentDownload.payload, 'GIF89a-phase08-media-body');
+
+  const chunkedCurrentDownload = await request(
+    harness,
+    `/_matrix/client/v1/media/download/${encodeURIComponent(chunked.serverName)}/${encodeURIComponent(chunked.mediaId)}/phase08-media-stream.gif`,
+    {
+      headers: {
+        authorization: `Bearer ${alice.access_token}`,
+      },
+    },
+  );
+  assert.equal(chunkedCurrentDownload.response.status, 200);
+  assert.equal(chunkedCurrentDownload.payload, 'GIF89a-phase08-stream-media-body');
 
   const legacyDownload = await request(
     harness,

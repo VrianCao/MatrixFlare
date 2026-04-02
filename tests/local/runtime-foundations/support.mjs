@@ -1,6 +1,8 @@
 import { DatabaseSync } from 'node:sqlite';
 
-import { CLOUDFLARE_KNOWN_LENGTH_STREAM } from '../../../packages/runtime-core/src/media-domain.mjs';
+import { readCloudflareKnownLengthStreamMetadata } from '../../../packages/runtime-core/src/media-domain.mjs';
+
+const R2_MULTIPART_MIN_PART_BYTES = 5 * 1024 * 1024;
 
 function detectStatementType(sql) {
   const trimmed = sql.trim().replace(/^\uFEFF/, '');
@@ -89,13 +91,21 @@ export function createFakeD1Database() {
 export class FakeR2Bucket {
   constructor() {
     this.objects = new Map();
+    this.multipartUploads = new Map();
+    this.nextMultipartUploadId = 1;
   }
 
   async put(key, value, options = {}) {
-    if (typeof value?.getReader === 'function' && !value[CLOUDFLARE_KNOWN_LENGTH_STREAM]) {
-      throw new Error('Provided readable stream must have a known length (request/response body or readable half of FixedLengthStream)');
+    const streamMetadata = typeof value?.getReader === 'function'
+      ? readCloudflareKnownLengthStreamMetadata(value)
+      : null;
+    if (typeof value?.getReader === 'function' && !Number.isInteger(streamMetadata?.byte_length)) {
+      throw new Error('Provided readable stream must declare an exact known byte length');
     }
     const body = await readInputToBuffer(value);
+    if (Number.isInteger(streamMetadata?.byte_length) && body.byteLength !== streamMetadata.byte_length) {
+      throw new Error(`Provided readable stream declared ${streamMetadata.byte_length} bytes but produced ${body.byteLength}`);
+    }
     this.objects.set(key, {
       body,
       options,
@@ -107,8 +117,9 @@ export class FakeR2Bucket {
     if (!entry) {
       return null;
     }
+    const streamBody = createReadableStreamFromBuffer(entry.body);
     return {
-      body: entry.body,
+      body: streamBody,
       size: entry.body.byteLength,
       etag: `"${key}"`,
       key,
@@ -163,6 +174,94 @@ export class FakeR2Bucket {
       delimitedPrefixes: [],
     };
   }
+
+  async createMultipartUpload(key, options = {}) {
+    const uploadId = `multipart-${this.nextMultipartUploadId++}`;
+    this.multipartUploads.set(uploadId, {
+      key,
+      options,
+      parts: new Map(),
+    });
+    return new FakeR2MultipartUpload(this, uploadId);
+  }
+}
+
+class FakeR2MultipartUpload {
+  constructor(bucket, uploadId) {
+    this.bucket = bucket;
+    this.uploadId = uploadId;
+  }
+
+  async uploadPart(partNumber, value) {
+    const state = this.#state();
+    const body = await readInputToBuffer(value);
+    const normalizedPartNumber = Number(partNumber);
+    const etag = `"${this.uploadId}:${normalizedPartNumber}"`;
+    state.parts.set(normalizedPartNumber, {
+      partNumber: normalizedPartNumber,
+      etag,
+      body,
+    });
+    return {
+      partNumber: normalizedPartNumber,
+      etag,
+    };
+  }
+
+  async complete(uploadedParts) {
+    const state = this.#state();
+    const normalizedParts = Array.isArray(uploadedParts)
+      ? uploadedParts
+      : [...state.parts.values()]
+        .sort((left, right) => left.partNumber - right.partNumber)
+        .map(({ partNumber, etag }) => ({ partNumber, etag }));
+    const resolvedParts = normalizedParts.map((part, index) => {
+      const normalizedPartNumber = Number(part?.partNumber);
+      const storedPart = state.parts.get(normalizedPartNumber);
+      if (!storedPart || storedPart.etag !== part?.etag) {
+        throw new Error(`Missing multipart upload part ${normalizedPartNumber}`);
+      }
+      if (index < normalizedParts.length - 1 && storedPart.body.byteLength < R2_MULTIPART_MIN_PART_BYTES) {
+        throw new Error(`Multipart upload part ${normalizedPartNumber} must be at least ${R2_MULTIPART_MIN_PART_BYTES} bytes`);
+      }
+      return storedPart;
+    });
+    this.bucket.objects.set(state.key, {
+      body: Buffer.concat(resolvedParts.map((part) => part.body)),
+      options: state.options,
+    });
+    this.bucket.multipartUploads.delete(this.uploadId);
+    return {
+      key: state.key,
+      etag: `"${state.key}"`,
+    };
+  }
+
+  async abort() {
+    this.bucket.multipartUploads.delete(this.uploadId);
+  }
+
+  #state() {
+    const state = this.bucket.multipartUploads.get(this.uploadId);
+    if (!state) {
+      throw new Error(`Unknown multipart upload ${this.uploadId}`);
+    }
+    return state;
+  }
+}
+
+function createReadableStreamFromBuffer(buffer) {
+  let sent = false;
+  return new ReadableStream({
+    pull(controller) {
+      if (sent) {
+        controller.close();
+        return;
+      }
+      sent = true;
+      controller.enqueue(Buffer.from(buffer));
+    },
+  });
 }
 
 async function readInputToBuffer(value) {

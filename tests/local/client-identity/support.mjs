@@ -122,11 +122,16 @@ export function createGatewayPhase04Rig(overrides = {}) {
     if (body != null && json != null) {
       throw new TypeError('body and json are mutually exclusive');
     }
-    const request = new Request(`https://matrix.example.test${pathname}`, {
+    const resolvedBody = json == null ? body : JSON.stringify(json);
+    const requestInit = {
       method,
       headers: requestHeaders,
-      body: json == null ? body : JSON.stringify(json),
-    });
+      body: resolvedBody,
+    };
+    if (resolvedBody && typeof resolvedBody.getReader === 'function') {
+      requestInit.duplex = 'half';
+    }
+    const request = new Request(`https://matrix.example.test${pathname}`, requestInit);
     return gatewayWorkerModule.fetch(request, env);
   }
 
