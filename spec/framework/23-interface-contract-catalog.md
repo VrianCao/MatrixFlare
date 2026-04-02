@@ -173,6 +173,11 @@ Federation explicit unsupported wire contract 固定如下：
 | `IF-OPS-007` | HTTP | operator / automation | `ops-worker` | `POST /_ops/v1/jobs/{jobId}/cancel` | Cloudflare Access JWT | `JobCancelRequest` / `JobCancelResponse` | `{operator_principal_id,idempotency_key,job_id}` | linearized by `job_id` | typed ops error; 401/403/404/409/429/500/503 | `42`,`40` | `DATA-OPS-001`,`DATA-OPS-002`,`DATA-OPS-004` | `FLOW-OPS-JOB-CONTROL` |
 | `IF-OPS-008` | HTTP | operator / automation | `ops-worker` | `GET/POST /_ops/v1/appservices`, `GET/PUT/DELETE /_ops/v1/appservices/{appserviceId}` | Cloudflare Access JWT | `AppserviceConfigRequest` / `AppserviceConfigResponse` | `{operator_principal_id,idempotency_key,appservice_id}` | linearized by `appservice_id` | typed ops error; 401/403/404/409/422/429/500/503 | `34`,`40`,`42` | `DATA-D1-005`,`DATA-OPS-004` | `FLOW-OPS-JOB-CONTROL` |
 
+补充约束：
+
+* 上述 `IF-OPS-*` 行只约束已经穿过 Cloudflare Access 并到达 `ops-worker` 的请求。
+* 若请求在 Access 边缘就因缺少/无效 service token、cookie 或 JWT 而被拒绝，该拒绝响应属于 Access-protected ingress 的 fail-closed 行为，不要求实例化 `OpsErrorResponse`，也不要求返回 JSON；non-local gate 只需证明该 protected ingress 确实拒绝了未授权请求。
+
 ## 4. Internal Runtime Contracts
 
 ### 4.1 Worker-to-DO
@@ -206,7 +211,7 @@ Federation explicit unsupported wire contract 固定如下：
 | `IF-INT-WKR-004` | RPC | `ops-worker` | `jobs-worker` | `startRestore(jobSpec)` | service binding | `RestoreJobSpec` / `JobHandle` | operator job id | at-most-once create | typed internal error | `42` | `DATA-OPS-001`,`DATA-R2-005` | `FLOW-OPS-JOB-CONTROL` |
 | `IF-INT-WKR-005` | RPC | `ops-worker` | `jobs-worker` | `startRepair(jobSpec)` | service binding | `RepairJobSpec` / `JobHandle` | operator job id | at-most-once create | typed internal error | `42` | `DATA-OPS-001`,`DATA-OPS-003` | `FLOW-OPS-JOB-CONTROL` |
 | `IF-QUE-001` | Queue | `jobs-worker` or DO producer | `jobs-worker` | `search-index-job` | internal | `SearchIndexJob` | `event_id` | unordered, idempotent consumer | poison/retry | `34` | `DATA-D1-001` | `FLOW-SEARCH-INDEX` |
-| `IF-QUE-002` | Queue | `gateway-worker` | `jobs-worker` | `media-thumbnail-job` | internal | `ThumbnailJob` | `mxc_uri` | unordered, idempotent consumer | poison/retry | `33` | `DATA-R2-003`,`DATA-D1-004` | `FLOW-CS-MEDIA-UPLOAD` |
+| `IF-QUE-002` | Queue | `jobs-worker` | `jobs-worker` | `media-thumbnail-job` | internal | `ThumbnailJob` | `mxc_uri` | unordered, idempotent consumer | poison/retry | `33` | `DATA-R2-003`,`DATA-D1-004` | `FLOW-CS-MEDIA-UPLOAD` |
 | `IF-QUE-003` | Queue | `jobs-worker` | `jobs-worker` | `appservice-txn-job` | internal | `AppserviceTxnJob` | `{appservice_id,txn_id}` | strict logical order per appservice | poison/retry | `34` | `DATA-D1-005` | `FLOW-AS-TXN-DELIVERY` |
 | `IF-QUE-004` | Queue | `ops-worker` / `jobs-worker` | `jobs-worker` | `rebuild-shard-job` | internal | `RebuildShardJob` | `{job_id,rebuild_target,shard_type,shard_key}` | checkpointed replay order | poison/retry | `34`,`42` | `DATA-OPS-001`,`DATA-OPS-002` | `FLOW-REPLAY-REBUILD` |
 | `IF-QUE-005` | Queue | `ops-worker` / `jobs-worker` | `jobs-worker` | `export-shard-job` | internal | `ExportShardJob` | `{job_id,export_epoch,shard_type,shard_key}` | checkpointed replay order | poison/retry | `42` | `DATA-OPS-001`,`DATA-R2-005` | `FLOW-OPS-JOB-CONTROL` |

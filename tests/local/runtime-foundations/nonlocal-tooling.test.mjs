@@ -269,6 +269,28 @@ test('ops-worker non-local wrangler config requires real Access metadata and wir
   assert.equal(config.env.staging.vars.ACCESS_AUDIENCE, 'aud-staging-ops');
 });
 
+test('jobs-worker non-local wrangler config preserves derived queue producers needed by remote search and media flows', () => {
+  const plan = buildNonLocalEnvironmentPlan('pre-release', {
+    workersSubdomain: 'matrixflare',
+  });
+  const config = createEnvironmentWranglerConfig('jobs-worker', plan, {
+    d1DatabaseId: 'db-pre-release',
+    kvNamespaceId: 'kv-pre-release',
+  });
+
+  assert.deepEqual(
+    config.env['pre-release'].queues.producers.map((entry) => `${entry.binding}:${entry.queue}`),
+    [
+      'SEARCH_INDEX_QUEUE:matrix-search-index-job-pre-release',
+      'MEDIA_THUMBNAIL_QUEUE:matrix-media-thumbnail-job-pre-release',
+      'REBUILD_SHARD_QUEUE:matrix-rebuild-shard-job-pre-release',
+      'EXPORT_SHARD_QUEUE:matrix-export-shard-job-pre-release',
+      'RESTORE_SHARD_QUEUE:matrix-restore-shard-job-pre-release',
+      'REPAIR_SHARD_QUEUE:matrix-repair-shard-job-pre-release',
+    ],
+  );
+});
+
 test('non-local gateway deployment contract keeps the default shared search limiter baseline when no abuse override is configured', () => {
   const plan = buildNonLocalEnvironmentPlan('staging', {
     workersSubdomain: 'matrixflare',
@@ -909,9 +931,8 @@ test('latest active Cloudflare deployment identity validation rejects stale or m
 
 test('non-local deployment readiness retries with fresh per-attempt registration identities', async () => {
   const remoteHarnessEnv = {
-    MATRIX_REMOTE_BASE_URL: 'https://matrix-gateway-worker-staging.matrixflare.workers.dev',
-    MATRIX_REMOTE_SERVER_NAME: 'matrix-gateway-worker-staging.matrixflare.workers.dev',
-    MATRIX_REMOTE_OPS_BASE_URL: 'https://matrix-ops-worker-staging.matrixflare.workers.dev',
+    MATRIX_REMOTE_BASE_URL: 'https://matrix-gateway-worker-ci-integration.matrixflare.workers.dev',
+    MATRIX_REMOTE_SERVER_NAME: 'matrix-gateway-worker-ci-integration.matrixflare.workers.dev',
   };
   const expectedPaths = [
     '/_matrix/client/versions',
@@ -941,7 +962,7 @@ test('non-local deployment readiness retries with fresh per-attempt registration
   const observedCredentials = [];
   let responseIndex = 0;
 
-  const readiness = await waitForNonLocalDeploymentReadiness('staging', remoteHarnessEnv, {
+  const readiness = await waitForNonLocalDeploymentReadiness('ci-integration', remoteHarnessEnv, {
     maxAttempts: 2,
     initialDelayMs: 250,
     maxDelayMs: 250,
@@ -995,13 +1016,12 @@ test('non-local deployment readiness retries with fresh per-attempt registration
 
 test('non-local deployment readiness fails closed when representative HTTP paths stay unhealthy', async () => {
   const remoteHarnessEnv = {
-    MATRIX_REMOTE_BASE_URL: 'https://matrix-gateway-worker-pre-release.matrixflare.workers.dev',
-    MATRIX_REMOTE_SERVER_NAME: 'matrix-gateway-worker-pre-release.matrixflare.workers.dev',
-    MATRIX_REMOTE_OPS_BASE_URL: 'https://matrix-ops-worker-pre-release.matrixflare.workers.dev',
+    MATRIX_REMOTE_BASE_URL: 'https://matrix-gateway-worker-ci-integration.matrixflare.workers.dev',
+    MATRIX_REMOTE_SERVER_NAME: 'matrix-gateway-worker-ci-integration.matrixflare.workers.dev',
   };
   const delayCalls = [];
 
-  const readiness = await waitForNonLocalDeploymentReadiness('pre-release', remoteHarnessEnv, {
+  const readiness = await waitForNonLocalDeploymentReadiness('ci-integration', remoteHarnessEnv, {
     maxAttempts: 1,
     sleepImpl: async (delayMs) => {
       delayCalls.push(delayMs);
@@ -1026,6 +1046,17 @@ test('non-local deployment readiness fails closed when representative HTTP paths
   assert.equal(readiness.attempts[0].failure.step_name, 'versions');
   assert.match(readiness.last_error, /versions/);
   assert.deepEqual(delayCalls, []);
+});
+
+test('non-local deployment readiness refuses to probe staging without an Access session payload', async () => {
+  await assert.rejects(
+    () => waitForNonLocalDeploymentReadiness('staging', {
+      MATRIX_REMOTE_BASE_URL: 'https://matrix-gateway-worker-staging.matrixflare.workers.dev',
+      MATRIX_REMOTE_SERVER_NAME: 'matrix-gateway-worker-staging.matrixflare.workers.dev',
+      MATRIX_REMOTE_OPS_BASE_URL: 'https://matrix-ops-worker-staging.matrixflare.workers.dev',
+    }),
+    /Remote staging harness must provide MATRIX_REMOTE_OPS_ACCESS_CLIENT_ID/,
+  );
 });
 
 test('non-local deployment readiness probes authenticated ops health when Access credentials are available', async () => {
@@ -1122,33 +1153,33 @@ test('non-local deployment readiness probes authenticated ops health when Access
 test('runEnvironmentBackedSuite does not spawn the suite when readiness fails', async () => {
   const repoRoot = path.resolve('.');
   const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-nonlocal-suite-readiness-fail-'));
-  const deploymentSummary = buildDeploymentSummaryFixture('staging');
+  const deploymentSummary = buildDeploymentSummaryFixture('ci-integration');
   let spawnCalls = 0;
 
   try {
-    const result = await runEnvironmentBackedSuite('staging', repoRoot, {
+    const result = await runEnvironmentBackedSuite('ci-integration', repoRoot, {
       runTimestamp: '20260401T163500Z',
       outputRoot,
       sourceRunUri: 'https://github.com/example/matrix/actions/runs/12345',
       logArtifact: 'https://github.com/example/matrix/actions/runs/12345/artifacts/1',
-      executedBy: 'gha://example/matrix/nonlocal/staging',
-      reviewedBy: 'gha://example/matrix/nonlocal/staging',
-      topologyKind: 'cloudflare-staging',
+      executedBy: 'gha://example/matrix/nonlocal/ci-integration',
+      reviewedBy: 'gha://example/matrix/nonlocal/ci-integration',
+      topologyKind: 'cloudflare-ci-integration',
       deploymentSummary,
     }, {
-      requireGitHubActionsExecutionImpl: async () => ({ environment: 'staging' }),
+      requireGitHubActionsExecutionImpl: async () => ({ environment: 'ci-integration' }),
       assessNonLocalEnvironmentHarnessReadinessImpl: async () => ({
         ready: true,
         reason: null,
-        expanded_test_files: ['tests/staging/l1-mandatory.test.mjs'],
+        expanded_test_files: ['tests/integration/l1-mandatory.test.mjs'],
       }),
       requireCloudflareCredentialsImpl: () => ({ accountId: 'cf-account', apiToken: 'cf-token' }),
       readWorkersSubdomainImpl: async () => 'matrixflare',
       validateDeploymentSummaryAgainstCurrentCloudflareStateImpl: async () => (
-        buildDeploymentIdentityValidationFixture('staging')
+        buildDeploymentIdentityValidationFixture('ci-integration')
       ),
-      getRequiredTestFilesImpl: async () => [path.join(repoRoot, 'tests/staging/l1-mandatory.test.mjs')],
-      waitForNonLocalDeploymentReadinessImpl: async () => buildReadinessProbeFixture('staging', {
+      getRequiredTestFilesImpl: async () => [path.join(repoRoot, 'tests/integration/l1-mandatory.test.mjs')],
+      waitForNonLocalDeploymentReadinessImpl: async () => buildReadinessProbeFixture('ci-integration', {
         ready: false,
         lastError: 'register_complete: {"status":500,"error":"transient deploy window"}',
       }),
@@ -1173,14 +1204,63 @@ test('runEnvironmentBackedSuite does not spawn the suite when readiness fails', 
 test('runEnvironmentBackedSuite revalidates deployment identity after readiness before spawning the suite', async () => {
   const repoRoot = path.resolve('.');
   const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-nonlocal-suite-identity-'));
-  const deploymentSummary = buildDeploymentSummaryFixture('staging');
+  const deploymentSummary = buildDeploymentSummaryFixture('ci-integration');
   let spawnCalls = 0;
   let validationCalls = 0;
 
   try {
     await assert.rejects(
-      () => runEnvironmentBackedSuite('staging', repoRoot, {
+      () => runEnvironmentBackedSuite('ci-integration', repoRoot, {
         runTimestamp: '20260401T163600Z',
+        outputRoot,
+        sourceRunUri: 'https://github.com/example/matrix/actions/runs/12345',
+        logArtifact: 'https://github.com/example/matrix/actions/runs/12345/artifacts/1',
+        executedBy: 'gha://example/matrix/nonlocal/ci-integration',
+        reviewedBy: 'gha://example/matrix/nonlocal/ci-integration',
+        topologyKind: 'cloudflare-ci-integration',
+        deploymentSummary,
+      }, {
+        requireGitHubActionsExecutionImpl: async () => ({ environment: 'ci-integration' }),
+        assessNonLocalEnvironmentHarnessReadinessImpl: async () => ({
+          ready: true,
+          reason: null,
+          expanded_test_files: ['tests/integration/l1-mandatory.test.mjs'],
+        }),
+        requireCloudflareCredentialsImpl: () => ({ accountId: 'cf-account', apiToken: 'cf-token' }),
+        readWorkersSubdomainImpl: async () => 'matrixflare',
+        validateDeploymentSummaryAgainstCurrentCloudflareStateImpl: async () => {
+          validationCalls += 1;
+          if (validationCalls === 1) {
+            return buildDeploymentIdentityValidationFixture('ci-integration');
+          }
+          throw new Error('stale gateway deployment identity');
+        },
+        getRequiredTestFilesImpl: async () => [path.join(repoRoot, 'tests/integration/l1-mandatory.test.mjs')],
+        waitForNonLocalDeploymentReadinessImpl: async () => buildReadinessProbeFixture('ci-integration'),
+        spawnImpl: () => {
+          spawnCalls += 1;
+          throw new Error('suite must not spawn after stale deployment identity');
+        },
+      }),
+      /stale gateway deployment identity/,
+    );
+
+    assert.equal(validationCalls, 2);
+    assert.equal(spawnCalls, 0);
+  } finally {
+    await fs.rm(outputRoot, { recursive: true, force: true });
+  }
+});
+
+test('runEnvironmentBackedSuite refuses to run staging without a prepared Access session', async () => {
+  const repoRoot = path.resolve('.');
+  const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-nonlocal-suite-missing-access-'));
+  const deploymentSummary = buildDeploymentSummaryFixture('staging');
+
+  try {
+    await assert.rejects(
+      () => runEnvironmentBackedSuite('staging', repoRoot, {
+        runTimestamp: '20260402T163000Z',
         outputRoot,
         sourceRunUri: 'https://github.com/example/matrix/actions/runs/12345',
         logArtifact: 'https://github.com/example/matrix/actions/runs/12345/artifacts/1',
@@ -1193,29 +1273,17 @@ test('runEnvironmentBackedSuite revalidates deployment identity after readiness 
         assessNonLocalEnvironmentHarnessReadinessImpl: async () => ({
           ready: true,
           reason: null,
-          expanded_test_files: ['tests/staging/l1-mandatory.test.mjs'],
+          expanded_test_files: ['tests/staging/test-der-001.test.mjs'],
         }),
         requireCloudflareCredentialsImpl: () => ({ accountId: 'cf-account', apiToken: 'cf-token' }),
         readWorkersSubdomainImpl: async () => 'matrixflare',
-        validateDeploymentSummaryAgainstCurrentCloudflareStateImpl: async () => {
-          validationCalls += 1;
-          if (validationCalls === 1) {
-            return buildDeploymentIdentityValidationFixture('staging');
-          }
-          throw new Error('stale gateway deployment identity');
-        },
-        getRequiredTestFilesImpl: async () => [path.join(repoRoot, 'tests/staging/l1-mandatory.test.mjs')],
-        waitForNonLocalDeploymentReadinessImpl: async () => buildReadinessProbeFixture('staging'),
-        spawnImpl: () => {
-          spawnCalls += 1;
-          throw new Error('suite must not spawn after stale deployment identity');
-        },
+        validateDeploymentSummaryAgainstCurrentCloudflareStateImpl: async () => (
+          buildDeploymentIdentityValidationFixture('staging')
+        ),
+        getRequiredTestFilesImpl: async () => [path.join(repoRoot, 'tests/staging/test-der-001.test.mjs')],
       }),
-      /stale gateway deployment identity/,
+      /Remote staging harness must provide MATRIX_REMOTE_OPS_ACCESS_CLIENT_ID/,
     );
-
-    assert.equal(validationCalls, 2);
-    assert.equal(spawnCalls, 0);
   } finally {
     await fs.rm(outputRoot, { recursive: true, force: true });
   }

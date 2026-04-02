@@ -170,6 +170,8 @@ const WORKER_RUNTIME_MANIFEST = Object.freeze({
       services: Object.freeze([]),
       queues: Object.freeze({
         producers: Object.freeze([
+          { binding: 'SEARCH_INDEX_QUEUE', queue: 'matrix-search-index-job' },
+          { binding: 'MEDIA_THUMBNAIL_QUEUE', queue: 'matrix-media-thumbnail-job' },
           { binding: 'REBUILD_SHARD_QUEUE', queue: 'matrix-rebuild-shard-job' },
           { binding: 'EXPORT_SHARD_QUEUE', queue: 'matrix-export-shard-job' },
           { binding: 'RESTORE_SHARD_QUEUE', queue: 'matrix-restore-shard-job' },

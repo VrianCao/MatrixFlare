@@ -48,6 +48,14 @@
   "queues": {
     "producers": [
       {
+        "binding": "SEARCH_INDEX_QUEUE",
+        "queue": "matrix-search-index-job"
+      },
+      {
+        "binding": "MEDIA_THUMBNAIL_QUEUE",
+        "queue": "matrix-media-thumbnail-job"
+      },
+      {
         "binding": "REBUILD_SHARD_QUEUE",
         "queue": "matrix-rebuild-shard-job"
       },

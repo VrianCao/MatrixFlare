@@ -106,6 +106,25 @@ function assertNonLocalEnvironmentName(environmentName) {
   return environmentName;
 }
 
+function nonLocalEnvironmentRequiresOpsAccess(environmentName) {
+  return environmentName === 'staging' || environmentName === 'pre-release';
+}
+
+function assertRequiredOpsAccessRemoteHarnessEnv(environmentName, remoteHarnessEnv) {
+  if (!nonLocalEnvironmentRequiresOpsAccess(environmentName)) {
+    return;
+  }
+  if (!isNonEmptyString(remoteHarnessEnv.MATRIX_REMOTE_OPS_BASE_URL)) {
+    throw new RangeError(`Remote ${environmentName} harness must expose MATRIX_REMOTE_OPS_BASE_URL`);
+  }
+  if (!isNonEmptyString(remoteHarnessEnv.MATRIX_REMOTE_OPS_ACCESS_CLIENT_ID)) {
+    throw new RangeError(`Remote ${environmentName} harness must provide MATRIX_REMOTE_OPS_ACCESS_CLIENT_ID`);
+  }
+  if (!isNonEmptyString(remoteHarnessEnv.MATRIX_REMOTE_OPS_ACCESS_CLIENT_SECRET)) {
+    throw new RangeError(`Remote ${environmentName} harness must provide MATRIX_REMOTE_OPS_ACCESS_CLIENT_SECRET`);
+  }
+}
+
 function stableJson(value) {
   return JSON.stringify(value, null, 2) + '\n';
 }
@@ -2641,6 +2660,7 @@ export async function waitForNonLocalDeploymentReadiness(environmentName, remote
 } = {}) {
   const normalizedEnvironmentName = assertNonLocalEnvironmentName(environmentName);
   const validatedRemoteHarnessEnv = validateRemoteHarnessEnvironmentVariables(remoteHarnessEnv);
+  assertRequiredOpsAccessRemoteHarnessEnv(normalizedEnvironmentName, validatedRemoteHarnessEnv);
   if (!Number.isInteger(maxAttempts) || maxAttempts <= 0) {
     throw new RangeError('maxAttempts must be a positive integer');
   }
@@ -3197,6 +3217,7 @@ export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
     }),
     accessSession,
   );
+  assertRequiredOpsAccessRemoteHarnessEnv(normalizedEnvironmentName, remoteHarnessEnv);
   const deploymentIdentityValidation = {
     before_readiness: await validateDeploymentSummaryAgainstCurrentCloudflareStateImpl(deploymentSummary, {
       accountId,

@@ -706,6 +706,41 @@ test('ops-worker requires Access JWT before request parsing or resource lookup o
   }
 });
 
+test('ops-worker rejects raw service-token ingress headers when Access did not mint a JWT assertion', async () => {
+  const teamDomain = `ops-service-headers-${Date.now()}.cloudflareaccess.com`;
+  const rig = await createControlPlaneRig({
+    teamDomain,
+    policies: [
+      defaultPolicy({
+        principalId: 'svc-ci',
+        principalType: 'service',
+        subjectValue: 'svc-ci',
+        teamDomain,
+        audience: 'aud-ops',
+      }),
+    ],
+  });
+
+  try {
+    const response = await rig.opsWorker(
+      rig.makeOpsRequest('/_ops/v1/healthz', {
+        assertion: null,
+        headers: {
+          'CF-Access-Client-Id': 'fake-client-id.access',
+          'CF-Access-Client-Secret': 'fake-client-secret',
+        },
+      }),
+      rig.opsEnv,
+    );
+    assert.equal(response.status, 401);
+    const payload = await response.json();
+    assert.equal(payload.code, 'unauthorized');
+    assert.equal(payload.retryable, false);
+  } finally {
+    rig.close();
+  }
+});
+
 test('ops-worker accepts export jobs, deduplicates identical requests, rejects conflicts, and jobs-worker completes queued export tasks', async () => {
   const teamDomain = `ops-${Date.now()}.cloudflareaccess.com`;
   const rig = await createControlPlaneRig({

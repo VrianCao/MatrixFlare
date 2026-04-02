@@ -126,7 +126,6 @@ jobs:
       - name: Prepare non-local ops Access session
         if: matrix.environment != 'ci-integration'
         id: access
-        continue-on-error: true
         run: |
           node packages/testing/src/cli.mjs nonlocal-prepare-ops-access \
             --environment "${{ matrix.environment }}" \
@@ -152,7 +151,7 @@ jobs:
             --reviewed-by "github-actions-run:${{ github.run_id }}"
             --topology-kind "cloudflare-${{ matrix.environment }}"
           )
-          if [ -f "${{ steps.paths.outputs.access_session }}" ]; then
+          if [ "${{ matrix.environment }}" != "ci-integration" ]; then
             args+=(--access-session "${{ steps.paths.outputs.access_session }}")
           fi
           "${args[@]}"

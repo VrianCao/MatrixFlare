@@ -95,7 +95,8 @@
 
 适用规则：
 
-* [23-interface-contract-catalog.md](./23-interface-contract-catalog.md) 中所有 `typed ops error` 及其带显式 HTTP status 后缀的变体，都必须实例化为 `OpsErrorResponse`。
+* [23-interface-contract-catalog.md](./23-interface-contract-catalog.md) 中所有已经到达 `ops-worker` 的 `typed ops error` 及其带显式 HTTP status 后缀的变体，都必须实例化为 `OpsErrorResponse`。
+* 若请求在 Cloudflare Access 边缘就被拒绝、从未到达 `ops-worker`，该响应不属于 `OpsErrorResponse` 契约范围；非本地门禁应把它视为 Access-protected ingress 的 fail-closed 结果，而不是 origin typed-error 违规。
 * 若 `Error Model` 写成 `typed ops error; 401/403/404/409/422` 之类形式，分号后的状态集合只约束允许返回的 HTTP status；响应体 shape 仍固定为 `OpsErrorResponse`。
 * `OpsErrorResponse.code` 与 HTTP status 的默认映射固定如下：`unauthorized -> 401`，`forbidden -> 403`，`not_found -> 404`，`idempotency_conflict -> 409`，`precondition_failed -> 409`，`validation_failed -> 422`，`rate_limited -> 429`，`internal -> 500` 或 `503`（仅当 `retryable = true` 时允许 `503`）。
 

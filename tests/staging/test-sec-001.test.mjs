@@ -33,10 +33,19 @@ async function requestAs(harness, accessToken, pathname, {
   });
 }
 
-function assertUnauthorizedOps(result) {
+function assertProtectedOpsIngressDeny(result) {
   assert.equal(result.response.status, 401);
-  assert.equal(result.payload?.code, 'unauthorized');
-  assert.equal(result.payload?.retryable, false);
+  const contentType = result.response.headers.get('content-type') ?? '';
+  if (contentType.includes('application/json')) {
+    assert.equal(result.payload?.code, 'unauthorized');
+    assert.equal(result.payload?.retryable, false);
+    return;
+  }
+  assert.equal(typeof result.payload, 'string');
+  assert.ok(
+    result.response.headers.has('cf-access-domain') || result.response.headers.has('cf-access-aud'),
+    'expected Cloudflare Access edge denial headers on non-JSON protected-ingress response',
+  );
 }
 
 async function collectBatchResponses(total, batchSize, callback) {
@@ -244,7 +253,7 @@ test('TEST-SEC-001 staging covers token revocation, route-bound UIA, and ops sec
   assert.equal(latestPasswordWhoAmI.payload?.user_id, alice.user_id);
 
   const opsWithoutJwt = await requestOps(harness, '/_ops/v1/healthz');
-  assertUnauthorizedOps(opsWithoutJwt);
+  assertProtectedOpsIngressDeny(opsWithoutJwt);
 
   const opsWithServiceTokenHeaders = await requestOps(harness, '/_ops/v1/healthz', {
     headers: {
@@ -252,7 +261,7 @@ test('TEST-SEC-001 staging covers token revocation, route-bound UIA, and ops sec
       'CF-Access-Client-Secret': 'fake-client-secret',
     },
   });
-  assertUnauthorizedOps(opsWithServiceTokenHeaders);
+  assertProtectedOpsIngressDeny(opsWithServiceTokenHeaders);
 
   const opsWithCookieOnly = await requestOps(harness, '/_ops/v1/healthz', {
     headers: {
@@ -260,7 +269,7 @@ test('TEST-SEC-001 staging covers token revocation, route-bound UIA, and ops sec
       'cf-access-token': 'fake-cookie',
     },
   });
-  assertUnauthorizedOps(opsWithCookieOnly);
+  assertProtectedOpsIngressDeny(opsWithCookieOnly);
 });
 
 test('TEST-SEC-001 staging enforces baseline abuse guards on always-on login, media, search, and publicRooms surfaces', async (context) => {

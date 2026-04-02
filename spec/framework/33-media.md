@@ -35,7 +35,7 @@
 3. 生成本地 `mxc://server/media_id`。
 4. 将请求体流式写入 `DATA-R2-001`。
 5. 写入成功后调用 `IF-INT-MEDIA-002 finalizeMediaUpload(result)`。
-6. 投递 `IF-QUE-002`，异步执行缩略图生成与媒体目录 upsert。
+6. 调用 `IF-INT-WKR-001 enqueueDerivedWork()` 投递 `media_thumbnail` derived work；`jobs-worker` 随后发出 `IF-QUE-002`，异步执行缩略图生成与媒体目录 upsert。
 
 ### 3.2 尺寸限制
 
@@ -111,7 +111,7 @@
 3. 执行远端发现与连接。
 4. 流式抓取远端媒体。
 5. 同步写入 `DATA-R2-002`，并把该缓存对象的 `legacy_unauth_access_flag` 固定为“是否在 freeze 前首次填充缓存”。
-6. 投递 `IF-QUE-002`，异步写入媒体目录与需要的缩略图任务。
+6. 调用 `IF-INT-WKR-001 enqueueDerivedWork()` 投递 `media_thumbnail` derived work；`jobs-worker` 随后发出 `IF-QUE-002`，异步写入媒体目录与需要的缩略图任务。
 7. 向客户端返回本次流。
 
 ### 5.2 远端抓取护栏
