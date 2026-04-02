@@ -184,9 +184,9 @@ async function handleAppserviceList(request, env, config, requestContext, persis
     persistence,
     scope,
     body,
-    mutate: async () => {
+    mutate: async (tx) => {
       const now = new Date().toISOString();
-      await persistence.upsertAppserviceConfig({
+      await tx.upsertAppserviceConfig({
         appservice_id: body.appservice.appservice_id,
         descriptor: body.appservice,
         created_at: now,
@@ -250,8 +250,8 @@ async function handleAppserviceItem(request, env, config, requestContext, persis
       persistence,
       scope,
       body,
-      mutate: async () => {
-        await persistence.deleteAppserviceConfig(appserviceId);
+      mutate: async (tx) => {
+        await tx.deleteAppserviceConfig(appserviceId);
         return {
           appservice: null,
           appservices: null,
@@ -283,10 +283,10 @@ async function handleAppserviceItem(request, env, config, requestContext, persis
     persistence,
     scope,
     body,
-    mutate: async () => {
-      const existing = await persistence.getAppserviceConfig(appserviceId);
+    prepare: async (tx) => tx.getAppserviceConfig(appserviceId),
+    mutate: async (tx, existing) => {
       const createdAt = existing?.created_at ?? new Date().toISOString();
-      await persistence.upsertAppserviceConfig({
+      await tx.upsertAppserviceConfig({
         appservice_id: appserviceId,
         descriptor: body.appservice,
         created_at: createdAt,

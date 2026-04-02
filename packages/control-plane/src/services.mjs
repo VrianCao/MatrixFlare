@@ -1895,6 +1895,7 @@ export async function createAppserviceMutation({
   persistence,
   scope,
   body,
+  prepare = null,
   mutate,
 }) {
   const idempotencyKey = request.headers.get('Idempotency-Key');
@@ -1936,6 +1937,8 @@ export async function createAppserviceMutation({
 
   try {
     const finalEnvelope = await persistence.transaction(async (tx) => {
+      const prepared = typeof prepare === 'function' ? await prepare(tx) : null;
+
       await appendAuditEvent({
         persistence: tx,
         eventType: 'appservice.accepted',
@@ -1971,7 +1974,7 @@ export async function createAppserviceMutation({
         route_template: routeTemplate,
       };
       try {
-        const responseBody = await mutate();
+        const responseBody = await mutate(tx, prepared);
         envelope = serializeEnvelope('success', 200, responseBody);
         resultCode = 'succeeded';
         eventType = 'appservice.succeeded';

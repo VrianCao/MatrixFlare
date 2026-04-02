@@ -4067,6 +4067,63 @@ test('ops-worker rebuild start converges legacy control-plane D1 tables to the c
   }
 });
 
+test('ops-worker rebuild start stays successful when the control-plane D1 runtime rejects raw SQL transaction statements', async () => {
+  const teamDomain = `ops-d1-managed-${Date.now()}.cloudflareaccess.com`;
+  const idempotencyKey = `idem-managed-d1-rebuild-${Date.now()}`;
+  const rig = await createControlPlaneRig({
+    teamDomain,
+    policies: [
+      defaultPolicy({
+        principalId: 'human-1',
+        subjectValue: '@operator:example.test',
+        teamDomain,
+        audience: 'aud-ops',
+      }),
+    ],
+    controlPlaneD1Options: {
+      rejectRawTransactions: true,
+    },
+  });
+
+  try {
+    await rig.persistence.upsertShardRegistry({
+      shard_type: 'UserDO',
+      shard_key: '@operator:example.test',
+      created_at: '2026-04-02T19:00:00.000Z',
+      last_seen_at: '2026-04-02T19:00:00.000Z',
+      schema_version: 1,
+      disabled_at: null,
+    });
+
+    const response = await rig.opsWorker(
+      rig.makeOpsRequest('/_ops/v1/rebuilds', {
+        method: 'POST',
+        body: {
+          rebuild_target: 'user_directory',
+          scope: {
+            scope_kind: 'global',
+            scope_id: null,
+          },
+          reason: 'managed d1 transaction semantics',
+          force_full_scan: false,
+        },
+        headers: {
+          'Idempotency-Key': idempotencyKey,
+        },
+      }),
+      rig.opsEnv,
+    );
+
+    assert.equal(response.status, 202);
+    const payload = await response.json();
+    assert.equal(payload.job_type, 'rebuild');
+    assert.equal(payload.idempotency_key_echo, idempotencyKey);
+    assert.equal(rig.queues.rebuild.messages.length, 1);
+  } finally {
+    rig.close();
+  }
+});
+
 test('dispatchJobStart keeps non-JSON jobs-worker failures diagnosable without echoing raw HTML in the error message', async () => {
   await assert.rejects(
     dispatchJobStart({

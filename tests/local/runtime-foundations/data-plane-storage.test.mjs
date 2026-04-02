@@ -961,6 +961,200 @@ test('control-plane D1 schema bootstrap avoids exec() so non-local publicRooms d
   d1.close();
 });
 
+test('control-plane D1 transaction avoids raw BEGIN/COMMIT SQL on managed D1 bindings', async () => {
+  const d1 = createFakeD1Database();
+  const originalExec = d1.exec.bind(d1);
+  const executedSql = [];
+  d1.exec = async (sql) => {
+    executedSql.push(sql);
+    if (/^\s*(BEGIN|COMMIT|ROLLBACK)\b/i.test(sql)) {
+      throw new Error('D1_EXEC_ERROR: raw transaction SQL is not allowed on managed D1 bindings');
+    }
+    return originalExec(sql);
+  };
+
+  const controlPlane = createD1ControlPlanePersistence(d1);
+  await controlPlane.ensureSchema();
+  await controlPlane.transaction(async (tx) => {
+    await tx.upsertOperatorPolicy({
+      principal_id: 'ops-managed-d1',
+      principal_type: 'human',
+      access_issuer: 'https://matrix.cloudflareaccess.com',
+      access_audience: 'aud-managed',
+      access_subject_binding: { mode: 'sub' },
+      access_subject_value: 'managed-subject',
+      allowed_scopes: ['ops.read'],
+      target_scope_constraints: { global: true },
+      expires_at: null,
+      disabled_at: null,
+      require_reason: false,
+      require_ticket: false,
+      created_at: '2026-04-02T19:00:00.000Z',
+      updated_at: '2026-04-02T19:00:00.000Z',
+    });
+  });
+
+  const activePolicies = await controlPlane.listActiveOperatorPolicies({
+    issuer: 'https://matrix.cloudflareaccess.com',
+    audience: 'aud-managed',
+    now: '2026-04-02T19:00:01.000Z',
+  });
+  assert.equal(activePolicies.length, 1);
+  assert.equal(
+    executedSql.some((sql) => /^\s*(BEGIN|COMMIT|ROLLBACK)\b/i.test(sql)),
+    false,
+  );
+  d1.close();
+});
+
+test('control-plane D1 transaction rolls back the entire batch when one grouped write fails', async () => {
+  const d1 = createFakeD1Database();
+  const controlPlane = createD1ControlPlanePersistence(d1);
+  await controlPlane.ensureSchema();
+
+  await assert.rejects(
+    controlPlane.transaction(async (tx) => {
+      const event = {
+        event_id: 'audit-rollback-test',
+        event_type: 'rebuild.accepted',
+        occurred_at: '2026-04-02T19:10:00.000Z',
+        operator_principal_id: 'ops-managed-d1',
+        auth_mechanism: 'access-jwt',
+        scope: {
+          scope_kind: 'global',
+          scope_id: null,
+        },
+        request_id: 'req-managed-d1',
+        idempotency_key: 'idem-managed-d1',
+        request_fingerprint: 'fingerprint-managed-d1',
+        job_id: 'job-managed-d1',
+        causation_id: 'job-managed-d1',
+        result_code: 'accepted',
+        affected_objects: [{ kind: 'job', id: 'job-managed-d1' }],
+        details: {
+          action: 'accepted',
+        },
+      };
+      await tx.insertAuditEvent(event);
+      await tx.insertAuditEvent(event);
+    }),
+    /UNIQUE|constraint/i,
+  );
+
+  const exported = await controlPlane.exportControlPlaneSnapshot();
+  assert.equal(exported.tables.audit_events.length, 0);
+  d1.close();
+});
+
+test('control-plane D1 transaction rejects nested transaction() calls instead of merging them into the same batch', async () => {
+  const d1 = createFakeD1Database();
+  const controlPlane = createD1ControlPlanePersistence(d1);
+  await controlPlane.ensureSchema();
+
+  await assert.rejects(
+    controlPlane.transaction(async (tx) => {
+      await tx.transaction(async (inner) => {
+        await inner.insertAuditEvent({
+          event_id: 'audit-nested-test',
+          event_type: 'rebuild.accepted',
+          occurred_at: '2026-04-02T20:30:00.000Z',
+          operator_principal_id: 'ops-managed-d1',
+          auth_mechanism: 'access-jwt',
+          scope: {
+            scope_kind: 'global',
+            scope_id: null,
+          },
+          request_id: 'req-nested',
+          idempotency_key: 'idem-nested',
+          request_fingerprint: 'fingerprint-nested',
+          job_id: 'job-nested',
+          causation_id: 'job-nested',
+          result_code: 'accepted',
+          affected_objects: [{ kind: 'job', id: 'job-nested' }],
+          details: {
+            action: 'accepted',
+          },
+        });
+      });
+    }),
+    /nested or concurrent transaction\(\) calls/i,
+  );
+
+  const exported = await controlPlane.exportControlPlaneSnapshot();
+  assert.equal(exported.tables.audit_events.length, 0);
+  d1.close();
+});
+
+test('control-plane D1 transaction rejects concurrent transaction() calls instead of sharing the active batch', async () => {
+  const d1 = createFakeD1Database();
+  const controlPlane = createD1ControlPlanePersistence(d1);
+  await controlPlane.ensureSchema();
+
+  let releaseOuterTransaction = null;
+  const outerBlocked = new Promise((resolve) => {
+    releaseOuterTransaction = resolve;
+  });
+  const outerPromise = controlPlane.transaction(async (tx) => {
+    await tx.insertAuditEvent({
+      event_id: 'audit-concurrent-outer',
+      event_type: 'rebuild.accepted',
+      occurred_at: '2026-04-02T20:31:00.000Z',
+      operator_principal_id: 'ops-managed-d1',
+      auth_mechanism: 'access-jwt',
+      scope: {
+        scope_kind: 'global',
+        scope_id: null,
+      },
+      request_id: 'req-concurrent-outer',
+      idempotency_key: 'idem-concurrent-outer',
+      request_fingerprint: 'fingerprint-concurrent-outer',
+      job_id: 'job-concurrent-outer',
+      causation_id: 'job-concurrent-outer',
+      result_code: 'accepted',
+      affected_objects: [{ kind: 'job', id: 'job-concurrent-outer' }],
+      details: {
+        action: 'accepted',
+      },
+    });
+    await outerBlocked;
+  });
+
+  await assert.rejects(
+    controlPlane.transaction(async (tx) => {
+      await tx.insertAuditEvent({
+        event_id: 'audit-concurrent-inner',
+        event_type: 'rebuild.accepted',
+        occurred_at: '2026-04-02T20:31:01.000Z',
+        operator_principal_id: 'ops-managed-d1',
+        auth_mechanism: 'access-jwt',
+        scope: {
+          scope_kind: 'global',
+          scope_id: null,
+        },
+        request_id: 'req-concurrent-inner',
+        idempotency_key: 'idem-concurrent-inner',
+        request_fingerprint: 'fingerprint-concurrent-inner',
+        job_id: 'job-concurrent-inner',
+        causation_id: 'job-concurrent-inner',
+        result_code: 'accepted',
+        affected_objects: [{ kind: 'job', id: 'job-concurrent-inner' }],
+        details: {
+          action: 'accepted',
+        },
+      });
+    }),
+    /nested or concurrent transaction\(\) calls/i,
+  );
+
+  releaseOuterTransaction();
+  await outerPromise;
+
+  const exported = await controlPlane.exportControlPlaneSnapshot();
+  assert.equal(exported.tables.audit_events.length, 1);
+  assert.equal(exported.tables.audit_events[0].event_id, 'audit-concurrent-outer');
+  d1.close();
+});
+
 test('control-plane D1 schema bootstrap memoizes once-per-isolate after the first successful ensureSchema()', async () => {
   const d1 = createFakeD1Database();
   const originalPrepare = d1.prepare.bind(d1);

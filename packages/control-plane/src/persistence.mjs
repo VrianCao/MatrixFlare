@@ -370,6 +370,35 @@ export function createD1ControlPlanePersistence(db) {
   }
   let schemaReady = false;
   let schemaReadyPromise = null;
+  let activeBatchStatements = null;
+
+  const statementRun = async (statement, ...bindings) => {
+    const boundStatement = statement.bind(...bindings);
+    if (activeBatchStatements) {
+      activeBatchStatements.push(boundStatement);
+      return { success: true };
+    }
+    return boundStatement.run();
+  };
+
+  const assertTransactionalReadAllowed = () => {
+    if (activeBatchStatements && activeBatchStatements.length > 0) {
+      throw new Error(
+        'control-plane D1 transaction cannot perform reads after queued transactional writes; split the read phase before the write batch',
+      );
+    }
+  };
+
+  const statementFirst = async (statement, ...bindings) => {
+    assertTransactionalReadAllowed();
+    return statement.bind(...bindings).first();
+  };
+
+  const statementAll = async (statement, ...bindings) => {
+    assertTransactionalReadAllowed();
+    const result = await statement.bind(...bindings).all();
+    return result?.results ?? [];
+  };
 
   return Object.freeze({
     async ensureSchema() {
@@ -410,14 +439,27 @@ export function createD1ControlPlanePersistence(db) {
       return rows.length === REQUIRED_CONTROL_PLANE_TABLES.length;
     },
     async transaction(callback) {
-      await db.exec('BEGIN IMMEDIATE;');
+      if (typeof callback !== 'function') {
+        throw new TypeError('transaction callback must be a function');
+      }
+      if (activeBatchStatements) {
+        throw new Error(
+          'control-plane D1 transaction does not support nested or concurrent transaction() calls on the same persistence instance',
+        );
+      }
+      if (typeof db.batch !== 'function') {
+        throw new TypeError('db must expose D1-compatible batch() for transactional control-plane writes');
+      }
+
+      activeBatchStatements = [];
       try {
         const result = await callback(this);
-        await db.exec('COMMIT;');
+        if (activeBatchStatements.length > 0) {
+          await db.batch(activeBatchStatements);
+        }
         return result;
-      } catch (error) {
-        await db.exec('ROLLBACK;');
-        throw error;
+      } finally {
+        activeBatchStatements = null;
       }
     },
     async upsertOperatorPolicy(record) {

@@ -60,6 +60,21 @@ export function createFakeSqlStorage() {
 
 export function createFakeD1Database() {
   const database = new DatabaseSync(':memory:');
+  const executePreparedStatement = (sql, bindings) => {
+    const statement = database.prepare(sql);
+    const statementType = detectStatementType(sql);
+    if (['SELECT', 'PRAGMA', 'WITH'].includes(statementType)) {
+      return {
+        success: true,
+        results: statement.all(...bindings),
+      };
+    }
+    statement.run(...bindings);
+    return {
+      success: true,
+      results: [],
+    };
+  };
   return {
     exec(sql) {
       database.exec(sql);
@@ -70,6 +85,9 @@ export function createFakeD1Database() {
       return {
         bind(...bindings) {
           return {
+            __sql: sql,
+            __bindings: bindings,
+            __batchExecute: () => executePreparedStatement(sql, bindings),
             run: async () => {
               statement.run(...bindings);
               return { success: true };
@@ -81,6 +99,23 @@ export function createFakeD1Database() {
           };
         },
       };
+    },
+    batch(statements) {
+      database.exec('BEGIN');
+      try {
+        const results = [];
+        for (const statement of statements) {
+          if (!statement || typeof statement.__batchExecute !== 'function') {
+            throw new TypeError('batch() requires prepared statements returned by bind()');
+          }
+          results.push(statement.__batchExecute());
+        }
+        database.exec('COMMIT');
+        return Promise.resolve(results);
+      } catch (error) {
+        database.exec('ROLLBACK');
+        return Promise.reject(error);
+      }
     },
     close() {
       database.close();
