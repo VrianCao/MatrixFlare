@@ -104,6 +104,8 @@ const EXPECTED_WORKER_BASE_NAMES = Object.freeze([
 const L1_TEST_IMPLEMENTATION_FILES = Object.freeze({
   'TEST-CS-001': Object.freeze({
     local: Object.freeze(['tests/local/client-identity/phase-04.test.mjs']),
+    'ci-integration': Object.freeze(['tests/integration/test-cs-001.test.mjs']),
+    staging: Object.freeze(['tests/staging/test-cs-001.test.mjs']),
   }),
   'TEST-CS-002': Object.freeze({
     local: Object.freeze(['tests/local/client-identity/phase-05.test.mjs']),
@@ -113,18 +115,27 @@ const L1_TEST_IMPLEMENTATION_FILES = Object.freeze({
       'tests/local/client-identity/phase-05.test.mjs',
       'tests/local/client-identity/phase-05a.test.mjs',
     ]),
+    staging: Object.freeze(['tests/staging/test-cs-003.test.mjs']),
   }),
   'TEST-CS-004': Object.freeze({
     local: Object.freeze(['tests/local/client-identity/phase-04.test.mjs']),
+    'ci-integration': Object.freeze(['tests/integration/test-cs-004.test.mjs']),
+    staging: Object.freeze(['tests/staging/test-cs-004.test.mjs']),
   }),
   'TEST-ROOM-001': Object.freeze({
     local: Object.freeze(['tests/local/client-identity/phase-06.test.mjs']),
+    'ci-integration': Object.freeze(['tests/integration/test-room-001.test.mjs']),
+    staging: Object.freeze(['tests/staging/test-room-001.test.mjs']),
   }),
   'TEST-ROOM-002': Object.freeze({
     local: Object.freeze(['tests/local/client-identity/phase-06.test.mjs']),
+    'ci-integration': Object.freeze(['tests/integration/test-room-002.test.mjs']),
+    staging: Object.freeze(['tests/staging/test-room-002.test.mjs']),
   }),
   'TEST-MEDIA-001': Object.freeze({
     local: Object.freeze(['tests/local/client-identity/phase-07.test.mjs']),
+    staging: Object.freeze(['tests/staging/test-media-001.test.mjs']),
+    'pre-release': Object.freeze(['tests/pre-release/test-media-001.test.mjs']),
   }),
   'TEST-DER-001': Object.freeze({
     local: Object.freeze(['tests/local/client-identity/phase-07.test.mjs']),
