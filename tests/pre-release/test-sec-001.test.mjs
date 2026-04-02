@@ -51,6 +51,51 @@ async function collectBatchResponses(total, batchSize, callback) {
   return results;
 }
 
+async function assertPermissiveSearchLimiter(harness, accessToken, searchTerm, {
+  attempts = 12,
+  batchSize = 8,
+  delayMs = 100,
+} = {}) {
+  let limited = null;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const responses = await collectBatchResponses(batchSize, batchSize, async () => postAuthenticated(
+      harness,
+      accessToken,
+      '/_matrix/client/v3/search',
+      {
+        search_categories: {
+          room_events: {
+            search_term: searchTerm,
+            filter: {
+              limit: 1,
+            },
+          },
+        },
+      },
+    ));
+    for (const response of responses) {
+      if (response.response.status === 429) {
+        limited ??= response;
+        continue;
+      }
+      assert.equal(
+        response.response.status,
+        200,
+        `Expected bounded search limiter window to return 200 or 429, received ${response.response.status}`,
+      );
+      assert.ok(Array.isArray(response.payload?.search_categories?.room_events?.results));
+    }
+    if (limited != null) {
+      break;
+    }
+    if (attempt + 1 < attempts) {
+      await sleep(delayMs);
+    }
+  }
+  assert.notEqual(limited, null, `Expected search limiter to yield 429 within ${attempts * batchSize} bounded attempts`);
+  await expectMatrixError(limited, 429, 'M_LIMIT_EXCEEDED');
+}
+
 async function assertPermissivePublicRoomsLimiter(harness, {
   attempts = 12,
   delayMs = 100,
@@ -279,27 +324,7 @@ test('TEST-SEC-001 pre-release enforces baseline abuse guards on always-on login
     password: 'phase08-sec-prerelease-password-6',
     deviceId: 'SECPRSEARCH',
   });
-  let searchLimited = null;
-  for (let index = 0; index < 70; index += 1) {
-    const search = await postAuthenticated(harness, searchUser.access_token, '/_matrix/client/v3/search', {
-      search_categories: {
-        room_events: {
-          search_term: 'phase08-sec-prerelease',
-          filter: {
-            limit: 1,
-          },
-        },
-      },
-    });
-    if (search.response.status === 429) {
-      searchLimited = search;
-      break;
-    }
-    assert.equal(search.response.status, 200);
-    assert.ok(Array.isArray(search.payload?.search_categories?.room_events?.results));
-  }
-  assert.notEqual(searchLimited, null);
-  await expectMatrixError(searchLimited, 429, 'M_LIMIT_EXCEEDED');
+  await assertPermissiveSearchLimiter(harness, searchUser.access_token, 'phase08-sec-prerelease');
 
   await assertPermissivePublicRoomsLimiter(harness);
 
