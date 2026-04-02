@@ -106,11 +106,13 @@ async function fetchHierarchy(harness, accessToken, spaceRoomId) {
 }
 
 async function waitForRebuildSuccess(harness, jobId) {
+  let lastJob = null;
   for (let attempt = 1; attempt <= 60; attempt += 1) {
     const result = await requestOpsAuthorized(harness, `/_ops/v1/jobs/${encodeURIComponent(jobId)}`);
     assert.equal(result.response.status, 200);
     const job = result.payload?.job;
     assert.equal(job?.job_id, jobId);
+    lastJob = job;
     if (job?.state === 'succeeded') {
       return job;
     }
@@ -121,7 +123,9 @@ async function waitForRebuildSuccess(harness, jobId) {
     }
     await sleep(1000);
   }
-  assert.fail(`rebuild job ${jobId} did not reach succeeded within the polling window`);
+  assert.fail(
+    `rebuild job ${jobId} did not reach succeeded within the polling window: ${summarizeOpsPayload(lastJob)}`,
+  );
 }
 
 test('TEST-DER-001 staging covers derived query semantics and Access-authenticated rebuild consistency', async (context) => {
@@ -329,30 +333,56 @@ test('TEST-DER-001 staging covers derived query semantics and Access-authenticat
     delayMs: 500,
   });
 
-  const rebuild = await requestOpsAuthorized(harness, '/_ops/v1/rebuilds', {
+  // This proof only needs the derived shards touched by the test data.
+  const userDirectoryRebuild = await requestOpsAuthorized(harness, '/_ops/v1/rebuilds', {
     method: 'POST',
     headers: {
-      'Idempotency-Key': `test-der-001-staging-${token}`,
+      'Idempotency-Key': `test-der-001-staging-user-${token}`,
     },
     json: {
-      rebuild_target: 'all_derived',
+      rebuild_target: 'user_directory',
       scope: {
-        scope_kind: 'global',
-        scope_id: null,
+        scope_kind: 'user_id',
+        scope_id: bob.user_id,
       },
-      reason: `TEST-DER-001 staging rebuild ${token}`,
-      ticket_id: `OPS-DER-STG-${token}`,
+      reason: `TEST-DER-001 staging user-directory rebuild ${token}`,
+      ticket_id: `OPS-DER-STG-USER-${token}`,
       force_full_scan: false,
     },
   });
   assert.equal(
-    rebuild.response.status,
+    userDirectoryRebuild.response.status,
     202,
-    `expected rebuild start to return 202, received ${rebuild.response.status}: ${summarizeOpsPayload(rebuild.payload)}`,
+    `expected user-directory rebuild start to return 202, received ${userDirectoryRebuild.response.status}: ${summarizeOpsPayload(userDirectoryRebuild.payload)}`,
   );
-  assert.equal(rebuild.payload?.job_type, 'rebuild');
-  const rebuildJob = await waitForRebuildSuccess(harness, rebuild.payload.job_id);
-  assert.equal(rebuildJob.result_summary?.rebuild_summary?.rebuild_target, 'all_derived');
+  assert.equal(userDirectoryRebuild.payload?.job_type, 'rebuild');
+  const userDirectoryJob = await waitForRebuildSuccess(harness, userDirectoryRebuild.payload.job_id);
+  assert.equal(userDirectoryJob.result_summary?.rebuild_summary?.rebuild_target, 'user_directory');
+
+  const roomDerivedRebuild = await requestOpsAuthorized(harness, '/_ops/v1/rebuilds', {
+    method: 'POST',
+    headers: {
+      'Idempotency-Key': `test-der-001-staging-room-${token}`,
+    },
+    json: {
+      rebuild_target: 'all_derived',
+      scope: {
+        scope_kind: 'room_id',
+        scope_id: publicRoomId,
+      },
+      reason: `TEST-DER-001 staging room-derived rebuild ${token}`,
+      ticket_id: `OPS-DER-STG-ROOM-${token}`,
+      force_full_scan: false,
+    },
+  });
+  assert.equal(
+    roomDerivedRebuild.response.status,
+    202,
+    `expected room-derived rebuild start to return 202, received ${roomDerivedRebuild.response.status}: ${summarizeOpsPayload(roomDerivedRebuild.payload)}`,
+  );
+  assert.equal(roomDerivedRebuild.payload?.job_type, 'rebuild');
+  const roomDerivedJob = await waitForRebuildSuccess(harness, roomDerivedRebuild.payload.job_id);
+  assert.equal(roomDerivedJob.result_summary?.rebuild_summary?.rebuild_target, 'all_derived');
 
   const anonymousAfterRebuild = await eventually(async () => {
     const payload = await fetchAnonymousPublicRooms(harness, token);
