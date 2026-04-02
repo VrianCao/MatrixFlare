@@ -101,9 +101,6 @@ async function assertPermissiveSearchAndPublicRoomsLimiter(harness, accessToken,
       );
       assert.ok(Array.isArray(searchResponse.payload?.search_categories?.room_events?.results));
     }
-    if (limited != null) {
-      break;
-    }
 
     const publicRoomsResponse = await request(
       harness,
