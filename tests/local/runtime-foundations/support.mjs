@@ -217,6 +217,13 @@ class FakeR2MultipartUpload {
         .map(({ partNumber, etag }) => ({ partNumber, etag }));
     const resolvedParts = normalizedParts.map((part, index) => {
       const normalizedPartNumber = Number(part?.partNumber);
+      if (!Number.isInteger(normalizedPartNumber) || normalizedPartNumber < 1) {
+        throw new Error(`Multipart upload part number ${String(part?.partNumber)} is invalid`);
+      }
+      const previousPartNumber = index === 0 ? null : Number(normalizedParts[index - 1]?.partNumber);
+      if (previousPartNumber != null && normalizedPartNumber <= previousPartNumber) {
+        throw new Error('Multipart upload parts must be strictly increasing and unique');
+      }
       const storedPart = state.parts.get(normalizedPartNumber);
       if (!storedPart || storedPart.etag !== part?.etag) {
         throw new Error(`Missing multipart upload part ${normalizedPartNumber}`);

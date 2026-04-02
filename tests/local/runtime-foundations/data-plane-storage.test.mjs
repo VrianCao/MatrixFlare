@@ -39,6 +39,7 @@ import {
 } from '../../../packages/runtime-core/src/index.mjs';
 import { createD1ControlPlanePersistence } from '../../../packages/control-plane/src/index.mjs';
 import { markCloudflareKnownLengthStream } from '../../../packages/runtime-core/src/media-domain.mjs';
+import { R2_MULTIPART_MIN_PART_BYTES } from '../../../packages/runtime-core/src/media-domain.mjs';
 import {
   FakeKvNamespace,
   FakeR2Bucket,
@@ -340,6 +341,23 @@ test('UserDO persistence lands DATA-USER-001 through DATA-USER-017 and exposes s
   const schemaState = await userDo.ensureSchema();
   assert.equal(schemaState.schema_version, USER_DO_SCHEMA_VERSION);
   storage.close();
+});
+
+test('FakeR2 multipart completion rejects out-of-order and duplicate uploaded parts', async () => {
+  const bucket = new FakeR2Bucket();
+  const multipart = await bucket.createMultipartUpload('phase08/multipart-ordering');
+  const first = await multipart.uploadPart(1, Buffer.alloc(R2_MULTIPART_MIN_PART_BYTES, 'a'));
+  const second = await multipart.uploadPart(2, Buffer.alloc(R2_MULTIPART_MIN_PART_BYTES, 'b'));
+
+  await assert.rejects(
+    multipart.complete([second, first]),
+    /strictly increasing and unique/,
+  );
+
+  await assert.rejects(
+    multipart.complete([first, first]),
+    /strictly increasing and unique/,
+  );
 });
 
 test('RoomDO persistence lands DATA-ROOM-001 through DATA-ROOM-012 with query indices and outbox helpers', async () => {

@@ -132,7 +132,8 @@ test('TEST-MEDIA-001 pre-release covers current auth media, legacy unauth compat
   assert.match(animatedThumbnail.payload, /^thumbnail:48x48:scale:animated\n/u);
   assert.notEqual(animatedThumbnail.payload, staticThumbnail.payload);
 
-  for (let index = 0; index < 8; index += 1) {
+  // The two upload requests above consume the same userdo_media semantic quota window.
+  for (let index = 0; index < 6; index += 1) {
     const reservation = await postAuthenticated(harness, alice.access_token, '/_matrix/media/v3/create');
     assert.equal(reservation.response.status, 200);
   }
