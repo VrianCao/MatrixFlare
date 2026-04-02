@@ -42,6 +42,7 @@ export {
   normalizeRepairJobRequest,
   normalizeRestoreJobRequest,
   normalizeTargetScope,
+  resolveCanonicalControlPlaneQueueName,
   parseScopeToken,
   scopeToToken,
 } from './schemas.mjs';

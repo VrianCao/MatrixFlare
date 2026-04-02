@@ -3026,6 +3026,346 @@ test('jobs-worker runtime consumer queues acknowledge malformed search jobs inst
   }
 });
 
+test('jobs-worker runtime consumer queues recognize environment-suffixed search queue names', async () => {
+  const rig = await createControlPlaneRig({
+    envOverrides: {
+      RESOURCE_BINDING_NAMES_JSON: JSON.stringify({
+        queues: {
+          SEARCH_INDEX_QUEUE: 'matrix-search-index-job-staging',
+        },
+      }),
+    },
+  });
+
+  try {
+    const message = {
+      body: {
+        target: 'search-index',
+      },
+      acked: false,
+      retried: false,
+      ack() {
+        this.acked = true;
+      },
+      retry() {
+        this.retried = true;
+      },
+    };
+    await rig.jobsWorker.queue({
+      queue: 'matrix-search-index-job-staging',
+      messages: [message],
+    }, rig.jobsEnv);
+
+    assert.equal(message.acked, true);
+    assert.equal(message.retried, false);
+  } finally {
+    rig.close();
+  }
+});
+
+test('jobs-worker runtime consumer queues still recognize canonical search queue names when bindings are suffixed', async () => {
+  const rig = await createControlPlaneRig({
+    envOverrides: {
+      RESOURCE_BINDING_NAMES_JSON: JSON.stringify({
+        queues: {
+          SEARCH_INDEX_QUEUE: 'matrix-search-index-job-staging',
+        },
+      }),
+    },
+  });
+
+  try {
+    const message = {
+      body: {
+        target: 'search-index',
+      },
+      acked: false,
+      retried: false,
+      ack() {
+        this.acked = true;
+      },
+      retry() {
+        this.retried = true;
+      },
+    };
+    await rig.jobsWorker.queue({
+      queue: 'matrix-search-index-job',
+      messages: [message],
+    }, rig.jobsEnv);
+
+    assert.equal(message.acked, true);
+    assert.equal(message.retried, false);
+  } finally {
+    rig.close();
+  }
+});
+
+test('jobs-worker runtime consumer queues recognize canonical and suffixed media queue names when bindings are suffixed', async () => {
+  const rig = await createControlPlaneRig({
+    envOverrides: {
+      RESOURCE_BINDING_NAMES_JSON: JSON.stringify({
+        queues: {
+          MEDIA_THUMBNAIL_QUEUE: 'matrix-media-thumbnail-job-staging',
+        },
+      }),
+    },
+  });
+
+  try {
+    for (const queueName of ['matrix-media-thumbnail-job-staging', 'matrix-media-thumbnail-job']) {
+      const message = {
+        body: 'not-an-object',
+        acked: false,
+        retried: false,
+        ack() {
+          this.acked = true;
+        },
+        retry() {
+          this.retried = true;
+        },
+      };
+      await rig.jobsWorker.queue({
+        queue: queueName,
+        messages: [message],
+      }, rig.jobsEnv);
+
+      assert.equal(message.acked, true, `${queueName} should be acknowledged by the runtime handler`);
+      assert.equal(message.retried, false, `${queueName} should not retry malformed runtime payloads`);
+    }
+  } finally {
+    rig.close();
+  }
+});
+
+test('jobs-worker control-plane consumer queues recognize environment-suffixed export queue names', async () => {
+  const rig = await createControlPlaneRig({
+    envOverrides: {
+      RESOURCE_BINDING_NAMES_JSON: JSON.stringify({
+        queues: {
+          EXPORT_SHARD_QUEUE: 'matrix-export-shard-job-staging',
+        },
+      }),
+    },
+  });
+
+  try {
+    const exportEpoch = `export_epoch_suffixed_queue_${Date.now()}`;
+    const spec = buildInternalJobSpec({
+      jobId: `export-suffixed-queue-${Date.now()}`,
+      jobType: 'export',
+      operatorPrincipalId: 'human-1',
+      authMechanism: 'Cf-Access-Jwt-Assertion',
+      scope: {
+        scope_kind: 'global',
+        scope_id: null,
+      },
+      reason: 'test suffixed export queue delivery',
+      ticketId: 'OPS-SUFFIXED-QUEUE',
+      idempotencyKey: 'idem-suffixed-queue',
+      requestFingerprint: 'fingerprint-suffixed-queue',
+      extra: {
+        registry_snapshot_id: 'registry_snapshot_suffixed_queue',
+        export_epoch: exportEpoch,
+        reuse_checkpoint_policy: 'force_fresh',
+      },
+    });
+    await rig.persistence.createJob(createStoredJobRecord({
+      spec,
+      internalState: 'checkpointed',
+      checkpointState: {
+        queue_ready: 1,
+        queue_name: 'matrix-export-shard-job-staging',
+      },
+      progressTotalUnits: 1,
+      registrySnapshotId: 'registry_snapshot_suffixed_queue',
+      exportEpoch,
+    }));
+    await rig.persistence.upsertJobCheckpoint({
+      job_id: spec.job_id,
+      shard_type: 'RoomDO',
+      shard_key: '!room:test',
+      checkpoint: {
+        status: 'queued',
+        queue_name: 'matrix-export-shard-job-staging',
+        attempt: 0,
+      },
+      updated_at: new Date().toISOString(),
+    });
+
+    const message = {
+      body: buildExportShardJob({
+        jobId: spec.job_id,
+        exportEpoch,
+        shardType: 'RoomDO',
+        shardKey: '!room:test',
+        checkpointStrategy: 'force_fresh',
+        attempt: 0,
+      }),
+      acked: false,
+      retried: false,
+      ack() {
+        this.acked = true;
+      },
+      retry() {
+        this.retried = true;
+      },
+    };
+    await rig.jobsWorker.queue({
+      queue: 'matrix-export-shard-job-staging',
+      messages: [message],
+    }, rig.jobsEnv);
+    assert.equal(message.acked, true);
+    assert.equal(message.retried, false);
+
+    const failedJob = await rig.persistence.getJob(spec.job_id);
+    assert.equal(failedJob.internal_state, 'failed');
+    assert.equal(failedJob.last_error.code, 'precondition_failed');
+    assert.match(failedJob.last_error.message, /only control-plane\/ops-core is implemented/);
+  } finally {
+    rig.close();
+  }
+});
+
+test('jobs-worker control-plane consumer queues still recognize canonical export queue names when bindings are suffixed', async () => {
+  const rig = await createControlPlaneRig({
+    envOverrides: {
+      RESOURCE_BINDING_NAMES_JSON: JSON.stringify({
+        queues: {
+          EXPORT_SHARD_QUEUE: 'matrix-export-shard-job-staging',
+        },
+      }),
+    },
+  });
+
+  try {
+    const exportEpoch = `export_epoch_canonical_queue_${Date.now()}`;
+    const spec = buildInternalJobSpec({
+      jobId: `export-canonical-queue-${Date.now()}`,
+      jobType: 'export',
+      operatorPrincipalId: 'human-1',
+      authMechanism: 'Cf-Access-Jwt-Assertion',
+      scope: {
+        scope_kind: 'global',
+        scope_id: null,
+      },
+      reason: 'test canonical export queue delivery under suffixed binding override',
+      ticketId: 'OPS-CANONICAL-QUEUE',
+      idempotencyKey: 'idem-canonical-queue',
+      requestFingerprint: 'fingerprint-canonical-queue',
+      extra: {
+        registry_snapshot_id: 'registry_snapshot_canonical_queue',
+        export_epoch: exportEpoch,
+        reuse_checkpoint_policy: 'force_fresh',
+      },
+    });
+    await rig.persistence.createJob(createStoredJobRecord({
+      spec,
+      internalState: 'checkpointed',
+      checkpointState: {
+        queue_ready: 1,
+        queue_name: 'matrix-export-shard-job',
+      },
+      progressTotalUnits: 1,
+      registrySnapshotId: 'registry_snapshot_canonical_queue',
+      exportEpoch,
+    }));
+    await rig.persistence.upsertJobCheckpoint({
+      job_id: spec.job_id,
+      shard_type: 'RoomDO',
+      shard_key: '!room:test',
+      checkpoint: {
+        status: 'queued',
+        queue_name: 'matrix-export-shard-job',
+        attempt: 0,
+      },
+      updated_at: new Date().toISOString(),
+    });
+
+    const message = {
+      body: buildExportShardJob({
+        jobId: spec.job_id,
+        exportEpoch,
+        shardType: 'RoomDO',
+        shardKey: '!room:test',
+        checkpointStrategy: 'force_fresh',
+        attempt: 0,
+      }),
+      acked: false,
+      retried: false,
+      ack() {
+        this.acked = true;
+      },
+      retry() {
+        this.retried = true;
+      },
+    };
+    await rig.jobsWorker.queue({
+      queue: 'matrix-export-shard-job',
+      messages: [message],
+    }, rig.jobsEnv);
+    assert.equal(message.acked, true);
+    assert.equal(message.retried, false);
+
+    const failedJob = await rig.persistence.getJob(spec.job_id);
+    assert.equal(failedJob.internal_state, 'failed');
+    assert.equal(failedJob.last_error.code, 'precondition_failed');
+    assert.match(failedJob.last_error.message, /only control-plane\/ops-core is implemented/);
+  } finally {
+    rig.close();
+  }
+});
+
+test('jobs-worker control-plane consumer queues still recognize canonical and suffixed rebuild/restore/repair queue names when bindings are suffixed', async () => {
+  const rig = await createControlPlaneRig({
+    envOverrides: {
+      RESOURCE_BINDING_NAMES_JSON: JSON.stringify({
+        queues: {
+          REBUILD_SHARD_QUEUE: 'matrix-rebuild-shard-job-staging',
+          RESTORE_SHARD_QUEUE: 'matrix-restore-shard-job-staging',
+          REPAIR_SHARD_QUEUE: 'matrix-repair-shard-job-staging',
+        },
+      }),
+    },
+  });
+
+  try {
+    const scenarios = [
+      { queueName: 'matrix-rebuild-shard-job-staging', jobId: `rebuild-suffixed-${Date.now()}` },
+      { queueName: 'matrix-rebuild-shard-job', jobId: `rebuild-canonical-${Date.now()}` },
+      { queueName: 'matrix-restore-shard-job-staging', jobId: `restore-suffixed-${Date.now()}` },
+      { queueName: 'matrix-restore-shard-job', jobId: `restore-canonical-${Date.now()}` },
+      { queueName: 'matrix-repair-shard-job-staging', jobId: `repair-suffixed-${Date.now()}` },
+      { queueName: 'matrix-repair-shard-job', jobId: `repair-canonical-${Date.now()}` },
+    ];
+
+    for (const scenario of scenarios) {
+      const message = {
+        body: {
+          job_id: scenario.jobId,
+          schema_version: 999,
+        },
+        acked: false,
+        retried: false,
+        ack() {
+          this.acked = true;
+        },
+        retry() {
+          this.retried = true;
+        },
+      };
+      await rig.jobsWorker.queue({
+        queue: scenario.queueName,
+        messages: [message],
+      }, rig.jobsEnv);
+
+      assert.equal(message.acked, true, `${scenario.queueName} should be acknowledged by the control-plane handler`);
+      assert.equal(message.retried, false, `${scenario.queueName} should fail closed on unsupported schema versions`);
+    }
+  } finally {
+    rig.close();
+  }
+});
+
 test('ops-worker cancel idempotency is linearized by job_id instead of shared scope token', async () => {
   const teamDomain = `ops-cancel-${Date.now()}.cloudflareaccess.com`;
   const rig = await createControlPlaneRig({

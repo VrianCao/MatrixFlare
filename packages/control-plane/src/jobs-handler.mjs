@@ -8,6 +8,7 @@ import {
   createAsyncTaskContext,
   loadWorkerRuntimeConfig,
   makeId,
+  resolveWorkerResourceBindingNames,
   SEARCH_INDEX_BATCH_ROWS_PER_STATEMENT,
 } from '../../runtime-core/src/index.mjs';
 import {
@@ -22,6 +23,7 @@ import {
   buildRestoreShardJob,
   mapInternalJobStateToPublicState,
   normalizeQueuePayload,
+  resolveCanonicalControlPlaneQueueName,
 } from './schemas.mjs';
 import {
   buildControlPlaneCheckpointArtifact,
@@ -817,6 +819,7 @@ async function executeRebuildAction({
 
 async function processQueueMessage({
   queueName,
+  canonicalQueueName = queueName,
   messageBody,
   persistence,
   archiveBucket,
@@ -856,14 +859,14 @@ async function processQueueMessage({
     };
   }
 
-  const runningState = queueName === QUEUE_NAMES.export
+  const runningState = canonicalQueueName === QUEUE_NAMES.export
     ? 'materializing'
-    : queueName === QUEUE_NAMES.restore
+    : canonicalQueueName === QUEUE_NAMES.restore
       ? 'validating'
-      : queueName === QUEUE_NAMES.repair
+      : canonicalQueueName === QUEUE_NAMES.repair
         ? 'scanning'
         : 'scanning';
-  const terminalState = queueName === QUEUE_NAMES.export ? 'finalized' : 'completed';
+  const terminalState = canonicalQueueName === QUEUE_NAMES.export ? 'finalized' : 'completed';
   const now = new Date();
 
   const checkpointShardType = messageBody.shard_type ?? scopeKindToShardType(messageBody.scope_kind);
@@ -876,7 +879,7 @@ async function processQueueMessage({
   if (!existingCheckpoint) {
     throw new Error(`Checkpoint ${job.job_id}/${checkpointShardType}/${checkpointShardKey} was not staged before queue delivery`);
   }
-  if (queueName === QUEUE_NAMES.export) {
+  if (canonicalQueueName === QUEUE_NAMES.export) {
     assertSupportedExportMaterializationTarget({
       shardType: checkpointShardType,
       shardKey: checkpointShardKey,
@@ -888,7 +891,7 @@ async function processQueueMessage({
     const totalUnits = Math.max(job.progress_total_units ?? 1, 1);
     const isTerminal = completedUnits >= totalUnits;
     if (isTerminal && !['completed', 'finalized', 'failed', 'canceled'].includes(job.internal_state)) {
-      if (queueName === QUEUE_NAMES.export) {
+      if (canonicalQueueName === QUEUE_NAMES.export) {
         const keyRing = parseExportKeyRingFromEnv(loadWorkerRuntimeConfig('jobs-worker', env), env);
         await finalizeExportBundleManifest({
           persistence,
@@ -930,7 +933,7 @@ async function processQueueMessage({
       reason: 'checkpoint_already_complete',
     };
   }
-  if (queueName === QUEUE_NAMES.rebuild && existingCheckpoint?.checkpoint?.status === 'queued') {
+  if (canonicalQueueName === QUEUE_NAMES.rebuild && existingCheckpoint?.checkpoint?.status === 'queued') {
     const expectedChunkCursor = normalizeRebuildProgress(existingCheckpoint.checkpoint, messageBody).next_chunk_cursor;
     const messageChunkCursor = normalizeRebuildChunkCursor(messageBody.chunk_cursor);
     if (!sameRebuildChunkCursor(expectedChunkCursor, messageChunkCursor)) {
@@ -996,7 +999,7 @@ async function processQueueMessage({
     completed_at: now.toISOString(),
     shard_type: checkpointShardType,
     shard_key: checkpointShardKey,
-    manifest_completeness_state: queueName === QUEUE_NAMES.restore ? 'complete' : null,
+    manifest_completeness_state: canonicalQueueName === QUEUE_NAMES.restore ? 'complete' : null,
     manifest_hash: null,
     manifest_r2_object_key: null,
     source_watermark: null,
@@ -1005,7 +1008,7 @@ async function processQueueMessage({
   };
   let resultSummary = null;
 
-  if (queueName === QUEUE_NAMES.export) {
+  if (canonicalQueueName === QUEUE_NAMES.export) {
     const keyRing = parseExportKeyRingFromEnv(loadWorkerRuntimeConfig('jobs-worker', env), env);
     const artifact = await buildControlPlaneCheckpointArtifact({
       persistence,
@@ -1025,7 +1028,7 @@ async function processQueueMessage({
       object_entries: artifact.object_entries,
       apply_phase: 'control-plane',
     };
-  } else if (queueName === QUEUE_NAMES.restore) {
+  } else if (canonicalQueueName === QUEUE_NAMES.restore) {
     checkpointId = messageBody.checkpoint_id;
     const keyRing = parseExportKeyRingFromEnv(loadWorkerRuntimeConfig('jobs-worker', env), env);
     const restoreCheckpoints = await resolveRestoreCheckpointRefs({
@@ -1055,7 +1058,7 @@ async function processQueueMessage({
       object_entries: matchedCheckpoint.checkpoint_manifest.objects ?? [],
       apply_phase: matchedCheckpoint.apply_phase,
     };
-  } else if (queueName === QUEUE_NAMES.rebuild) {
+  } else if (canonicalQueueName === QUEUE_NAMES.rebuild) {
     const rebuildResult = await executeRebuildAction({
       job,
       messageBody,
@@ -1129,7 +1132,7 @@ async function processQueueMessage({
       ...completedCheckpoint,
       rebuild_progress: rebuildResult.rebuild_progress ?? null,
     };
-  } else if (queueName === QUEUE_NAMES.repair) {
+  } else if (canonicalQueueName === QUEUE_NAMES.repair) {
     const repairSummary = await executeRepairAction({
       job,
       messageBody,
@@ -1154,7 +1157,7 @@ async function processQueueMessage({
   const completedUnits = checkpoints.filter((entry) => entry.checkpoint?.status === 'complete').length;
   const totalUnits = Math.max(job.progress_total_units ?? 1, 1);
   const isTerminal = completedUnits >= totalUnits;
-  if (queueName === QUEUE_NAMES.export && isTerminal) {
+  if (canonicalQueueName === QUEUE_NAMES.export && isTerminal) {
     const keyRing = parseExportKeyRingFromEnv(loadWorkerRuntimeConfig('jobs-worker', env), env);
     await finalizeExportBundleManifest({
       persistence,
@@ -1181,7 +1184,7 @@ async function processQueueMessage({
       ...(job.checkpoint_state ?? {}),
       last_completed_checkpoint_id: checkpointId,
       queue_name: queueName,
-      ...(queueName === QUEUE_NAMES.rebuild
+      ...(canonicalQueueName === QUEUE_NAMES.rebuild
         ? buildRebuildCheckpointState(resultSummary?.rebuild_progress ?? {}, {
           shardType: checkpointShardType,
           shardKey: checkpointShardKey,
@@ -1197,7 +1200,7 @@ async function processQueueMessage({
       terminal_state: mapInternalJobStateToPublicState(terminalState),
       last_checkpoint_id: checkpointId,
       ...(resultSummary == null ? {} : {
-        [queueName === QUEUE_NAMES.repair ? 'repair_summary' : (queueName === QUEUE_NAMES.rebuild ? 'rebuild_summary' : 'queue_summary')]: resultSummary,
+        [canonicalQueueName === QUEUE_NAMES.repair ? 'repair_summary' : (canonicalQueueName === QUEUE_NAMES.rebuild ? 'rebuild_summary' : 'queue_summary')]: resultSummary,
       }),
     } : null,
   });
@@ -1295,6 +1298,7 @@ export function createJobsWorkerFetchHandler() {
 export function createJobsWorkerQueueHandler() {
   return async function jobsWorkerQueue(batch, env) {
     const config = loadWorkerRuntimeConfig('jobs-worker', env);
+    const queueBindingNames = resolveWorkerResourceBindingNames(env).queues;
     const persistence = getControlPlanePersistence(env);
     await persistence.ensureSchema();
     for (const message of batch.messages) {
@@ -1308,9 +1312,11 @@ export function createJobsWorkerQueueHandler() {
         jobId: rawJobId,
       });
       try {
-        const normalizedBody = normalizeQueuePayload(batch.queue, message.body);
+        const canonicalQueueName = resolveCanonicalControlPlaneQueueName(batch.queue, queueBindingNames);
+        const normalizedBody = normalizeQueuePayload(batch.queue, message.body, queueBindingNames);
         const result = await processQueueMessage({
           queueName: batch.queue,
+          canonicalQueueName,
           messageBody: normalizedBody,
           persistence,
           archiveBucket: env.MATRIX_ARCHIVE_BUCKET,

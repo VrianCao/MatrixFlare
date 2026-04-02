@@ -81,6 +81,12 @@ export const QUEUE_NAMES = Object.freeze({
   restore: 'matrix-restore-shard-job',
   repair: 'matrix-repair-shard-job',
 });
+const CONTROL_PLANE_QUEUE_BINDINGS = Object.freeze({
+  rebuild: 'REBUILD_SHARD_QUEUE',
+  export: 'EXPORT_SHARD_QUEUE',
+  restore: 'RESTORE_SHARD_QUEUE',
+  repair: 'REPAIR_SHARD_QUEUE',
+});
 export const JOB_TO_SCOPE = Object.freeze({
   export: 'ops.export.write',
   restore: 'ops.restore.write',
@@ -658,8 +664,31 @@ export function buildRepairShardJob({
   };
 }
 
-export function normalizeQueuePayload(queueName, value) {
+export function resolveCanonicalControlPlaneQueueName(queueName, queueBindingNames = null) {
+  const effectiveQueueNames = {
+    rebuild: queueBindingNames?.[CONTROL_PLANE_QUEUE_BINDINGS.rebuild] ?? QUEUE_NAMES.rebuild,
+    export: queueBindingNames?.[CONTROL_PLANE_QUEUE_BINDINGS.export] ?? QUEUE_NAMES.export,
+    restore: queueBindingNames?.[CONTROL_PLANE_QUEUE_BINDINGS.restore] ?? QUEUE_NAMES.restore,
+    repair: queueBindingNames?.[CONTROL_PLANE_QUEUE_BINDINGS.repair] ?? QUEUE_NAMES.repair,
+  };
+  if (queueName === QUEUE_NAMES.export || queueName === effectiveQueueNames.export) {
+    return QUEUE_NAMES.export;
+  }
+  if (queueName === QUEUE_NAMES.rebuild || queueName === effectiveQueueNames.rebuild) {
+    return QUEUE_NAMES.rebuild;
+  }
+  if (queueName === QUEUE_NAMES.restore || queueName === effectiveQueueNames.restore) {
+    return QUEUE_NAMES.restore;
+  }
+  if (queueName === QUEUE_NAMES.repair || queueName === effectiveQueueNames.repair) {
+    return QUEUE_NAMES.repair;
+  }
+  throw new RangeError(`Unsupported queue name ${queueName}`);
+}
+
+export function normalizeQueuePayload(queueName, value, queueBindingNames = null) {
   assertObject(value, 'queue payload');
+  const canonicalQueueName = resolveCanonicalControlPlaneQueueName(queueName, queueBindingNames);
   const schemaVersion = normalizeInteger(value.schema_version, 'schema_version', { min: 1 });
   if (schemaVersion !== CONTROL_PLANE_SCHEMA_VERSION) {
     throw Object.assign(
@@ -667,7 +696,7 @@ export function normalizeQueuePayload(queueName, value) {
       { code: 'unsupported_schema_version', retryable: false },
     );
   }
-  if (queueName === QUEUE_NAMES.export) {
+  if (canonicalQueueName === QUEUE_NAMES.export) {
     return buildExportShardJob({
       jobId: value.job_id,
       exportEpoch: value.export_epoch,
@@ -677,7 +706,7 @@ export function normalizeQueuePayload(queueName, value) {
       attempt: value.attempt,
     });
   }
-  if (queueName === QUEUE_NAMES.rebuild) {
+  if (canonicalQueueName === QUEUE_NAMES.rebuild) {
     return buildRebuildShardJob({
       jobId: value.job_id,
       rebuildTarget: value.rebuild_target,
@@ -688,7 +717,7 @@ export function normalizeQueuePayload(queueName, value) {
       attempt: value.attempt,
     });
   }
-  if (queueName === QUEUE_NAMES.restore) {
+  if (canonicalQueueName === QUEUE_NAMES.restore) {
     return buildRestoreShardJob({
       jobId: value.job_id,
       checkpointId: value.checkpoint_id,
@@ -698,7 +727,7 @@ export function normalizeQueuePayload(queueName, value) {
       attempt: value.attempt,
     });
   }
-  if (queueName === QUEUE_NAMES.repair) {
+  if (canonicalQueueName === QUEUE_NAMES.repair) {
     return buildRepairShardJob({
       jobId: value.job_id,
       repairKind: value.repair_kind,
@@ -709,5 +738,4 @@ export function normalizeQueuePayload(queueName, value) {
       attempt: value.attempt,
     });
   }
-  throw new RangeError(`Unsupported queue name ${queueName}`);
 }
