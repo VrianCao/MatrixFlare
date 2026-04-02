@@ -16,10 +16,6 @@ import {
   sleep,
 } from './support.mjs';
 
-// The non-local gateway deployment contract currently leaves ABUSE_GUARD_POLICY_JSON empty,
-// so gateway_search keeps the runtime default baseline of 60 requests.
-const SHARED_SEARCH_LIMITER_BASELINE_LIMIT = 60;
-
 async function requestAs(harness, accessToken, pathname, {
   method = 'GET',
   json = undefined,
@@ -55,7 +51,7 @@ async function collectBatchResponses(total, batchSize, callback) {
   return results;
 }
 
-async function exercisePermissiveSearchLimiter(harness, accessToken, searchTerm, {
+async function assertPermissiveSearchLimiter(harness, accessToken, searchTerm, {
   attempts = 12,
   batchSize = 8,
   delayMs = 100,
@@ -96,37 +92,50 @@ async function exercisePermissiveSearchLimiter(harness, accessToken, searchTerm,
       await sleep(delayMs);
     }
   }
-  if (limited != null) {
-    await expectMatrixError(limited, 429, 'M_LIMIT_EXCEEDED');
-  }
+  assert.notEqual(
+    limited,
+    null,
+    `Expected search limiter to yield 429 within ${attempts * batchSize} bounded search attempts`,
+  );
+  await expectMatrixError(limited, 429, 'M_LIMIT_EXCEEDED');
   return limited;
 }
 
 async function assertPermissivePublicRoomsLimiter(harness, {
-  attempts = 24,
+  attempts = 12,
+  batchSize = 8,
   delayMs = 100,
 } = {}) {
-  assert.ok(
-    attempts < SHARED_SEARCH_LIMITER_BASELINE_LIMIT,
-    `publicRooms follow-up window must stay below the standalone shared search limiter baseline of ${SHARED_SEARCH_LIMITER_BASELINE_LIMIT} requests`,
-  );
   let limited = null;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
-    const result = await request(harness, '/_matrix/client/v3/publicRooms?limit=1');
-    if (result.response.status === 429) {
-      limited = result;
+    const responses = await collectBatchResponses(batchSize, batchSize, async () => request(
+      harness,
+      '/_matrix/client/v3/publicRooms?limit=1',
+    ));
+    for (const result of responses) {
+      if (result.response.status === 429) {
+        limited ??= result;
+        continue;
+      }
+      assert.equal(
+        result.response.status,
+        200,
+        `Expected bounded publicRooms limiter window to return 200 or 429, received ${result.response.status}`,
+      );
+      assert.ok(Array.isArray(result.payload?.chunk));
+    }
+    if (limited != null) {
       break;
     }
-    assert.equal(
-      result.response.status,
-      200,
-      `Expected bounded publicRooms limiter window to return 200 or 429, received ${result.response.status}`,
-    );
     if (attempt + 1 < attempts) {
       await sleep(delayMs);
     }
   }
-  assert.notEqual(limited, null, `Expected shared search/publicRooms limiter to yield 429 within ${attempts} publicRooms attempts after bounded search traffic`);
+  assert.notEqual(
+    limited,
+    null,
+    `Expected publicRooms limiter to yield 429 within ${attempts * batchSize} bounded anonymous publicRooms attempts`,
+  );
   await expectMatrixError(limited, 429, 'M_LIMIT_EXCEEDED');
 }
 
@@ -253,7 +262,7 @@ test('TEST-SEC-001 staging covers token revocation, route-bound UIA, and ops sec
   assertUnauthorizedOps(opsWithCookieOnly);
 });
 
-test('TEST-SEC-001 staging enforces baseline abuse guards on always-on login, media, and search surfaces', async (context) => {
+test('TEST-SEC-001 staging enforces baseline abuse guards on always-on login, media, search, and publicRooms surfaces', async (context) => {
   const harness = requireRemoteHarnessContext(context, 'staging');
   if (harness == null) {
     return;
@@ -334,7 +343,7 @@ test('TEST-SEC-001 staging enforces baseline abuse guards on always-on login, me
     password: 'phase08-sec-staging-password-6',
     deviceId: 'SECSTGSEARCH',
   });
-  await exercisePermissiveSearchLimiter(harness, searchUser.access_token, 'phase08-sec-staging');
+  await assertPermissiveSearchLimiter(harness, searchUser.access_token, 'phase08-sec-staging');
 
   await assertPermissivePublicRoomsLimiter(harness);
 
