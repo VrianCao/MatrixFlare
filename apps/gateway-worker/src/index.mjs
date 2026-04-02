@@ -267,6 +267,23 @@ function decodePublicRoomsCursor(value) {
   }
 }
 
+function parsePublicRoomsCursorOffset(value, label) {
+  if (typeof value === 'number') {
+    if (Number.isSafeInteger(value) && value >= 0) {
+      return value;
+    }
+    throw createInvalidQueryParamError(`${label} must be an integer >= 0`);
+  }
+  if (typeof value !== 'string' || !/^\d+$/.test(value)) {
+    throw createInvalidQueryParamError(`${label} must be an integer >= 0`);
+  }
+  const parsedOffset = Number.parseInt(value, 10);
+  if (!Number.isSafeInteger(parsedOffset)) {
+    throw createInvalidQueryParamError(`${label} must be an integer >= 0`);
+  }
+  return parsedOffset;
+}
+
 function isPublicDirectoryRowComplete(row) {
   return row != null
     && typeof row.room_id === 'string'
@@ -331,34 +348,77 @@ function applyPublicRoomsQuery(rows, {
   since = null,
   searchTerm = null,
 } = {}) {
+  const paging = normalizePublicRoomsPaging({ limit, since, searchTerm });
+  const filteredRows = filterPublicRoomsCandidateRows(rows, paging.lowered_search_term);
+  return buildPublicRoomsQueryResult(filteredRows.slice(
+    paging.offset,
+    paging.offset + paging.normalized_limit,
+  ), {
+    normalizedLimit: paging.normalized_limit,
+    offset: paging.offset,
+    nextOffset: paging.offset + paging.normalized_limit < filteredRows.length
+      ? paging.offset + paging.normalized_limit
+      : null,
+    totalRoomCountEstimate: filteredRows.length,
+  });
+}
+
+function normalizePublicRoomsPaging({
+  limit = 10,
+  since = null,
+  searchTerm = null,
+} = {}) {
   const normalizedLimit = Number.isInteger(limit) && limit >= 1
     ? limit
     : (() => {
       throw createInvalidQueryParamError('limit must be an integer >= 1');
     })();
   const cursor = decodePublicRoomsCursor(since);
-  const offset = cursor?.offset == null
-    ? 0
-    : (() => {
-      const parsedOffset = Number.parseInt(cursor.offset, 10);
-      if (!Number.isInteger(parsedOffset) || parsedOffset < 0) {
-        throw createInvalidQueryParamError('since.offset must be an integer >= 0');
-      }
-      return parsedOffset;
-    })();
+  // Legacy unversioned cursors only expose a public offset field. Treat them as visible-row
+  // offsets so rollout does not reintroduce hidden-candidate overlap or leak filtered-row counts.
+  const offset = cursor?.visible_offset != null
+    ? parsePublicRoomsCursorOffset(cursor.visible_offset, 'since.visible_offset')
+    : cursor?.offset != null
+      ? parsePublicRoomsCursorOffset(cursor.offset, 'since.offset')
+      : 0;
   const loweredSearchTerm = typeof searchTerm === 'string' ? searchTerm.toLowerCase() : '';
-  const filteredRows = rows
-    .filter((row) => row.is_public === true)
-    .filter((row) => loweredSearchTerm.length === 0 || (
-      (row.name ?? '').toLowerCase().includes(loweredSearchTerm)
-      || (row.topic ?? '').toLowerCase().includes(loweredSearchTerm)
-      || (row.canonical_alias ?? '').toLowerCase().includes(loweredSearchTerm)
-      || row.room_id.toLowerCase().includes(loweredSearchTerm)
-    ))
-    .sort((left, right) => right.joined_members - left.joined_members || left.room_id.localeCompare(right.room_id));
-  const page = filteredRows.slice(offset, offset + normalizedLimit);
   return {
-    chunk: page.map((row) => ({
+    normalized_limit: normalizedLimit,
+    offset,
+    lowered_search_term: loweredSearchTerm,
+  };
+}
+
+function matchesPublicRoomsSearchTerm(row, loweredSearchTerm) {
+  if (loweredSearchTerm.length === 0) {
+    return true;
+  }
+  return (row.name ?? '').toLowerCase().includes(loweredSearchTerm)
+    || (row.topic ?? '').toLowerCase().includes(loweredSearchTerm)
+    || (row.canonical_alias ?? '').toLowerCase().includes(loweredSearchTerm)
+    || row.room_id.toLowerCase().includes(loweredSearchTerm);
+}
+
+function sortPublicRoomsRows(left, right) {
+  return right.joined_members - left.joined_members || left.room_id.localeCompare(right.room_id);
+}
+
+function filterPublicRoomsCandidateRows(rows, loweredSearchTerm = '') {
+  return rows
+    .filter((row) => isPublicDirectoryRowComplete(row) && row.is_public === true)
+    .filter((row) => matchesPublicRoomsSearchTerm(row, loweredSearchTerm))
+    .sort(sortPublicRoomsRows);
+}
+
+function buildPublicRoomsQueryResult(rows, {
+  normalizedLimit,
+  offset,
+  nextOffset = null,
+  prevOffset = offset > 0 ? Math.max(0, offset - normalizedLimit) : null,
+  totalRoomCountEstimate,
+}) {
+  return {
+    chunk: rows.map((row) => ({
       room_id: row.room_id,
       name: row.name ?? undefined,
       topic: row.topic ?? undefined,
@@ -369,17 +429,61 @@ function applyPublicRoomsQuery(rows, {
       guest_can_join: row.guest_can_join === true,
       join_rule: row.join_rules ?? 'invite',
     })),
-    next_batch: offset + normalizedLimit < filteredRows.length
-      ? encodePublicRoomsCursor({ offset: offset + normalizedLimit })
+    next_batch: Number.isInteger(nextOffset)
+      ? encodePublicRoomsCursor({
+        cursor_version: 2,
+        visible_offset: nextOffset,
+      })
       : undefined,
-    prev_batch: offset > 0
-      ? encodePublicRoomsCursor({ offset: Math.max(0, offset - normalizedLimit) })
+    prev_batch: Number.isInteger(prevOffset)
+      ? encodePublicRoomsCursor({
+        cursor_version: 2,
+        visible_offset: prevOffset,
+      })
       : undefined,
-    total_room_count_estimate: filteredRows.length,
+    total_room_count_estimate: totalRoomCountEstimate,
   };
 }
 
-async function queryPublicRoomsWithTruthFallback(env, queryInput) {
+async function collectValidatedPublicRoomsPage(env, candidateRows, {
+  normalizedLimit,
+  offset,
+}) {
+  const pageRows = [];
+  const prevOffset = offset > 0 ? Math.max(0, offset - normalizedLimit) : null;
+  let visibleOffset = 0;
+  for (let scanIndex = 0; scanIndex < candidateRows.length; scanIndex += 1) {
+    const validated = await resolveValidatedPublicRoomRow(env, candidateRows[scanIndex].room_id, {
+      derivedRow: candidateRows[scanIndex],
+      forceTruth: false,
+    });
+    if (validated) {
+      if (visibleOffset < offset) {
+        visibleOffset += 1;
+        continue;
+      }
+      if (pageRows.length < normalizedLimit) {
+        pageRows.push(validated);
+        visibleOffset += 1;
+        continue;
+      }
+      return {
+        pageRows,
+        nextOffset: visibleOffset,
+        prevOffset,
+        visibleCountLowerBound: visibleOffset + 1,
+      };
+    }
+  }
+  return {
+    pageRows,
+    nextOffset: null,
+    prevOffset,
+    visibleCountLowerBound: visibleOffset,
+  };
+}
+
+async function queryPublicRoomsByFullTruthScan(env, queryInput) {
   await ensureDerivedSchema(env);
   const derived = getDerivedPersistence(env);
   const derivedRows = await derived.publicRoomDirectory.list();
@@ -397,6 +501,34 @@ async function queryPublicRoomsWithTruthFallback(env, queryInput) {
     }
   }
   return applyPublicRoomsQuery(validatedRows, queryInput);
+}
+
+async function queryPublicRoomsWithTruthFallback(env, queryInput) {
+  await ensureDerivedSchema(env);
+  const derived = getDerivedPersistence(env);
+  const derivedRows = await derived.publicRoomDirectory.list();
+  const paging = normalizePublicRoomsPaging(queryInput);
+  const candidateRows = filterPublicRoomsCandidateRows(derivedRows, paging.lowered_search_term);
+  const {
+    pageRows,
+    nextOffset,
+    prevOffset,
+    visibleCountLowerBound,
+  } = await collectValidatedPublicRoomsPage(env, candidateRows, {
+    normalizedLimit: paging.normalized_limit,
+    offset: paging.offset,
+  });
+  if (pageRows.length > 0 || paging.lowered_search_term.length === 0) {
+    return buildPublicRoomsQueryResult(pageRows, {
+      normalizedLimit: paging.normalized_limit,
+      offset: paging.offset,
+      nextOffset,
+      prevOffset,
+      // Count estimates must remain fail-closed when stale derived candidates validate away.
+      totalRoomCountEstimate: visibleCountLowerBound,
+    });
+  }
+  return queryPublicRoomsByFullTruthScan(env, queryInput);
 }
 
 async function resolveRoomAliasWithTruthFallback(env, alias) {

@@ -1,9 +1,11 @@
+import { Buffer } from 'node:buffer';
 import assert from 'node:assert/strict';
 import process from 'node:process';
 import test from 'node:test';
 
 import {
   classifyGatewayRequest,
+  createD1DerivedDataPersistence,
   enforceGatewayAbuseGuard,
   ensureDeploymentRecord,
   GATEWAY_RATE_LIMIT_BINDING_DEFINITIONS,
@@ -87,6 +89,13 @@ async function putJson(rig, accessToken, pathname, json = {}) {
     headers: rig.authHeaders(accessToken),
     json,
   });
+}
+
+async function expectMatrixError(response, status, errcode) {
+  assert.equal(response.status, status);
+  const body = await response.json();
+  assert.equal(body.errcode, errcode);
+  return body;
 }
 
 function createStubRateLimitBinding(limit) {
@@ -543,6 +552,233 @@ test('Phase 08 shard registry bootstrap avoids D1 exec() so register stays alive
 
   const alice = await registerUser(rig, { username: 'phase08-d1-exec-broken-alice' });
   assert.equal(alice.user_id, '@phase08-d1-exec-broken-alice:matrix.example.test');
+});
+
+test('Phase 08 anonymous publicRooms fast path does not touch control-plane shard scans when derived candidates are empty', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const originalPrepare = rig.env.MATRIX_CONTROL_D1.prepare.bind(rig.env.MATRIX_CONTROL_D1);
+  const forbiddenSql = [];
+  rig.env.MATRIX_CONTROL_D1.prepare = (sql) => {
+    if (/operator_authz_policies|audit_events|request_dedupe_projection|jobs|job_checkpoints|replay_manifests|repair_decisions|shard_registry|registry_snapshots|appservice_configs/.test(sql)) {
+      forbiddenSql.push(sql);
+      throw new Error('publicRooms fast path must not touch control-plane D1 when derived candidates are empty');
+    }
+    return originalPrepare(sql);
+  };
+
+  const response = await rig.gatewayFetch('/_matrix/client/v3/publicRooms?limit=1');
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), {
+    chunk: [],
+    total_room_count_estimate: 0,
+  });
+  assert.deepEqual(forbiddenSql, []);
+});
+
+test('Phase 08 anonymous publicRooms fast path does not leak stale private-room counts through total_room_count_estimate', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, { username: 'phase08-publicrooms-stale-count-alice' });
+  const publicRoomResponse = await postJson(rig, alice.access_token, '/_matrix/client/v3/createRoom', {
+    visibility: 'public',
+    name: 'Phase 08 Public Room',
+    room_alias_name: 'phase08-public-room',
+  });
+  assert.equal(publicRoomResponse.status, 200);
+  const publicRoom = await publicRoomResponse.json();
+  const privateRoomResponse = await postJson(rig, alice.access_token, '/_matrix/client/v3/createRoom', {
+    visibility: 'private',
+    name: 'Phase 08 Private Room',
+    room_alias_name: 'phase08-private-room',
+  });
+  assert.equal(privateRoomResponse.status, 200);
+  const privateRoom = await privateRoomResponse.json();
+
+  await rig.drainJobsQueues();
+  const derived = createD1DerivedDataPersistence(rig.d1);
+  await derived.ensureSchema();
+  const privateTruth = await rig.getRoomDo(privateRoom.room_id).getPublicRoomDirectoryEntry({
+    room_id: privateRoom.room_id,
+  });
+  await derived.publicRoomDirectory.put({
+    ...privateTruth.entry,
+    canonical_alias: `#phase08-private-room:${rig.env.MATRIX_SERVER_NAME}`,
+    join_rules: 'public',
+    history_visibility: 'world_readable',
+    world_readable: true,
+    guest_can_join: true,
+    joined_members: 999,
+    is_public: true,
+    updated_at: new Date().toISOString(),
+    record_json: {
+      stale_visibility_injected: true,
+    },
+  });
+
+  const response = await rig.gatewayFetch('/_matrix/client/v3/publicRooms?limit=10');
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), {
+    chunk: [
+      {
+        room_id: publicRoom.room_id,
+        name: 'Phase 08 Public Room',
+        canonical_alias: `#phase08-public-room:${rig.env.MATRIX_SERVER_NAME}`,
+        num_joined_members: 1,
+        world_readable: false,
+        guest_can_join: false,
+        join_rule: 'invite',
+      },
+    ],
+    total_room_count_estimate: 1,
+  });
+});
+
+test('Phase 08 anonymous publicRooms pagination stays stable when stale private derived rows are interleaved between visible rooms', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, { username: 'phase08-publicrooms-pagination-alice' });
+  const publicRooms = [];
+  for (const [aliasSuffix, name] of [
+    ['alpha', 'Phase 08 Public Alpha'],
+    ['beta', 'Phase 08 Public Beta'],
+    ['gamma', 'Phase 08 Public Gamma'],
+  ]) {
+    const response = await postJson(rig, alice.access_token, '/_matrix/client/v3/createRoom', {
+      visibility: 'public',
+      name,
+      room_alias_name: `phase08-pagination-${aliasSuffix}`,
+    });
+    assert.equal(response.status, 200);
+    publicRooms.push(await response.json());
+  }
+  const privateRoomResponse = await postJson(rig, alice.access_token, '/_matrix/client/v3/createRoom', {
+    visibility: 'private',
+    name: 'Phase 08 Private Interleaved',
+    room_alias_name: 'phase08-pagination-private',
+  });
+  assert.equal(privateRoomResponse.status, 200);
+  const privateRoom = await privateRoomResponse.json();
+
+  await rig.drainJobsQueues();
+  const derived = createD1DerivedDataPersistence(rig.d1);
+  await derived.ensureSchema();
+
+  for (const [joinedMembers, room] of [
+    [30, publicRooms[0]],
+    [20, publicRooms[1]],
+    [10, publicRooms[2]],
+  ]) {
+    const truth = await rig.getRoomDo(room.room_id).getPublicRoomDirectoryEntry({
+      room_id: room.room_id,
+    });
+    await derived.publicRoomDirectory.put({
+      ...truth.entry,
+      joined_members: joinedMembers,
+      updated_at: new Date().toISOString(),
+      record_json: {
+        pagination_order_injected: true,
+      },
+    });
+  }
+
+  const privateTruth = await rig.getRoomDo(privateRoom.room_id).getPublicRoomDirectoryEntry({
+    room_id: privateRoom.room_id,
+  });
+  await derived.publicRoomDirectory.put({
+    ...privateTruth.entry,
+    canonical_alias: `#phase08-pagination-private:${rig.env.MATRIX_SERVER_NAME}`,
+    join_rules: 'public',
+    history_visibility: 'world_readable',
+    world_readable: true,
+    guest_can_join: true,
+    joined_members: 25,
+    is_public: true,
+    updated_at: new Date().toISOString(),
+    record_json: {
+      stale_visibility_injected: true,
+      pagination_order_injected: true,
+    },
+  });
+
+  const pageOneResponse = await rig.gatewayFetch('/_matrix/client/v3/publicRooms?limit=2');
+  assert.equal(pageOneResponse.status, 200);
+  const pageOne = await pageOneResponse.json();
+  assert.deepEqual(
+    pageOne.chunk.map((entry) => entry.room_id),
+    [publicRooms[0].room_id, publicRooms[1].room_id],
+  );
+  assert.equal(pageOne.total_room_count_estimate, 3);
+  assert.equal(typeof pageOne.next_batch, 'string');
+  const decodedNextBatch = JSON.parse(Buffer.from(pageOne.next_batch, 'base64url').toString('utf8'));
+  assert.deepEqual(decodedNextBatch, {
+    cursor_version: 2,
+    visible_offset: 2,
+  });
+
+  const pageTwoResponse = await rig.gatewayFetch(
+    `/_matrix/client/v3/publicRooms?limit=2&since=${encodeURIComponent(pageOne.next_batch)}`,
+  );
+  assert.equal(pageTwoResponse.status, 200);
+  const pageTwo = await pageTwoResponse.json();
+  assert.deepEqual(
+    pageTwo.chunk.map((entry) => entry.room_id),
+    [publicRooms[2].room_id],
+  );
+  assert.equal(pageTwo.total_room_count_estimate, 3);
+  assert.equal(typeof pageTwo.prev_batch, 'string');
+
+  const previousPageResponse = await rig.gatewayFetch(
+    `/_matrix/client/v3/publicRooms?limit=2&since=${encodeURIComponent(pageTwo.prev_batch)}`,
+  );
+  assert.equal(previousPageResponse.status, 200);
+  const previousPage = await previousPageResponse.json();
+  assert.deepEqual(
+    previousPage.chunk.map((entry) => entry.room_id),
+    [publicRooms[0].room_id, publicRooms[1].room_id],
+  );
+
+  const legacyCursor = Buffer.from(JSON.stringify({ offset: 2 }), 'utf8').toString('base64url');
+  const legacyPageTwoResponse = await rig.gatewayFetch(
+    `/_matrix/client/v3/publicRooms?limit=2&since=${encodeURIComponent(legacyCursor)}`,
+  );
+  assert.equal(legacyPageTwoResponse.status, 200);
+  const legacyPageTwo = await legacyPageTwoResponse.json();
+  assert.deepEqual(
+    legacyPageTwo.chunk.map((entry) => entry.room_id),
+    [publicRooms[2].room_id],
+  );
+});
+
+test('Phase 08 anonymous publicRooms rejects malformed visible and legacy cursor offsets', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const malformedVisibleCursor = Buffer.from(JSON.stringify({
+    cursor_version: 2,
+    visible_offset: '1junk',
+  }), 'utf8').toString('base64url');
+  await expectMatrixError(
+    await rig.gatewayFetch(
+      `/_matrix/client/v3/publicRooms?limit=2&since=${encodeURIComponent(malformedVisibleCursor)}`,
+    ),
+    400,
+    'M_INVALID_PARAM',
+  );
+
+  const malformedLegacyCursor = Buffer.from(JSON.stringify({
+    offset: '2junk',
+  }), 'utf8').toString('base64url');
+  await expectMatrixError(
+    await rig.gatewayFetch(
+      `/_matrix/client/v3/publicRooms?limit=2&since=${encodeURIComponent(malformedLegacyCursor)}`,
+    ),
+    400,
+    'M_INVALID_PARAM',
+  );
 });
 
 test('Phase 08 request contracts stay functional under worker and authority version skew', async (t) => {

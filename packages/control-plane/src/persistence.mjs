@@ -281,14 +281,28 @@ export function createD1ControlPlanePersistence(db) {
   if (!db || typeof db.prepare !== 'function' || typeof db.exec !== 'function') {
     throw new TypeError('db must expose D1-compatible prepare() and exec() methods');
   }
+  let schemaReady = false;
+  let schemaReadyPromise = null;
 
   return Object.freeze({
     async ensureSchema() {
-      // D1 documents exec() as a maintenance-oriented raw SQL surface; request-path schema bootstrap
-      // must execute complete prepared statements so multiline CREATE TABLE literals stay portable.
-      for (const statementSql of CONTROL_PLANE_SCHEMA_STATEMENTS) {
-        await statementRun(db.prepare(statementSql));
+      if (schemaReady) {
+        return;
       }
+      if (!schemaReadyPromise) {
+        schemaReadyPromise = (async () => {
+          // D1 documents exec() as a maintenance-oriented raw SQL surface; request-path schema bootstrap
+          // must execute complete prepared statements so multiline CREATE TABLE literals stay portable.
+          for (const statementSql of CONTROL_PLANE_SCHEMA_STATEMENTS) {
+            await statementRun(db.prepare(statementSql));
+          }
+          schemaReady = true;
+        })().catch((error) => {
+          schemaReadyPromise = null;
+          throw error;
+        });
+      }
+      await schemaReadyPromise;
     },
     async isSchemaReady() {
       const rows = await statementAll(

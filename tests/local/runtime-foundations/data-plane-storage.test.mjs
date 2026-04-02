@@ -881,6 +881,48 @@ test('derived D1 schema bootstrap avoids exec() so non-local publicRooms does no
   d1.close();
 });
 
+test('derived D1 schema bootstrap memoizes once-per-isolate after the first successful ensureSchema()', async () => {
+  const d1 = createFakeD1Database();
+  const originalPrepare = d1.prepare.bind(d1);
+  let prepareCalls = 0;
+  d1.prepare = (sql) => {
+    prepareCalls += 1;
+    return originalPrepare(sql);
+  };
+
+  const derived = createD1DerivedDataPersistence(d1);
+  await derived.ensureSchema('2026-04-01T15:00:00.000Z');
+  const firstPrepareCount = prepareCalls;
+  assert.ok(firstPrepareCount > 0);
+
+  await derived.ensureSchema('2026-04-01T15:00:01.000Z');
+  assert.equal(prepareCalls, firstPrepareCount);
+  d1.close();
+});
+
+test('derived D1 schema bootstrap coalesces concurrent ensureSchema() calls into a single schema install', async () => {
+  const d1 = createFakeD1Database();
+  const originalPrepare = d1.prepare.bind(d1);
+  let prepareCalls = 0;
+  d1.prepare = (sql) => {
+    prepareCalls += 1;
+    return originalPrepare(sql);
+  };
+
+  const derived = createD1DerivedDataPersistence(d1);
+  await Promise.all([
+    derived.ensureSchema('2026-04-01T15:00:00.000Z'),
+    derived.ensureSchema('2026-04-01T15:00:01.000Z'),
+    derived.ensureSchema('2026-04-01T15:00:02.000Z'),
+  ]);
+  const firstPrepareCount = prepareCalls;
+  assert.ok(firstPrepareCount > 0);
+
+  await derived.ensureSchema('2026-04-01T15:00:03.000Z');
+  assert.equal(prepareCalls, firstPrepareCount);
+  d1.close();
+});
+
 test('control-plane D1 schema bootstrap avoids exec() so non-local publicRooms does not fail on newline-delimited D1 exec semantics', async () => {
   const d1 = createFakeD1Database();
   let execCalls = 0;
@@ -916,6 +958,48 @@ test('control-plane D1 schema bootstrap avoids exec() so non-local publicRooms d
     now: '2026-04-01T15:00:01.000Z',
   });
   assert.equal(activePolicies.length, 1);
+  d1.close();
+});
+
+test('control-plane D1 schema bootstrap memoizes once-per-isolate after the first successful ensureSchema()', async () => {
+  const d1 = createFakeD1Database();
+  const originalPrepare = d1.prepare.bind(d1);
+  let prepareCalls = 0;
+  d1.prepare = (sql) => {
+    prepareCalls += 1;
+    return originalPrepare(sql);
+  };
+
+  const controlPlane = createD1ControlPlanePersistence(d1);
+  await controlPlane.ensureSchema();
+  const firstPrepareCount = prepareCalls;
+  assert.ok(firstPrepareCount > 0);
+
+  await controlPlane.ensureSchema();
+  assert.equal(prepareCalls, firstPrepareCount);
+  d1.close();
+});
+
+test('control-plane D1 schema bootstrap coalesces concurrent ensureSchema() calls into a single schema install', async () => {
+  const d1 = createFakeD1Database();
+  const originalPrepare = d1.prepare.bind(d1);
+  let prepareCalls = 0;
+  d1.prepare = (sql) => {
+    prepareCalls += 1;
+    return originalPrepare(sql);
+  };
+
+  const controlPlane = createD1ControlPlanePersistence(d1);
+  await Promise.all([
+    controlPlane.ensureSchema(),
+    controlPlane.ensureSchema(),
+    controlPlane.ensureSchema(),
+  ]);
+  const firstPrepareCount = prepareCalls;
+  assert.ok(firstPrepareCount > 0);
+
+  await controlPlane.ensureSchema();
+  assert.equal(prepareCalls, firstPrepareCount);
   d1.close();
 });
 

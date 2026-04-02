@@ -221,6 +221,8 @@ async function tableExists(db, tableName) {
 
 export function createD1DerivedDataPersistence(database) {
   const db = requireD1Database(database);
+  let schemaReady = false;
+  let schemaReadyPromise = null;
   const searchIndex = createD1TableAccess(db, {
     tableName: 'search_index_rows',
     keyColumns: ['event_id'],
@@ -299,26 +301,38 @@ export function createD1DerivedDataPersistence(database) {
   return Object.freeze({
     schemaVersion: DERIVED_DATA_SCHEMA_VERSION,
     async ensureSchema(now = new Date().toISOString()) {
-      // Cloudflare D1 documents `exec()` as a newline-delimited maintenance surface; request-path schema
-      // bootstrap must run discrete prepared statements so multiline CREATE statements stay portable.
-      for (const statementSql of DERIVED_DATA_SCHEMA_STATEMENTS) {
-        await statementRun(db.prepare(statementSql));
+      if (schemaReady) {
+        return;
       }
-      await statementRun(
-        db.prepare(`
-          INSERT INTO ${DERIVED_SCHEMA_STATE_TABLE} (singleton, schema_version, updated_at)
-          VALUES (?, ?, ?)
-          ON CONFLICT(singleton) DO UPDATE SET
-            schema_version = CASE
-              WHEN ${DERIVED_SCHEMA_STATE_TABLE}.schema_version > excluded.schema_version THEN ${DERIVED_SCHEMA_STATE_TABLE}.schema_version
-              ELSE excluded.schema_version
-            END,
-            updated_at = excluded.updated_at
-        `),
-        1,
-        DERIVED_DATA_SCHEMA_VERSION,
-        normalizeString(now, 'now'),
-      );
+      if (!schemaReadyPromise) {
+        schemaReadyPromise = (async () => {
+          // Cloudflare D1 documents `exec()` as a newline-delimited maintenance surface; request-path schema
+          // bootstrap must run discrete prepared statements so multiline CREATE statements stay portable.
+          for (const statementSql of DERIVED_DATA_SCHEMA_STATEMENTS) {
+            await statementRun(db.prepare(statementSql));
+          }
+          await statementRun(
+            db.prepare(`
+              INSERT INTO ${DERIVED_SCHEMA_STATE_TABLE} (singleton, schema_version, updated_at)
+              VALUES (?, ?, ?)
+              ON CONFLICT(singleton) DO UPDATE SET
+                schema_version = CASE
+                  WHEN ${DERIVED_SCHEMA_STATE_TABLE}.schema_version > excluded.schema_version THEN ${DERIVED_SCHEMA_STATE_TABLE}.schema_version
+                  ELSE excluded.schema_version
+                END,
+                updated_at = excluded.updated_at
+            `),
+            1,
+            DERIVED_DATA_SCHEMA_VERSION,
+            normalizeString(now, 'now'),
+          );
+          schemaReady = true;
+        })().catch((error) => {
+          schemaReadyPromise = null;
+          throw error;
+        });
+      }
+      await schemaReadyPromise;
     },
     async isSchemaReady() {
       for (const tableName of REQUIRED_DERIVED_TABLES) {
