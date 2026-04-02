@@ -96,6 +96,7 @@ jobs:
           echo "artifact_root=${artifact_root}" >> "$GITHUB_OUTPUT"
           echo "provisioning=${state_root}/provisioning.json" >> "$GITHUB_OUTPUT"
           echo "deployment=${state_root}/deployment.json" >> "$GITHUB_OUTPUT"
+          echo "access_session=${state_root}/ops-access-session.json" >> "$GITHUB_OUTPUT"
           echo "github_artifact=${state_root}/github-artifact.json" >> "$GITHUB_OUTPUT"
           echo "log_upload=${state_root}/log-upload.json" >> "$GITHUB_OUTPUT"
           echo "bundle_upload=${state_root}/bundle-upload.json" >> "$GITHUB_OUTPUT"
@@ -122,20 +123,39 @@ jobs:
             --output "${{ steps.paths.outputs.deployment }}" \
             --deployment-id "gha-${{ matrix.environment }}-${MATRIX_PHASE08_RUN_TIMESTAMP}-${{ github.run_id }}-${{ github.run_attempt }}"
 
+      - name: Prepare non-local ops Access session
+        if: matrix.environment != 'ci-integration'
+        id: access
+        continue-on-error: true
+        run: |
+          node packages/testing/src/cli.mjs nonlocal-prepare-ops-access \
+            --environment "${{ matrix.environment }}" \
+            --provisioning "${{ steps.paths.outputs.provisioning }}" \
+            --deployment "${{ steps.paths.outputs.deployment }}" \
+            --working-root "${{ steps.paths.outputs.state_root }}/ops-access" \
+            --output "${{ steps.paths.outputs.access_session }}"
+
       - name: Run environment-backed suite
         id: suite
         continue-on-error: true
+        shell: bash
         run: |
-          node packages/testing/src/cli.mjs nonlocal-run \
-            --environment "${{ matrix.environment }}" \
-            --deployment "${{ steps.paths.outputs.deployment }}" \
-            --timestamp "${MATRIX_PHASE08_RUN_TIMESTAMP}" \
-            --output-root "${{ steps.paths.outputs.artifact_root }}" \
-            --source-run-uri "${MATRIX_PHASE08_RUN_URL}" \
-            --log-artifact "r2://matrix-evidence-${{ matrix.environment }}/${{ steps.paths.outputs.log_key }}" \
-            --executed-by "github-actions:${{ github.actor }}" \
-            --reviewed-by "github-actions-run:${{ github.run_id }}" \
+          args=(
+            node packages/testing/src/cli.mjs nonlocal-run
+            --environment "${{ matrix.environment }}"
+            --deployment "${{ steps.paths.outputs.deployment }}"
+            --timestamp "${MATRIX_PHASE08_RUN_TIMESTAMP}"
+            --output-root "${{ steps.paths.outputs.artifact_root }}"
+            --source-run-uri "${MATRIX_PHASE08_RUN_URL}"
+            --log-artifact "r2://matrix-evidence-${{ matrix.environment }}/${{ steps.paths.outputs.log_key }}"
+            --executed-by "github-actions:${{ github.actor }}"
+            --reviewed-by "github-actions-run:${{ github.run_id }}"
             --topology-kind "cloudflare-${{ matrix.environment }}"
+          )
+          if [ -f "${{ steps.paths.outputs.access_session }}" ]; then
+            args+=(--access-session "${{ steps.paths.outputs.access_session }}")
+          fi
+          "${args[@]}"
 
       - name: Bundle raw non-local artifacts
         if: always()

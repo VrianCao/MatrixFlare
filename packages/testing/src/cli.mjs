@@ -19,6 +19,7 @@ import {
   createEnvironmentWranglerConfig,
   deployNonLocalEnvironment,
   ensureNonLocalEnvironmentResources,
+  prepareNonLocalOpsAccessSession,
   runEnvironmentBackedSuite,
   uploadImmutableArtifactToR2,
   writeEnvironmentRunProvenance,
@@ -186,6 +187,12 @@ async function main() {
       activeDeploymentComposition: typeof options['active-deployment-composition'] === 'string'
         ? JSON.parse(options['active-deployment-composition'])
         : [],
+      access: typeof options['access-auth-domain'] === 'string' && typeof options['access-audience'] === 'string'
+        ? {
+          auth_domain: options['access-auth-domain'],
+          application_audience: options['access-audience'],
+        }
+        : null,
     });
     process.stdout.write(`${JSON.stringify({
       worker_name: result.worker_name,
@@ -233,9 +240,36 @@ async function main() {
     }, null, 2)}\n`);
     return;
   }
+  if (requestedEnvironment === 'nonlocal-prepare-ops-access') {
+    const options = parseKeyValueOptions(process.argv);
+    const provisionedEnvironment = await readJsonFile(path.resolve(process.cwd(), requireOption(options, 'provisioning')));
+    const deploymentSummary = await readJsonFile(path.resolve(process.cwd(), requireOption(options, 'deployment')));
+    const result = await prepareNonLocalOpsAccessSession(requireOption(options, 'environment'), {
+      repoRoot: process.cwd(),
+      provisionedEnvironment,
+      deploymentSummary,
+      workingRoot: typeof options['working-root'] === 'string'
+        ? path.resolve(process.cwd(), options['working-root'])
+        : null,
+      outputPath: typeof options.output === 'string' ? path.resolve(process.cwd(), options.output) : null,
+      accountId: typeof options['account-id'] === 'string' ? options['account-id'] : null,
+      apiToken: typeof options['api-token'] === 'string' ? options['api-token'] : null,
+    });
+    process.stdout.write(`${JSON.stringify({
+      environment_name: result.environment_name,
+      output_path: typeof options.output === 'string' ? options.output : null,
+      policy_id: result.access.policy_id,
+      service_token_id: result.access.service_token_id,
+      service_token_client_id: result.access.service_token_client_id,
+    }, null, 2)}\n`);
+    return;
+  }
   if (requestedEnvironment === 'nonlocal-run') {
     const options = parseKeyValueOptions(process.argv);
     const deployment = await readJsonFile(path.resolve(process.cwd(), requireOption(options, 'deployment')));
+    const accessSession = typeof options['access-session'] === 'string'
+      ? await readJsonFile(path.resolve(process.cwd(), options['access-session']))
+      : null;
     const result = await runEnvironmentBackedSuite(requireOption(options, 'environment'), process.cwd(), {
       runTimestamp: requireOption(options, 'timestamp'),
       outputRoot: path.resolve(process.cwd(), requireOption(options, 'output-root')),
@@ -245,6 +279,7 @@ async function main() {
       reviewedBy: requireOption(options, 'reviewed-by'),
       topologyKind: requireOption(options, 'topology-kind'),
       deploymentSummary: deployment,
+      accessSession,
     });
     process.stdout.write(`${JSON.stringify({
       report_path: path.relative(process.cwd(), result.report_path),

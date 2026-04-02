@@ -60,6 +60,8 @@ export function requireRemoteHarnessContext(testContext, expectedEnvironment) {
   assert.equal(parsedBaseUrl.protocol, 'https:', 'MATRIX_REMOTE_BASE_URL must target an HTTPS origin');
   assert.equal(parsedBaseUrl.host, serverName, 'MATRIX_REMOTE_SERVER_NAME must match the host of MATRIX_REMOTE_BASE_URL');
   const opsBaseUrl = stableString(process.env.MATRIX_REMOTE_OPS_BASE_URL);
+  const opsAccessClientId = stableString(process.env.MATRIX_REMOTE_OPS_ACCESS_CLIENT_ID);
+  const opsAccessClientSecret = stableString(process.env.MATRIX_REMOTE_OPS_ACCESS_CLIENT_SECRET);
   let parsedOpsBaseUrl = null;
   if (opsBaseUrl) {
     try {
@@ -74,6 +76,8 @@ export function requireRemoteHarnessContext(testContext, expectedEnvironment) {
     baseUrl: trimTrailingSlash(parsedBaseUrl.toString()),
     serverName,
     opsBaseUrl: parsedOpsBaseUrl == null ? '' : trimTrailingSlash(parsedOpsBaseUrl.toString()),
+    opsAccessClientId,
+    opsAccessClientSecret,
   };
 }
 
@@ -135,6 +139,32 @@ export async function requestOps(harness, pathname, {
     response,
     payload,
   };
+}
+
+export function buildOpsAccessHeaders(harness, headers = {}) {
+  assert.equal(typeof harness?.opsAccessClientId, 'string');
+  assert.equal(typeof harness?.opsAccessClientSecret, 'string');
+  assert.notEqual(harness.opsAccessClientId.length, 0, 'Remote harness requires MATRIX_REMOTE_OPS_ACCESS_CLIENT_ID');
+  assert.notEqual(harness.opsAccessClientSecret.length, 0, 'Remote harness requires MATRIX_REMOTE_OPS_ACCESS_CLIENT_SECRET');
+  return {
+    ...headers,
+    'CF-Access-Client-Id': harness.opsAccessClientId,
+    'CF-Access-Client-Secret': harness.opsAccessClientSecret,
+  };
+}
+
+export async function requestOpsAuthorized(harness, pathname, {
+  method = 'GET',
+  headers = {},
+  json = undefined,
+  body = undefined,
+} = {}) {
+  return requestOps(harness, pathname, {
+    method,
+    headers: buildOpsAccessHeaders(harness, headers),
+    json,
+    body,
+  });
 }
 
 export function authHeaders(accessToken) {

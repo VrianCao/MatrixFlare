@@ -16,6 +16,9 @@ import {
   listWorkerNames,
 } from '../../runtime-core/src/index.mjs';
 import {
+  CONTROL_PLANE_SCHEMA_SQL,
+} from '../../control-plane/src/index.mjs';
+import {
   assessNonLocalEnvironmentHarnessReadiness,
   validateEvidenceAttestationBundle,
   validateManualArtifactPayload,
@@ -87,6 +90,8 @@ const CLOUDFLARE_WORKER_TAG_MAX_LENGTH = 25;
 const GITHUB_ACTIONS_OIDC_ISSUER = 'https://token.actions.githubusercontent.com';
 const GITHUB_ACTIONS_OIDC_JWKS_URI = 'https://token.actions.githubusercontent.com/.well-known/jwks';
 const GITHUB_ACTIONS_OIDC_AUDIENCE = 'matrix-phase08-nonlocal';
+const NON_LOCAL_ACCESS_APPLICATION_SESSION_DURATION = '24h';
+const NON_LOCAL_ACCESS_SERVICE_TOKEN_DURATION = '8760h';
 const NON_LOCAL_READINESS_MAX_ATTEMPTS = 7;
 const NON_LOCAL_READINESS_INITIAL_DELAY_MS = 2_000;
 const NON_LOCAL_READINESS_MAX_DELAY_MS = 15_000;
@@ -406,6 +411,22 @@ function buildResourceSuffix(environmentName) {
   return assertNonLocalEnvironmentName(environmentName);
 }
 
+function buildAccessApplicationName(environmentName) {
+  return `matrix-phase08-${assertNonLocalEnvironmentName(environmentName)}-ops`;
+}
+
+function buildAccessPolicyName(environmentName) {
+  return `matrix-phase08-${assertNonLocalEnvironmentName(environmentName)}-gha-service-auth`;
+}
+
+function buildAccessServiceTokenName(environmentName) {
+  return `matrix-phase08-${assertNonLocalEnvironmentName(environmentName)}-gha-service-token`;
+}
+
+function buildOperatorPolicyPrincipalId(environmentName) {
+  return `matrix-phase08-${assertNonLocalEnvironmentName(environmentName)}-gha-ops`;
+}
+
 function buildResourceBindingNames(environmentName) {
   const suffix = buildResourceSuffix(environmentName);
   return Object.freeze({
@@ -469,6 +490,45 @@ export function buildNonLocalEnvironmentPlan(environmentName, {
     }),
     deployment_order: WORKER_DEPLOYMENT_ORDER,
     bootstrap_order: WORKER_BOOTSTRAP_ORDER,
+  });
+}
+
+function normalizeAccessDomainPath(value, label) {
+  if (!isNonEmptyString(value)) {
+    throw new RangeError(`${label} must be non-empty`);
+  }
+  const normalized = value.trim().replace(/^https?:\/\//iu, '').replace(/\/+$/, '');
+  if (normalized.length === 0 || normalized.includes('?') || normalized.includes('#')) {
+    throw new RangeError(`${label} must be a hostname or hostname/path without query or fragment`);
+  }
+  if (normalized.includes('://')) {
+    throw new RangeError(`${label} must not include a scheme`);
+  }
+  return normalized;
+}
+
+function buildAccessAppDomainForPlan(plan) {
+  const opsUrl = plan.worker_urls['ops-worker'] ?? `https://${plan.worker_scripts['ops-worker']}.workers.dev`;
+  const parsedOpsUrl = parseAbsoluteHttpsUrl(opsUrl, 'ops worker URL');
+  return normalizeAccessDomainPath(parsedOpsUrl.host, 'ops access app domain');
+}
+
+function buildAccessApplicationRequestBody(plan) {
+  const accessDomain = buildAccessAppDomainForPlan(plan);
+  return Object.freeze({
+    name: buildAccessApplicationName(plan.environment_name),
+    type: 'self_hosted',
+    domain: accessDomain,
+    app_launcher_visible: false,
+    self_hosted_domains: [accessDomain],
+    destinations: [
+      {
+        type: 'public',
+        uri: accessDomain,
+      },
+    ],
+    service_auth_401_redirect: true,
+    session_duration: NON_LOCAL_ACCESS_APPLICATION_SESSION_DURATION,
   });
 }
 
@@ -602,6 +662,7 @@ function buildWorkerVars(workerName, plan, {
   deploymentId,
   workerVersionId,
   activeDeploymentComposition,
+  access = null,
 }) {
   const baseUrl = plan.worker_urls['gateway-worker'] ?? `https://${plan.worker_scripts['gateway-worker']}.workers.dev`;
   const opsUrl = plan.worker_urls['ops-worker'] ?? `https://${plan.worker_scripts['ops-worker']}.workers.dev`;
@@ -617,8 +678,17 @@ function buildWorkerVars(workerName, plan, {
     MANAGEMENT_API_BASE_URL: opsUrl,
   };
   if (workerName === 'ops-worker') {
-    vars.ACCESS_TEAM_DOMAIN = `${slugifyLabel(plan.environment_name)}.cloudflareaccess.invalid`;
-    vars.ACCESS_AUDIENCE = `matrixflare-${slugifyLabel(plan.environment_name)}-ops`;
+    if (!isPlainObject(access)) {
+      throw new TypeError('ops-worker non-local deploy requires access metadata');
+    }
+    if (!isNonEmptyString(access.auth_domain)) {
+      throw new TypeError('ops-worker access.auth_domain must be non-empty');
+    }
+    if (!isNonEmptyString(access.application_audience)) {
+      throw new TypeError('ops-worker access.application_audience must be non-empty');
+    }
+    vars.ACCESS_TEAM_DOMAIN = access.auth_domain;
+    vars.ACCESS_AUDIENCE = access.application_audience;
   }
   return vars;
 }
@@ -638,6 +708,7 @@ export function createEnvironmentWranglerConfig(workerName, plan, {
   deploymentId = `gha-${plan.environment_name}`,
   workerVersionId = 'pending-runtime-version',
   activeDeploymentComposition = [],
+  access = null,
 } = {}) {
   const baseConfig = structuredCloneJson(createWranglerConfigSnapshot(workerName));
   const envName = plan.environment_name;
@@ -647,6 +718,7 @@ export function createEnvironmentWranglerConfig(workerName, plan, {
       deploymentId,
       workerVersionId,
       activeDeploymentComposition,
+      access,
     }),
   };
   const envConfig = {
@@ -855,6 +927,283 @@ async function callCloudflareApi({
   return payload;
 }
 
+async function getZeroTrustOrganization({
+  accountId,
+  apiToken,
+}) {
+  const payload = await callCloudflareApi({
+    accountId,
+    apiToken,
+    pathname: '/access/organizations',
+  });
+  const result = Array.isArray(payload.result) ? payload.result[0] : payload.result;
+  return normalizeCloudflareAccessOrganization(result);
+}
+
+async function listAccessApplications({
+  accountId,
+  apiToken,
+}) {
+  const payload = await callCloudflareApi({
+    accountId,
+    apiToken,
+    pathname: '/access/apps?per_page=100',
+  });
+  return extractArrayResult(payload.result, ['result']).map((entry) => normalizeCloudflareAccessApplication(entry));
+}
+
+async function createAccessApplication({
+  accountId,
+  apiToken,
+  body,
+}) {
+  const payload = await callCloudflareApi({
+    accountId,
+    apiToken,
+    method: 'POST',
+    pathname: '/access/apps',
+    body,
+  });
+  return normalizeCloudflareAccessApplication(payload.result);
+}
+
+async function updateAccessApplication({
+  accountId,
+  apiToken,
+  appId,
+  body,
+}) {
+  const payload = await callCloudflareApi({
+    accountId,
+    apiToken,
+    method: 'PUT',
+    pathname: `/access/apps/${appId}`,
+    body,
+  });
+  return normalizeCloudflareAccessApplication(payload.result);
+}
+
+async function ensureAccessApplication({
+  accountId,
+  apiToken,
+  plan,
+}) {
+  const requestBody = buildAccessApplicationRequestBody(plan);
+  const apps = await listAccessApplications({
+    accountId,
+    apiToken,
+  });
+  const matching = apps.filter((entry) => entry.domain === requestBody.domain);
+  if (matching.length > 1) {
+    throw new Error(`Multiple Cloudflare Access applications matched ops domain ${requestBody.domain}; refusing to guess`);
+  }
+  if (matching.length === 0) {
+    const created = await createAccessApplication({
+      accountId,
+      apiToken,
+      body: requestBody,
+    });
+    return {
+      application: created,
+      created: true,
+      updated: false,
+    };
+  }
+  const existing = matching[0];
+  const updated = await updateAccessApplication({
+    accountId,
+    apiToken,
+    appId: existing.id,
+    body: requestBody,
+  });
+  return {
+    application: updated,
+    created: false,
+    updated: true,
+  };
+}
+
+async function listAccessApplicationPolicies({
+  accountId,
+  apiToken,
+  appId,
+}) {
+  const payload = await callCloudflareApi({
+    accountId,
+    apiToken,
+    pathname: `/access/apps/${appId}/policies?per_page=100`,
+  });
+  return extractArrayResult(payload.result, ['result']).map((entry) => normalizeCloudflareAccessPolicy(entry));
+}
+
+async function createAccessApplicationPolicy({
+  accountId,
+  apiToken,
+  appId,
+  body,
+}) {
+  const payload = await callCloudflareApi({
+    accountId,
+    apiToken,
+    method: 'POST',
+    pathname: `/access/apps/${appId}/policies`,
+    body,
+  });
+  return normalizeCloudflareAccessPolicy(payload.result);
+}
+
+async function updateAccessApplicationPolicy({
+  accountId,
+  apiToken,
+  appId,
+  policyId,
+  body,
+}) {
+  const payload = await callCloudflareApi({
+    accountId,
+    apiToken,
+    method: 'PUT',
+    pathname: `/access/apps/${appId}/policies/${policyId}`,
+    body,
+  });
+  return normalizeCloudflareAccessPolicy(payload.result);
+}
+
+async function ensureAccessApplicationPolicy({
+  accountId,
+  apiToken,
+  appId,
+  environmentName,
+  serviceTokenId,
+}) {
+  const policies = await listAccessApplicationPolicies({
+    accountId,
+    apiToken,
+    appId,
+  });
+  const expectedName = buildAccessPolicyName(environmentName);
+  const matching = policies.filter((entry) => entry.name === expectedName);
+  if (matching.length > 1) {
+    throw new Error(`Multiple Cloudflare Access policies matched ${expectedName}; refusing to guess`);
+  }
+  const body = buildCloudflareAccessPolicyRequestBody({
+    environmentName,
+    serviceTokenId,
+  });
+  if (matching.length === 0) {
+    const created = await createAccessApplicationPolicy({
+      accountId,
+      apiToken,
+      appId,
+      body,
+    });
+    return {
+      policy: created,
+      created: true,
+      updated: false,
+    };
+  }
+  const updated = await updateAccessApplicationPolicy({
+    accountId,
+    apiToken,
+    appId,
+    policyId: matching[0].id,
+    body,
+  });
+  return {
+    policy: updated,
+    created: false,
+    updated: true,
+  };
+}
+
+async function listServiceTokens({
+  accountId,
+  apiToken,
+  name = null,
+}) {
+  const querySuffix = name == null ? '?per_page=100' : `?per_page=100&name=${encodeURIComponent(name)}`;
+  const payload = await callCloudflareApi({
+    accountId,
+    apiToken,
+    pathname: `/access/service_tokens${querySuffix}`,
+  });
+  return extractArrayResult(payload.result, ['result']).map((entry) => normalizeCloudflareServiceToken(entry));
+}
+
+async function createServiceToken({
+  accountId,
+  apiToken,
+  body,
+}) {
+  const payload = await callCloudflareApi({
+    accountId,
+    apiToken,
+    method: 'POST',
+    pathname: '/access/service_tokens',
+    body,
+  });
+  return normalizeCloudflareServiceToken(payload.result);
+}
+
+async function rotateServiceToken({
+  accountId,
+  apiToken,
+  serviceTokenId,
+}) {
+  const payload = await callCloudflareApi({
+    accountId,
+    apiToken,
+    method: 'POST',
+    pathname: `/access/service_tokens/${serviceTokenId}/rotate`,
+    body: {
+      previous_client_secret_expires_at: new Date().toISOString(),
+    },
+  });
+  return normalizeCloudflareServiceToken(payload.result);
+}
+
+async function ensureServiceToken({
+  accountId,
+  apiToken,
+  environmentName,
+}) {
+  const expectedName = buildAccessServiceTokenName(environmentName);
+  const existing = await listServiceTokens({
+    accountId,
+    apiToken,
+    name: expectedName,
+  });
+  if (existing.length > 1) {
+    throw new Error(`Multiple Cloudflare service tokens matched ${expectedName}; refusing to guess`);
+  }
+  if (existing.length === 0) {
+    const created = await createServiceToken({
+      accountId,
+      apiToken,
+      body: {
+        name: expectedName,
+        duration: NON_LOCAL_ACCESS_SERVICE_TOKEN_DURATION,
+      },
+    });
+    return {
+      service_token: created,
+      created: true,
+      rotated: false,
+    };
+  }
+  const rotated = await rotateServiceToken({
+    accountId,
+    apiToken,
+    serviceTokenId: existing[0].id,
+  });
+  return {
+    service_token: rotated,
+    created: false,
+    rotated: true,
+  };
+}
+
 function extractArrayResult(result, candidateKeys = []) {
   if (Array.isArray(result)) {
     return result;
@@ -889,6 +1238,138 @@ function extractStringField(value, candidateKeys) {
 
 function findNamedResult(entries, expectedName, candidateKeys) {
   return entries.find((entry) => extractStringField(entry, candidateKeys) === expectedName) ?? null;
+}
+
+function normalizeCloudflareAccessOrganization(result) {
+  const authDomain = extractStringField(result, ['auth_domain']);
+  if (!isNonEmptyString(authDomain)) {
+    throw new TypeError('Cloudflare Zero Trust organization must include auth_domain');
+  }
+  return Object.freeze({
+    auth_domain: authDomain.trim().toLowerCase(),
+  });
+}
+
+function normalizeCloudflareAccessApplication(result) {
+  const id = extractStringField(result, ['id']);
+  const aud = extractStringField(result, ['aud']);
+  const domain = extractStringField(result, ['domain']);
+  const type = extractStringField(result, ['type']);
+  const name = extractStringField(result, ['name']);
+  if (!isNonEmptyString(id)) {
+    throw new TypeError('Cloudflare Access application must include id');
+  }
+  if (!isNonEmptyString(aud)) {
+    throw new TypeError('Cloudflare Access application must include aud');
+  }
+  if (!isNonEmptyString(domain)) {
+    throw new TypeError('Cloudflare Access application must include domain');
+  }
+  if (!isNonEmptyString(type)) {
+    throw new TypeError('Cloudflare Access application must include type');
+  }
+  return Object.freeze({
+    id,
+    aud,
+    domain: normalizeAccessDomainPath(domain, 'Cloudflare Access application domain'),
+    type,
+    name: name ?? null,
+  });
+}
+
+function normalizeCloudflareAccessPolicy(result) {
+  const id = extractStringField(result, ['id']);
+  const name = extractStringField(result, ['name']);
+  const decision = extractStringField(result, ['decision']);
+  if (!isNonEmptyString(id)) {
+    throw new TypeError('Cloudflare Access policy must include id');
+  }
+  if (!isNonEmptyString(name)) {
+    throw new TypeError('Cloudflare Access policy must include name');
+  }
+  if (!isNonEmptyString(decision)) {
+    throw new TypeError('Cloudflare Access policy must include decision');
+  }
+  return Object.freeze({
+    id,
+    name,
+    decision,
+  });
+}
+
+function normalizeCloudflareServiceToken(result) {
+  const id = extractStringField(result, ['id']);
+  const name = extractStringField(result, ['name']);
+  const clientId = extractStringField(result, ['client_id']);
+  const clientSecret = extractStringField(result, ['client_secret']);
+  const duration = extractStringField(result, ['duration']);
+  if (!isNonEmptyString(id)) {
+    throw new TypeError('Cloudflare service token must include id');
+  }
+  if (!isNonEmptyString(name)) {
+    throw new TypeError('Cloudflare service token must include name');
+  }
+  if (!isNonEmptyString(clientId)) {
+    throw new TypeError('Cloudflare service token must include client_id');
+  }
+  return Object.freeze({
+    id,
+    name,
+    client_id: clientId,
+    client_secret: clientSecret ?? null,
+    duration: duration ?? null,
+  });
+}
+
+function buildCloudflareAccessPolicyRequestBody({
+  environmentName,
+  serviceTokenId,
+}) {
+  if (!isNonEmptyString(serviceTokenId)) {
+    throw new TypeError('serviceTokenId must be non-empty');
+  }
+  return Object.freeze({
+    name: buildAccessPolicyName(environmentName),
+    decision: 'non_identity',
+    precedence: 1,
+    include: [
+      {
+        service_token: {
+          token_id: serviceTokenId,
+        },
+      },
+    ],
+  });
+}
+
+function buildOperatorPolicyRecord({
+  environmentName,
+  authDomain,
+  audience,
+  accessSubjectValue,
+}) {
+  const now = new Date().toISOString();
+  return Object.freeze({
+    principal_id: buildOperatorPolicyPrincipalId(environmentName),
+    principal_type: 'service',
+    access_issuer: `https://${authDomain}`,
+    access_audience: audience,
+    access_subject_binding: {
+      mode: 'claim_priority',
+      claims: ['common_name', 'sub'],
+    },
+    access_subject_value: accessSubjectValue,
+    allowed_scopes: ['ops.read', 'ops.rebuild.write'],
+    target_scope_constraints: {
+      global: true,
+    },
+    expires_at: null,
+    disabled_at: null,
+    require_reason: false,
+    require_ticket: false,
+    created_at: now,
+    updated_at: now,
+  });
 }
 
 async function ensureWorkersSubdomain({
@@ -1121,6 +1602,94 @@ async function runWrangler(args, {
 async function runWranglerJson(args, options) {
   const result = await runWrangler(args, options);
   return parseJsonOutput(result.stdout);
+}
+
+async function executeRemoteD1Sql({
+  repoRoot = process.cwd(),
+  accountId,
+  databaseName,
+  sql,
+  workingRoot,
+}) {
+  if (!isNonEmptyString(databaseName)) {
+    throw new TypeError('databaseName must be non-empty');
+  }
+  if (!isNonEmptyString(sql)) {
+    throw new TypeError('sql must be non-empty');
+  }
+  const resolvedWorkingRoot = path.resolve(workingRoot ?? path.join(repoRoot, '.tmp', 'nonlocal-d1'));
+  await fs.mkdir(resolvedWorkingRoot, { recursive: true });
+  const sqlPath = path.join(resolvedWorkingRoot, `${slugifyLabel(databaseName)}-${Date.now().toString(36)}.sql`);
+  await fs.writeFile(sqlPath, sql);
+  try {
+    await runWrangler([
+      'd1',
+      'execute',
+      databaseName,
+      '--remote',
+      '--json',
+      '--file',
+      sqlPath,
+    ], {
+      repoRoot,
+      accountId,
+    });
+  } finally {
+    await fs.rm(sqlPath, { force: true });
+  }
+}
+
+function escapeSqlString(value) {
+  return String(value).replaceAll("'", "''");
+}
+
+function buildOperatorPolicyUpsertSql(record) {
+  return `
+INSERT INTO operator_authz_policies (
+  principal_id,
+  principal_type,
+  access_issuer,
+  access_audience,
+  access_subject_binding,
+  access_subject_value,
+  allowed_scopes,
+  target_scope_constraints,
+  expires_at,
+  disabled_at,
+  require_reason,
+  require_ticket,
+  created_at,
+  updated_at
+) VALUES (
+  '${escapeSqlString(record.principal_id)}',
+  '${escapeSqlString(record.principal_type)}',
+  '${escapeSqlString(record.access_issuer)}',
+  '${escapeSqlString(record.access_audience)}',
+  '${escapeSqlString(JSON.stringify(record.access_subject_binding))}',
+  '${escapeSqlString(record.access_subject_value)}',
+  '${escapeSqlString(JSON.stringify(record.allowed_scopes))}',
+  '${escapeSqlString(JSON.stringify(record.target_scope_constraints))}',
+  NULL,
+  NULL,
+  ${record.require_reason ? 1 : 0},
+  ${record.require_ticket ? 1 : 0},
+  '${escapeSqlString(record.created_at)}',
+  '${escapeSqlString(record.updated_at)}'
+)
+ON CONFLICT(principal_id) DO UPDATE SET
+  principal_type = excluded.principal_type,
+  access_issuer = excluded.access_issuer,
+  access_audience = excluded.access_audience,
+  access_subject_binding = excluded.access_subject_binding,
+  access_subject_value = excluded.access_subject_value,
+  allowed_scopes = excluded.allowed_scopes,
+  target_scope_constraints = excluded.target_scope_constraints,
+  expires_at = excluded.expires_at,
+  disabled_at = excluded.disabled_at,
+  require_reason = excluded.require_reason,
+  require_ticket = excluded.require_ticket,
+  updated_at = excluded.updated_at;
+`.trim();
 }
 
 export function summarizeWorkerDeploymentState({
@@ -1476,7 +2045,16 @@ export async function ensureNonLocalEnvironmentResources(environmentName, {
   const plan = buildNonLocalEnvironmentPlan(environmentName, {
     workersSubdomain: workersSubdomain.subdomain,
   });
-  const [d1Database, kvNamespace, mediaBucket, archiveBucket, artifactBucket, ...queues] = await Promise.all([
+  const [organization, accessApp, d1Database, kvNamespace, mediaBucket, archiveBucket, artifactBucket, ...queues] = await Promise.all([
+    getZeroTrustOrganization({
+      accountId,
+      apiToken,
+    }),
+    ensureAccessApplication({
+      accountId,
+      apiToken,
+      plan,
+    }),
     ensureD1Database({
       accountId,
       apiToken,
@@ -1514,6 +2092,17 @@ export async function ensureNonLocalEnvironmentResources(environmentName, {
     account_id: accountId,
     workers_subdomain: workersSubdomain.subdomain,
     plan,
+    access: {
+      auth_domain: organization.auth_domain,
+      application_id: accessApp.application.id,
+      application_audience: accessApp.application.aud,
+      application_domain: accessApp.application.domain,
+      application_type: accessApp.application.type,
+      application_name: accessApp.application.name,
+      protected_ops_url: `https://${accessApp.application.domain}`,
+      created: accessApp.created,
+      updated: accessApp.updated,
+    },
     resources: {
       d1_database: d1Database,
       kv_namespace: kvNamespace,
@@ -1523,6 +2112,117 @@ export async function ensureNonLocalEnvironmentResources(environmentName, {
         evidence: artifactBucket,
       },
       queues,
+    },
+  };
+  if (outputPath != null) {
+    await fs.mkdir(path.dirname(outputPath), { recursive: true });
+    await fs.writeFile(outputPath, stableJson(result));
+  }
+  return result;
+}
+
+export async function prepareNonLocalOpsAccessSession(environmentName, {
+  repoRoot = process.cwd(),
+  provisionedEnvironment,
+  deploymentSummary,
+  workingRoot = null,
+  outputPath = null,
+  accountId: explicitAccountId = null,
+  apiToken: explicitApiToken = null,
+} = {}) {
+  const normalizedEnvironmentName = assertNonLocalEnvironmentName(environmentName);
+  await requireGitHubActionsExecution('prepareNonLocalOpsAccessSession', {
+    expectedEnvironmentName: normalizedEnvironmentName,
+  });
+  if (!isPlainObject(provisionedEnvironment) || provisionedEnvironment.environment_name !== normalizedEnvironmentName) {
+    throw new TypeError(`provisionedEnvironment must be the ${normalizedEnvironmentName} provisioning payload`);
+  }
+  if (!isPlainObject(deploymentSummary) || deploymentSummary.environment_name !== normalizedEnvironmentName) {
+    throw new TypeError(`deploymentSummary must be the ${normalizedEnvironmentName} deployment payload`);
+  }
+  if (!isPlainObject(provisionedEnvironment.access)) {
+    throw new TypeError('provisionedEnvironment.access must be present');
+  }
+  const accessMetadata = provisionedEnvironment.access;
+  if (!isNonEmptyString(accessMetadata.auth_domain)) {
+    throw new TypeError('provisionedEnvironment.access.auth_domain must be non-empty');
+  }
+  if (!isNonEmptyString(accessMetadata.application_id)) {
+    throw new TypeError('provisionedEnvironment.access.application_id must be non-empty');
+  }
+  if (!isNonEmptyString(accessMetadata.application_audience)) {
+    throw new TypeError('provisionedEnvironment.access.application_audience must be non-empty');
+  }
+  if (!isNonEmptyString(provisionedEnvironment.resources?.d1_database?.name)) {
+    throw new TypeError('provisionedEnvironment.resources.d1_database.name must be non-empty');
+  }
+  const { accountId, apiToken } = requireCloudflareCredentials({
+    accountId: explicitAccountId,
+    apiToken: explicitApiToken,
+  });
+  const serviceTokenResult = await ensureServiceToken({
+    accountId,
+    apiToken,
+    environmentName: normalizedEnvironmentName,
+  });
+  if (!isNonEmptyString(serviceTokenResult.service_token.client_secret)) {
+    throw new Error(`Cloudflare service token rotation for ${normalizedEnvironmentName} did not return client_secret`);
+  }
+  const accessPolicyResult = await ensureAccessApplicationPolicy({
+    accountId,
+    apiToken,
+    appId: accessMetadata.application_id,
+    environmentName: normalizedEnvironmentName,
+    serviceTokenId: serviceTokenResult.service_token.id,
+  });
+  const operatorPolicyRecord = buildOperatorPolicyRecord({
+    environmentName: normalizedEnvironmentName,
+    authDomain: accessMetadata.auth_domain,
+    audience: accessMetadata.application_audience,
+    accessSubjectValue: serviceTokenResult.service_token.client_id,
+  });
+  const resolvedWorkingRoot = path.resolve(workingRoot ?? path.join(repoRoot, '.tmp', 'nonlocal', normalizedEnvironmentName, 'ops-access'));
+  await executeRemoteD1Sql({
+    repoRoot,
+    accountId,
+    databaseName: provisionedEnvironment.resources.d1_database.name,
+    sql: CONTROL_PLANE_SCHEMA_SQL,
+    workingRoot: resolvedWorkingRoot,
+  });
+  await executeRemoteD1Sql({
+    repoRoot,
+    accountId,
+    databaseName: provisionedEnvironment.resources.d1_database.name,
+    sql: buildOperatorPolicyUpsertSql(operatorPolicyRecord),
+    workingRoot: resolvedWorkingRoot,
+  });
+  const result = {
+    environment_name: normalizedEnvironmentName,
+    account_id: accountId,
+    access: {
+      auth_domain: accessMetadata.auth_domain,
+      application_id: accessMetadata.application_id,
+      application_audience: accessMetadata.application_audience,
+      application_domain: accessMetadata.application_domain,
+      protected_ops_url: accessMetadata.protected_ops_url ?? deploymentSummary.workers?.['ops-worker']?.url ?? '',
+      policy_id: accessPolicyResult.policy.id,
+      policy_name: accessPolicyResult.policy.name,
+      service_token_id: serviceTokenResult.service_token.id,
+      service_token_name: serviceTokenResult.service_token.name,
+      service_token_client_id: serviceTokenResult.service_token.client_id,
+      service_token_client_secret: serviceTokenResult.service_token.client_secret,
+    },
+    operator_policy: {
+      principal_id: operatorPolicyRecord.principal_id,
+      access_subject_value: operatorPolicyRecord.access_subject_value,
+      allowed_scopes: operatorPolicyRecord.allowed_scopes,
+      target_scope_constraints: operatorPolicyRecord.target_scope_constraints,
+    },
+    audit: {
+      service_token_created: serviceTokenResult.created,
+      service_token_rotated: serviceTokenResult.rotated,
+      policy_created: accessPolicyResult.created,
+      policy_updated: accessPolicyResult.updated,
     },
   };
   if (outputPath != null) {
@@ -1600,12 +2300,13 @@ async function requestRemoteHarnessJson(remoteHarnessEnv, pathname, {
   body = null,
   fetchImpl = globalThis.fetch,
   timeoutMs = NON_LOCAL_READINESS_REQUEST_TIMEOUT_MS,
+  baseUrl = null,
 } = {}) {
   const requestHeaders = new Headers(headers);
   if (json != null && !requestHeaders.has('content-type')) {
     requestHeaders.set('content-type', 'application/json; charset=utf-8');
   }
-  const response = await fetchImpl(`${remoteHarnessEnv.MATRIX_REMOTE_BASE_URL}${pathname}`, {
+  const response = await fetchImpl(`${baseUrl ?? remoteHarnessEnv.MATRIX_REMOTE_BASE_URL}${pathname}`, {
     method,
     headers: requestHeaders,
     body: json == null ? body : JSON.stringify(json),
@@ -1661,6 +2362,12 @@ function summarizeReadinessProbeStepDetail(stepName, payload) {
   if (stepName === 'media_create') {
     return {
       content_uri_present: typeof payload?.content_uri === 'string',
+    };
+  }
+  if (stepName === 'ops_healthz') {
+    return {
+      service: payload?.service ?? null,
+      status: payload?.status ?? null,
     };
   }
   return null;
@@ -1865,6 +2572,30 @@ async function runNonLocalReadinessProbeAttempt(environmentName, remoteHarnessEn
     }
     recordSuccess('media_create', mediaCreate.payload);
 
+    if (
+      isNonEmptyString(remoteHarnessEnv.MATRIX_REMOTE_OPS_BASE_URL)
+      && isNonEmptyString(remoteHarnessEnv.MATRIX_REMOTE_OPS_ACCESS_CLIENT_ID)
+      && isNonEmptyString(remoteHarnessEnv.MATRIX_REMOTE_OPS_ACCESS_CLIENT_SECRET)
+    ) {
+      const opsHeaders = {
+        'CF-Access-Client-Id': remoteHarnessEnv.MATRIX_REMOTE_OPS_ACCESS_CLIENT_ID,
+        'CF-Access-Client-Secret': remoteHarnessEnv.MATRIX_REMOTE_OPS_ACCESS_CLIENT_SECRET,
+      };
+      const opsHealthz = await requestRemoteHarnessJson(remoteHarnessEnv, '/_ops/v1/healthz', {
+        headers: opsHeaders,
+        fetchImpl,
+        baseUrl: remoteHarnessEnv.MATRIX_REMOTE_OPS_BASE_URL,
+      });
+      if (opsHealthz.response.status !== 200 || opsHealthz.payload?.service !== 'ops-worker') {
+        return {
+          ok: false,
+          steps,
+          failure: recordFailure('ops_healthz', opsHealthz.response, opsHealthz.payload),
+        };
+      }
+      recordSuccess('ops_healthz', opsHealthz.payload);
+    }
+
     return {
       ok: true,
       steps,
@@ -2059,10 +2790,16 @@ export function buildRemoteHarnessEnvironmentVariablesFromDeployment(environment
       expectedWorkerVersionId: deploymentSummary.deployment_identity.worker_version_ids[WORKER_DEPLOYMENT_ORDER.indexOf('ops-worker')],
     },
   );
+  const declaredProtectedOpsUrl = isNonEmptyString(deploymentSummary.access?.protected_ops_url)
+    ? parseAbsoluteHttpsUrl(deploymentSummary.access.protected_ops_url, 'deployment summary access.protected_ops_url')
+    : null;
+  if (declaredProtectedOpsUrl != null && declaredProtectedOpsUrl.host !== new URL(opsWorker.url).host) {
+    throw new TypeError('deployment summary access.protected_ops_url must match the deployed ops-worker host');
+  }
   return Object.freeze({
     MATRIX_REMOTE_BASE_URL: gatewayWorker.url,
     MATRIX_REMOTE_SERVER_NAME: new URL(gatewayWorker.url).host,
-    MATRIX_REMOTE_OPS_BASE_URL: opsWorker.url,
+    MATRIX_REMOTE_OPS_BASE_URL: (declaredProtectedOpsUrl ?? new URL(opsWorker.url)).toString().replace(/\/$/, ''),
   });
 }
 
@@ -2083,12 +2820,41 @@ export function validateRemoteHarnessEnvironmentVariables(env) {
   if (opsBaseUrl.length > 0) {
     parseAbsoluteHttpsUrl(opsBaseUrl, 'MATRIX_REMOTE_OPS_BASE_URL');
   }
+  const opsAccessClientId = String(env.MATRIX_REMOTE_OPS_ACCESS_CLIENT_ID ?? '').trim();
+  const opsAccessClientSecret = String(env.MATRIX_REMOTE_OPS_ACCESS_CLIENT_SECRET ?? '').trim();
+  if ((opsAccessClientId.length === 0) !== (opsAccessClientSecret.length === 0)) {
+    throw new RangeError('MATRIX_REMOTE_OPS_ACCESS_CLIENT_ID and MATRIX_REMOTE_OPS_ACCESS_CLIENT_SECRET must be provided together');
+  }
   return Object.freeze({
     MATRIX_REMOTE_BASE_URL: parsedRemoteBaseUrl.toString().replace(/\/$/, ''),
     MATRIX_REMOTE_SERVER_NAME: remoteServerName,
     MATRIX_REMOTE_OPS_BASE_URL: opsBaseUrl.length === 0
       ? ''
       : parseAbsoluteHttpsUrl(opsBaseUrl, 'MATRIX_REMOTE_OPS_BASE_URL').toString().replace(/\/$/, ''),
+    MATRIX_REMOTE_OPS_ACCESS_CLIENT_ID: opsAccessClientId,
+    MATRIX_REMOTE_OPS_ACCESS_CLIENT_SECRET: opsAccessClientSecret,
+  });
+}
+
+function buildRemoteHarnessEnvironmentVariablesWithAccessSession(remoteHarnessEnv, accessSession = null) {
+  if (accessSession == null) {
+    return validateRemoteHarnessEnvironmentVariables(remoteHarnessEnv);
+  }
+  if (!isPlainObject(accessSession)) {
+    throw new TypeError('accessSession must be an object');
+  }
+  const clientId = String(accessSession.access?.service_token_client_id ?? '').trim();
+  const clientSecret = String(accessSession.access?.service_token_client_secret ?? '').trim();
+  if (!isNonEmptyString(clientId)) {
+    throw new TypeError('accessSession.access.service_token_client_id must be non-empty');
+  }
+  if (!isNonEmptyString(clientSecret)) {
+    throw new TypeError('accessSession.access.service_token_client_secret must be non-empty');
+  }
+  return validateRemoteHarnessEnvironmentVariables({
+    ...remoteHarnessEnv,
+    MATRIX_REMOTE_OPS_ACCESS_CLIENT_ID: clientId,
+    MATRIX_REMOTE_OPS_ACCESS_CLIENT_SECRET: clientSecret,
   });
 }
 
@@ -2126,6 +2892,7 @@ async function deployWorker(workerName, provisionedEnvironment, {
     deploymentId,
     workerVersionId: buildRuntimeWorkerVersionId(deploymentId, workerName),
     activeDeploymentComposition: runtimeComposition,
+    access: provisionedEnvironment.access,
   });
   const secretBundle = buildNonProductionSecretBundle({
     environmentName: provisionedEnvironment.environment_name,
@@ -2230,6 +2997,13 @@ export async function deployNonLocalEnvironment(environmentName, {
     deployment_id: resolvedDeploymentId,
     working_root: resolvedWorkingRoot,
     workers_subdomain: provisionedEnvironment.workers_subdomain,
+    access: {
+      auth_domain: provisionedEnvironment.access.auth_domain,
+      application_id: provisionedEnvironment.access.application_id,
+      application_audience: provisionedEnvironment.access.application_audience,
+      application_domain: provisionedEnvironment.access.application_domain,
+      protected_ops_url: provisionedEnvironment.access.protected_ops_url,
+    },
     remote_harness_env: buildRemoteHarnessEnvironmentVariables(provisionedEnvironment.plan),
     cloudflare_resources: {
       ...provisionedEnvironment.plan.cloudflare_resources,
@@ -2378,6 +3152,7 @@ export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
   reviewedBy,
   topologyKind,
   deploymentSummary,
+  accessSession = null,
 } = {}, {
   requireGitHubActionsExecutionImpl = requireGitHubActionsExecution,
   assessNonLocalEnvironmentHarnessReadinessImpl = assessNonLocalEnvironmentHarnessReadiness,
@@ -2416,10 +3191,11 @@ export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
       throw new TypeError(`deployment summary workers_subdomain must match Cloudflare account workers.dev subdomain ${workersSubdomain}`);
     }
   }
-  const remoteHarnessEnv = validateRemoteHarnessEnvironmentVariables(
+  const remoteHarnessEnv = buildRemoteHarnessEnvironmentVariablesWithAccessSession(
     buildRemoteHarnessEnvironmentVariablesFromDeployment(normalizedEnvironmentName, deploymentSummary, {
       workersSubdomain,
     }),
+    accessSession,
   );
   const deploymentIdentityValidation = {
     before_readiness: await validateDeploymentSummaryAgainstCurrentCloudflareStateImpl(deploymentSummary, {

@@ -283,8 +283,10 @@ export async function createControlPlaneRig({
       aud: audienceOverride,
       exp: now + expiresInSeconds,
       nbf: now - 10,
-      sub: subject,
     };
+    if (subject !== null) {
+      payload.sub = subject;
+    }
     if (commonName) {
       payload.common_name = commonName;
     }

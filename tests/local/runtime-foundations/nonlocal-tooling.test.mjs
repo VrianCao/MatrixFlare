@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import { createServer } from 'node:http';
 import fs from 'node:fs/promises';
 import os from 'node:os';
@@ -242,6 +243,32 @@ test('environment wrangler config rewrites bindings for a specific non-local env
   );
 });
 
+test('ops-worker non-local wrangler config requires real Access metadata and wires it into worker vars', () => {
+  const plan = buildNonLocalEnvironmentPlan('staging', {
+    workersSubdomain: 'matrixflare',
+  });
+
+  assert.throws(
+    () => createEnvironmentWranglerConfig('ops-worker', plan, {
+      d1DatabaseId: 'db-staging',
+      kvNamespaceId: 'kv-staging',
+    }),
+    /ops-worker non-local deploy requires access metadata/,
+  );
+
+  const config = createEnvironmentWranglerConfig('ops-worker', plan, {
+    d1DatabaseId: 'db-staging',
+    kvNamespaceId: 'kv-staging',
+    access: {
+      auth_domain: 'matrixflare.cloudflareaccess.com',
+      application_audience: 'aud-staging-ops',
+    },
+  });
+
+  assert.equal(config.env.staging.vars.ACCESS_TEAM_DOMAIN, 'matrixflare.cloudflareaccess.com');
+  assert.equal(config.env.staging.vars.ACCESS_AUDIENCE, 'aud-staging-ops');
+});
+
 test('non-local gateway deployment contract keeps the default shared search limiter baseline when no abuse override is configured', () => {
   const plan = buildNonLocalEnvironmentPlan('staging', {
     workersSubdomain: 'matrixflare',
@@ -274,6 +301,12 @@ test('written non-local wrangler config rewrites main to a real worker entrypoin
         deploymentId: 'gha-staging-test',
         workerVersionId: `gha-staging-test-${workerName}`,
         activeDeploymentComposition: [],
+        access: workerName === 'ops-worker'
+          ? {
+            auth_domain: 'matrixflare.cloudflareaccess.com',
+            application_audience: 'aud-staging-ops',
+          }
+          : null,
       });
       const resolvedMainPath = path.resolve(path.dirname(outputPath), written.config.main);
       assert.equal(
@@ -435,6 +468,28 @@ test('remote harness env vars derive from a validated deployment summary instead
       workersSubdomain: 'matrixflare',
     }),
     /deployment summary workers_subdomain must equal matrixflare/,
+  );
+});
+
+test('remote harness env vars prefer the declared protected ops URL when deployment summary exposes Access metadata', () => {
+  const deploymentSummary = buildDeploymentSummaryFixture('staging');
+  deploymentSummary.workers['ops-worker'] = {
+    ...deploymentSummary.workers['ops-worker'],
+    url: 'https://matrix-ops-worker-staging.matrixflare.workers.dev/origin-only',
+  };
+  deploymentSummary.access = {
+    protected_ops_url: 'https://matrix-ops-worker-staging.matrixflare.workers.dev',
+  };
+
+  assert.deepEqual(
+    buildRemoteHarnessEnvironmentVariablesFromDeployment('staging', deploymentSummary, {
+      workersSubdomain: 'matrixflare',
+    }),
+    {
+      MATRIX_REMOTE_BASE_URL: 'https://matrix-gateway-worker-staging.matrixflare.workers.dev',
+      MATRIX_REMOTE_SERVER_NAME: 'matrix-gateway-worker-staging.matrixflare.workers.dev',
+      MATRIX_REMOTE_OPS_BASE_URL: 'https://matrix-ops-worker-staging.matrixflare.workers.dev',
+    },
   );
 });
 
@@ -973,6 +1028,97 @@ test('non-local deployment readiness fails closed when representative HTTP paths
   assert.deepEqual(delayCalls, []);
 });
 
+test('non-local deployment readiness probes authenticated ops health when Access credentials are available', async () => {
+  const requestLog = [];
+  let registerRequestCount = 0;
+  const readiness = await waitForNonLocalDeploymentReadiness('staging', {
+    MATRIX_REMOTE_BASE_URL: 'https://matrix-gateway-worker-staging.matrixflare.workers.dev',
+    MATRIX_REMOTE_SERVER_NAME: 'matrix-gateway-worker-staging.matrixflare.workers.dev',
+    MATRIX_REMOTE_OPS_BASE_URL: 'https://matrix-ops-worker-staging.matrixflare.workers.dev',
+    MATRIX_REMOTE_OPS_ACCESS_CLIENT_ID: 'service-token-id.access',
+    MATRIX_REMOTE_OPS_ACCESS_CLIENT_SECRET: 'service-token-secret',
+  }, {
+    maxAttempts: 1,
+    fetchImpl: async (url, init = {}) => {
+      const requestUrl = new URL(String(url));
+      const headers = new Headers(init.headers ?? {});
+      requestLog.push({
+        url: requestUrl.toString(),
+        pathname: requestUrl.pathname,
+        host: requestUrl.host,
+        method: init.method ?? 'GET',
+        headers: {
+          'cf-access-client-id': headers.get('cf-access-client-id'),
+          'cf-access-client-secret': headers.get('cf-access-client-secret'),
+          authorization: headers.get('authorization'),
+        },
+      });
+      if (requestUrl.pathname === '/_matrix/client/versions') {
+        return new Response(JSON.stringify({ versions: ['v1.17'] }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (requestUrl.pathname === '/_matrix/client/v3/publicRooms') {
+        return new Response(JSON.stringify({ chunk: [] }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (requestUrl.pathname === '/_matrix/client/v3/register') {
+        registerRequestCount += 1;
+        if (registerRequestCount === 1) {
+          return new Response(JSON.stringify({
+            session: 'readiness-session',
+            flows: [{ stages: ['m.login.dummy'] }],
+          }), {
+            status: 401,
+            headers: { 'content-type': 'application/json' },
+          });
+        }
+        return new Response(JSON.stringify({
+          user_id: '@readiness:test',
+          access_token: 'readiness-access-token',
+        }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (requestUrl.pathname === '/_matrix/client/v3/sync') {
+        return new Response(JSON.stringify({ next_batch: 's123' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (requestUrl.pathname === '/_matrix/media/v3/create') {
+        return new Response(JSON.stringify({ content_uri: 'mxc://matrix.example.test/readiness' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (requestUrl.pathname === '/_ops/v1/healthz') {
+        return new Response(JSON.stringify({ service: 'ops-worker', status: 'ok' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      throw new Error(`Unexpected readiness probe URL ${requestUrl}`);
+    },
+  });
+
+  assert.equal(readiness.ready, true);
+  assert.equal(readiness.attempt_count, 1);
+  assert.deepEqual(
+    readiness.attempts[0].steps.map((step) => step.step),
+    ['versions', 'public_rooms', 'register_challenge', 'register_complete', 'sync', 'media_create', 'ops_healthz'],
+  );
+  const opsRequest = requestLog.find((entry) => entry.pathname === '/_ops/v1/healthz');
+  assert.ok(opsRequest);
+  assert.equal(opsRequest.host, 'matrix-ops-worker-staging.matrixflare.workers.dev');
+  assert.equal(opsRequest.headers['cf-access-client-id'], 'service-token-id.access');
+  assert.equal(opsRequest.headers['cf-access-client-secret'], 'service-token-secret');
+});
+
 test('runEnvironmentBackedSuite does not spawn the suite when readiness fails', async () => {
   const repoRoot = path.resolve('.');
   const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-nonlocal-suite-readiness-fail-'));
@@ -1075,6 +1221,70 @@ test('runEnvironmentBackedSuite revalidates deployment identity after readiness 
   }
 });
 
+test('runEnvironmentBackedSuite injects the prepared Access session into the child test environment', async () => {
+  const repoRoot = path.resolve('.');
+  const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-nonlocal-suite-access-session-'));
+  const deploymentSummary = buildDeploymentSummaryFixture('staging');
+  deploymentSummary.access = {
+    protected_ops_url: 'https://matrix-ops-worker-staging.matrixflare.workers.dev',
+  };
+  let capturedEnv = null;
+
+  try {
+    const result = await runEnvironmentBackedSuite('staging', repoRoot, {
+      runTimestamp: '20260402T160000Z',
+      outputRoot,
+      sourceRunUri: 'https://github.com/example/matrix/actions/runs/12345',
+      logArtifact: 'https://github.com/example/matrix/actions/runs/12345/artifacts/1',
+      executedBy: 'gha://example/matrix/nonlocal/staging',
+      reviewedBy: 'gha://example/matrix/nonlocal/staging',
+      topologyKind: 'cloudflare-staging',
+      deploymentSummary,
+      accessSession: {
+        access: {
+          service_token_client_id: 'service-token-id.access',
+          service_token_client_secret: 'service-token-secret',
+        },
+      },
+    }, {
+      requireGitHubActionsExecutionImpl: async () => ({ environment: 'staging' }),
+      assessNonLocalEnvironmentHarnessReadinessImpl: async () => ({
+        ready: true,
+        reason: null,
+        expanded_test_files: ['tests/staging/test-der-001.test.mjs'],
+      }),
+      requireCloudflareCredentialsImpl: () => ({ accountId: 'cf-account', apiToken: 'cf-token' }),
+      readWorkersSubdomainImpl: async () => 'matrixflare',
+      validateDeploymentSummaryAgainstCurrentCloudflareStateImpl: async () => (
+        buildDeploymentIdentityValidationFixture('staging')
+      ),
+      getRequiredTestFilesImpl: async () => [path.join(repoRoot, 'tests/staging/test-der-001.test.mjs')],
+      waitForNonLocalDeploymentReadinessImpl: async () => buildReadinessProbeFixture('staging'),
+      spawnImpl: (_command, _args, options) => {
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        capturedEnv = options?.env ?? null;
+        queueMicrotask(() => {
+          child.stdout.emit('data', Buffer.from('suite ok\n', 'utf8'));
+          child.emit('close', 0);
+        });
+        return child;
+      },
+    });
+
+    assert.equal(result.report.status, 'pass');
+    assert.equal(result.report.exit_code, 0);
+    assert.ok(capturedEnv);
+    assert.equal(capturedEnv.MATRIX_TEST_ENVIRONMENT, 'staging');
+    assert.equal(capturedEnv.MATRIX_REMOTE_OPS_BASE_URL, 'https://matrix-ops-worker-staging.matrixflare.workers.dev');
+    assert.equal(capturedEnv.MATRIX_REMOTE_OPS_ACCESS_CLIENT_ID, 'service-token-id.access');
+    assert.equal(capturedEnv.MATRIX_REMOTE_OPS_ACCESS_CLIENT_SECRET, 'service-token-secret');
+  } finally {
+    await fs.rm(outputRoot, { recursive: true, force: true });
+  }
+});
+
 test('remote harness env vars must target an external HTTPS deployment and match the remote server host', () => {
   const validated = validateRemoteHarnessEnvironmentVariables({
     MATRIX_REMOTE_BASE_URL: 'https://matrix-gateway-worker-staging.matrixflare.workers.dev/',
@@ -1086,6 +1296,8 @@ test('remote harness env vars must target an external HTTPS deployment and match
     MATRIX_REMOTE_BASE_URL: 'https://matrix-gateway-worker-staging.matrixflare.workers.dev',
     MATRIX_REMOTE_SERVER_NAME: 'matrix-gateway-worker-staging.matrixflare.workers.dev',
     MATRIX_REMOTE_OPS_BASE_URL: 'https://matrix-ops-worker-staging.matrixflare.workers.dev',
+    MATRIX_REMOTE_OPS_ACCESS_CLIENT_ID: '',
+    MATRIX_REMOTE_OPS_ACCESS_CLIENT_SECRET: '',
   });
 
   assert.throws(() => validateRemoteHarnessEnvironmentVariables({
@@ -1107,6 +1319,12 @@ test('remote harness env vars must target an external HTTPS deployment and match
     MATRIX_REMOTE_BASE_URL: 'https://matrix-gateway-worker-staging.matrixflare.workers.dev',
     MATRIX_REMOTE_SERVER_NAME: 'matrix.example.test',
   }), /MATRIX_REMOTE_SERVER_NAME must match the host of MATRIX_REMOTE_BASE_URL/);
+
+  assert.throws(() => validateRemoteHarnessEnvironmentVariables({
+    MATRIX_REMOTE_BASE_URL: 'https://matrix-gateway-worker-staging.matrixflare.workers.dev',
+    MATRIX_REMOTE_SERVER_NAME: 'matrix-gateway-worker-staging.matrixflare.workers.dev',
+    MATRIX_REMOTE_OPS_ACCESS_CLIENT_ID: 'client-id-only',
+  }), /MATRIX_REMOTE_OPS_ACCESS_CLIENT_ID and MATRIX_REMOTE_OPS_ACCESS_CLIENT_SECRET must be provided together/);
 });
 
 test('environment attestation provenance links GitHub run identity to immutable R2 objects and deployment identity', () => {

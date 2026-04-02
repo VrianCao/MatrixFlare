@@ -569,7 +569,7 @@ test('createSignedManifest stays self-verifiable when crypto metadata is implici
   assert.equal(verifySignedManifest(manifest, keyRing.signing.public_key_pem), true);
 });
 
-test('ops-worker healthz requires a valid Access JWT and supports JWK refresh on kid miss', async () => {
+test('ops-worker healthz requires a valid Access JWT, supports JWK refresh on kid miss, and accepts service-auth JWTs with empty sub', async () => {
   const teamDomain = `refresh-${Date.now()}.cloudflareaccess.com`;
   const rig = await createControlPlaneRig({
     teamDomain,
@@ -598,7 +598,7 @@ test('ops-worker healthz requires a valid Access JWT and supports JWK refresh on
     const refreshedResponse = await rig.opsWorker(
       rig.makeOpsRequest('/_ops/v1/healthz', {
         assertion: rig.createAccessJwt({
-          subject: 'service-subject',
+          subject: '',
           commonName: 'svc-ci',
         }),
       }),
