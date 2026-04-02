@@ -986,6 +986,8 @@ test('ops-worker accepts export jobs, deduplicates identical requests, rejects c
     assert.equal(completedJobPayload.job.state, 'succeeded');
     assert.equal(completedJobPayload.job.progress.completed_units, 1);
     assert.equal(completedJobPayload.job.progress.total_units, 1);
+    assert.equal('result_summary' in completedJobPayload.job, false);
+    assert.equal('spec' in completedJobPayload.job, false);
 
     const registrySnapshotKey = [...rig.archiveBucket.objects.keys()].find((key) => key.includes('/registry-snapshot/'));
     const bundleManifestKey = [...rig.archiveBucket.objects.keys()].find((key) => key.includes('/bundle-manifest/'));

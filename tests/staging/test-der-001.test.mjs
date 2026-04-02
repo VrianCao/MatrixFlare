@@ -356,7 +356,11 @@ test('TEST-DER-001 staging covers derived query semantics and Access-authenticat
   );
   assert.equal(rebuild.payload?.job_type, 'rebuild');
   const rebuildJob = await waitForRebuildSuccess(harness, rebuild.payload.job_id);
-  assert.equal(rebuildJob.result_summary?.rebuild_summary?.rebuild_target, 'all_derived');
+  assert.equal(rebuildJob.state, 'succeeded');
+  assert.deepEqual(rebuildJob.scope, {
+    scope_kind: 'global',
+    scope_id: null,
+  });
 
   const anonymousAfterRebuild = await eventually(async () => {
     const payload = await fetchAnonymousPublicRooms(harness, token);
