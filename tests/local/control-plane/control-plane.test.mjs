@@ -11,6 +11,7 @@ import {
   dispatchJobStart,
   encryptBytes,
   parseExportKeyRing,
+  startControlPlaneJob,
   verifySignedManifest,
 } from '../../../packages/control-plane/src/index.mjs';
 import {
@@ -4093,4 +4094,464 @@ test('dispatchJobStart keeps non-JSON jobs-worker failures diagnosable without e
       return true;
     },
   );
+});
+
+test('ops-worker rebuild start converts async start rejections into deterministic JSON errors', async () => {
+  const teamDomain = `ops-async-start-${Date.now()}.cloudflareaccess.com`;
+  const rig = await createControlPlaneRig({
+    teamDomain,
+    policies: [
+      defaultPolicy({
+        principalId: 'human-1',
+        subjectValue: '@operator:example.test',
+        teamDomain,
+        audience: 'aud-ops',
+      }),
+    ],
+  });
+  const originalPrepare = rig.d1.prepare.bind(rig.d1);
+
+  rig.d1.prepare = (sql) => {
+    if (typeof sql === 'string' && sql.includes('INSERT INTO request_dedupe_projection')) {
+      throw new Error('simulated dedupe insert failure');
+    }
+    return originalPrepare(sql);
+  };
+
+  try {
+    const response = await rig.opsWorker(
+      rig.makeOpsRequest('/_ops/v1/rebuilds', {
+        method: 'POST',
+        body: {
+          rebuild_target: 'user_directory',
+          scope: {
+            scope_kind: 'global',
+            scope_id: null,
+          },
+          reason: 'simulate async start rejection',
+          force_full_scan: false,
+        },
+        headers: {
+          'Idempotency-Key': 'idem-async-start-rejection',
+        },
+      }),
+      rig.opsEnv,
+    );
+
+    assert.equal(response.status, 503);
+    const payload = await response.json();
+    assert.equal(payload.code, 'internal');
+    assert.equal(payload.retryable, true);
+    assert.match(payload.message, /simulated dedupe insert failure/);
+  } finally {
+    rig.d1.prepare = originalPrepare;
+    rig.close();
+  }
+});
+
+test('startControlPlaneJob preserves the original failure envelope when failed-state persistence also errors', async () => {
+  const teamDomain = `ops-failure-fallback-${Date.now()}.cloudflareaccess.com`;
+  const rig = await createControlPlaneRig({
+    teamDomain,
+    policies: [
+      defaultPolicy({
+        principalId: 'human-1',
+        subjectValue: '@operator:example.test',
+        teamDomain,
+        audience: 'aud-ops',
+      }),
+    ],
+  });
+  const originalPrepare = rig.d1.prepare.bind(rig.d1);
+  let injectedFailure = false;
+  rig.d1.prepare = (sql) => {
+    if (!injectedFailure && typeof sql === 'string' && sql.includes('UPDATE jobs')) {
+      injectedFailure = true;
+      throw new Error('simulated failed-state persistence write');
+    }
+    return originalPrepare(sql);
+  };
+
+  try {
+    const request = rig.makeOpsRequest('/_ops/v1/rebuilds', {
+      method: 'POST',
+      body: {
+        rebuild_target: 'user_directory',
+        scope: {
+          scope_kind: 'global',
+          scope_id: null,
+        },
+        reason: 'simulate failed-state fallback',
+        force_full_scan: false,
+      },
+      headers: {
+        'Idempotency-Key': 'idem-failure-fallback',
+      },
+    });
+    const response = await startControlPlaneJob({
+      env: {
+        ...rig.opsEnv,
+        JOBS_WORKER: {
+          fetch: async () => new Response('<!DOCTYPE html><html><body>jobs worker failed</body></html>', {
+            status: 500,
+            headers: {
+              'content-type': 'text/html; charset=utf-8',
+            },
+          }),
+        },
+      },
+      config: {},
+      persistence: rig.persistence,
+      requestContext: {
+        requestId: 'request-failure-fallback',
+        logger: {
+          error() {},
+        },
+      },
+      operator: {
+        principal_id: 'human-1',
+        auth_mechanism: 'cloudflare-access-jwt',
+        require_ticket: false,
+      },
+      routeTemplate: '/_ops/v1/rebuilds',
+      request,
+      requestBody: {
+        rebuild_target: 'user_directory',
+        scope: {
+          scope_kind: 'global',
+          scope_id: null,
+        },
+        reason: 'simulate failed-state fallback',
+        force_full_scan: false,
+      },
+    });
+
+    assert.equal(response.status, 503);
+    const payload = await response.json();
+    assert.equal(payload.code, 'internal');
+    assert.equal(payload.retryable, true);
+    assert.match(payload.message, /jobs-worker start failed with 500: non-JSON error body/);
+    assert.equal(/simulated failed-state persistence write/.test(payload.message), false);
+  } finally {
+    rig.d1.prepare = originalPrepare;
+    rig.close();
+  }
+});
+
+test('ops-worker idempotent replay stays fail-closed when failed-state persistence never lands', async () => {
+  const teamDomain = `ops-replay-pending-${Date.now()}.cloudflareaccess.com`;
+  const rig = await createControlPlaneRig({
+    teamDomain,
+    policies: [
+      defaultPolicy({
+        principalId: 'human-1',
+        subjectValue: '@operator:example.test',
+        teamDomain,
+        audience: 'aud-ops',
+      }),
+    ],
+  });
+  const originalPrepare = rig.d1.prepare.bind(rig.d1);
+  const originalJobsWorker = rig.opsEnv.JOBS_WORKER;
+  let injectedFailure = false;
+  rig.d1.prepare = (sql) => {
+    if (!injectedFailure && typeof sql === 'string' && sql.includes('UPDATE jobs')) {
+      injectedFailure = true;
+      throw new Error('simulated failed-state persistence write');
+    }
+    return originalPrepare(sql);
+  };
+  rig.opsEnv.JOBS_WORKER = {
+    fetch: async () => new Response('<!DOCTYPE html><html><body>jobs worker failed</body></html>', {
+      status: 500,
+      headers: {
+        'content-type': 'text/html; charset=utf-8',
+      },
+    }),
+  };
+
+  try {
+    const now = new Date().toISOString();
+    await rig.persistence.upsertShardRegistry({
+      shard_type: 'UserDO',
+      shard_key: '@alice:test',
+      created_at: now,
+      last_seen_at: now,
+      schema_version: 1,
+      disabled_at: null,
+    });
+
+    const requestOptions = {
+      method: 'POST',
+      body: {
+        rebuild_target: 'user_directory',
+        scope: {
+          scope_kind: 'global',
+          scope_id: null,
+        },
+        reason: 'simulate replay after failed-state write loss',
+        force_full_scan: false,
+      },
+      headers: {
+        'Idempotency-Key': 'idem-replay-pending-fail-closed',
+      },
+    };
+
+    const firstResponse = await rig.opsWorker(
+      rig.makeOpsRequest('/_ops/v1/rebuilds', requestOptions),
+      rig.opsEnv,
+    );
+    assert.equal(firstResponse.status, 503);
+
+    const replayResponse = await rig.opsWorker(
+      rig.makeOpsRequest('/_ops/v1/rebuilds', requestOptions),
+      rig.opsEnv,
+    );
+    assert.equal(replayResponse.status, 503);
+    const replayPayload = await replayResponse.json();
+    assert.equal(replayPayload.code, 'internal');
+    assert.equal(replayPayload.retryable, true);
+    assert.match(replayPayload.message, /jobs-worker start failed with 500: non-JSON error body/);
+  } finally {
+    rig.d1.prepare = originalPrepare;
+    rig.opsEnv.JOBS_WORKER = originalJobsWorker;
+    rig.close();
+  }
+});
+
+test('ops-worker idempotent replay returns the stored failed start error when dedupe finalization fails', async () => {
+  const teamDomain = `ops-replay-failed-${Date.now()}.cloudflareaccess.com`;
+  const rig = await createControlPlaneRig({
+    teamDomain,
+    policies: [
+      defaultPolicy({
+        principalId: 'human-1',
+        subjectValue: '@operator:example.test',
+        teamDomain,
+        audience: 'aud-ops',
+      }),
+    ],
+  });
+  const originalPrepare = rig.d1.prepare.bind(rig.d1);
+  const originalJobsWorker = rig.opsEnv.JOBS_WORKER;
+  let injectedFailure = false;
+  rig.d1.prepare = (sql) => {
+    if (!injectedFailure && typeof sql === 'string' && sql.includes('UPDATE request_dedupe_projection')) {
+      injectedFailure = true;
+      throw new Error('simulated dedupe finalization failure');
+    }
+    return originalPrepare(sql);
+  };
+  rig.opsEnv.JOBS_WORKER = {
+    fetch: async () => new Response('<!DOCTYPE html><html><body>jobs worker failed</body></html>', {
+      status: 500,
+      headers: {
+        'content-type': 'text/html; charset=utf-8',
+      },
+    }),
+  };
+
+  try {
+    const now = new Date().toISOString();
+    await rig.persistence.upsertShardRegistry({
+      shard_type: 'UserDO',
+      shard_key: '@alice:test',
+      created_at: now,
+      last_seen_at: now,
+      schema_version: 1,
+      disabled_at: null,
+    });
+
+    const requestOptions = {
+      method: 'POST',
+      body: {
+        rebuild_target: 'user_directory',
+        scope: {
+          scope_kind: 'global',
+          scope_id: null,
+        },
+        reason: 'simulate replay after dedupe finalization loss',
+        force_full_scan: false,
+      },
+      headers: {
+        'Idempotency-Key': 'idem-replay-failed-fail-closed',
+      },
+    };
+
+    const firstResponse = await rig.opsWorker(
+      rig.makeOpsRequest('/_ops/v1/rebuilds', requestOptions),
+      rig.opsEnv,
+    );
+    assert.equal(firstResponse.status, 503);
+
+    const replayResponse = await rig.opsWorker(
+      rig.makeOpsRequest('/_ops/v1/rebuilds', requestOptions),
+      rig.opsEnv,
+    );
+    assert.equal(replayResponse.status, 503);
+    const replayPayload = await replayResponse.json();
+    assert.equal(replayPayload.code, 'internal');
+    assert.equal(replayPayload.retryable, true);
+    assert.match(replayPayload.message, /jobs-worker start failed with 500: non-JSON error body/);
+  } finally {
+    rig.d1.prepare = originalPrepare;
+    rig.opsEnv.JOBS_WORKER = originalJobsWorker;
+    rig.close();
+  }
+});
+
+test('ops-worker idempotent replay fails closed when failed job truth lost its stored error payload', async () => {
+  const teamDomain = `ops-replay-missing-error-${Date.now()}.cloudflareaccess.com`;
+  const rig = await createControlPlaneRig({
+    teamDomain,
+    policies: [
+      defaultPolicy({
+        principalId: 'human-1',
+        subjectValue: '@operator:example.test',
+        teamDomain,
+        audience: 'aud-ops',
+      }),
+    ],
+  });
+  const originalPrepare = rig.d1.prepare.bind(rig.d1);
+  const originalJobsWorker = rig.opsEnv.JOBS_WORKER;
+  let injectedFailure = false;
+  rig.d1.prepare = (sql) => {
+    if (!injectedFailure && typeof sql === 'string' && sql.includes('UPDATE request_dedupe_projection')) {
+      injectedFailure = true;
+      throw new Error('simulated dedupe finalization failure');
+    }
+    return originalPrepare(sql);
+  };
+  rig.opsEnv.JOBS_WORKER = {
+    fetch: async () => new Response('<!DOCTYPE html><html><body>jobs worker failed</body></html>', {
+      status: 500,
+      headers: {
+        'content-type': 'text/html; charset=utf-8',
+      },
+    }),
+  };
+
+  try {
+    const now = new Date().toISOString();
+    await rig.persistence.upsertShardRegistry({
+      shard_type: 'UserDO',
+      shard_key: '@alice:test',
+      created_at: now,
+      last_seen_at: now,
+      schema_version: 1,
+      disabled_at: null,
+    });
+
+    const requestOptions = {
+      method: 'POST',
+      body: {
+        rebuild_target: 'user_directory',
+        scope: {
+          scope_kind: 'global',
+          scope_id: null,
+        },
+        reason: 'simulate replay after failed error payload loss',
+        force_full_scan: false,
+      },
+      headers: {
+        'Idempotency-Key': 'idem-replay-missing-error-fail-closed',
+      },
+    };
+
+    const firstResponse = await rig.opsWorker(
+      rig.makeOpsRequest('/_ops/v1/rebuilds', requestOptions),
+      rig.opsEnv,
+    );
+    assert.equal(firstResponse.status, 503);
+    const firstPayload = await firstResponse.json();
+    assert.equal(firstPayload.code, 'internal');
+
+    const failedJob = await rig.persistence.getJob(firstPayload.details.job_id);
+    await rig.persistence.updateJob({
+      ...failedJob,
+      last_error: null,
+    });
+
+    const replayResponse = await rig.opsWorker(
+      rig.makeOpsRequest('/_ops/v1/rebuilds', requestOptions),
+      rig.opsEnv,
+    );
+    assert.equal(replayResponse.status, 503);
+    const replayPayload = await replayResponse.json();
+    assert.equal(replayPayload.code, 'internal');
+    assert.equal(replayPayload.retryable, true);
+    assert.match(replayPayload.message, /missing or invalid/);
+  } finally {
+    rig.d1.prepare = originalPrepare;
+    rig.opsEnv.JOBS_WORKER = originalJobsWorker;
+    rig.close();
+  }
+});
+
+test('ops-worker idempotent replay fails closed when replay dedupe state references a missing job record', async () => {
+  const teamDomain = `ops-replay-missing-job-${Date.now()}.cloudflareaccess.com`;
+  const rig = await createControlPlaneRig({
+    teamDomain,
+    policies: [
+      defaultPolicy({
+        principalId: 'human-1',
+        subjectValue: '@operator:example.test',
+        teamDomain,
+        audience: 'aud-ops',
+      }),
+    ],
+  });
+
+  try {
+    const now = new Date().toISOString();
+    await rig.persistence.upsertShardRegistry({
+      shard_type: 'UserDO',
+      shard_key: '@alice:test',
+      created_at: now,
+      last_seen_at: now,
+      schema_version: 1,
+      disabled_at: null,
+    });
+
+    const requestOptions = {
+      method: 'POST',
+      body: {
+        rebuild_target: 'user_directory',
+        scope: {
+          scope_kind: 'global',
+          scope_id: null,
+        },
+        reason: 'simulate replay with missing job truth',
+        force_full_scan: false,
+      },
+      headers: {
+        'Idempotency-Key': 'idem-replay-missing-job-fail-closed',
+      },
+    };
+
+    const acceptedResponse = await rig.opsWorker(
+      rig.makeOpsRequest('/_ops/v1/rebuilds', requestOptions),
+      rig.opsEnv,
+    );
+    assert.equal(acceptedResponse.status, 202);
+    const acceptedPayload = await acceptedResponse.json();
+
+    await rig.d1.prepare('DELETE FROM jobs WHERE job_id = ?').bind(acceptedPayload.job_id).run();
+    const deletedJob = await rig.persistence.getJob(acceptedPayload.job_id);
+    assert.equal(deletedJob, null);
+
+    const replayResponse = await rig.opsWorker(
+      rig.makeOpsRequest('/_ops/v1/rebuilds', requestOptions),
+      rig.opsEnv,
+    );
+    assert.equal(replayResponse.status, 503);
+    const replayPayload = await replayResponse.json();
+    assert.equal(replayPayload.code, 'internal');
+    assert.equal(replayPayload.retryable, true);
+    assert.equal(replayPayload.details?.job_id, acceptedPayload.job_id);
+    assert.match(replayPayload.message, /missing job record/);
+  } finally {
+    rig.close();
+  }
 });

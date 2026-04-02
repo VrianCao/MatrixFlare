@@ -379,7 +379,7 @@ export function createOpsWorkerFetchHandler() {
           operator,
           targetScope: parsed.scope,
         });
-        return startControlPlaneJob({
+        return await startControlPlaneJob({
           env,
           config,
           persistence,

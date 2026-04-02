@@ -2074,6 +2074,53 @@ export function parseJobCreateRequest(routeTemplate, body) {
   throw new RangeError(`Unsupported route template ${routeTemplate}`);
 }
 
+function classifyJobStartFailure(error) {
+  const failureCode = error.code === 'job_conflict'
+    ? 'precondition_failed'
+    : error.code === 'unsupported_schema_version'
+      ? 'validation_failed'
+    : error instanceof TypeError || error instanceof RangeError
+      ? 'validation_failed'
+      : 'internal';
+  const retryable = failureCode === 'internal'
+    ? (error.retryable == null ? true : Boolean(error.retryable))
+    : Boolean(error.retryable);
+  return {
+    failureCode,
+    retryable,
+  };
+}
+
+function responseFromStoredOpsError(errorBody, requestId) {
+  if (!errorBody || typeof errorBody !== 'object') {
+    return opsErrorResponse({
+      requestId,
+      code: 'internal',
+      message: 'Stored job error payload is missing or invalid',
+      retryable: true,
+    });
+  }
+  return opsErrorResponse({
+    requestId: errorBody.request_id ?? requestId,
+    code: errorBody.code ?? 'internal',
+    message: errorBody.message ?? 'Stored job error payload is missing message',
+    retryable: errorBody.retryable === true,
+    details: errorBody.details ?? null,
+  });
+}
+
+function responseForMissingReplayJob({ requestId, jobId = null }) {
+  return opsErrorResponse({
+    requestId,
+    code: 'internal',
+    message: 'Replay dedupe state references a missing job record',
+    retryable: true,
+    details: {
+      job_id: jobId,
+    },
+  });
+}
+
 export function buildInternalStartSpec({
   jobType,
   jobId,
@@ -2224,12 +2271,31 @@ export async function startControlPlaneJob({
     const replayJob = reservation.job_id == null
       ? null
       : await persistence.getJob(reservation.job_id);
-    const replayBody = reservation.envelope?.body ?? null;
-    const replayableQueueStart = replayJob
+    const replayEnvelope = reservation.envelope;
+    const replayBody = replayEnvelope?.body ?? null;
+    const replayMissingJob = replayEnvelope?.kind === 'success'
+      && reservation.job_id != null
+      && replayJob == null;
+    const sameJobType = replayJob?.job_type === jobType;
+    const replayStoredFailure = sameJobType
+      && replayEnvelope?.kind === 'success'
+      && replayJob.internal_state === 'failed';
+    const replayPendingStart = sameJobType
+      && replayEnvelope?.kind === 'success'
+      && replayJob.internal_state === 'pending';
+    const replayableQueueStart = sameJobType
       && replayBody?.retryable === true
-      && replayJob.checkpoint_state?.queue_delivery_state === 'staged'
-      && replayJob.job_type === jobType;
-    if (!replayableQueueStart) {
+      && replayJob.checkpoint_state?.queue_delivery_state === 'staged';
+    if (replayMissingJob) {
+      return responseForMissingReplayJob({
+        requestId: requestContext.requestId,
+        jobId: reservation.job_id,
+      });
+    }
+    if (replayStoredFailure) {
+      return responseFromStoredOpsError(replayJob.last_error, requestContext.requestId);
+    }
+    if (!replayableQueueStart && !replayPendingStart) {
       return responseFromEnvelope(reservation.envelope);
     }
     try {
@@ -2264,8 +2330,20 @@ export async function startControlPlaneJob({
         },
       });
       return responseFromEnvelope(successEnvelope);
-    } catch {
-      return responseFromEnvelope(reservation.envelope);
+    } catch (error) {
+      if (replayJob?.last_error) {
+        return responseFromStoredOpsError(replayJob.last_error, requestContext.requestId);
+      }
+      const { failureCode, retryable } = classifyJobStartFailure(error);
+      return opsErrorResponse({
+        requestId: requestContext.requestId,
+        code: failureCode,
+        message: error.message,
+        retryable,
+        details: {
+          job_id: replayJob?.job_id ?? reservation.job_id ?? null,
+        },
+      });
     }
   }
 
@@ -2363,16 +2441,7 @@ export async function startControlPlaneJob({
     });
     return responseFromEnvelope(successEnvelope);
   } catch (error) {
-    const failureCode = error.code === 'job_conflict'
-      ? 'precondition_failed'
-      : error.code === 'unsupported_schema_version'
-        ? 'validation_failed'
-      : error instanceof TypeError || error instanceof RangeError
-        ? 'validation_failed'
-        : 'internal';
-    const retryable = failureCode === 'internal'
-      ? (error.retryable == null ? true : Boolean(error.retryable))
-      : Boolean(error.retryable);
+    const { failureCode, retryable } = classifyJobStartFailure(error);
     const failureStatus = failureCode === 'precondition_failed'
       ? 409
       : failureCode === 'validation_failed'
@@ -2380,8 +2449,6 @@ export async function startControlPlaneJob({
         : retryable
           ? 503
           : 500;
-    const storedJob = await persistence.getJob(jobId);
-    const failureBase = storedJob ?? jobRecord;
     const failureBody = buildOpsErrorJson({
       code: failureCode,
       message: error.message,
@@ -2391,37 +2458,58 @@ export async function startControlPlaneJob({
         job_id: jobId,
       },
     });
-    const failedJob = {
-      ...failureBase,
-      internal_state: 'failed',
-      completed_at: new Date().toISOString(),
-      last_error: failureBody,
-      result_summary: {
-        failure: error.message,
-      },
-    };
-    await persistence.updateJob(failedJob);
-    recordJobMetric(env, {
-      jobType,
-      jobId,
-      state: 'failed',
-    });
     const errorEnvelope = serializeEnvelope('error', failureStatus, failureBody);
-    await finalizeReservedWrite({
-      persistence,
-      operator,
-      scope: requestBody.scope,
-      idempotencyKey,
-      envelope: errorEnvelope,
-      resultCode: 'failed',
-      requestContext,
-      requestFingerprint,
-      jobId,
-      eventType: `${jobType}.failed`,
-      details: {
+    let failureMetricRecorded = false;
+    const recordFailureMetric = () => {
+      if (failureMetricRecorded) {
+        return;
+      }
+      recordJobMetric(env, {
+        jobType,
+        jobId,
+        state: 'failed',
+      });
+      failureMetricRecorded = true;
+    };
+    try {
+      const storedJob = await persistence.getJob(jobId);
+      const failureBase = storedJob ?? jobRecord;
+      const failedJob = {
+        ...failureBase,
+        internal_state: 'failed',
+        completed_at: new Date().toISOString(),
+        last_error: failureBody,
+        result_summary: {
+          failure: error.message,
+        },
+      };
+      await persistence.updateJob(failedJob);
+      recordFailureMetric();
+      await finalizeReservedWrite({
+        persistence,
+        operator,
+        scope: requestBody.scope,
+        idempotencyKey,
+        envelope: errorEnvelope,
+        resultCode: 'failed',
+        requestContext,
+        requestFingerprint,
+        jobId,
+        eventType: `${jobType}.failed`,
+        details: {
+          route_template: routeTemplate,
+        },
+      });
+    } catch (finalizationError) {
+      recordFailureMetric();
+      requestContext?.logger?.error?.('ops.job.failure.finalization_failed', {
+        job_id: jobId,
+        job_type: jobType,
         route_template: routeTemplate,
-      },
-    });
+        original_error_message: error.message,
+        finalization_error_message: finalizationError?.message ?? String(finalizationError),
+      });
+    }
     return responseFromEnvelope(errorEnvelope);
   }
 }
