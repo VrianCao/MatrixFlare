@@ -36,6 +36,20 @@ function normalizeHierarchyResponse(payload) {
     : [];
 }
 
+function summarizeOpsPayload(payload) {
+  if (payload == null) {
+    return 'null';
+  }
+  if (typeof payload === 'string') {
+    return payload.slice(0, 512);
+  }
+  try {
+    return JSON.stringify(payload).slice(0, 2048);
+  } catch {
+    return String(payload).slice(0, 512);
+  }
+}
+
 async function fetchAnonymousPublicRooms(harness, searchToken) {
   const result = await request(
     harness,
@@ -101,7 +115,9 @@ async function waitForRebuildSuccess(harness, jobId) {
       return job;
     }
     if (job?.state === 'failed' || job?.state === 'canceled') {
-      assert.fail(`rebuild job ${jobId} entered terminal state ${job.state}`);
+      assert.fail(
+        `rebuild job ${jobId} entered terminal state ${job.state}: ${summarizeOpsPayload(job.last_error ?? job.result_summary ?? job)}`,
+      );
     }
     await sleep(1000);
   }
@@ -329,7 +345,11 @@ test('TEST-DER-001 pre-release covers derived query semantics and Access-authent
       force_full_scan: false,
     },
   });
-  assert.equal(rebuild.response.status, 202);
+  assert.equal(
+    rebuild.response.status,
+    202,
+    `expected rebuild start to return 202, received ${rebuild.response.status}: ${summarizeOpsPayload(rebuild.payload)}`,
+  );
   assert.equal(rebuild.payload?.job_type, 'rebuild');
   const rebuildJob = await waitForRebuildSuccess(harness, rebuild.payload.job_id);
   assert.equal(rebuildJob.result_summary?.rebuild_summary?.rebuild_target, 'all_derived');

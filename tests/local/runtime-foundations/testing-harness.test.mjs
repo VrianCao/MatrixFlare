@@ -101,6 +101,20 @@ function buildPhase08ArtifactStoreUri(environmentName, runTimestamp, fileName) {
 
 function buildValidEnvironmentReport(environmentName, runTimestamp, overrides = {}) {
   const directory = getTestEnvironmentDefinition(environmentName).directory;
+  const readinessSteps = [
+    { step: 'versions', ok: true, detail: { versions_count: 1 } },
+    { step: 'public_rooms', ok: true, detail: { chunk_length: 0 } },
+    { step: 'register_challenge', ok: true, detail: { session_present: true, flows_count: 1 } },
+    { step: 'register_complete', ok: true, detail: { user_id_present: true, access_token_present: true } },
+    { step: 'sync', ok: true, detail: { next_batch_present: true } },
+    { step: 'media_create', ok: true, detail: { content_uri_present: true } },
+  ];
+  if (environmentName === 'staging' || environmentName === 'pre-release') {
+    readinessSteps.push(
+      { step: 'ops_healthz', ok: true, detail: { service: 'ops-worker', status: 'ok' } },
+      { step: 'ops_rebuild_start', ok: true, detail: { job_id_present: true, job_type: 'rebuild', state: 'accepted' } },
+    );
+  }
   return {
     environment_name: environmentName,
     status: 'pass',
@@ -140,11 +154,7 @@ function buildValidEnvironmentReport(environmentName, runTimestamp, overrides = 
           completed_at: '2026-03-31T13:59:30.000Z',
           duration_ms: 30000,
           ok: true,
-          steps: [
-            { step: 'versions', ok: true, detail: { versions_count: 1 } },
-            { step: 'public_rooms', ok: true, detail: { chunk_length: 0 } },
-            { step: 'media_create', ok: true, detail: { content_uri_present: true } },
-          ],
+          steps: readinessSteps,
           failure: null,
           delay_before_next_attempt_ms: null,
         },
@@ -1082,6 +1092,27 @@ test('manual artifact payload validation requires structured non-local reports a
   assert.deepEqual(
     validateManualArtifactPayload('staging_run_report', {
       ...validStagingReport,
+      readiness_probe: {
+        ...validStagingReport.readiness_probe,
+        attempts: [
+          {
+            ...validStagingReport.readiness_probe.attempts[0],
+            steps: validStagingReport.readiness_probe.attempts[0].steps.filter((step) => step.step !== 'ops_rebuild_start'),
+          },
+        ],
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'environment run report readiness_probe final attempt must include successful steps: ops_rebuild_start',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('staging_run_report', {
+      ...validStagingReport,
       cloudflare_resources: {
         ...validStagingReport.cloudflare_resources,
         workers: [],
@@ -1849,6 +1880,30 @@ test('manual artifact attestation validation requires immutable provenance plus 
     {
       valid: false,
       error: 'attested payload invalid: environment run report readiness_probe must include a successful final attempt',
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('staging_run_report', {
+      ...validStagingAttestation,
+      payload: {
+        ...validStagingAttestation.payload,
+        readiness_probe: {
+          ...validStagingAttestation.payload.readiness_probe,
+          attempts: [
+            {
+              ...validStagingAttestation.payload.readiness_probe.attempts[0],
+              steps: validStagingAttestation.payload.readiness_probe.attempts[0].steps.filter((step) => step.step !== 'ops_rebuild_start'),
+            },
+          ],
+        },
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'attested payload invalid: environment run report readiness_probe final attempt must include successful steps: ops_rebuild_start',
     },
   );
 

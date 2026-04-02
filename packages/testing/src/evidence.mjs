@@ -3215,6 +3215,21 @@ function requiresExternalManualArtifactEvidence(artifactId) {
   return resolveEnvironmentNameForArtifactId(artifactId) != null || artifactId === 'prod_cost_snapshot';
 }
 
+function listRequiredReadinessProbeStepNames(expectedEnvironmentName) {
+  const requiredSteps = [
+    'versions',
+    'public_rooms',
+    'register_challenge',
+    'register_complete',
+    'sync',
+    'media_create',
+  ];
+  if (expectedEnvironmentName === 'staging' || expectedEnvironmentName === 'pre-release') {
+    requiredSteps.push('ops_healthz', 'ops_rebuild_start');
+  }
+  return requiredSteps;
+}
+
 function validateEnvironmentRunReadinessProbe(reportLabel, readinessProbe, expectedEnvironmentName) {
   if (!isPlainObject(readinessProbe)) {
     return {
@@ -3298,6 +3313,20 @@ function validateEnvironmentRunReadinessProbe(reportLabel, readinessProbe, expec
     return {
       valid: false,
       error: `${reportLabel} readiness_probe must include a successful final attempt`,
+    };
+  }
+  const finalAttempt = readinessProbe.attempts.at(-1);
+  const successfulFinalStepNames = new Set(
+    finalAttempt.steps
+      .filter((step) => step.ok === true)
+      .map((step) => step.step),
+  );
+  const missingRequiredSteps = listRequiredReadinessProbeStepNames(expectedEnvironmentName)
+    .filter((stepName) => !successfulFinalStepNames.has(stepName));
+  if (missingRequiredSteps.length > 0) {
+    return {
+      valid: false,
+      error: `${reportLabel} readiness_probe final attempt must include successful steps: ${missingRequiredSteps.join(', ')}`,
     };
   }
   if (readinessProbe.last_error !== null) {

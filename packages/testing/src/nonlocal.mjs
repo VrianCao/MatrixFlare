@@ -2389,6 +2389,13 @@ function summarizeReadinessProbeStepDetail(stepName, payload) {
       status: payload?.status ?? null,
     };
   }
+  if (stepName === 'ops_rebuild_start') {
+    return {
+      job_id_present: typeof payload?.job_id === 'string',
+      job_type: payload?.job_type ?? null,
+      state: payload?.state ?? null,
+    };
+  }
   return null;
 }
 
@@ -2442,6 +2449,17 @@ function buildReadinessProbeCredentials(environmentName, {
   });
 }
 
+function buildReadinessProbeRebuildIdempotencyKey(environmentName, {
+  probeRunSeed = null,
+} = {}) {
+  const runSeed = probeRunSeed ?? buildReadinessProbeRunSeed(environmentName);
+  const digest = createHash('sha256').update(JSON.stringify({
+    environmentName,
+    probe_run_seed: runSeed,
+  })).digest('hex');
+  return `readiness-ops-${slugifyLabel(environmentName)}-${digest.slice(0, 24)}`;
+}
+
 function createReadinessProbeStep(stepName, ok, detail) {
   return {
     step: stepName,
@@ -2469,6 +2487,10 @@ async function runNonLocalReadinessProbeAttempt(environmentName, remoteHarnessEn
       attemptIndex,
       probeRunSeed,
     });
+  const readinessProbeRebuildIdempotencyKey = buildReadinessProbeRebuildIdempotencyKey(
+    environmentName,
+    { probeRunSeed },
+  );
   const recordSuccess = (stepName, payload) => {
     steps.push(createReadinessProbeStep(
       stepName,
@@ -2613,6 +2635,39 @@ async function runNonLocalReadinessProbeAttempt(environmentName, remoteHarnessEn
         };
       }
       recordSuccess('ops_healthz', opsHealthz.payload);
+
+      const opsRebuildStart = await requestRemoteHarnessJson(remoteHarnessEnv, '/_ops/v1/rebuilds', {
+        method: 'POST',
+        headers: {
+          ...opsHeaders,
+          'Idempotency-Key': readinessProbeRebuildIdempotencyKey,
+        },
+        json: {
+          rebuild_target: 'user_directory',
+          scope: {
+            scope_kind: 'global',
+            scope_id: null,
+          },
+          reason: `Phase 08 readiness probe ${environmentName} ops rebuild start`,
+          force_full_scan: false,
+        },
+        fetchImpl,
+        baseUrl: remoteHarnessEnv.MATRIX_REMOTE_OPS_BASE_URL,
+      });
+      if (
+        opsRebuildStart.response.status !== 202
+        || typeof opsRebuildStart.payload?.job_id !== 'string'
+        || opsRebuildStart.payload?.job_type !== 'rebuild'
+        || typeof opsRebuildStart.payload?.state !== 'string'
+        || opsRebuildStart.payload?.idempotency_key_echo !== readinessProbeRebuildIdempotencyKey
+      ) {
+        return {
+          ok: false,
+          steps,
+          failure: recordFailure('ops_rebuild_start', opsRebuildStart.response, opsRebuildStart.payload),
+        };
+      }
+      recordSuccess('ops_rebuild_start', opsRebuildStart.payload);
     }
 
     return {

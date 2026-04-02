@@ -112,6 +112,20 @@ function buildReadinessProbeFixture(environmentName, {
   failureStepName = 'register_complete',
   failureDetail = { status: 500, error: 'transient deploy window' },
 } = {}) {
+  const successSteps = [
+    { step: 'versions', ok: true, detail: { versions_count: 1 } },
+    { step: 'public_rooms', ok: true, detail: { chunk_length: 0 } },
+    { step: 'register_challenge', ok: true, detail: { session_present: true, flows_count: 1 } },
+    { step: 'register_complete', ok: true, detail: { user_id_present: true, access_token_present: true } },
+    { step: 'sync', ok: true, detail: { next_batch_present: true } },
+    { step: 'media_create', ok: true, detail: { content_uri_present: true } },
+  ];
+  if (environmentName !== 'ci-integration') {
+    successSteps.push(
+      { step: 'ops_healthz', ok: true, detail: { service: 'ops-worker', status: 'ok' } },
+      { step: 'ops_rebuild_start', ok: true, detail: { job_id_present: true, job_type: 'rebuild', state: 'accepted' } },
+    );
+  }
   const attempts = ready
     ? [{
       attempt: 1,
@@ -119,14 +133,7 @@ function buildReadinessProbeFixture(environmentName, {
       completed_at: '2026-04-01T16:00:03.000Z',
       duration_ms: 3000,
       ok: true,
-      steps: [
-        { step: 'versions', ok: true, detail: { versions_count: 1 } },
-        { step: 'public_rooms', ok: true, detail: { chunk_length: 0 } },
-        { step: 'register_challenge', ok: true, detail: { session_present: true, flows_count: 1 } },
-        { step: 'register_complete', ok: true, detail: { user_id_present: true, access_token_present: true } },
-        { step: 'sync', ok: true, detail: { next_batch_present: true } },
-        { step: 'media_create', ok: true, detail: { content_uri_present: true } },
-      ],
+      steps: successSteps,
       failure: null,
       delay_before_next_attempt_ms: null,
     }]
@@ -1133,6 +1140,27 @@ test('non-local deployment readiness probes authenticated ops health when Access
           headers: { 'content-type': 'application/json' },
         });
       }
+      if (requestUrl.pathname === '/_ops/v1/rebuilds') {
+        const body = JSON.parse(String(init.body));
+        const idempotencyKey = String(headers.get('idempotency-key') ?? '');
+        assert.equal(init.method, 'POST');
+        assert.equal(body.rebuild_target, 'user_directory');
+        assert.deepEqual(body.scope, {
+          scope_kind: 'global',
+          scope_id: null,
+        });
+        assert.equal(body.force_full_scan, false);
+        assert.match(idempotencyKey, /^readiness-ops-staging-[a-f0-9]{24}$/);
+        return new Response(JSON.stringify({
+          job_id: 'rebuild_readiness_1',
+          job_type: 'rebuild',
+          state: 'accepted',
+          idempotency_key_echo: idempotencyKey,
+        }), {
+          status: 202,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
       throw new Error(`Unexpected readiness probe URL ${requestUrl}`);
     },
   });
@@ -1141,13 +1169,139 @@ test('non-local deployment readiness probes authenticated ops health when Access
   assert.equal(readiness.attempt_count, 1);
   assert.deepEqual(
     readiness.attempts[0].steps.map((step) => step.step),
-    ['versions', 'public_rooms', 'register_challenge', 'register_complete', 'sync', 'media_create', 'ops_healthz'],
+    ['versions', 'public_rooms', 'register_challenge', 'register_complete', 'sync', 'media_create', 'ops_healthz', 'ops_rebuild_start'],
   );
   const opsRequest = requestLog.find((entry) => entry.pathname === '/_ops/v1/healthz');
   assert.ok(opsRequest);
   assert.equal(opsRequest.host, 'matrix-ops-worker-staging.matrixflare.workers.dev');
   assert.equal(opsRequest.headers['cf-access-client-id'], 'service-token-id.access');
   assert.equal(opsRequest.headers['cf-access-client-secret'], 'service-token-secret');
+  const rebuildRequest = requestLog.find((entry) => entry.pathname === '/_ops/v1/rebuilds');
+  assert.ok(rebuildRequest);
+  assert.equal(rebuildRequest.host, 'matrix-ops-worker-staging.matrixflare.workers.dev');
+  assert.equal(rebuildRequest.headers['cf-access-client-id'], 'service-token-id.access');
+  assert.equal(rebuildRequest.headers['cf-access-client-secret'], 'service-token-secret');
+});
+
+test('non-local deployment readiness reuses the same ops rebuild idempotency key across retries', async () => {
+  const observedCredentials = [];
+  const rebuildIdempotencyKeys = [];
+  let registerRequestCount = 0;
+  let rebuildAttemptCount = 0;
+
+  const readiness = await waitForNonLocalDeploymentReadiness('staging', {
+    MATRIX_REMOTE_BASE_URL: 'https://matrix-gateway-worker-staging.matrixflare.workers.dev',
+    MATRIX_REMOTE_SERVER_NAME: 'matrix-gateway-worker-staging.matrixflare.workers.dev',
+    MATRIX_REMOTE_OPS_BASE_URL: 'https://matrix-ops-worker-staging.matrixflare.workers.dev',
+    MATRIX_REMOTE_OPS_ACCESS_CLIENT_ID: 'service-token-id.access',
+    MATRIX_REMOTE_OPS_ACCESS_CLIENT_SECRET: 'service-token-secret',
+  }, {
+    maxAttempts: 2,
+    initialDelayMs: 10,
+    maxDelayMs: 10,
+    sleepImpl: async () => {},
+    fetchImpl: async (url, init = {}) => {
+      const requestUrl = new URL(String(url));
+      const headers = new Headers(init.headers ?? {});
+      if (requestUrl.pathname === '/_matrix/client/versions') {
+        return new Response(JSON.stringify({ versions: ['v1.17'] }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (requestUrl.pathname === '/_matrix/client/v3/publicRooms') {
+        return new Response(JSON.stringify({ chunk: [] }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (requestUrl.pathname === '/_matrix/client/v3/register') {
+        registerRequestCount += 1;
+        const body = JSON.parse(String(init.body));
+        observedCredentials.push({
+          username: body.username,
+          password: body.password,
+          deviceId: body.device_id,
+          step: body.auth == null ? 'register_challenge' : 'register_complete',
+        });
+        if (registerRequestCount % 2 === 1) {
+          return new Response(JSON.stringify({
+            session: `readiness-session-${registerRequestCount}`,
+            flows: [{ stages: ['m.login.dummy'] }],
+          }), {
+            status: 401,
+            headers: { 'content-type': 'application/json' },
+          });
+        }
+        return new Response(JSON.stringify({
+          user_id: `@readiness-${registerRequestCount}:test`,
+          access_token: `readiness-access-token-${registerRequestCount}`,
+        }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (requestUrl.pathname === '/_matrix/client/v3/sync') {
+        return new Response(JSON.stringify({ next_batch: 's123' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (requestUrl.pathname === '/_matrix/media/v3/create') {
+        return new Response(JSON.stringify({ content_uri: 'mxc://matrix.example.test/readiness' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (requestUrl.pathname === '/_ops/v1/healthz') {
+        return new Response(JSON.stringify({ service: 'ops-worker', status: 'ok' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (requestUrl.pathname === '/_ops/v1/rebuilds') {
+        rebuildAttemptCount += 1;
+        const idempotencyKey = String(headers.get('idempotency-key') ?? '');
+        rebuildIdempotencyKeys.push(idempotencyKey);
+        if (rebuildAttemptCount === 1) {
+          return new Response(JSON.stringify({
+            code: 'internal',
+            message: 'transient deploy window',
+            retryable: true,
+          }), {
+            status: 503,
+            headers: { 'content-type': 'application/json' },
+          });
+        }
+        return new Response(JSON.stringify({
+          job_id: 'rebuild_readiness_2',
+          job_type: 'rebuild',
+          state: 'accepted',
+          idempotency_key_echo: idempotencyKey,
+        }), {
+          status: 202,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      throw new Error(`Unexpected readiness probe URL ${requestUrl}`);
+    },
+  });
+
+  assert.equal(readiness.ready, true);
+  assert.equal(readiness.attempt_count, 2);
+  assert.equal(readiness.attempts[0].ok, false);
+  assert.equal(readiness.attempts[0].failure.step_name, 'ops_rebuild_start');
+  assert.equal(readiness.attempts[1].ok, true);
+  assert.deepEqual(
+    observedCredentials.map(({ step }) => step),
+    ['register_challenge', 'register_complete', 'register_challenge', 'register_complete'],
+  );
+  assert.notEqual(observedCredentials[0].username, observedCredentials[2].username);
+  assert.notEqual(observedCredentials[0].password, observedCredentials[2].password);
+  assert.notEqual(observedCredentials[0].deviceId, observedCredentials[2].deviceId);
+  assert.equal(rebuildIdempotencyKeys.length, 2);
+  assert.equal(rebuildIdempotencyKeys[0], rebuildIdempotencyKeys[1]);
+  assert.match(rebuildIdempotencyKeys[0], /^readiness-ops-staging-[a-f0-9]{24}$/);
 });
 
 test('runEnvironmentBackedSuite does not spawn the suite when readiness fails', async () => {
