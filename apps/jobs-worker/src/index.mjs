@@ -12,6 +12,7 @@ import {
   INTERNAL_RUNTIME_DERIVED_WORK_PATH,
   instrumentEnvironmentBindings,
   loadWorkerRuntimeConfig,
+  MEDIA_WRITE_BACKOFF_TTL_SECONDS,
   normalizeDerivedWorkBatch,
   observeMetric,
   parseLegacyUnauthFreezeAt,
@@ -73,7 +74,7 @@ async function withMediaKeyBackoff(env, objectKey, operation) {
       try {
         if (cache && typeof cache.put === 'function') {
           await cache.put(cacheKey, JSON.stringify({ locked_at: new Date().toISOString() }), {
-            expirationTtl: 5,
+            expirationTtl: MEDIA_WRITE_BACKOFF_TTL_SECONDS,
           });
         }
         return await operation();

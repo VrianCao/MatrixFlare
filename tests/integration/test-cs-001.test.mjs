@@ -9,6 +9,7 @@ import {
   expectMatrixError,
   getAuthenticated,
   getJoinedRoomEntry,
+  getStateEvents,
   joinRoom,
   loginWithPassword,
   refreshSession,
@@ -375,8 +376,9 @@ test('TEST-CS-001 ci-integration covers profile full reads, keyName GET/PUT/DELE
     );
     const roomEntry = getJoinedRoomEntry(bobIncrementalSync, room.room_id);
     assert.ok(roomEntry);
-    const memberEvent = (roomEntry.state?.events ?? roomEntry.state_after?.events ?? [])
-      .find((event) => event.type === 'm.room.member' && event.state_key === alice.user_id);
+    const memberEvents = getStateEvents(roomEntry)
+      .filter((event) => event.type === 'm.room.member' && event.state_key === alice.user_id);
+    const memberEvent = memberEvents.at(-1) ?? null;
     assert.ok(memberEvent);
     assert.equal(memberEvent.content?.displayname, 'Alice Propagated Profile');
     assert.equal('avatar_url' in (memberEvent.content ?? {}), false);

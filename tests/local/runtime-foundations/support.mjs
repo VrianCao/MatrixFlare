@@ -231,6 +231,11 @@ export class FakeKvNamespace {
   }
 
   async put(key, value, options = {}) {
+    if (options.expirationTtl != null) {
+      if (!Number.isInteger(options.expirationTtl) || options.expirationTtl < 60) {
+        throw new Error(`400 Invalid expiration_ttl of ${options.expirationTtl}. Expiration TTL must be at least 60.`);
+      }
+    }
     this.entries.set(key, {
       value,
       metadata: options.metadata ?? null,

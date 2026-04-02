@@ -54,6 +54,7 @@ import {
   resolveRequestedRoomVersion,
 } from '../../../packages/runtime-core/src/room-domain.mjs';
 import { canonicalJsonHash } from '../../../packages/runtime-core/src/fingerprints.mjs';
+import { MEDIA_WRITE_BACKOFF_TTL_SECONDS } from '../../../packages/runtime-core/src/media-domain.mjs';
 import {
   DEFAULT_UIA_CHALLENGE_TTL_MS,
   buildLocalUserId,
@@ -542,7 +543,7 @@ async function withMediaKeyBackoff(env, objectKey, operation) {
       try {
         if (cache && typeof cache.put === 'function') {
           await cache.put(cacheKey, JSON.stringify({ locked_at: new Date().toISOString() }), {
-            expirationTtl: 5,
+            expirationTtl: MEDIA_WRITE_BACKOFF_TTL_SECONDS,
           });
         }
         return await operation();

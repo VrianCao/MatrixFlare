@@ -9,6 +9,7 @@ import {
   getJoinedRoomEntry,
   joinRoom,
   makeTxnId,
+  postAuthenticated,
   putAuthenticated,
   registerUser,
   requireRemoteHarnessContext,
@@ -102,7 +103,7 @@ test('TEST-ROOM-001 ci-integration covers room creation, membership, send, redac
   );
   assert.equal(typing.response.status, 200);
 
-  const receipt = await putAuthenticated(
+  const receipt = await postAuthenticated(
     harness,
     bob.access_token,
     roomPath(createdRoom.room_id, `/receipt/m.read/${encodeURIComponent(firstMessage.payload.event_id)}`),

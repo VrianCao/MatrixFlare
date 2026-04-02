@@ -884,7 +884,8 @@ test('TEST-CS-003 staging covers room-key backup metadata and opaque backup obje
     },
   });
   assert.equal(putSingleSession.response.status, 200);
-  assert.deepEqual(putSingleSession.payload, {});
+  assert.equal(putSingleSession.payload?.count, 1);
+  assert.equal(typeof putSingleSession.payload?.etag, 'string');
 
   const deleteAllKeys = await requestAs(harness, alice.access_token, '/_matrix/client/v3/room_keys/keys?version=1', {
     method: 'DELETE',
