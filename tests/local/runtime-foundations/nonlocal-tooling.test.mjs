@@ -32,6 +32,9 @@ import {
 import {
   buildEnvironmentRateLimitNamespaceId,
 } from '../../../packages/testing/src/cloudflare-resources.mjs';
+import {
+  GATEWAY_RATE_LIMIT_BINDING_DEFINITIONS,
+} from '../../../packages/runtime-core/src/abuse-guard.mjs';
 
 function buildDeploymentSummaryFixture(environmentName) {
   const plan = buildNonLocalEnvironmentPlan(environmentName, {
@@ -237,6 +240,20 @@ test('environment wrangler config rewrites bindings for a specific non-local env
     JSON.parse(config.env['pre-release'].vars.RESOURCE_BINDING_NAMES_JSON).queues.RESTORE_SHARD_QUEUE,
     'matrix-restore-shard-job-pre-release',
   );
+});
+
+test('non-local gateway deployment contract keeps the default shared search limiter baseline when no abuse override is configured', () => {
+  const plan = buildNonLocalEnvironmentPlan('staging', {
+    workersSubdomain: 'matrixflare',
+  });
+  const config = createEnvironmentWranglerConfig('gateway-worker', plan, {
+    d1DatabaseId: 'db-staging',
+    kvNamespaceId: 'kv-staging',
+  });
+
+  assert.equal(config.env.staging.vars.ABUSE_GUARD_POLICY_JSON, '');
+  assert.equal(GATEWAY_RATE_LIMIT_BINDING_DEFINITIONS.gateway_search.limit, 60);
+  assert.equal(GATEWAY_RATE_LIMIT_BINDING_DEFINITIONS.gateway_search.period_seconds, 60);
 });
 
 test('written non-local wrangler config rewrites main to a real worker entrypoint relative to the generated config', async () => {

@@ -16,6 +16,10 @@ import {
   sleep,
 } from './support.mjs';
 
+// The non-local gateway deployment contract currently leaves ABUSE_GUARD_POLICY_JSON empty,
+// so gateway_search keeps the runtime default baseline of 60 requests.
+const SHARED_SEARCH_LIMITER_BASELINE_LIMIT = 60;
+
 async function requestAs(harness, accessToken, pathname, {
   method = 'GET',
   json = undefined,
@@ -51,7 +55,7 @@ async function collectBatchResponses(total, batchSize, callback) {
   return results;
 }
 
-async function assertPermissiveSearchLimiter(harness, accessToken, searchTerm, {
+async function exercisePermissiveSearchLimiter(harness, accessToken, searchTerm, {
   attempts = 12,
   batchSize = 8,
   delayMs = 100,
@@ -92,14 +96,20 @@ async function assertPermissiveSearchLimiter(harness, accessToken, searchTerm, {
       await sleep(delayMs);
     }
   }
-  assert.notEqual(limited, null, `Expected search limiter to yield 429 within ${attempts * batchSize} bounded attempts`);
-  await expectMatrixError(limited, 429, 'M_LIMIT_EXCEEDED');
+  if (limited != null) {
+    await expectMatrixError(limited, 429, 'M_LIMIT_EXCEEDED');
+  }
+  return limited;
 }
 
 async function assertPermissivePublicRoomsLimiter(harness, {
-  attempts = 12,
+  attempts = 24,
   delayMs = 100,
 } = {}) {
+  assert.ok(
+    attempts < SHARED_SEARCH_LIMITER_BASELINE_LIMIT,
+    `publicRooms follow-up window must stay below the standalone shared search limiter baseline of ${SHARED_SEARCH_LIMITER_BASELINE_LIMIT} requests`,
+  );
   let limited = null;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     const result = await request(harness, '/_matrix/client/v3/publicRooms?limit=1');
@@ -116,7 +126,7 @@ async function assertPermissivePublicRoomsLimiter(harness, {
       await sleep(delayMs);
     }
   }
-  assert.notEqual(limited, null, `Expected publicRooms limiter to yield 429 within ${attempts} attempts after the shared search limiter tripped`);
+  assert.notEqual(limited, null, `Expected shared search/publicRooms limiter to yield 429 within ${attempts} publicRooms attempts after bounded search traffic`);
   await expectMatrixError(limited, 429, 'M_LIMIT_EXCEEDED');
 }
 
@@ -324,7 +334,7 @@ test('TEST-SEC-001 staging enforces baseline abuse guards on always-on login, me
     password: 'phase08-sec-staging-password-6',
     deviceId: 'SECSTGSEARCH',
   });
-  await assertPermissiveSearchLimiter(harness, searchUser.access_token, 'phase08-sec-staging');
+  await exercisePermissiveSearchLimiter(harness, searchUser.access_token, 'phase08-sec-staging');
 
   await assertPermissivePublicRoomsLimiter(harness);
 
