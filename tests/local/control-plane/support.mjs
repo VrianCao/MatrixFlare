@@ -177,6 +177,7 @@ export async function createControlPlaneRig({
   policies = [],
   jwkSequence = null,
   envOverrides = {},
+  initializeControlPlaneD1 = null,
 } = {}) {
   const accessKeyPair = generateKeyPairSync('rsa', { modulusLength: 2048 });
   const accessPrivatePem = accessKeyPair.privateKey.export({ format: 'pem', type: 'pkcs8' });
@@ -192,6 +193,9 @@ export async function createControlPlaneRig({
   stalePublicJwk.use = 'sig';
 
   const d1 = createFakeD1Database();
+  if (typeof initializeControlPlaneD1 === 'function') {
+    await initializeControlPlaneD1(d1);
+  }
   const persistence = createD1ControlPlanePersistence(d1);
   await persistence.ensureSchema();
 

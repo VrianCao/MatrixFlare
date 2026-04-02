@@ -43,6 +43,17 @@ async function statementAll(statement, ...bindings) {
   return result?.results ?? [];
 }
 
+function assertSqlIdentifier(value, label) {
+  if (typeof value !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(value)) {
+    throw new TypeError(`${label} must be a safe SQL identifier`);
+  }
+  return value;
+}
+
+function quoteSqlIdentifier(value, label) {
+  return `"${assertSqlIdentifier(value, label)}"`;
+}
+
 function mapJobRow(row) {
   if (!row) {
     return null;
@@ -106,6 +117,51 @@ const REQUIRED_CONTROL_PLANE_TABLES = Object.freeze([
   'registry_snapshots',
   'appservice_configs',
 ]);
+
+const CONTROL_PLANE_SCHEMA_ADDITIVE_COLUMNS = Object.freeze({
+  operator_authz_policies: Object.freeze([
+    { column_name: 'target_scope_constraints', column_sql: `TEXT NOT NULL DEFAULT '{}'` },
+    { column_name: 'require_reason', column_sql: 'INTEGER NOT NULL DEFAULT 0' },
+    { column_name: 'require_ticket', column_sql: 'INTEGER NOT NULL DEFAULT 0' },
+  ]),
+  audit_events: Object.freeze([
+    { column_name: 'job_id', column_sql: 'TEXT' },
+    { column_name: 'causation_id', column_sql: 'TEXT' },
+    { column_name: 'details_json', column_sql: 'TEXT' },
+  ]),
+  request_dedupe_projection: Object.freeze([
+    { column_name: 'response_payload_json', column_sql: 'TEXT' },
+  ]),
+  jobs: Object.freeze([
+    { column_name: 'checkpoint_state_json', column_sql: 'TEXT' },
+    { column_name: 'progress_completed_units', column_sql: 'INTEGER NOT NULL DEFAULT 0' },
+    { column_name: 'progress_total_units', column_sql: 'INTEGER NOT NULL DEFAULT 0' },
+    { column_name: 'progress_unit_name', column_sql: `TEXT NOT NULL DEFAULT 'shard'` },
+    { column_name: 'last_error_json', column_sql: 'TEXT' },
+    { column_name: 'registry_snapshot_id', column_sql: 'TEXT' },
+    { column_name: 'export_epoch', column_sql: 'TEXT' },
+    { column_name: 'result_summary_json', column_sql: 'TEXT' },
+  ]),
+  replay_manifests: Object.freeze([
+    { column_name: 'export_epoch', column_sql: 'TEXT' },
+    { column_name: 'registry_snapshot_id', column_sql: 'TEXT' },
+    { column_name: 'r2_object_key', column_sql: 'TEXT' },
+  ]),
+  repair_decisions: Object.freeze([
+    { column_name: 'details_json', column_sql: 'TEXT' },
+  ]),
+  shard_registry: Object.freeze([
+    { column_name: 'disabled_at', column_sql: 'TEXT' },
+  ]),
+  registry_snapshots: Object.freeze([
+    { column_name: 'signature', column_sql: 'TEXT' },
+    { column_name: 'signing_key_version', column_sql: 'TEXT' },
+    { column_name: 'r2_object_key', column_sql: 'TEXT' },
+  ]),
+  appservice_configs: Object.freeze([
+    { column_name: 'disabled_at', column_sql: 'TEXT' },
+  ]),
+});
 
 const CONTROL_PLANE_SCHEMA_STATEMENTS = Object.freeze([
   `
@@ -277,6 +333,37 @@ const CONTROL_PLANE_SCHEMA_STATEMENTS = Object.freeze([
 
 export const CONTROL_PLANE_SCHEMA_SQL = `${CONTROL_PLANE_SCHEMA_STATEMENTS.join(';\n\n')};\n`;
 
+function isControlPlaneIndexStatement(statementSql) {
+  return /^\s*CREATE\s+INDEX\b/i.test(statementSql);
+}
+
+async function listTableColumns(db, tableName) {
+  return statementAll(
+    db.prepare(`PRAGMA table_info('${assertSqlIdentifier(tableName, 'tableName')}')`),
+  );
+}
+
+async function ensureAdditiveSchemaColumns(db) {
+  for (const [tableName, columns] of Object.entries(CONTROL_PLANE_SCHEMA_ADDITIVE_COLUMNS)) {
+    const existingColumns = new Set(
+      (await listTableColumns(db, tableName))
+        .map((row) => row?.name)
+        .filter((name) => typeof name === 'string' && name.length > 0),
+    );
+    for (const column of columns) {
+      if (existingColumns.has(column.column_name)) {
+        continue;
+      }
+      await statementRun(
+        db.prepare(
+          `ALTER TABLE ${quoteSqlIdentifier(tableName, 'tableName')} ADD COLUMN ${quoteSqlIdentifier(column.column_name, 'columnName')} ${column.column_sql}`,
+        ),
+      );
+      existingColumns.add(column.column_name);
+    }
+  }
+}
+
 export function createD1ControlPlanePersistence(db) {
   if (!db || typeof db.prepare !== 'function' || typeof db.exec !== 'function') {
     throw new TypeError('db must expose D1-compatible prepare() and exec() methods');
@@ -293,7 +380,14 @@ export function createD1ControlPlanePersistence(db) {
         schemaReadyPromise = (async () => {
           // D1 documents exec() as a maintenance-oriented raw SQL surface; request-path schema bootstrap
           // must execute complete prepared statements so multiline CREATE TABLE literals stay portable.
-          for (const statementSql of CONTROL_PLANE_SCHEMA_STATEMENTS) {
+          // Delay CREATE INDEX until after stale existing tables have converged to the current column set.
+          for (const statementSql of CONTROL_PLANE_SCHEMA_STATEMENTS.filter((statementSql) => !isControlPlaneIndexStatement(statementSql))) {
+            await statementRun(db.prepare(statementSql));
+          }
+          // Existing non-local D1 databases may predate newly added nullable/additive columns.
+          // Converge old tables in place before adding indexes that depend on newer columns.
+          await ensureAdditiveSchemaColumns(db);
+          for (const statementSql of CONTROL_PLANE_SCHEMA_STATEMENTS.filter((statementSql) => isControlPlaneIndexStatement(statementSql))) {
             await statementRun(db.prepare(statementSql));
           }
           schemaReady = true;

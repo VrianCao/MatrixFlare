@@ -8,6 +8,7 @@ import {
   buildInternalJobSpec,
   canonicalHash,
   createSignedManifest,
+  dispatchJobStart,
   encryptBytes,
   parseExportKeyRing,
   verifySignedManifest,
@@ -117,6 +118,127 @@ function createRotatedExportKeyRingSecret(baseSecret) {
   };
   rotated.encryption.active = 'enc-v2';
   return JSON.stringify(rotated);
+}
+
+const LEGACY_CONTROL_PLANE_SCHEMA_SQL = `
+  CREATE TABLE operator_authz_policies (
+    principal_id TEXT PRIMARY KEY,
+    principal_type TEXT NOT NULL,
+    access_issuer TEXT NOT NULL,
+    access_audience TEXT NOT NULL,
+    access_subject_binding TEXT NOT NULL,
+    access_subject_value TEXT NOT NULL,
+    allowed_scopes TEXT NOT NULL,
+    expires_at TEXT,
+    disabled_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+  CREATE TABLE audit_events (
+    event_id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    operator_principal_id TEXT NOT NULL,
+    auth_mechanism TEXT NOT NULL,
+    scope_kind TEXT NOT NULL,
+    scope_id TEXT,
+    scope_token TEXT NOT NULL,
+    request_id TEXT,
+    idempotency_key TEXT,
+    request_fingerprint TEXT,
+    result_code TEXT NOT NULL,
+    affected_objects TEXT NOT NULL
+  );
+  CREATE TABLE request_dedupe_projection (
+    operator_principal_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    scope_token TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL,
+    job_id TEXT,
+    result_code TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (operator_principal_id, idempotency_key, scope_token)
+  );
+  CREATE TABLE jobs (
+    job_id TEXT PRIMARY KEY,
+    job_type TEXT NOT NULL,
+    internal_state TEXT NOT NULL,
+    scope_kind TEXT NOT NULL,
+    scope_id TEXT,
+    scope_token TEXT NOT NULL,
+    operator_principal_id TEXT NOT NULL,
+    auth_mechanism TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL,
+    accepted_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    completed_at TEXT,
+    canceled_at TEXT,
+    cancel_reason TEXT,
+    spec_json TEXT NOT NULL
+  );
+  CREATE TABLE replay_manifests (
+    job_id TEXT PRIMARY KEY,
+    manifest_kind TEXT NOT NULL,
+    manifest_json TEXT NOT NULL,
+    manifest_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );
+  CREATE TABLE repair_decisions (
+    decision_id TEXT PRIMARY KEY,
+    repair_kind TEXT NOT NULL,
+    scope_kind TEXT NOT NULL,
+    scope_id TEXT,
+    scope_token TEXT NOT NULL,
+    dry_run INTEGER NOT NULL DEFAULT 0,
+    reason TEXT NOT NULL,
+    ticket_id TEXT,
+    created_at TEXT NOT NULL
+  );
+  CREATE TABLE shard_registry (
+    shard_type TEXT NOT NULL,
+    shard_key TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    schema_version INTEGER NOT NULL,
+    PRIMARY KEY (shard_type, shard_key)
+  );
+  CREATE TABLE registry_snapshots (
+    registry_snapshot_id TEXT PRIMARY KEY,
+    export_epoch TEXT NOT NULL,
+    scope_kind TEXT NOT NULL,
+    scope_id TEXT,
+    scope_token TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    row_count INTEGER NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    snapshot_hash TEXT NOT NULL
+  );
+  CREATE TABLE appservice_configs (
+    appservice_id TEXT PRIMARY KEY,
+    descriptor_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+`;
+
+const CONTROL_PLANE_LEGACY_CONVERGENCE_TABLES = Object.freeze([
+  'operator_authz_policies',
+  'audit_events',
+  'request_dedupe_projection',
+  'jobs',
+  'replay_manifests',
+  'repair_decisions',
+  'shard_registry',
+  'registry_snapshots',
+  'appservice_configs',
+]);
+
+async function listD1TableColumns(db, tableName) {
+  const result = await db.prepare(`PRAGMA table_info('${tableName}')`).bind().all();
+  return result.results.map((row) => row.name);
 }
 
 const ROOM_REQUIRED_OBJECT_SPECS_WITHOUT_ARCHIVE_REFERENCE = Object.freeze([
@@ -3883,4 +4005,92 @@ test('ops-worker appservice idempotency rejects fingerprint conflicts', async ()
   } finally {
     rig.close();
   }
+});
+
+test('ops-worker rebuild start converges legacy control-plane D1 tables to the current schema before queueing jobs', async () => {
+  const teamDomain = `ops-stale-schema-${Date.now()}.cloudflareaccess.com`;
+  const staleRig = await createControlPlaneRig({
+    teamDomain,
+    policies: [
+      defaultPolicy({
+        principalId: 'human-1',
+        subjectValue: '@operator:example.test',
+        teamDomain,
+        audience: 'aud-ops',
+      }),
+    ],
+    initializeControlPlaneD1: async (d1) => {
+      await d1.exec(LEGACY_CONTROL_PLANE_SCHEMA_SQL);
+    },
+  });
+  const freshRig = await createControlPlaneRig();
+
+  try {
+    const response = await staleRig.opsWorker(
+      staleRig.makeOpsRequest('/_ops/v1/rebuilds', {
+        method: 'POST',
+        body: {
+          rebuild_target: 'user_directory',
+          scope: {
+            scope_kind: 'user_id',
+            scope_id: '@alice:test',
+          },
+          reason: 'stale schema convergence',
+          force_full_scan: false,
+        },
+        headers: {
+          'Idempotency-Key': 'idem-stale-schema-rebuild',
+        },
+      }),
+      staleRig.opsEnv,
+    );
+
+    assert.equal(response.status, 202);
+    const payload = await response.json();
+    assert.equal(payload.job_type, 'rebuild');
+    assert.equal(payload.idempotency_key_echo, 'idem-stale-schema-rebuild');
+    assert.equal(staleRig.queues.rebuild.messages.length, 1);
+
+    for (const tableName of CONTROL_PLANE_LEGACY_CONVERGENCE_TABLES) {
+      const convergedColumns = await listD1TableColumns(staleRig.d1, tableName);
+      const currentColumns = await listD1TableColumns(freshRig.d1, tableName);
+      assert.deepEqual(
+        [...convergedColumns].sort(),
+        [...currentColumns].sort(),
+        `legacy table ${tableName} must converge to the current control-plane schema`,
+      );
+    }
+  } finally {
+    staleRig.close();
+    freshRig.close();
+  }
+});
+
+test('dispatchJobStart keeps non-JSON jobs-worker failures diagnosable without echoing raw HTML in the error message', async () => {
+  await assert.rejects(
+    dispatchJobStart({
+      env: {
+        JOBS_WORKER: {
+          fetch: async () => new Response('<!DOCTYPE html><html><body>worker crashed</body></html>', {
+            status: 500,
+            headers: {
+              'content-type': 'text/html; charset=utf-8',
+            },
+          }),
+        },
+      },
+      routeTemplate: '/_internal/jobs/start/rebuild',
+      spec: {
+        job_id: 'job-rebuild-test',
+      },
+    }),
+    (error) => {
+      assert.equal(error.status, 500);
+      assert.equal(error.retryable, true);
+      assert.match(error.message, /jobs-worker start failed with 500: non-JSON error body/);
+      assert.equal(/<!DOCTYPE html>/.test(error.message), false);
+      assert.match(error.details?.non_json_body_preview ?? '', /<!DOCTYPE html>/);
+      return true;
+    },
+  );
 });

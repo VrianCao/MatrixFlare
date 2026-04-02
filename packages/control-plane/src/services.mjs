@@ -1753,8 +1753,26 @@ export async function dispatchJobStart({
     },
     body: JSON.stringify(spec),
   }));
-  const responseBody = await response.json();
+  const responseText = await response.text();
+  let responseBody = null;
+  if (responseText.length > 0) {
+    try {
+      responseBody = JSON.parse(responseText);
+    } catch {
+      responseBody = null;
+    }
+  }
   if (!response.ok) {
+    if (responseBody == null) {
+      const responsePreview = responseText.trim().replace(/\s+/g, ' ').slice(0, 240);
+      throw Object.assign(new Error(`jobs-worker start failed with ${response.status}: non-JSON error body`), {
+        retryable: response.status >= 500,
+        status: response.status,
+        details: {
+          non_json_body_preview: responsePreview || null,
+        },
+      });
+    }
     try {
       const internalError = parseInternalErrorEnvelope(responseBody);
       throw Object.assign(new Error(internalError.message), {
@@ -1772,6 +1790,15 @@ export async function dispatchJobStart({
         status: response.status,
       });
     }
+  }
+  if (responseBody == null) {
+    throw Object.assign(new Error(`jobs-worker start returned non-JSON success payload for ${routeTemplate}`), {
+      retryable: true,
+      status: response.status,
+      details: {
+        non_json_body_preview: responseText.trim().replace(/\s+/g, ' ').slice(0, 240) || null,
+      },
+    });
   }
   return responseBody;
 }
