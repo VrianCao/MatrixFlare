@@ -59,6 +59,7 @@ import {
   buildPushRulesView,
   computePushRulePriorityIndex,
   createStoredFilterEnvelope,
+  evaluatePushRuleNotification,
   filterEventList,
   getNextPushRulePriorityIndex,
   getSyncFilterFlags,
@@ -1152,8 +1153,103 @@ function normalizeRoomFanoutDelta(delta = {}) {
   };
 }
 
+function normalizeRoomNotificationEvent(candidate = {}) {
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+    return null;
+  }
+  if (typeof candidate.type !== 'string' || candidate.type.length === 0) {
+    return null;
+  }
+  if (candidate.state_key != null && typeof candidate.state_key !== 'string') {
+    throw new TypeError('candidate.state_key must be a string when present');
+  }
+  return {
+    room_id: candidate.room_id == null ? null : normalizeString(candidate.room_id, 'candidate.room_id'),
+    event_id: candidate.event_id == null ? null : normalizeString(candidate.event_id, 'candidate.event_id'),
+    sender: candidate.sender == null ? null : normalizeString(candidate.sender, 'candidate.sender'),
+    type: normalizeString(candidate.type, 'candidate.type'),
+    state_key: candidate.state_key ?? null,
+    content: candidate.content && typeof candidate.content === 'object' && !Array.isArray(candidate.content)
+      ? structuredClone(candidate.content)
+      : {},
+    room_member_count: Number.isInteger(candidate.room_member_count) && candidate.room_member_count >= 0
+      ? candidate.room_member_count
+      : null,
+    sender_notification_permission_room: candidate.sender_notification_permission_room === true,
+  };
+}
+
+function readLatestRoomNotificationState(userPersistence, roomId) {
+  const latest = userPersistence.userStream.list()
+    .filter((entry) => entry.stream_kind === 'room_fanout' && entry.room_id === roomId)
+    .sort((left, right) => right.stream_pos - left.stream_pos)[0] ?? null;
+  return {
+    notification_count: Number.isInteger(latest?.payload?.notification_count) && latest.payload.notification_count >= 0
+      ? latest.payload.notification_count
+      : 0,
+    highlight_count: Number.isInteger(latest?.payload?.highlight_count) && latest.payload.highlight_count >= 0
+      ? latest.payload.highlight_count
+      : 0,
+    unread_thread_notifications: latest?.payload?.unread_thread_notifications
+      && typeof latest.payload.unread_thread_notifications === 'object'
+      && !Array.isArray(latest.payload.unread_thread_notifications)
+      ? structuredClone(latest.payload.unread_thread_notifications)
+      : null,
+  };
+}
+
+function resolveRoomFanoutNotificationState(userPersistence, principal, delta, notificationEvent) {
+  if (delta.membership_bucket !== 'join') {
+    return {
+      notification_count: null,
+      highlight_count: null,
+      unread_thread_notifications: null,
+    };
+  }
+  if (
+    Number.isInteger(delta.notification_count)
+    || Number.isInteger(delta.highlight_count)
+    || delta.unread_thread_notifications != null
+  ) {
+    return {
+      notification_count: delta.notification_count,
+      highlight_count: delta.highlight_count,
+      unread_thread_notifications: delta.unread_thread_notifications,
+    };
+  }
+  const previous = readLatestRoomNotificationState(userPersistence, delta.room_id);
+  if (notificationEvent == null) {
+    return previous;
+  }
+  const evaluation = evaluatePushRuleNotification(
+    principal.user_id,
+    userPersistence.pushRules.list(),
+    notificationEvent,
+    {
+      room_id: delta.room_id,
+      room_member_count: notificationEvent.room_member_count,
+      sender_notification_permission_room: notificationEvent.sender_notification_permission_room,
+    },
+  );
+  if (!evaluation.notify) {
+    return previous;
+  }
+  return {
+    notification_count: previous.notification_count + 1,
+    highlight_count: previous.highlight_count + (evaluation.highlight ? 1 : 0),
+    unread_thread_notifications: previous.unread_thread_notifications,
+  };
+}
+
 function buildRoomFanoutDedupeKey(delta) {
   return `${delta.room_id}|${delta.room_pos}|${delta.user_id}`;
+}
+
+function decodeRoomCursorOrNull(cursor) {
+  if (typeof cursor !== 'string' || cursor.length === 0) {
+    return null;
+  }
+  return decodeRoomCursor(cursor);
 }
 
 function parseSnapshotRoomPos(snapshot) {
@@ -1431,6 +1527,23 @@ function getRequiredEventPowerLevel(roomDo, roomVersion, stateMap, candidateEven
     return powerLevels.events[candidateEvent.type];
   }
   return Number.isInteger(powerLevels.events_default) ? powerLevels.events_default : 0;
+}
+
+function getRequiredNotificationPowerLevel(roomDo, stateMap, key) {
+  const powerLevels = getCurrentPowerLevelsContent(roomDo, stateMap);
+  const notifications = isObjectRecord(powerLevels.notifications) ? powerLevels.notifications : {};
+  if (Number.isInteger(notifications[key])) {
+    return notifications[key];
+  }
+  return 50;
+}
+
+function hasSenderNotificationPermission(roomDo, roomVersion, stateMap, senderUserId, key) {
+  if (typeof senderUserId !== 'string' || senderUserId.length === 0) {
+    return false;
+  }
+  return getUserPowerLevel(roomDo, roomVersion, stateMap, senderUserId)
+    >= getRequiredNotificationPowerLevel(roomDo, stateMap, key);
 }
 
 function getJoinRule(roomDo, stateMap) {
@@ -2319,6 +2432,7 @@ export class UserDO extends BaseDurableObject {
     const [request = {}] = arguments;
     const principal = this.persistence.userPrincipal.get();
     const delta = normalizeRoomFanoutDelta(request);
+    const notificationEvent = normalizeRoomNotificationEvent(request.notification_event);
     if (!principal || principal.user_id !== delta.user_id) {
       return {
         ok: false,
@@ -2371,24 +2485,29 @@ export class UserDO extends BaseDurableObject {
     }
 
     const now = request?.now ?? new Date().toISOString();
+    const notificationState = resolveRoomFanoutNotificationState(this.persistence, principal, delta, notificationEvent);
+    const effectiveDelta = {
+      ...delta,
+      ...notificationState,
+    };
     let wakePos = 0;
     const sql = this.requireSqlStorage();
     withSqliteTransaction(sql, () => {
       const streamEntry = this.persistence.appendUserStreamWithinTransaction({
         user_id: principal.user_id,
         stream_kind: 'room_fanout',
-        room_id: delta.room_id,
-        event_id: delta.event_id,
+        room_id: effectiveDelta.room_id,
+        event_id: effectiveDelta.event_id,
         dedupe_key: dedupeKey,
         created_at: now,
-        payload: delta,
+        payload: effectiveDelta,
       });
       wakePos = streamEntry.stream_pos;
       this.persistence.userPrincipal.put(principalRowToPutRecord(principal, {
         record: mergeRoomSyncMembershipRecord(principal, {
-          room_id: delta.room_id,
-          membership_bucket: delta.membership_bucket,
-          room_pos: delta.room_pos,
+          room_id: effectiveDelta.room_id,
+          membership_bucket: effectiveDelta.membership_bucket,
+          room_pos: effectiveDelta.room_pos,
           updated_at: now,
         }),
       }));
@@ -7122,8 +7241,11 @@ export class RoomDO extends BaseDurableObject {
     snapshotId,
   }) {
     const roomId = this.persistence.getRuntimeState()?.room_id ?? committedEvent.room_id ?? null;
+    const roomVersion = this.persistence.getRuntimeState()?.room_version ?? DEFAULT_ROOM_VERSION;
     const stateKey = stateKeyForEvent(committedEvent);
+    const stateMap = getRoomStateMapForSnapshot(this.persistence, snapshotId);
     const summary = buildRoomSyncSummary(this.persistence);
+    const roomMentionRequested = committedEvent?.content?.['m.mentions']?.room === true;
     const currentSnapshotEventIds = snapshotId
       ? this.persistence.stateEntries.list()
         .filter((row) => row.snapshot_id === snapshotId)
@@ -7155,9 +7277,27 @@ export class RoomDO extends BaseDurableObject {
         timeline_event_ids: [],
         state_event_ids: [],
         limited: false,
-        prev_batch: roomPos > 1 ? encodeRoomCursor(roomPos - 1) : null,
-        notification_count: 0,
-        highlight_count: 0,
+        prev_batch: roomPos > 1 ? encodeRoomCursor(roomPos) : null,
+        notification_event: {
+          room_id: roomId,
+          event_id: committedEvent.event_id,
+          sender: committedEvent.sender ?? null,
+          type: committedEvent.type,
+          state_key: committedEvent.state_key ?? null,
+          content: committedEvent.content && typeof committedEvent.content === 'object' && !Array.isArray(committedEvent.content)
+            ? structuredClone(committedEvent.content)
+            : {},
+          room_member_count: summary.joined_member_count ?? null,
+          sender_notification_permission_room: roomMentionRequested
+            ? hasSenderNotificationPermission(
+              this,
+              roomVersion,
+              stateMap,
+              committedEvent.sender ?? null,
+              'room',
+            )
+            : false,
+        },
         summary,
       };
       if (membershipBucket === 'join' || membershipBucket === 'leave') {
@@ -7976,10 +8116,10 @@ export class RoomDO extends BaseDurableObject {
     const timelineEventIds = uniqueStringArray(request?.timeline_event_ids);
     const stateEventIds = uniqueStringArray(request?.state_event_ids);
     const loadProjectedEvents = (eventIds) => {
-      const events = [];
+      const entries = [];
       for (const eventId of eventIds) {
         try {
-          events.push(this.loadVisibleRoomEventById(eventId, { maxRoomPos: visibilityRoomPos }).event);
+          entries.push(this.loadVisibleRoomEventById(eventId, { maxRoomPos: visibilityRoomPos }));
         } catch (error) {
           if (error?.code === 'event_not_found') {
             continue;
@@ -7992,7 +8132,7 @@ export class RoomDO extends BaseDurableObject {
       }
       return {
         ok: true,
-        events,
+        entries,
       };
     };
     const timelineEventsResult = loadProjectedEvents(timelineEventIds);
@@ -8003,8 +8143,21 @@ export class RoomDO extends BaseDurableObject {
     if (!deltaStateEventsResult.ok) {
       return deltaStateEventsResult;
     }
-    const timelineEvents = timelineEventsResult.events;
-    const deltaStateEvents = deltaStateEventsResult.events;
+    const timelineLimit = Number.isInteger(filterFlags.timeline_limit) && filterFlags.timeline_limit >= 1
+      ? filterFlags.timeline_limit
+      : null;
+    const fullTimelineEntries = timelineEventsResult.entries;
+    const limitedTimelineEntries = timelineLimit != null && fullTimelineEntries.length > timelineLimit
+      ? fullTimelineEntries.slice(-timelineLimit)
+      : fullTimelineEntries;
+    const timelineEvents = limitedTimelineEntries.map((entry) => entry.event);
+    const deltaStateEvents = deltaStateEventsResult.entries.map((entry) => entry.event);
+    const filteredByTimelineLimit = timelineLimit != null && fullTimelineEntries.length > timelineLimit;
+    const limitedPrevBatch = filteredByTimelineLimit && limitedTimelineEntries.length > 0
+      ? (limitedTimelineEntries[0].metadata.room_pos > 1
+        ? encodeRoomCursor(limitedTimelineEntries[0].metadata.room_pos)
+        : null)
+      : null;
 
     let currentStateEvents = [];
     try {
@@ -8028,8 +8181,8 @@ export class RoomDO extends BaseDurableObject {
     const projection = {
       room_id: roomId,
       membership_bucket: membershipBucket,
-      limited: request?.limited === true,
-      prev_batch: typeof request?.prev_batch === 'string' && request.prev_batch.length > 0 ? request.prev_batch : null,
+      limited: request?.limited === true || filteredByTimelineLimit,
+      prev_batch: limitedPrevBatch ?? (typeof request?.prev_batch === 'string' && request.prev_batch.length > 0 ? request.prev_batch : null),
       timeline_events: timelineEvents,
       state_events: request?.full_state === true ? currentStateEvents : deltaStateEvents,
       state_after_events: request?.use_state_after === true ? currentStateEvents : null,

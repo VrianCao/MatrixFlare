@@ -114,6 +114,7 @@ const L1_TEST_IMPLEMENTATION_FILES = Object.freeze({
   }),
   'TEST-CS-002': Object.freeze({
     local: Object.freeze(['tests/local/client-identity/phase-05.test.mjs']),
+    staging: Object.freeze(['tests/staging/test-cs-002.test.mjs']),
   }),
   'TEST-CS-003': Object.freeze({
     local: Object.freeze([

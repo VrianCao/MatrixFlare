@@ -686,7 +686,7 @@ test('non-local coverage fails closed when a required environment mapping points
         expectedError: /basename is anchored by "test-cs-002"/,
       },
       {
-        mappedFile: 'tests/staging/test-cs-002.test.mjs',
+        mappedFile: 'tests/staging/test-cs-002-missing.test.mjs',
         expectedError: /must reference existing repo-owned \.test\.mjs files/,
       },
     ];
@@ -796,7 +796,7 @@ test('non-local coverage fails closed when a canonical suite symlink escapes rep
     assert.notEqual(mappingEnd, -1);
 
     await fs.mkdir(path.join(fixtureRoot, 'tests', 'staging'), { recursive: true });
-    const mappedFile = 'tests/staging/test-cs-002.test.mjs';
+    const mappedFile = 'tests/staging/test-cs-002-symlink.test.mjs';
     const externalProofFile = path.join(fixtureParent, 'external-proof.test.mjs');
     await fs.writeFile(externalProofFile, "export const proof = true;\n");
     await fs.symlink(externalProofFile, path.join(fixtureRoot, mappedFile));

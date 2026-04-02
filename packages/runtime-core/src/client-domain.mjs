@@ -635,11 +635,17 @@ export function getSyncFilterFlags(filterJson = null) {
   const state = room.state && typeof room.state === 'object' && !Array.isArray(room.state)
     ? room.state
     : {};
+  const timeline = room.timeline && typeof room.timeline === 'object' && !Array.isArray(room.timeline)
+    ? room.timeline
+    : {};
   return {
     include_leave: room.include_leave === true,
     lazy_load_members: state.lazy_load_members === true,
     include_redundant_members: state.lazy_load_members === true && state.include_redundant_members === true,
     unread_thread_notifications: room.unread_thread_notifications === true,
+    timeline_limit: Number.isInteger(timeline.limit) && timeline.limit >= 1
+      ? timeline.limit
+      : null,
   };
 }
 
@@ -728,6 +734,180 @@ export function buildPushRulesAccountDataEvent(userId, rows = []) {
     content: {
       global: buildPushRulesView(userId, rows),
     },
+  };
+}
+
+function readNestedJsonValue(value, dottedKey) {
+  if (typeof dottedKey !== 'string' || dottedKey.length === 0) {
+    return undefined;
+  }
+  let current = value;
+  const segments = dottedKey.split('.');
+  let index = 0;
+  while (index < segments.length) {
+    if (!current || typeof current !== 'object' || Array.isArray(current)) {
+      return undefined;
+    }
+    let matched = false;
+    for (let end = segments.length; end > index; end -= 1) {
+      const candidateKey = segments.slice(index, end).join('.');
+      if (!Object.hasOwn(current, candidateKey)) {
+        continue;
+      }
+      current = current[candidateKey];
+      index = end;
+      matched = true;
+      break;
+    }
+    if (!matched) {
+      return undefined;
+    }
+  }
+  return current;
+}
+
+function jsonValueEquals(left, right) {
+  if (left === right) {
+    return true;
+  }
+  if (typeof left !== typeof right) {
+    return false;
+  }
+  if (Array.isArray(left) || Array.isArray(right)) {
+    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) {
+      return false;
+    }
+    return left.every((entry, index) => jsonValueEquals(entry, right[index]));
+  }
+  if (left && typeof left === 'object' && right && typeof right === 'object') {
+    const leftKeys = Object.keys(left);
+    const rightKeys = Object.keys(right);
+    if (leftKeys.length !== rightKeys.length) {
+      return false;
+    }
+    return leftKeys.every((key) => Object.hasOwn(right, key) && jsonValueEquals(left[key], right[key]));
+  }
+  return false;
+}
+
+function matchPushRulePattern(value, pattern) {
+  if (typeof value !== 'string' || typeof pattern !== 'string') {
+    return false;
+  }
+  if (pattern === '*') {
+    return true;
+  }
+  if (pattern.endsWith('*')) {
+    return value.startsWith(pattern.slice(0, -1));
+  }
+  return value === pattern;
+}
+
+function matchPushRuleContentPattern(body, pattern) {
+  if (typeof body !== 'string' || typeof pattern !== 'string' || pattern.length === 0) {
+    return false;
+  }
+  if (pattern === '*') {
+    return true;
+  }
+  if (pattern.startsWith('*') && pattern.endsWith('*') && pattern.length > 2) {
+    return body.includes(pattern.slice(1, -1));
+  }
+  if (pattern.startsWith('*')) {
+    return body.endsWith(pattern.slice(1));
+  }
+  if (pattern.endsWith('*')) {
+    return body.startsWith(pattern.slice(0, -1));
+  }
+  return body.includes(pattern);
+}
+
+function matchPushRuleCondition(condition, event, context) {
+  if (!condition || typeof condition !== 'object' || Array.isArray(condition)) {
+    return false;
+  }
+  switch (condition.kind) {
+    case 'event_match': {
+      const value = readNestedJsonValue(event, condition.key);
+      return matchPushRulePattern(value, condition.pattern);
+    }
+    case 'event_property_contains': {
+      const value = readNestedJsonValue(event, condition.key);
+      return Array.isArray(value) && value.some((entry) => jsonValueEquals(entry, condition.value));
+    }
+    case 'event_property_is': {
+      return jsonValueEquals(readNestedJsonValue(event, condition.key), condition.value);
+    }
+    case 'room_member_count': {
+      return String(context?.room_member_count ?? '') === String(condition.is ?? '');
+    }
+    case 'sender_notification_permission': {
+      if (condition.key === 'room') {
+        return context?.sender_notification_permission_room === true;
+      }
+      return false;
+    }
+    default:
+      return false;
+  }
+}
+
+function matchPushRuleByKind(kind, rule, event, context) {
+  if (kind === 'content') {
+    return matchPushRuleContentPattern(readNestedJsonValue(event, 'content.body'), rule.pattern);
+  }
+  if (kind === 'room') {
+    return typeof context?.room_id === 'string' && context.room_id === rule.rule_id;
+  }
+  if (kind === 'sender') {
+    return typeof event?.sender === 'string' && event.sender === rule.rule_id;
+  }
+  const conditions = Array.isArray(rule.conditions) ? rule.conditions : [];
+  if (conditions.length === 0) {
+    return true;
+  }
+  return conditions.every((condition) => matchPushRuleCondition(condition, event, context));
+}
+
+export function evaluatePushRuleNotification(userId, rows = [], event, context = {}) {
+  const normalizedUserId = normalizeString(userId, 'userId');
+  if (!event || typeof event !== 'object' || Array.isArray(event) || event.sender === normalizedUserId) {
+    return {
+      matched: false,
+      rule_id: null,
+      notify: false,
+      highlight: false,
+    };
+  }
+  const view = buildPushRulesView(normalizedUserId, rows);
+  for (const [kind, rules] of [
+    ['override', view.override],
+    ['content', view.content],
+    ['room', view.room],
+    ['sender', view.sender],
+    ['underride', view.underride],
+  ]) {
+    for (const rule of rules) {
+      if (rule?.enabled === false || !matchPushRuleByKind(kind, rule, event, context)) {
+        continue;
+      }
+      const actions = Array.isArray(rule.actions) ? rule.actions : [];
+      const highlightAction = actions.find((action) => (
+        action && typeof action === 'object' && !Array.isArray(action) && action.set_tweak === 'highlight'
+      )) ?? null;
+      return {
+        matched: true,
+        rule_id: rule.rule_id,
+        notify: actions.includes('notify'),
+        highlight: highlightAction != null && highlightAction.value !== false,
+      };
+    }
+  }
+  return {
+    matched: false,
+    rule_id: null,
+    notify: false,
+    highlight: false,
   };
 }
 

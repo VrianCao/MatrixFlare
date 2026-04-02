@@ -51,6 +51,7 @@ import {
 } from '../../../packages/runtime-core/src/client-domain.mjs';
 import {
   DEFAULT_ROOM_VERSION,
+  decodeRoomCursor,
   deriveCreateRoomIdentity,
   resolveRequestedRoomVersion,
 } from '../../../packages/runtime-core/src/room-domain.mjs';
@@ -951,6 +952,13 @@ function ensureRoomProjectionTarget(targets, roomId) {
   return targets.get(roomId);
 }
 
+function decodeRoomCursorOrNull(cursor) {
+  if (typeof cursor !== 'string' || cursor.length === 0) {
+    return null;
+  }
+  return decodeRoomCursor(cursor);
+}
+
 function mergeRoomDeltaIntoTarget(target, delta) {
   if (!delta || typeof delta !== 'object' || Array.isArray(delta)) {
     return;
@@ -978,7 +986,11 @@ function mergeRoomDeltaIntoTarget(target, delta) {
     target.limited = true;
   }
   if (typeof delta.prev_batch === 'string' && delta.prev_batch.length > 0) {
-    target.prev_batch = delta.prev_batch;
+    const nextPrevBatch = decodeRoomCursorOrNull(delta.prev_batch);
+    const currentPrevBatch = decodeRoomCursorOrNull(target.prev_batch);
+    if (currentPrevBatch == null || (nextPrevBatch != null && nextPrevBatch < currentPrevBatch)) {
+      target.prev_batch = delta.prev_batch;
+    }
   }
   if (Number.isInteger(delta.notification_count) && delta.notification_count >= 0) {
     target.notification_count = delta.notification_count;
@@ -995,6 +1007,9 @@ function buildRoomSyncEntry(projection, target) {
   if (!projection) {
     return null;
   }
+  const effectivePrevBatch = typeof projection.prev_batch === 'string' && projection.prev_batch.length > 0
+    ? projection.prev_batch
+    : target.prev_batch;
   const entry = {};
   if (projection.membership_bucket === 'invite') {
     entry.invite_state = {
@@ -1008,11 +1023,11 @@ function buildRoomSyncEntry(projection, target) {
     };
     return entry;
   }
-  if (projection.timeline_events?.length > 0 || projection.limited === true || target.prev_batch) {
+  if (projection.timeline_events?.length > 0 || projection.limited === true || effectivePrevBatch) {
     entry.timeline = {
       events: structuredClone(projection.timeline_events ?? []),
       limited: projection.limited === true,
-      ...(target.prev_batch ? { prev_batch: target.prev_batch } : {}),
+      ...(effectivePrevBatch ? { prev_batch: effectivePrevBatch } : {}),
     };
   }
   if (projection.state_after_events != null) {
