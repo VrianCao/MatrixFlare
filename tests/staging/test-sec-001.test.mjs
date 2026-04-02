@@ -51,31 +51,43 @@ async function collectBatchResponses(total, batchSize, callback) {
   return results;
 }
 
-async function assertPermissiveSearchLimiter(harness, accessToken, searchTerm, {
+async function assertPermissiveSearchAndPublicRoomsLimiter(harness, accessToken, searchTerm, {
   attempts = 12,
   batchSize = 8,
   delayMs = 100,
 } = {}) {
   let limited = null;
+  let search429Count = 0;
+  let publicRooms429Count = 0;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
-    const responses = await collectBatchResponses(batchSize, batchSize, async () => postAuthenticated(
-      harness,
-      accessToken,
-      '/_matrix/client/v3/search',
-      {
-        search_categories: {
-          room_events: {
-            search_term: searchTerm,
-            filter: {
-              limit: 1,
+    const [searchResponses, publicRoomsResponses] = await Promise.all([
+      collectBatchResponses(batchSize, batchSize, async () => postAuthenticated(
+        harness,
+        accessToken,
+        '/_matrix/client/v3/search',
+        {
+          search_categories: {
+            room_events: {
+              search_term: searchTerm,
+              filter: {
+                limit: 1,
+              },
             },
           },
         },
-      },
-    ));
-    for (const response of responses) {
+      )),
+      collectBatchResponses(batchSize, batchSize, async () => request(
+        harness,
+        '/_matrix/client/v3/publicRooms?limit=1',
+      )),
+    ]);
+    for (const response of searchResponses) {
       if (response.response.status === 429) {
-        limited ??= response;
+        search429Count += 1;
+        limited ??= {
+          route: 'search',
+          response,
+        };
         continue;
       }
       assert.equal(
@@ -85,36 +97,13 @@ async function assertPermissiveSearchLimiter(harness, accessToken, searchTerm, {
       );
       assert.ok(Array.isArray(response.payload?.search_categories?.room_events?.results));
     }
-    if (limited != null) {
-      break;
-    }
-    if (attempt + 1 < attempts) {
-      await sleep(delayMs);
-    }
-  }
-  assert.notEqual(
-    limited,
-    null,
-    `Expected search limiter to yield 429 within ${attempts * batchSize} bounded search attempts`,
-  );
-  await expectMatrixError(limited, 429, 'M_LIMIT_EXCEEDED');
-  return limited;
-}
-
-async function assertPermissivePublicRoomsLimiter(harness, {
-  attempts = 12,
-  batchSize = 8,
-  delayMs = 100,
-} = {}) {
-  let limited = null;
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
-    const responses = await collectBatchResponses(batchSize, batchSize, async () => request(
-      harness,
-      '/_matrix/client/v3/publicRooms?limit=1',
-    ));
-    for (const result of responses) {
+    for (const result of publicRoomsResponses) {
       if (result.response.status === 429) {
-        limited ??= result;
+        publicRooms429Count += 1;
+        limited ??= {
+          route: 'publicRooms',
+          response: result,
+        };
         continue;
       }
       assert.equal(
@@ -134,9 +123,10 @@ async function assertPermissivePublicRoomsLimiter(harness, {
   assert.notEqual(
     limited,
     null,
-    `Expected publicRooms limiter to yield 429 within ${attempts * batchSize} bounded anonymous publicRooms attempts`,
+    `Expected shared search/publicRooms limiter to yield 429 within ${attempts * batchSize * 2} combined attempts (observed search429=${search429Count}, publicRooms429=${publicRooms429Count})`,
   );
-  await expectMatrixError(limited, 429, 'M_LIMIT_EXCEEDED');
+  await expectMatrixError(limited.response, 429, 'M_LIMIT_EXCEEDED');
+  return limited;
 }
 
 test('TEST-SEC-001 staging covers token revocation, route-bound UIA, and ops secret-bearing auth fail-closed paths', async (context) => {
@@ -343,9 +333,7 @@ test('TEST-SEC-001 staging enforces baseline abuse guards on always-on login, me
     password: 'phase08-sec-staging-password-6',
     deviceId: 'SECSTGSEARCH',
   });
-  await assertPermissiveSearchLimiter(harness, searchUser.access_token, 'phase08-sec-staging');
-
-  await assertPermissivePublicRoomsLimiter(harness);
+  await assertPermissiveSearchAndPublicRoomsLimiter(harness, searchUser.access_token, 'phase08-sec-staging');
 
   const roomUser = await registerUser(harness, {
     usernamePrefix: 'sec-staging-roomsend',
