@@ -2,6 +2,7 @@ export {
   classifyGatewayRequest,
   createMatrixRateLimitResponse,
   enforceGatewayAbuseGuard,
+  GATEWAY_RATE_LIMIT_BINDING_DEFINITIONS,
   enforceSemanticQuota,
   resolveAbusePolicy,
 } from './abuse-guard.mjs';

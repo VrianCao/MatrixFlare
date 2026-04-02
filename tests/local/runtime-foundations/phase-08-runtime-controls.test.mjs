@@ -6,6 +6,7 @@ import {
   classifyGatewayRequest,
   enforceGatewayAbuseGuard,
   ensureDeploymentRecord,
+  GATEWAY_RATE_LIMIT_BINDING_DEFINITIONS,
   INTERNAL_RUNTIME_DERIVED_WORK_PATH,
   instrumentEnvironmentBindings,
   loadWorkerRuntimeConfig,
@@ -88,11 +89,26 @@ async function putJson(rig, accessToken, pathname, json = {}) {
   });
 }
 
+function createStubRateLimitBinding(limit) {
+  const hits = new Map();
+  return {
+    async limit({ key }) {
+      const next = (hits.get(key) ?? 0) + 1;
+      hits.set(key, next);
+      return {
+        success: next <= limit,
+      };
+    },
+  };
+}
+
 test('Phase 08 gateway abuse guard classifies L1 surfaces and enforces IP limits', async () => {
   const env = {
     ABUSE_GUARD_POLICY_JSON: JSON.stringify({
       gateway_public_entry: { limit: 1, window_ms: 60_000 },
+      gateway_register: { limit: 1, window_ms: 60_000 },
       gateway_login: { limit: 1, window_ms: 60_000 },
+      gateway_refresh: { limit: 1, window_ms: 60_000 },
       gateway_search: { limit: 1, window_ms: 60_000 },
       gateway_media: { limit: 1, window_ms: 60_000 },
       gateway_room_write: { limit: 1, window_ms: 60_000 },
@@ -113,7 +129,8 @@ test('Phase 08 gateway abuse guard classifies L1 surfaces and enforces IP limits
   ];
 
   for (const [method, pathname, routeFamily, policyId] of cases) {
-    env.__MATRIX_GATEWAY_ABUSE_GUARD__ = new Map();
+    const bindingDefinition = GATEWAY_RATE_LIMIT_BINDING_DEFINITIONS[policyId];
+    env[bindingDefinition.binding_name] = createStubRateLimitBinding(1);
     const classification = classifyGatewayRequest(method, pathname);
     assert.equal(classification.route_family, routeFamily);
     assert.equal(classification.gateway_policy_id, policyId);
@@ -124,14 +141,69 @@ test('Phase 08 gateway abuse guard classifies L1 surfaces and enforces IP limits
         'cf-connecting-ip': '198.51.100.10',
       },
     });
-    assert.equal(enforceGatewayAbuseGuard(request, env, classification), null);
-    const limited = enforceGatewayAbuseGuard(request, env, classification);
+    assert.equal(await enforceGatewayAbuseGuard(request, env, classification), null);
+    const limited = await enforceGatewayAbuseGuard(request, env, classification);
     assert.ok(limited instanceof Response);
     assert.equal(limited.status, 429);
     const body = await limited.json();
     assert.equal(body.errcode, 'M_LIMIT_EXCEEDED');
     assert.ok(body.error.includes(routeFamily));
   }
+});
+
+test('Phase 08 gateway abuse guard shares the same search limiter across authenticated search and anonymous publicRooms', async () => {
+  const env = {
+    [GATEWAY_RATE_LIMIT_BINDING_DEFINITIONS.gateway_search.binding_name]: createStubRateLimitBinding(1),
+  };
+  const searchRequest = new Request('https://matrix.example.test/_matrix/client/v3/search', {
+    method: 'POST',
+    headers: {
+      'cf-connecting-ip': '198.51.100.25',
+    },
+  });
+  const publicRoomsRequest = new Request('https://matrix.example.test/_matrix/client/v3/publicRooms?limit=1', {
+    method: 'GET',
+    headers: {
+      'cf-connecting-ip': '198.51.100.25',
+    },
+  });
+
+  assert.equal(await enforceGatewayAbuseGuard(searchRequest, env), null);
+  const limited = await enforceGatewayAbuseGuard(publicRoomsRequest, env);
+  assert.ok(limited instanceof Response);
+  assert.equal(limited.status, 429);
+  const body = await limited.json();
+  assert.equal(body.errcode, 'M_LIMIT_EXCEEDED');
+});
+
+test('Phase 08 gateway abuse guard fails closed in non-local environments when a required Workers rate-limit binding is missing', async () => {
+  const request = new Request('https://matrix.example.test/_matrix/client/v3/publicRooms?limit=1', {
+    method: 'GET',
+    headers: {
+      'cf-connecting-ip': '198.51.100.40',
+    },
+  });
+  await assert.rejects(
+    enforceGatewayAbuseGuard(request, {
+      ENVIRONMENT_NAME: 'staging',
+    }),
+    /Missing required Workers rate-limit binding GATEWAY_SEARCH_RATE_LIMITER/,
+  );
+});
+
+test('Phase 08 gateway abuse guard fails closed for unexpected environment names when a required Workers rate-limit binding is missing', async () => {
+  const request = new Request('https://matrix.example.test/_matrix/client/v3/publicRooms?limit=1', {
+    method: 'GET',
+    headers: {
+      'cf-connecting-ip': '198.51.100.41',
+    },
+  });
+  await assert.rejects(
+    enforceGatewayAbuseGuard(request, {
+      ENVIRONMENT_NAME: 'staging-typo',
+    }),
+    /Missing required Workers rate-limit binding GATEWAY_SEARCH_RATE_LIMITER/,
+  );
 });
 
 test('Phase 08 gateway telemetry does not crash when process.cpuUsage is unavailable in Workers runtime', async (t) => {

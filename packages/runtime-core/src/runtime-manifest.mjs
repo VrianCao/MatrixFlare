@@ -1,3 +1,5 @@
+import { GATEWAY_RATE_LIMIT_BINDING_DEFINITIONS } from './abuse-guard.mjs';
+
 const COMPATIBILITY_DATE = '2026-03-26';
 const COMPATIBILITY_FLAGS = Object.freeze([
   'nodejs_compat',
@@ -129,6 +131,16 @@ const WORKER_RUNTIME_MANIFEST = Object.freeze({
       kv: Object.freeze([
         { binding: 'MATRIX_EDGE_CACHE', id: '00000000000000000000000000000001' },
       ]),
+      ratelimits: Object.freeze(
+        Object.values(GATEWAY_RATE_LIMIT_BINDING_DEFINITIONS).map((definition) => ({
+          binding: definition.binding_name,
+          namespaceId: definition.default_namespace_id,
+          simple: Object.freeze({
+            limit: definition.limit,
+            period: definition.period_seconds,
+          }),
+        })),
+      ),
     }),
   }),
   'jobs-worker': Object.freeze({
@@ -187,6 +199,7 @@ const WORKER_RUNTIME_MANIFEST = Object.freeze({
       kv: Object.freeze([
         { binding: 'MATRIX_EDGE_CACHE', id: '00000000000000000000000000000001' },
       ]),
+      ratelimits: Object.freeze([]),
     }),
   }),
   'ops-worker': Object.freeze({
@@ -227,6 +240,7 @@ const WORKER_RUNTIME_MANIFEST = Object.freeze({
         { binding: 'MATRIX_ARCHIVE_BUCKET', bucketName: 'matrix-archive' },
       ]),
       kv: Object.freeze([]),
+      ratelimits: Object.freeze([]),
     }),
   }),
 });
@@ -481,6 +495,17 @@ export function createWranglerConfigSnapshot(workerName) {
     config.kv_namespaces = manifest.bindings.kv.map((binding) => ({
       binding: binding.binding,
       id: binding.id,
+    }));
+  }
+
+  if (manifest.bindings.ratelimits.length > 0) {
+    config.ratelimits = manifest.bindings.ratelimits.map((binding) => ({
+      name: binding.binding,
+      namespace_id: binding.namespaceId,
+      simple: {
+        limit: binding.simple.limit,
+        period: binding.simple.period,
+      },
     }));
   }
 

@@ -19,6 +19,10 @@ import {
   getTestEnvironmentDefinition,
   getTestEnvironmentDirectory,
 } from './bootstrap.mjs';
+import {
+  listEnvironmentRateLimitNamespaces,
+  listProductionRateLimitNamespaces,
+} from './cloudflare-resources.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -79,6 +83,7 @@ const CLOUDFLARE_RESOURCE_NAMES = Object.freeze([
   'd1_databases',
   'r2_buckets',
   'kv_namespaces',
+  'ratelimit_namespaces',
   'queues',
 ]);
 const EXPECTED_CLOUDFLARE_QUEUE_BASE_NAMES = Object.freeze([
@@ -430,6 +435,21 @@ function sortUniqueStringArray(value) {
 function buildExpectedCloudflareResources(environmentName, {
   includeArtifactBucket = true,
 } = {}) {
+  if (environmentName === 'prod') {
+    return Object.freeze({
+      workers: Object.freeze(EXPECTED_WORKER_BASE_NAMES.map((workerName) => `matrix-${workerName}-prod`).sort()),
+      durable_objects: EXPECTED_DURABLE_OBJECT_NAMES,
+      d1_databases: Object.freeze(['matrix-control-and-derived-prod']),
+      r2_buckets: Object.freeze(sortUniqueStringArray([
+        'matrix-media-prod',
+        'matrix-archive-prod',
+        ...(includeArtifactBucket ? ['matrix-evidence-prod'] : []),
+      ])),
+      kv_namespaces: Object.freeze(['matrix-edge-cache-prod']),
+      ratelimit_namespaces: listProductionRateLimitNamespaces(),
+      queues: Object.freeze(EXPECTED_CLOUDFLARE_QUEUE_BASE_NAMES.map((queueName) => `${queueName}-prod`).sort()),
+    });
+  }
   return Object.freeze({
     workers: Object.freeze(EXPECTED_WORKER_BASE_NAMES.map((workerName) => `matrix-${workerName}-${environmentName}`).sort()),
     durable_objects: EXPECTED_DURABLE_OBJECT_NAMES,
@@ -440,6 +460,7 @@ function buildExpectedCloudflareResources(environmentName, {
       ...(includeArtifactBucket ? [`matrix-evidence-${environmentName}`] : []),
     ])),
     kv_namespaces: Object.freeze([`matrix-edge-cache-${environmentName}`]),
+    ratelimit_namespaces: listEnvironmentRateLimitNamespaces(environmentName),
     queues: Object.freeze(EXPECTED_CLOUDFLARE_QUEUE_BASE_NAMES.map((queueName) => `${queueName}-${environmentName}`).sort()),
   });
 }

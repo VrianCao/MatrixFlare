@@ -368,6 +368,7 @@
 | `d1_databases` | array | 非空字符串数组 |
 | `r2_buckets` | array | 非空字符串数组 |
 | `kv_namespaces` | array | 非空字符串数组 |
+| `ratelimit_namespaces` | array | 非空字符串数组；记录本次执行或采样所使用的 Workers `ratelimits.namespace_id` 集合，便于审计环境隔离与 provenance |
 | `queues` | array | 非空字符串数组 |
 
 适用面：

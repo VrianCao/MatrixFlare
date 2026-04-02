@@ -2,6 +2,61 @@ function stableString(value) {
   return typeof value === 'string' ? value.trim() : '';
 }
 
+export const GATEWAY_RATE_LIMIT_BINDING_DEFINITIONS = Object.freeze({
+  gateway_public_entry: Object.freeze({
+    binding_name: 'GATEWAY_PUBLIC_ENTRY_RATE_LIMITER',
+    default_namespace_id: '84081001',
+    limit: 120,
+    period_seconds: 60,
+  }),
+  gateway_register: Object.freeze({
+    binding_name: 'GATEWAY_REGISTER_RATE_LIMITER',
+    default_namespace_id: '84081002',
+    limit: 24,
+    period_seconds: 60,
+  }),
+  gateway_login: Object.freeze({
+    binding_name: 'GATEWAY_LOGIN_RATE_LIMITER',
+    default_namespace_id: '84081003',
+    limit: 60,
+    period_seconds: 60,
+  }),
+  gateway_refresh: Object.freeze({
+    binding_name: 'GATEWAY_REFRESH_RATE_LIMITER',
+    default_namespace_id: '84081004',
+    limit: 120,
+    period_seconds: 60,
+  }),
+  gateway_media: Object.freeze({
+    binding_name: 'GATEWAY_MEDIA_RATE_LIMITER',
+    default_namespace_id: '84081005',
+    limit: 180,
+    period_seconds: 60,
+  }),
+  gateway_search: Object.freeze({
+    binding_name: 'GATEWAY_SEARCH_RATE_LIMITER',
+    default_namespace_id: '84081006',
+    limit: 60,
+    period_seconds: 60,
+  }),
+  gateway_room_write: Object.freeze({
+    binding_name: 'GATEWAY_ROOM_WRITE_RATE_LIMITER',
+    default_namespace_id: '84081007',
+    limit: 240,
+    period_seconds: 60,
+  }),
+});
+
+const STRICT_GATEWAY_RATE_LIMIT_ENVIRONMENTS = Object.freeze(new Set([
+  'ci-integration',
+  'staging',
+  'pre-release',
+]));
+const LOCAL_GATEWAY_RATE_LIMIT_ENVIRONMENTS = Object.freeze(new Set([
+  'local',
+  'environment_name-placeholder',
+]));
+
 function parsePolicyOverrides(env) {
   const raw = stableString(env?.ABUSE_GUARD_POLICY_JSON);
   if (!raw) {
@@ -47,13 +102,15 @@ export function ensureGatewayAbuseGuardStore(env) {
 }
 
 const DEFAULT_POLICIES = Object.freeze({
-  gateway_public_entry: Object.freeze({ limit: 120, window_ms: 60_000 }),
-  gateway_register: Object.freeze({ limit: 24, window_ms: 60_000 }),
-  gateway_login: Object.freeze({ limit: 60, window_ms: 60_000 }),
-  gateway_refresh: Object.freeze({ limit: 120, window_ms: 60_000 }),
-  gateway_media: Object.freeze({ limit: 180, window_ms: 60_000 }),
-  gateway_search: Object.freeze({ limit: 60, window_ms: 60_000 }),
-  gateway_room_write: Object.freeze({ limit: 240, window_ms: 60_000 }),
+  ...Object.fromEntries(
+    Object.entries(GATEWAY_RATE_LIMIT_BINDING_DEFINITIONS).map(([policyId, definition]) => [
+      policyId,
+      Object.freeze({
+        limit: definition.limit,
+        window_ms: definition.period_seconds * 1000,
+      }),
+    ]),
+  ),
   userdo_register: Object.freeze({ limit: 4, window_ms: 60_000 }),
   userdo_login: Object.freeze({ limit: 8, window_ms: 60_000 }),
   userdo_refresh: Object.freeze({ limit: 20, window_ms: 60_000 }),
@@ -84,6 +141,17 @@ function resolveClientAddress(request) {
     || stableString(request.headers.get('x-forwarded-for')).split(',')[0]?.trim()
     || stableString(request.headers.get('x-real-ip'));
   return direct || 'unknown';
+}
+
+function requiresStrictGatewayRateLimitBinding(env) {
+  const environmentName = stableString(env?.ENVIRONMENT_NAME);
+  if (STRICT_GATEWAY_RATE_LIMIT_ENVIRONMENTS.has(environmentName)) {
+    return true;
+  }
+  if (environmentName.length === 0 || LOCAL_GATEWAY_RATE_LIMIT_ENVIRONMENTS.has(environmentName)) {
+    return false;
+  }
+  return true;
 }
 
 export function classifyGatewayRequest(method, pathname) {
@@ -176,6 +244,27 @@ export function enforceGatewayAbuseGuard(request, env, classification = classify
   if (!classification?.gateway_policy_id) {
     return null;
   }
+  const bindingDefinition = GATEWAY_RATE_LIMIT_BINDING_DEFINITIONS[classification.gateway_policy_id] ?? null;
+  if (bindingDefinition != null) {
+    const binding = env?.[bindingDefinition.binding_name];
+    if (binding != null && typeof binding.limit === 'function') {
+      return Promise.resolve(binding.limit({
+        key: resolveClientAddress(request),
+      })).then((result) => {
+        if (result == null || typeof result.success !== 'boolean') {
+          throw new TypeError(`${bindingDefinition.binding_name}.limit() must resolve to an object with boolean success`);
+        }
+        if (result.success) {
+          return null;
+        }
+        const policy = resolveAbusePolicy(env, classification.gateway_policy_id);
+        return createMatrixRateLimitResponse(policy.window_ms, `Rate limit exceeded for ${classification.route_family}`);
+      });
+    }
+    if (requiresStrictGatewayRateLimitBinding(env)) {
+      return Promise.reject(new Error(`Missing required Workers rate-limit binding ${bindingDefinition.binding_name} for ${stableString(env?.ENVIRONMENT_NAME) || 'unknown environment'}`));
+    }
+  }
   const policy = resolveAbusePolicy(env, classification.gateway_policy_id);
   const clientAddress = resolveClientAddress(request);
   const nowMs = Date.now();
@@ -190,7 +279,7 @@ export function enforceGatewayAbuseGuard(request, env, classification = classify
   }
   recentHits.push(nowMs);
   store.set(bucketKey, recentHits);
-  return null;
+  return Promise.resolve(null);
 }
 
 export function ensureSemanticQuotaStore(host) {

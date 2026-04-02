@@ -13,6 +13,7 @@ import {
   requestOps,
   requireRemoteHarnessContext,
   roomPath,
+  sleep,
 } from './support.mjs';
 
 async function requestAs(harness, accessToken, pathname, {
@@ -48,6 +49,30 @@ async function collectBatchResponses(total, batchSize, callback) {
     results.push(...(await Promise.all(batch)));
   }
   return results;
+}
+
+async function assertPermissivePublicRoomsLimiter(harness, {
+  attempts = 12,
+  delayMs = 100,
+} = {}) {
+  let limited = null;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const result = await request(harness, '/_matrix/client/v3/publicRooms?limit=1');
+    if (result.response.status === 429) {
+      limited = result;
+      break;
+    }
+    assert.equal(
+      result.response.status,
+      200,
+      `Expected bounded publicRooms limiter window to return 200 or 429, received ${result.response.status}`,
+    );
+    if (attempt + 1 < attempts) {
+      await sleep(delayMs);
+    }
+  }
+  assert.notEqual(limited, null, `Expected publicRooms limiter to yield 429 within ${attempts} attempts after the shared search limiter tripped`);
+  await expectMatrixError(limited, 429, 'M_LIMIT_EXCEEDED');
 }
 
 test('TEST-SEC-001 pre-release covers token revocation, route-bound UIA, and ops secret-bearing auth fail-closed paths', async (context) => {
@@ -276,8 +301,7 @@ test('TEST-SEC-001 pre-release enforces baseline abuse guards on always-on login
   assert.notEqual(searchLimited, null);
   await expectMatrixError(searchLimited, 429, 'M_LIMIT_EXCEEDED');
 
-  const publicRoomsLimited = await request(harness, '/_matrix/client/v3/publicRooms?limit=1');
-  await expectMatrixError(publicRoomsLimited, 429, 'M_LIMIT_EXCEEDED');
+  await assertPermissivePublicRoomsLimiter(harness);
 
   const roomUser = await registerUser(harness, {
     usernamePrefix: 'sec-prerelease-roomsend',

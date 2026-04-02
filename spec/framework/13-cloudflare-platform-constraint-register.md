@@ -65,6 +65,7 @@
 | `CF-WKR-024` | Workers | limits | workers-limits | Paid | Request header size 上限 `128 KB (total)`；response header size 上限 `128 KB (total)`。 | Access/JWT、联邦签名与任何 cookie/header 注入不得把 header 膨胀为大 payload；可增长的材料必须限制长度或改走 body/locator。 | `21`,`32`,`40` |
 | `CF-WKR-025` | Workers | limits | workers-limits | Paid | Worker 必须在 `1s` 内完成 global scope（top-level code）解析与执行；超限时部署校验会失败，Wrangler 会报告 `startup_time_ms`，并可能返回 `Script startup exceeded CPU time limit (10021)`。 | 所有 Worker 必须避免重型 top-level 初始化；发布门禁必须记录 `startup_time_ms` 并在接近 `1s` ceiling 前 fail-closed，而不是等线上流量触发问题。 | `21`,`42` |
 | `CF-WKR-026` | Workers | runtime | workers-compatibility-flags, workers-nodejs-apis, workers-nodejs-process | Paid | Node.js runtime APIs 只在显式启用 `nodejs_compat` compatibility flag 时可用；该 flag 不会在未来某个日期自动变为默认开启。Cloudflare 同时明确说明 Workers 只支持一部分 Node.js API，且部分 API 只是 partially supported 或 non-functional stub。启用 `nodejs_compat` 后，若不希望 bindings 被自动注入到 `process.env`，必须显式设置 `nodejs_compat_do_not_populate_process_env`。 | 若代码中存在 `node:*` import，则 wrangler 配置必须显式钉住 `compatibility_flags`；默认策略为启用 `nodejs_compat` 并禁用 `process.env` 自动注入，以维持 secret/feature gate 的集中装载模型。任何对 `process.*` 或其他 Node helper 的依赖都必须先 feature-detect 并可安全降级，不得让观测/telemetry 辅助逻辑把请求路径打成 `500`。 | `13`,`21`,`40`,`41`,`42` |
+| `CF-WKR-027` | Workers Rate Limiting | behavior | workers-rate-limit | Paid | Workers `ratelimits` binding 的 `simple.period` 只允许 `10` 或 `60` 秒；Rate Limiting 是 local-to-location、eventually consistent，并被 Cloudflare 明确标记为 permissive 而非严格安全边界。 | 可以用来实现 `gateway-worker` 的 coarse request shaping，避免 isolate-local 内存计数在 non-local 环境下失真；但它不能替代 `UserDO` / `RoomDO` 的语义级 quota，也不能被当作全局精确计数或唯一 abuse truth。 | `21`,`40`,`43` |
 
 ## 4. Durable Objects 约束
 
@@ -157,6 +158,7 @@
 * 所有 DO alarm 驱动的 retry、cleanup 与 rebuild 都必须按 single-slot + at-least-once + 最多 `6` 次自动重试建模；若要持续 liveness，handler 必须显式重新 `setAlarm()`。引用：`CF-DO-019`。
 * 所有 SQLite-backed DO 的显式事务都必须走 `ctx.storage.transaction()` 或 `ctx.storage.transactionSync()`；不得在 `sql.exec()` 中直接发 `BEGIN` / `SAVEPOINT` / `COMMIT`。引用：`CF-DO-020`。
 * 所有 Worker-to-Worker 与 Worker-to-DO 的普通 RPC 契约都必须受 `32 MiB` serialized payload ceiling 约束；若可能超限，必须改为 stream 或 locator 模式。引用：`CF-WKR-023`。
+* `gateway-worker` 的 coarse abuse guard 若使用 Workers `ratelimits` binding，只能把它当作 per-location 的 permissive edge shaping，而不能把它当作全局精确计数、授权真相或语义级 quota。引用：`CF-WKR-027`。
 * 所有媒体上传能力都必须同时受 Matrix 协议能力声明和 Cloudflare zone request body 限制约束。引用：`CF-WKR-007`,`CF-R2-002`。
 * 所有 DO truth / repair / export 设计都必须同时尊重 `2 MB` row/value ceiling、`100 KB` SQL statement ceiling、`32 MiB` received WebSocket ceiling 与 `128 MB` runtime memory ceiling。引用：`CF-DO-015`,`CF-DO-016`,`CF-DO-017`,`CF-DO-018`。
 * 所有通过 Cloudflare Access 保护的管理面都必须以 `Cf-Access-Jwt-Assertion` 为应用层身份源，并实现 JWK 轮换容忍；service token 只用于 Access 边缘鉴权，不是 origin 侧长期 bearer secret。引用：`CF-NET-004`,`CF-NET-005`,`CF-NET-006`。

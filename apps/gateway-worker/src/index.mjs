@@ -4559,7 +4559,7 @@ async function handleRequest(request, env) {
     path: pathname,
   });
   try {
-    const abuseResponse = enforceGatewayAbuseGuard(request, env, classification);
+    const abuseResponse = await enforceGatewayAbuseGuard(request, env, classification);
     const response = await (async () => {
       if (abuseResponse) {
         return abuseResponse;

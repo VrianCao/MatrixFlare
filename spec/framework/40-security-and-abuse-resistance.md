@@ -140,6 +140,7 @@
 ### 6.1 Rate Limit Placement
 
 * 粗粒度入口限流放在 `gateway-worker`。
+* `gateway-worker` 的 coarse edge shaping 若采用 Workers `ratelimits` binding，只能把它当作 per-location、permissive 的前置护栏；任何 correctness-sensitive 的用户、会话、媒体、membership 或房间写语义配额，仍必须在应用拥有者侧实现。引用：`CF-WKR-027`。
 * 语义级配额和并发控制放在主权对象内实现。
 * Cloudflare 平台防护可作为附加防线，但不能替代业务语义配额。
 

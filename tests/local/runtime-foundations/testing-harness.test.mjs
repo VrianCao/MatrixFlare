@@ -32,6 +32,9 @@ import {
   buildNonLocalEnvironmentPlan,
 } from '../../../packages/testing/src/nonlocal.mjs';
 import {
+  listProductionRateLimitNamespaces,
+} from '../../../packages/testing/src/cloudflare-resources.mjs';
+import {
   assertPathsDoNotExist,
   writeGovernanceEvidence,
 } from '../../../packages/spec-tools/src/governance.mjs';
@@ -52,6 +55,7 @@ function buildExpectedCloudflareResources(environmentName) {
       d1_databases: ['matrix-control-and-derived-prod'],
       r2_buckets: ['matrix-archive-prod', 'matrix-evidence-prod', 'matrix-media-prod'],
       kv_namespaces: ['matrix-edge-cache-prod'],
+      ratelimit_namespaces: listProductionRateLimitNamespaces(),
       queues: [
         'matrix-appservice-txn-job-prod',
         'matrix-export-shard-job-prod',

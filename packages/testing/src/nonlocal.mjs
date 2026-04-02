@@ -21,6 +21,10 @@ import {
   validateManualArtifactPayload,
 } from './evidence.mjs';
 import {
+  buildEnvironmentRateLimitNamespaceId,
+  listEnvironmentRateLimitNamespaces,
+} from './cloudflare-resources.mjs';
+import {
   getTestEnvironmentDirectory,
   getRequiredTestFiles,
 } from './bootstrap.mjs';
@@ -87,7 +91,6 @@ const NON_LOCAL_READINESS_MAX_ATTEMPTS = 7;
 const NON_LOCAL_READINESS_INITIAL_DELAY_MS = 2_000;
 const NON_LOCAL_READINESS_MAX_DELAY_MS = 15_000;
 const NON_LOCAL_READINESS_REQUEST_TIMEOUT_MS = 10_000;
-
 let githubActionsOidcIdentityPromise = null;
 let githubActionsJwksPromise = null;
 
@@ -280,6 +283,14 @@ async function requireGitHubActionsExecution(operationName, {
   return claims;
 }
 
+function sortUniqueStringArray(values) {
+  return [...new Set(
+    values
+      .filter((value) => isNonEmptyString(value))
+      .map((value) => String(value)),
+  )].sort();
+}
+
 function sha256Hex(value) {
   return createHash('sha256').update(value).digest('hex');
 }
@@ -294,6 +305,10 @@ function normalizePathForMarkdown(value) {
 
 function isNonEmptyString(value) {
   return typeof value === 'string' && value.length > 0;
+}
+
+function isNonEmptyStringArray(value) {
+  return Array.isArray(value) && value.length > 0 && value.every((entry) => isNonEmptyString(entry));
 }
 
 function normalizeWorkersSubdomain(value, label = 'workersSubdomain') {
@@ -449,6 +464,7 @@ export function buildNonLocalEnvironmentPlan(environmentName, {
         resourceBindingNames.r2_buckets.MATRIX_ARCHIVE_BUCKET,
       ]),
       kv_namespaces: Object.freeze([resourceBindingNames.kv_namespaces.MATRIX_EDGE_CACHE]),
+      ratelimit_namespaces: listEnvironmentRateLimitNamespaces(normalizedEnvironmentName),
       queues: Object.freeze(Object.values(resourceBindingNames.queues)),
     }),
     deployment_order: WORKER_DEPLOYMENT_ORDER,
@@ -697,6 +713,13 @@ export function createEnvironmentWranglerConfig(workerName, plan, {
     envConfig.kv_namespaces = baseConfig.kv_namespaces.map((binding) => ({
       binding: binding.binding,
       id: kvNamespaceId,
+    }));
+  }
+
+  if (Array.isArray(baseConfig.ratelimits) && baseConfig.ratelimits.length > 0) {
+    envConfig.ratelimits = baseConfig.ratelimits.map((binding) => ({
+      ...binding,
+      namespace_id: buildEnvironmentRateLimitNamespaceId(envName, binding.namespace_id),
     }));
   }
 
@@ -1166,6 +1189,43 @@ export async function fetchWorkerDeploymentState({
   });
 }
 
+function summarizeWorkerBindingState({
+  bindings,
+}) {
+  const ratelimitNamespaceIds = [];
+  for (const binding of extractArrayResult({ bindings }, ['bindings'])) {
+    if (!isPlainObject(binding)) {
+      continue;
+    }
+    if (extractStringField(binding, ['type']) !== 'ratelimit') {
+      continue;
+    }
+    const namespaceId = extractStringField(binding, ['namespace_id', 'namespaceId']);
+    if (!isNonEmptyString(namespaceId)) {
+      throw new TypeError('Cloudflare ratelimit binding must include namespace_id');
+    }
+    ratelimitNamespaceIds.push(namespaceId);
+  }
+  return Object.freeze({
+    ratelimit_namespace_ids: Object.freeze(sortUniqueStringArray(ratelimitNamespaceIds)),
+  });
+}
+
+export async function fetchWorkerBindingState({
+  accountId,
+  apiToken,
+  scriptName,
+}) {
+  const settingsPayload = await callCloudflareApi({
+    accountId,
+    apiToken,
+    pathname: `/workers/scripts/${scriptName}/settings`,
+  });
+  return summarizeWorkerBindingState({
+    bindings: extractArrayResult(settingsPayload.result, ['bindings']),
+  });
+}
+
 function isMissingWorkerScriptObservationError(scriptName, error) {
   if (!isNonEmptyString(scriptName) || (!(error instanceof Error) && !isPlainObject(error))) {
     return false;
@@ -1243,6 +1303,7 @@ export async function validateDeploymentSummaryAgainstCurrentCloudflareState(dep
   accountId,
   apiToken,
   fetchWorkerDeploymentStateImpl = fetchWorkerDeploymentState,
+  fetchWorkerBindingStateImpl = fetchWorkerBindingState,
 } = {}) {
   if (!isPlainObject(deploymentSummary)) {
     throw new TypeError('deployment summary must be an object');
@@ -1256,31 +1317,82 @@ export async function validateDeploymentSummaryAgainstCurrentCloudflareState(dep
   if (typeof fetchWorkerDeploymentStateImpl !== 'function') {
     throw new TypeError('fetchWorkerDeploymentStateImpl must be a function');
   }
+  if (typeof fetchWorkerBindingStateImpl !== 'function') {
+    throw new TypeError('fetchWorkerBindingStateImpl must be a function');
+  }
   if (!isPlainObject(deploymentSummary.workers)) {
     throw new TypeError('deployment summary workers must be an object');
+  }
+  if (!isPlainObject(deploymentSummary.cloudflare_resources)) {
+    throw new TypeError('deployment summary cloudflare_resources must be an object');
+  }
+  if (!isNonEmptyStringArray(deploymentSummary.cloudflare_resources.ratelimit_namespaces)) {
+    throw new TypeError('deployment summary cloudflare_resources.ratelimit_namespaces must be a non-empty string array');
   }
 
   const workers = {};
   for (const workerName of WORKER_DEPLOYMENT_ORDER) {
     const workerSummary = deploymentSummary.workers?.[workerName];
-    const currentDeploymentState = await fetchWorkerDeploymentStateImpl({
-      accountId,
-      apiToken,
-      scriptName: workerSummary?.script_name,
-    });
+    const [currentDeploymentState, currentBindingState] = await Promise.all([
+      fetchWorkerDeploymentStateImpl({
+        accountId,
+        apiToken,
+        scriptName: workerSummary?.script_name,
+      }),
+      fetchWorkerBindingStateImpl({
+        accountId,
+        apiToken,
+        scriptName: workerSummary?.script_name,
+      }),
+    ]);
     validateLatestActiveCloudflareWorkerIdentity(workerName, workerSummary, currentDeploymentState);
+    if (
+      !isPlainObject(currentBindingState)
+      || !Array.isArray(currentBindingState.ratelimit_namespace_ids)
+      || !currentBindingState.ratelimit_namespace_ids.every((namespaceId) => isNonEmptyString(namespaceId))
+    ) {
+      throw new TypeError(`current Cloudflare binding state for ${workerName} must expose ratelimit_namespace_ids`);
+    }
     workers[workerName] = Object.freeze({
       script_name: workerSummary.script_name,
       latest_active_deployment_id: currentDeploymentState.latest_active_deployment_id,
       active_worker_version_ids: Object.freeze([
         ...currentDeploymentState.active_worker_version_ids,
       ]),
+      ratelimit_namespace_ids: Object.freeze([
+        ...currentBindingState.ratelimit_namespace_ids,
+      ]),
     });
+  }
+  const declaredRateLimitNamespaces = [...deploymentSummary.cloudflare_resources.ratelimit_namespaces];
+  const normalizedDeclaredRateLimitNamespaces = sortUniqueStringArray(declaredRateLimitNamespaces);
+  if (normalizedDeclaredRateLimitNamespaces.length !== declaredRateLimitNamespaces.length) {
+    throw new TypeError('deployment summary cloudflare_resources.ratelimit_namespaces must not contain duplicates');
+  }
+  const observedGatewayRateLimitNamespaces = Object.freeze(sortUniqueStringArray(
+    workers['gateway-worker']?.ratelimit_namespace_ids ?? [],
+  ));
+  if (
+    normalizedDeclaredRateLimitNamespaces.length !== observedGatewayRateLimitNamespaces.length
+    || normalizedDeclaredRateLimitNamespaces.some((namespaceId, index) => namespaceId !== observedGatewayRateLimitNamespaces[index])
+  ) {
+    throw new TypeError('deployment summary cloudflare_resources.ratelimit_namespaces must match currently deployed Cloudflare ratelimit namespace bindings on gateway-worker');
+  }
+  for (const workerName of WORKER_DEPLOYMENT_ORDER) {
+    if (workerName === 'gateway-worker') {
+      continue;
+    }
+    if ((workers[workerName]?.ratelimit_namespace_ids?.length ?? 0) > 0) {
+      throw new TypeError(`${workerName} must not expose ratelimit namespace bindings`);
+    }
   }
 
   return Object.freeze({
     validated_at: new Date().toISOString(),
     workers: Object.freeze(workers),
+    cloudflare_resources: Object.freeze({
+      ratelimit_namespaces: observedGatewayRateLimitNamespaces,
+    }),
   });
 }
 
@@ -2320,6 +2432,10 @@ export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
   if (!isPlainObject(cloudflareResources)) {
     throw new TypeError('deployment summary cloudflare_resources must be an object');
   }
+  const validatedCloudflareResources = structuredCloneJson(cloudflareResources);
+  validatedCloudflareResources.ratelimit_namespaces = [
+    ...deploymentIdentityValidation.before_readiness.cloudflare_resources.ratelimit_namespaces,
+  ];
   const files = await getRequiredTestFilesImpl(normalizedEnvironmentName, repoRoot);
   const startedAt = new Date().toISOString();
   const startedMs = Date.now();
@@ -2336,6 +2452,9 @@ export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
       accountId,
       apiToken,
     });
+    validatedCloudflareResources.ratelimit_namespaces = [
+      ...deploymentIdentityValidation.before_suite.cloudflare_resources.ratelimit_namespaces,
+    ];
     exitCode = await new Promise((resolve) => {
       const child = spawnImpl(process.execPath, commandArgs, {
         cwd: repoRoot,
@@ -2388,7 +2507,7 @@ export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
     reviewed_by: reviewedBy,
     source_run_uri: sourceRunUri,
     topology_kind: topologyKind,
-    cloudflare_resources: cloudflareResources,
+    cloudflare_resources: validatedCloudflareResources,
     deployment_identity_validation: deploymentIdentityValidation,
     run_timestamp: runTimestamp,
   };
@@ -2468,8 +2587,12 @@ export async function writeProdCostSnapshotAttestation({
   payloadPath,
   outputPath,
   provenance,
-}) {
-  await requireGitHubActionsExecution('writeProdCostSnapshotAttestation');
+}, {
+  requireGitHubActionsExecutionImpl = requireGitHubActionsExecution,
+} = {}) {
+  await requireGitHubActionsExecutionImpl('writeProdCostSnapshotAttestation', {
+    expectedEnvironmentName: 'prod',
+  });
   const payload = JSON.parse(await fs.readFile(payloadPath, 'utf8'));
   const bundle = {
     schema_version: 1,

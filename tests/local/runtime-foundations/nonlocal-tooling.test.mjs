@@ -25,9 +25,13 @@ import {
   validateLatestActiveCloudflareWorkerIdentity,
   validateRemoteHarnessEnvironmentVariables,
   waitForNonLocalDeploymentReadiness,
+  writeProdCostSnapshotAttestation,
   writeEnvironmentWranglerConfig,
   writeEnvironmentRunProvenance,
 } from '../../../packages/testing/src/nonlocal.mjs';
+import {
+  buildEnvironmentRateLimitNamespaceId,
+} from '../../../packages/testing/src/cloudflare-resources.mjs';
 
 function buildDeploymentSummaryFixture(environmentName) {
   const plan = buildNonLocalEnvironmentPlan(environmentName, {
@@ -70,8 +74,14 @@ function buildDeploymentSummaryFixture(environmentName) {
 }
 
 function buildDeploymentIdentityValidationFixture(environmentName) {
+  const plan = buildNonLocalEnvironmentPlan(environmentName, {
+    workersSubdomain: 'matrixflare',
+  });
   return {
     validated_at: '2026-04-01T16:00:00.000Z',
+    cloudflare_resources: {
+      ratelimit_namespaces: plan.cloudflare_resources.ratelimit_namespaces,
+    },
     workers: {
       'jobs-worker': {
         script_name: buildWorkerScriptName('jobs-worker', environmentName),
@@ -158,6 +168,15 @@ test('non-local environment plan derives deterministic workers.dev scripts and r
   assert.equal(plan.runtime_resource_binding_names.queues.SEARCH_INDEX_QUEUE, 'matrix-search-index-job-staging');
   assert.equal(plan.kv_namespace_title, 'matrix-edge-cache-staging');
   assert.equal(plan.artifact_bucket_name, 'matrix-evidence-staging');
+  assert.deepEqual(plan.cloudflare_resources.ratelimit_namespaces, [
+    '84281001',
+    '84281002',
+    '84281003',
+    '84281004',
+    '84281005',
+    '84281006',
+    '84281007',
+  ]);
 });
 
 test('non-production secret bundle stays stable for the same inputs and diverges across environments', () => {
@@ -211,6 +230,9 @@ test('environment wrangler config rewrites bindings for a specific non-local env
   assert.equal(config.env['pre-release'].d1_databases[0].database_id, 'db-pre-release');
   assert.equal(config.env['pre-release'].r2_buckets[0].bucket_name, 'matrix-media-pre-release');
   assert.equal(config.env['pre-release'].kv_namespaces[0].id, 'kv-pre-release');
+  assert.equal(config.env['pre-release'].ratelimits[0].name, 'GATEWAY_PUBLIC_ENTRY_RATE_LIMITER');
+  assert.equal(config.env['pre-release'].ratelimits[0].namespace_id, '84381001');
+  assert.equal(config.env['pre-release'].ratelimits[0].simple.limit, 120);
   assert.equal(
     JSON.parse(config.env['pre-release'].vars.RESOURCE_BINDING_NAMES_JSON).queues.RESTORE_SHARD_QUEUE,
     'matrix-restore-shard-job-pre-release',
@@ -444,25 +466,7 @@ test('worker deployment state summary keeps only the latest active deployment ve
 });
 
 test('deployment summary Cloudflare revalidation checks every worker against the latest active identity', async () => {
-  const deploymentSummary = {
-    workers: {
-      'jobs-worker': {
-        script_name: 'matrix-jobs-worker-staging',
-        deployment_id: 'dep-jobs',
-        worker_version_id: 'ver-jobs',
-      },
-      'ops-worker': {
-        script_name: 'matrix-ops-worker-staging',
-        deployment_id: 'dep-ops',
-        worker_version_id: 'ver-ops',
-      },
-      'gateway-worker': {
-        script_name: 'matrix-gateway-worker-staging',
-        deployment_id: 'dep-gateway',
-        worker_version_id: 'ver-gateway',
-      },
-    },
-  };
+  const deploymentSummary = buildDeploymentSummaryFixture('staging');
   const observedScripts = [];
 
   const validation = await validateDeploymentSummaryAgainstCurrentCloudflareState(deploymentSummary, {
@@ -476,6 +480,11 @@ test('deployment summary Cloudflare revalidation checks every worker against the
         active_worker_version_ids: [`ver-${workerAlias}`, 'ver-older'],
       };
     },
+    fetchWorkerBindingStateImpl: async ({ scriptName }) => ({
+      ratelimit_namespace_ids: scriptName === deploymentSummary.workers['gateway-worker'].script_name
+        ? deploymentSummary.cloudflare_resources.ratelimit_namespaces
+        : [],
+    }),
   });
 
   assert.deepEqual(observedScripts, [
@@ -485,7 +494,150 @@ test('deployment summary Cloudflare revalidation checks every worker against the
   ]);
   assert.equal(validation.workers['jobs-worker'].latest_active_deployment_id, 'dep-jobs');
   assert.deepEqual(validation.workers['gateway-worker'].active_worker_version_ids, ['ver-gateway', 'ver-older']);
+  assert.deepEqual(
+    validation.workers['gateway-worker'].ratelimit_namespace_ids,
+    deploymentSummary.cloudflare_resources.ratelimit_namespaces,
+  );
+  assert.deepEqual(
+    validation.cloudflare_resources.ratelimit_namespaces,
+    deploymentSummary.cloudflare_resources.ratelimit_namespaces,
+  );
   assert.match(validation.validated_at, /^\d{4}-\d{2}-\d{2}T/);
+});
+
+test('deployment summary Cloudflare revalidation rejects ratelimit namespace drift from the deployed worker bindings', async () => {
+  const deploymentSummary = buildDeploymentSummaryFixture('staging');
+
+  await assert.rejects(
+    () => validateDeploymentSummaryAgainstCurrentCloudflareState(deploymentSummary, {
+      accountId: 'cf-account',
+      apiToken: 'cf-token',
+      fetchWorkerDeploymentStateImpl: async ({ scriptName }) => {
+        const workerAlias = scriptName.split('-')[1];
+        return {
+          latest_active_deployment_id: `dep-${workerAlias}`,
+          active_worker_version_ids: [`ver-${workerAlias}`],
+        };
+      },
+      fetchWorkerBindingStateImpl: async ({ scriptName }) => ({
+        ratelimit_namespace_ids: scriptName === deploymentSummary.workers['gateway-worker'].script_name
+          ? ['99999999']
+          : [],
+      }),
+    }),
+    /cloudflare_resources\.ratelimit_namespaces must match currently deployed Cloudflare ratelimit namespace bindings on gateway-worker/,
+  );
+});
+
+test('deployment summary Cloudflare revalidation rejects malformed declared ratelimit namespace snapshots', async () => {
+  const deploymentSummary = buildDeploymentSummaryFixture('staging');
+  deploymentSummary.cloudflare_resources = {
+    ...deploymentSummary.cloudflare_resources,
+    ratelimit_namespaces: [
+      deploymentSummary.cloudflare_resources.ratelimit_namespaces[0],
+      '',
+      null,
+      123,
+    ],
+  };
+
+  await assert.rejects(
+    () => validateDeploymentSummaryAgainstCurrentCloudflareState(deploymentSummary, {
+      accountId: 'cf-account',
+      apiToken: 'cf-token',
+      fetchWorkerDeploymentStateImpl: async ({ scriptName }) => {
+        const workerAlias = scriptName.split('-')[1];
+        return {
+          latest_active_deployment_id: `dep-${workerAlias}`,
+          active_worker_version_ids: [`ver-${workerAlias}`],
+        };
+      },
+      fetchWorkerBindingStateImpl: async ({ scriptName }) => ({
+        ratelimit_namespace_ids: scriptName === deploymentSummary.workers['gateway-worker'].script_name
+          ? buildDeploymentSummaryFixture('staging').cloudflare_resources.ratelimit_namespaces
+          : [],
+      }),
+    }),
+    /cloudflare_resources\.ratelimit_namespaces must be a non-empty string array/,
+  );
+});
+
+test('environment ratelimit namespace builder rejects partially numeric namespace ids', () => {
+  assert.throws(
+    () => buildEnvironmentRateLimitNamespaceId('staging', '84081001junk'),
+    /namespaceId must be a positive integer string/,
+  );
+  assert.throws(
+    () => buildEnvironmentRateLimitNamespaceId('staging', '84 081001'),
+    /namespaceId must be a positive integer string/,
+  );
+});
+
+test('deployment summary Cloudflare revalidation rejects ratelimit namespaces reported by non-gateway workers', async () => {
+  const deploymentSummary = buildDeploymentSummaryFixture('staging');
+
+  await assert.rejects(
+    () => validateDeploymentSummaryAgainstCurrentCloudflareState(deploymentSummary, {
+      accountId: 'cf-account',
+      apiToken: 'cf-token',
+      fetchWorkerDeploymentStateImpl: async ({ scriptName }) => {
+        const workerAlias = scriptName.split('-')[1];
+        return {
+          latest_active_deployment_id: `dep-${workerAlias}`,
+          active_worker_version_ids: [`ver-${workerAlias}`],
+        };
+      },
+      fetchWorkerBindingStateImpl: async ({ scriptName }) => {
+        if (scriptName === deploymentSummary.workers['gateway-worker'].script_name) {
+          return {
+            ratelimit_namespace_ids: deploymentSummary.cloudflare_resources.ratelimit_namespaces,
+          };
+        }
+        if (scriptName === deploymentSummary.workers['jobs-worker'].script_name) {
+          return {
+            ratelimit_namespace_ids: [
+              deploymentSummary.cloudflare_resources.ratelimit_namespaces[0],
+            ],
+          };
+        }
+        return {
+          ratelimit_namespace_ids: [],
+        };
+      },
+    }),
+    /jobs-worker must not expose ratelimit namespace bindings/,
+  );
+});
+
+test('deployment summary Cloudflare revalidation rejects duplicate declared ratelimit namespaces', async () => {
+  const deploymentSummary = buildDeploymentSummaryFixture('staging');
+  deploymentSummary.cloudflare_resources = {
+    ...deploymentSummary.cloudflare_resources,
+    ratelimit_namespaces: [
+      deploymentSummary.cloudflare_resources.ratelimit_namespaces[0],
+      deploymentSummary.cloudflare_resources.ratelimit_namespaces[0],
+    ],
+  };
+
+  await assert.rejects(
+    () => validateDeploymentSummaryAgainstCurrentCloudflareState(deploymentSummary, {
+      accountId: 'cf-account',
+      apiToken: 'cf-token',
+      fetchWorkerDeploymentStateImpl: async ({ scriptName }) => {
+        const workerAlias = scriptName.split('-')[1];
+        return {
+          latest_active_deployment_id: `dep-${workerAlias}`,
+          active_worker_version_ids: [`ver-${workerAlias}`],
+        };
+      },
+      fetchWorkerBindingStateImpl: async ({ scriptName }) => ({
+        ratelimit_namespace_ids: scriptName === deploymentSummary.workers['gateway-worker'].script_name
+          ? buildDeploymentSummaryFixture('staging').cloudflare_resources.ratelimit_namespaces
+          : [],
+      }),
+    }),
+    /cloudflare_resources\.ratelimit_namespaces must not contain duplicates/,
+  );
 });
 
 test('pre-deploy worker deployment state only treats fully missing script observations as an empty bootstrap state', () => {
@@ -1177,4 +1329,24 @@ test('non-local provenance writing rejects spoofed local GitHub Actions env with
     }
     await fs.rm(tempRoot, { recursive: true, force: true });
   }
+});
+
+test('prod cost attestation writing requires the GitHub Actions prod environment claim', async () => {
+  await assert.rejects(
+    () => writeProdCostSnapshotAttestation({
+      runTimestamp: '20260402T050000Z',
+      payloadPath: '/tmp/unused-prod-cost-snapshot.json',
+      outputPath: '/tmp/unused-prod-cost-attestation.json',
+      provenance: {},
+    }, {
+      requireGitHubActionsExecutionImpl: async (operationName, {
+        expectedEnvironmentName = null,
+      } = {}) => {
+        assert.equal(operationName, 'writeProdCostSnapshotAttestation');
+        assert.equal(expectedEnvironmentName, 'prod');
+        throw new Error('stop after verifying expected prod environment');
+      },
+    }),
+    /stop after verifying expected prod environment/,
+  );
 });
