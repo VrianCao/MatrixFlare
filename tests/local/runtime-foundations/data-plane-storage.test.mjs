@@ -1155,6 +1155,74 @@ test('control-plane D1 transaction rejects concurrent transaction() calls instea
   d1.close();
 });
 
+test('control-plane D1 transaction rejects direct writes outside the active transaction on the same persistence instance', async () => {
+  const d1 = createFakeD1Database();
+  const controlPlane = createD1ControlPlanePersistence(d1);
+  await controlPlane.ensureSchema();
+
+  let releaseOuterTransaction = null;
+  const outerBlocked = new Promise((resolve) => {
+    releaseOuterTransaction = resolve;
+  });
+  const outerPromise = controlPlane.transaction(async (tx) => {
+    await tx.insertAuditEvent({
+      event_id: 'audit-direct-write-outer',
+      event_type: 'rebuild.accepted',
+      occurred_at: '2026-04-02T20:32:00.000Z',
+      operator_principal_id: 'ops-managed-d1',
+      auth_mechanism: 'access-jwt',
+      scope: {
+        scope_kind: 'global',
+        scope_id: null,
+      },
+      request_id: 'req-direct-write-outer',
+      idempotency_key: 'idem-direct-write-outer',
+      request_fingerprint: 'fingerprint-direct-write-outer',
+      job_id: 'job-direct-write-outer',
+      causation_id: 'job-direct-write-outer',
+      result_code: 'accepted',
+      affected_objects: [{ kind: 'job', id: 'job-direct-write-outer' }],
+      details: {
+        action: 'accepted',
+      },
+    });
+    await outerBlocked;
+  });
+
+  await assert.rejects(
+    controlPlane.insertAuditEvent({
+      event_id: 'audit-direct-write-inner',
+      event_type: 'rebuild.accepted',
+      occurred_at: '2026-04-02T20:32:01.000Z',
+      operator_principal_id: 'ops-managed-d1',
+      auth_mechanism: 'access-jwt',
+      scope: {
+        scope_kind: 'global',
+        scope_id: null,
+      },
+      request_id: 'req-direct-write-inner',
+      idempotency_key: 'idem-direct-write-inner',
+      request_fingerprint: 'fingerprint-direct-write-inner',
+      job_id: 'job-direct-write-inner',
+      causation_id: 'job-direct-write-inner',
+      result_code: 'accepted',
+      affected_objects: [{ kind: 'job', id: 'job-direct-write-inner' }],
+      details: {
+        action: 'accepted',
+      },
+    }),
+    /outside the active transaction/i,
+  );
+
+  releaseOuterTransaction();
+  await outerPromise;
+
+  const exported = await controlPlane.exportControlPlaneSnapshot();
+  assert.equal(exported.tables.audit_events.length, 1);
+  assert.equal(exported.tables.audit_events[0].event_id, 'audit-direct-write-outer');
+  d1.close();
+});
+
 test('control-plane D1 schema bootstrap memoizes once-per-isolate after the first successful ensureSchema()', async () => {
   const d1 = createFakeD1Database();
   const originalPrepare = d1.prepare.bind(d1);

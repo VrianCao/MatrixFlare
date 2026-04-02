@@ -371,36 +371,47 @@ export function createD1ControlPlanePersistence(db) {
   let schemaReady = false;
   let schemaReadyPromise = null;
   let activeBatchStatements = null;
+  let activeTransactionContext = null;
 
-  const statementRun = async (statement, ...bindings) => {
-    const boundStatement = statement.bind(...bindings);
-    if (activeBatchStatements) {
-      activeBatchStatements.push(boundStatement);
-      return { success: true };
-    }
-    return boundStatement.run();
-  };
+  const createPersistenceFacade = (transactionContext = null) => {
+    const statementRun = async (statement, ...bindings) => {
+      const boundStatement = statement.bind(...bindings);
+      if (activeBatchStatements) {
+        if (transactionContext !== activeTransactionContext) {
+          throw new Error(
+            'control-plane D1 writes outside the active transaction are not allowed on the same persistence instance',
+          );
+        }
+        activeBatchStatements.push(boundStatement);
+        return { success: true };
+      }
+      return boundStatement.run();
+    };
 
-  const assertTransactionalReadAllowed = () => {
-    if (activeBatchStatements && activeBatchStatements.length > 0) {
-      throw new Error(
-        'control-plane D1 transaction cannot perform reads after queued transactional writes; split the read phase before the write batch',
-      );
-    }
-  };
+    const assertTransactionalReadAllowed = () => {
+      if (
+        transactionContext === activeTransactionContext &&
+        activeBatchStatements &&
+        activeBatchStatements.length > 0
+      ) {
+        throw new Error(
+          'control-plane D1 transaction cannot perform reads after queued transactional writes; split the read phase before the write batch',
+        );
+      }
+    };
 
-  const statementFirst = async (statement, ...bindings) => {
-    assertTransactionalReadAllowed();
-    return statement.bind(...bindings).first();
-  };
+    const statementFirst = async (statement, ...bindings) => {
+      assertTransactionalReadAllowed();
+      return statement.bind(...bindings).first();
+    };
 
-  const statementAll = async (statement, ...bindings) => {
-    assertTransactionalReadAllowed();
-    const result = await statement.bind(...bindings).all();
-    return result?.results ?? [];
-  };
+    const statementAll = async (statement, ...bindings) => {
+      assertTransactionalReadAllowed();
+      const result = await statement.bind(...bindings).all();
+      return result?.results ?? [];
+    };
 
-  return Object.freeze({
+    return Object.freeze({
     async ensureSchema() {
       if (schemaReady) {
         return;
@@ -451,15 +462,18 @@ export function createD1ControlPlanePersistence(db) {
         throw new TypeError('db must expose D1-compatible batch() for transactional control-plane writes');
       }
 
+      const nextTransactionContext = Symbol('control-plane-d1-transaction');
+      activeTransactionContext = nextTransactionContext;
       activeBatchStatements = [];
       try {
-        const result = await callback(this);
+        const result = await callback(createPersistenceFacade(nextTransactionContext));
         if (activeBatchStatements.length > 0) {
           await db.batch(activeBatchStatements);
         }
         return result;
       } finally {
         activeBatchStatements = null;
+        activeTransactionContext = null;
       }
     },
     async upsertOperatorPolicy(record) {
@@ -1170,5 +1184,8 @@ export function createD1ControlPlanePersistence(db) {
         normalizeString(appserviceId, 'appserviceId'),
       );
     },
-  });
+    });
+  };
+
+  return createPersistenceFacade();
 }
