@@ -358,6 +358,11 @@ test('FakeR2 multipart completion rejects out-of-order and duplicate uploaded pa
     multipart.complete([first, first]),
     /strictly increasing and unique/,
   );
+
+  await assert.rejects(
+    multipart.complete([{ partNumber: 0, etag: first.etag }]),
+    /part number 0 is invalid/,
+  );
 });
 
 test('RoomDO persistence lands DATA-ROOM-001 through DATA-ROOM-012 with query indices and outbox helpers', async () => {

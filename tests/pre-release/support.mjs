@@ -21,6 +21,10 @@ function currentEnvironmentName() {
   return stableString(process.env.MATRIX_TEST_ENVIRONMENT) || 'local';
 }
 
+function allowMissingRemoteHarnessInAggregateLocalRun() {
+  return stableString(process.env.MATRIX_AGGREGATE_LOCAL_NONLOCAL_SKIP) === 'true';
+}
+
 function uniqueToken(prefix = 'phase08') {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`.toLowerCase();
 }
@@ -41,25 +45,35 @@ export function requireRemoteHarnessContext(testContext, expectedEnvironment) {
   }
   const baseUrl = stableString(process.env.MATRIX_REMOTE_BASE_URL);
   const serverName = stableString(process.env.MATRIX_REMOTE_SERVER_NAME);
-  if (!baseUrl || !serverName) {
+  if (baseUrl.length === 0 && serverName.length === 0 && allowMissingRemoteHarnessInAggregateLocalRun()) {
     testContext.skip(`Remote ${expectedEnvironment} harness requires MATRIX_REMOTE_BASE_URL and MATRIX_REMOTE_SERVER_NAME`);
     return null;
   }
+  assert.notEqual(baseUrl.length, 0, `Remote ${expectedEnvironment} harness requires MATRIX_REMOTE_BASE_URL`);
+  assert.notEqual(serverName.length, 0, `Remote ${expectedEnvironment} harness requires MATRIX_REMOTE_SERVER_NAME`);
   let parsedBaseUrl;
   try {
     parsedBaseUrl = new URL(baseUrl);
   } catch {
-    testContext.skip('MATRIX_REMOTE_BASE_URL must be a valid absolute URL');
-    return null;
+    throw new TypeError('MATRIX_REMOTE_BASE_URL must be a valid absolute URL');
   }
-  if (parsedBaseUrl.protocol !== 'https:' || parsedBaseUrl.host !== serverName) {
-    testContext.skip('Remote harness must target an HTTPS gateway host matching MATRIX_REMOTE_SERVER_NAME');
-    return null;
+  assert.equal(parsedBaseUrl.protocol, 'https:', 'MATRIX_REMOTE_BASE_URL must target an HTTPS origin');
+  assert.equal(parsedBaseUrl.host, serverName, 'MATRIX_REMOTE_SERVER_NAME must match the host of MATRIX_REMOTE_BASE_URL');
+  const opsBaseUrl = stableString(process.env.MATRIX_REMOTE_OPS_BASE_URL);
+  let parsedOpsBaseUrl = null;
+  if (opsBaseUrl) {
+    try {
+      parsedOpsBaseUrl = new URL(opsBaseUrl);
+    } catch {
+      throw new TypeError('MATRIX_REMOTE_OPS_BASE_URL must be a valid absolute URL when provided');
+    }
+    assert.equal(parsedOpsBaseUrl.protocol, 'https:', 'MATRIX_REMOTE_OPS_BASE_URL must target an HTTPS origin');
   }
   return {
     environmentName: expectedEnvironment,
     baseUrl: trimTrailingSlash(parsedBaseUrl.toString()),
     serverName,
+    opsBaseUrl: parsedOpsBaseUrl == null ? '' : trimTrailingSlash(parsedOpsBaseUrl.toString()),
   };
 }
 
@@ -75,6 +89,37 @@ export async function request(harness, pathname, {
   }
   const resolvedBody = json === undefined ? body : JSON.stringify(json);
   const response = await fetch(`${harness.baseUrl}${pathname}`, {
+    method,
+    headers: requestHeaders,
+    body: resolvedBody,
+    ...(resolvedBody && typeof resolvedBody.getReader === 'function'
+      ? { duplex: 'half' }
+      : {}),
+  });
+  const contentType = response.headers.get('content-type') ?? '';
+  const payload = contentType.includes('application/json')
+    ? await response.json()
+    : await response.text();
+  return {
+    response,
+    payload,
+  };
+}
+
+export async function requestOps(harness, pathname, {
+  method = 'GET',
+  headers = {},
+  json = undefined,
+  body = undefined,
+} = {}) {
+  assert.equal(typeof harness?.opsBaseUrl, 'string');
+  assert.notEqual(harness.opsBaseUrl.length, 0, 'Remote harness requires MATRIX_REMOTE_OPS_BASE_URL');
+  const requestHeaders = new Headers(headers);
+  if (json !== undefined && !requestHeaders.has('content-type')) {
+    requestHeaders.set('content-type', 'application/json; charset=utf-8');
+  }
+  const resolvedBody = json === undefined ? body : JSON.stringify(json);
+  const response = await fetch(`${harness.opsBaseUrl}${pathname}`, {
     method,
     headers: requestHeaders,
     body: resolvedBody,

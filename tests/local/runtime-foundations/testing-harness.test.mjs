@@ -8,6 +8,7 @@ import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 
 import {
+  buildRunEnvironmentVariables,
   discoverTestFiles,
   getTestEnvironmentDefinition,
   getTestEnvironmentDirectory,
@@ -6241,6 +6242,85 @@ test('concurrent governance evidence writes fail closed on the same run timestam
   } finally {
     await fs.rm(fixtureParent, { recursive: true, force: true });
   }
+});
+
+test('staging security suite fails closed when the non-local environment is selected without a remote harness', async () => {
+  const supportModule = await import(`${pathToFileURL(path.join(repoRoot, 'tests/staging/support.mjs')).href}?cacheBust=${Date.now()}-${Math.random()}`);
+  const savedEnvironment = {
+    MATRIX_TEST_ENVIRONMENT: process.env.MATRIX_TEST_ENVIRONMENT,
+    MATRIX_REMOTE_BASE_URL: process.env.MATRIX_REMOTE_BASE_URL,
+    MATRIX_REMOTE_SERVER_NAME: process.env.MATRIX_REMOTE_SERVER_NAME,
+    MATRIX_REMOTE_OPS_BASE_URL: process.env.MATRIX_REMOTE_OPS_BASE_URL,
+    MATRIX_AGGREGATE_LOCAL_NONLOCAL_SKIP: process.env.MATRIX_AGGREGATE_LOCAL_NONLOCAL_SKIP,
+  };
+  try {
+    process.env.MATRIX_TEST_ENVIRONMENT = 'staging';
+    delete process.env.MATRIX_REMOTE_BASE_URL;
+    delete process.env.MATRIX_REMOTE_SERVER_NAME;
+    delete process.env.MATRIX_REMOTE_OPS_BASE_URL;
+    delete process.env.MATRIX_AGGREGATE_LOCAL_NONLOCAL_SKIP;
+
+    assert.throws(
+      () => supportModule.requireRemoteHarnessContext({ skip() {} }, 'staging'),
+      /Remote staging harness requires MATRIX_REMOTE_BASE_URL/,
+    );
+  } finally {
+    for (const [key, value] of Object.entries(savedEnvironment)) {
+      if (value == null) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+  }
+});
+
+test('staging security suite skips cleanly during aggregate local runs when no remote harness is configured', async () => {
+  const supportModule = await import(`${pathToFileURL(path.join(repoRoot, 'tests/staging/support.mjs')).href}?cacheBust=${Date.now()}-${Math.random()}`);
+  const savedEnvironment = {
+    MATRIX_TEST_ENVIRONMENT: process.env.MATRIX_TEST_ENVIRONMENT,
+    MATRIX_REMOTE_BASE_URL: process.env.MATRIX_REMOTE_BASE_URL,
+    MATRIX_REMOTE_SERVER_NAME: process.env.MATRIX_REMOTE_SERVER_NAME,
+    MATRIX_REMOTE_OPS_BASE_URL: process.env.MATRIX_REMOTE_OPS_BASE_URL,
+    MATRIX_AGGREGATE_LOCAL_NONLOCAL_SKIP: process.env.MATRIX_AGGREGATE_LOCAL_NONLOCAL_SKIP,
+  };
+  const skipCalls = [];
+
+  try {
+    process.env.MATRIX_TEST_ENVIRONMENT = 'staging';
+    delete process.env.MATRIX_REMOTE_BASE_URL;
+    delete process.env.MATRIX_REMOTE_SERVER_NAME;
+    delete process.env.MATRIX_REMOTE_OPS_BASE_URL;
+    process.env.MATRIX_AGGREGATE_LOCAL_NONLOCAL_SKIP = 'true';
+
+    const harness = supportModule.requireRemoteHarnessContext({
+      skip(message) {
+        skipCalls.push(message);
+      },
+    }, 'staging');
+
+    assert.equal(harness, null);
+    assert.deepEqual(skipCalls, [
+      'Remote staging harness requires MATRIX_REMOTE_BASE_URL and MATRIX_REMOTE_SERVER_NAME',
+    ]);
+  } finally {
+    for (const [key, value] of Object.entries(savedEnvironment)) {
+      if (value == null) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+  }
+});
+
+test('explicit non-local run environment overrides an ambient aggregate-local skip flag back to fail-closed', () => {
+  const runEnv = buildRunEnvironmentVariables({
+    MATRIX_AGGREGATE_LOCAL_NONLOCAL_SKIP: 'true',
+  }, 'staging');
+
+  assert.equal(runEnv.MATRIX_TEST_ENVIRONMENT, 'staging');
+  assert.equal(runEnv.MATRIX_AGGREGATE_LOCAL_NONLOCAL_SKIP, 'false');
 });
 
 test('CLI failure paths surface immutability errors and exit with code 1', async () => {

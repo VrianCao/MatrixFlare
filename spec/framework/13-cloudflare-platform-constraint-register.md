@@ -147,6 +147,7 @@
 | `CF-NET-004` | Cloudflare Access | request identity propagation | access-validate-jwt | Zone | 通过 Access 成功鉴权后，请求到达 origin/Worker 时会带 `Cf-Access-Jwt-Assertion` 头；浏览器流量还可能带 `CF_Authorization` cookie，但 cookie 不保证总会传递。 | 应用层身份校验必须首选 `Cf-Access-Jwt-Assertion`，不得只信任 cookie 或展示性注入头。 | `40`,`42` |
 | `CF-NET-005` | Cloudflare Access | signing keys | access-validate-jwt | Zone | Access JWT 必须使用 team domain 的 `/cdn-cgi/access/certs` JWK/cert 集校验；签名 key 默认约每 `6` 周轮换，旧 key 约保留 `7` 天；必须按 JWT `kid` 选择匹配 key，而不是钉死单一当前证书。 | `ops-worker` 必须实现 JWK 集缓存、`kid` 命中与轮换容忍，且在无匹配有效 key 时 fail-closed。 | `40`,`42` |
 | `CF-NET-006` | Cloudflare Access | service tokens | access-service-tokens | Zone | Access service token 是发给 Access 边缘的 `Client ID + Client Secret` 凭据；在 service-auth only 应用中，调用方通常需要在每次请求继续发送该凭据给 Access。origin/Worker 应信任 Access 生成并注入的 JWT，而不是直接把 service-token headers 当作应用层 bearer secret。 | 运维自动化必须把 service token 视为 Access ingress credential；`ops-worker` 的应用层授权只基于已验证 JWT 与内部 authz policy。 | `40`,`42` |
+| `CF-NET-007` | Cloudflare Access | application hostname ownership | access-applications | Zone | Access self-hosted application 的 hostname/domain 必须属于当前账户中的 active zone；不能把任意 `workers.dev` 或无 zone 归属的 hostname 当作可受 Access 保护的管理域。 | 若 non-local `ops-worker` 需要真实 Access-protected positive coverage，就必须先提供 active-zone management hostname；仅有 `workers.dev` URL 与占位 team domain 不足以形成合法 Access ingress。 | `21`,`40`,`42` |
 
 ## 10. 规范性设计结论
 

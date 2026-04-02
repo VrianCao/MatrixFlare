@@ -6,6 +6,7 @@ import path from 'node:path';
 import process from 'node:process';
 
 import {
+  buildRunEnvironmentVariables,
   getTestEnvironmentDirectory,
   getRequiredTestFiles,
   listTestEnvironmentNames,
@@ -33,7 +34,7 @@ const EVIDENCE_L1_MANUAL_ARTIFACT_FLAGS = Object.freeze({
   '--prod-cost-attestation': 'prod_cost_snapshot',
 });
 
-async function runEnvironment(environmentName) {
+async function runEnvironment(environmentName, options = {}) {
   const repoRoot = process.cwd();
   let files;
   try {
@@ -47,10 +48,9 @@ async function runEnvironment(environmentName) {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, ['--test', ...files], {
       cwd: repoRoot,
-      env: {
-        ...process.env,
-        MATRIX_TEST_ENVIRONMENT: environmentName,
-      },
+      env: buildRunEnvironmentVariables(process.env, environmentName, {
+        allowMissingRemoteHarness: options.allowMissingRemoteHarness === true,
+      }),
       stdio: 'inherit',
     });
 
@@ -334,7 +334,9 @@ async function main() {
 
   let exitCode = 0;
   for (const environmentName of environments) {
-    const code = await runEnvironment(environmentName);
+    const code = await runEnvironment(environmentName, {
+      allowMissingRemoteHarness: requestedEnvironment === 'all' && environmentName !== 'local',
+    });
     if (code !== 0) {
       exitCode = code;
       break;

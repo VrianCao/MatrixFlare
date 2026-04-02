@@ -132,11 +132,15 @@ test('TEST-MEDIA-001 staging covers current auth media, legacy unauth compatibil
   assert.match(animatedThumbnail.payload, /^thumbnail:48x48:scale:animated\n/u);
   assert.notEqual(animatedThumbnail.payload, staticThumbnail.payload);
 
-  // The two upload requests above consume the same userdo_media semantic quota window.
-  for (let index = 0; index < 6; index += 1) {
-    const reservation = await postAuthenticated(harness, alice.access_token, '/_matrix/media/v3/create');
+  const quotaUser = await registerUser(harness, {
+    usernamePrefix: 'media-staging-quota',
+    deviceId: 'MEDIASTGQUOTA',
+  });
+
+  for (let index = 0; index < 8; index += 1) {
+    const reservation = await postAuthenticated(harness, quotaUser.access_token, '/_matrix/media/v3/create');
     assert.equal(reservation.response.status, 200);
   }
-  const overQuotaReservation = await postAuthenticated(harness, alice.access_token, '/_matrix/media/v3/create');
+  const overQuotaReservation = await postAuthenticated(harness, quotaUser.access_token, '/_matrix/media/v3/create');
   await expectMatrixError(overQuotaReservation, 429, 'M_LIMIT_EXCEEDED');
 });

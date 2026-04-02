@@ -90,3 +90,13 @@ export function skipUnlessEnvironment(testContext, expectedEnvironment) {
     testContext.skip(`Expected ${resolvedExpectedEnvironment}, received ${actualEnvironment}`);
   }
 }
+
+export function buildRunEnvironmentVariables(baseEnv, environmentName, {
+  allowMissingRemoteHarness = false,
+} = {}) {
+  return {
+    ...baseEnv,
+    MATRIX_TEST_ENVIRONMENT: resolveTestEnvironmentName(environmentName),
+    MATRIX_AGGREGATE_LOCAL_NONLOCAL_SKIP: allowMissingRemoteHarness === true ? 'true' : 'false',
+  };
+}

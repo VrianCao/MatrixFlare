@@ -145,6 +145,8 @@ const L1_TEST_IMPLEMENTATION_FILES = Object.freeze({
       'tests/local/client-identity/phase-04.test.mjs',
       'tests/local/runtime-foundations/phase-08-runtime-controls.test.mjs',
     ]),
+    staging: Object.freeze(['tests/staging/test-sec-001.test.mjs']),
+    'pre-release': Object.freeze(['tests/pre-release/test-sec-001.test.mjs']),
   }),
   'TEST-OPS-001': Object.freeze({
     local: Object.freeze([
