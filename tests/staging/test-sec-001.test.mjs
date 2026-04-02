@@ -51,67 +51,81 @@ async function collectBatchResponses(total, batchSize, callback) {
   return results;
 }
 
+function describeLimiterObservation(step, route, result) {
+  const cfRay = result.response.headers.get('cf-ray') ?? 'n/a';
+  return `${step}:${route}:${result.response.status}:${cfRay}`;
+}
+
+// Cloudflare Workers ratelimits are local-to-location and permissive, so the
+// release gate must observe a bounded retry window rather than require the
+// first burst to trip immediately.
 async function assertPermissiveSearchAndPublicRoomsLimiter(harness, accessToken, searchTerm, {
-  attempts = 12,
-  batchSize = 8,
-  delayMs = 100,
+  attempts = 40,
+  delayMs = 250,
 } = {}) {
   let limited = null;
   let search429Count = 0;
   let publicRooms429Count = 0;
+  const recentObservations = [];
   for (let attempt = 0; attempt < attempts; attempt += 1) {
-    const [searchResponses, publicRoomsResponses] = await Promise.all([
-      collectBatchResponses(batchSize, batchSize, async () => postAuthenticated(
-        harness,
-        accessToken,
-        '/_matrix/client/v3/search',
-        {
-          search_categories: {
-            room_events: {
-              search_term: searchTerm,
-              filter: {
-                limit: 1,
-              },
+    const searchResponse = await postAuthenticated(
+      harness,
+      accessToken,
+      '/_matrix/client/v3/search',
+      {
+        search_categories: {
+          room_events: {
+            search_term: searchTerm,
+            filter: {
+              limit: 1,
             },
           },
         },
-      )),
-      collectBatchResponses(batchSize, batchSize, async () => request(
-        harness,
-        '/_matrix/client/v3/publicRooms?limit=1',
-      )),
-    ]);
-    for (const response of searchResponses) {
-      if (response.response.status === 429) {
-        search429Count += 1;
-        limited ??= {
-          route: 'search',
-          response,
-        };
-        continue;
-      }
-      assert.equal(
-        response.response.status,
-        200,
-        `Expected bounded search limiter window to return 200 or 429, received ${response.response.status}`,
-      );
-      assert.ok(Array.isArray(response.payload?.search_categories?.room_events?.results));
+      },
+    );
+    recentObservations.push(describeLimiterObservation(attempt, 'search', searchResponse));
+    if (recentObservations.length > 8) {
+      recentObservations.shift();
     }
-    for (const result of publicRoomsResponses) {
-      if (result.response.status === 429) {
-        publicRooms429Count += 1;
-        limited ??= {
-          route: 'publicRooms',
-          response: result,
-        };
-        continue;
-      }
+    if (searchResponse.response.status === 429) {
+      search429Count += 1;
+      limited ??= {
+        route: 'search',
+        response: searchResponse,
+      };
+    } else {
       assert.equal(
-        result.response.status,
+        searchResponse.response.status,
         200,
-        `Expected bounded publicRooms limiter window to return 200 or 429, received ${result.response.status}`,
+        `Expected bounded search limiter window to return 200 or 429, received ${searchResponse.response.status}`,
       );
-      assert.ok(Array.isArray(result.payload?.chunk));
+      assert.ok(Array.isArray(searchResponse.payload?.search_categories?.room_events?.results));
+    }
+    if (limited != null) {
+      break;
+    }
+
+    const publicRoomsResponse = await request(
+      harness,
+      '/_matrix/client/v3/publicRooms?limit=1',
+    );
+    recentObservations.push(describeLimiterObservation(attempt, 'publicRooms', publicRoomsResponse));
+    if (recentObservations.length > 8) {
+      recentObservations.shift();
+    }
+    if (publicRoomsResponse.response.status === 429) {
+      publicRooms429Count += 1;
+      limited ??= {
+        route: 'publicRooms',
+        response: publicRoomsResponse,
+      };
+    } else {
+      assert.equal(
+        publicRoomsResponse.response.status,
+        200,
+        `Expected bounded publicRooms limiter window to return 200 or 429, received ${publicRoomsResponse.response.status}`,
+      );
+      assert.ok(Array.isArray(publicRoomsResponse.payload?.chunk));
     }
     if (limited != null) {
       break;
@@ -123,7 +137,7 @@ async function assertPermissiveSearchAndPublicRoomsLimiter(harness, accessToken,
   assert.notEqual(
     limited,
     null,
-    `Expected shared search/publicRooms limiter to yield 429 within ${attempts * batchSize * 2} combined attempts (observed search429=${search429Count}, publicRooms429=${publicRooms429Count})`,
+    `Expected shared search/publicRooms limiter to yield 429 within ${attempts * 2} alternating attempts (observed search429=${search429Count}, publicRooms429=${publicRooms429Count}; recent=${recentObservations.join(', ')})`,
   );
   await expectMatrixError(limited.response, 429, 'M_LIMIT_EXCEEDED');
   return limited;
