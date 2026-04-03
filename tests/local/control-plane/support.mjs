@@ -283,6 +283,7 @@ export async function createControlPlaneRig({
     CPU_LIMIT_CLASS: 'default',
     MANAGEMENT_API_BASE_URL: 'https://ops.example.test',
     MATRIX_PUBLIC_BASE_URL: 'https://matrix.example.test',
+    GATEWAY_WORKER_SCRIPT_NAME: 'matrix-gateway-worker-local',
     ACCESS_TEAM_DOMAIN: teamDomain,
     ACCESS_AUDIENCE: audience,
     FF_FEDERATION: 'false',

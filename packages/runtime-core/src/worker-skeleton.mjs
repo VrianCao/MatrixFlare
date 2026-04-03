@@ -1,5 +1,6 @@
 import { createAsyncTaskContext, createRequestContext } from './structured-logging.mjs';
 import { loadWorkerRuntimeConfig } from './runtime-manifest.mjs';
+import { resolveRuntimeWorkerVersionId } from './version-metadata.mjs';
 
 function jsonResponse(payload, status = 200) {
   return new Response(JSON.stringify(payload), {
@@ -18,7 +19,7 @@ export function createSkeletonFetchHandler(workerName, {
     const config = loadWorkerRuntimeConfig(workerName, env);
     const requestContext = createRequestContext({
       workerName,
-      workerVersion: config.text.WORKER_VERSION_ID,
+      workerVersion: resolveRuntimeWorkerVersionId(env, config.text.WORKER_VERSION_ID),
       request,
       routeFamily,
     });
@@ -48,7 +49,7 @@ export function createSkeletonQueueHandler(workerName, {
     const config = loadWorkerRuntimeConfig(workerName, env);
     const asyncContext = createAsyncTaskContext({
       workerName,
-      workerVersion: config.text.WORKER_VERSION_ID,
+      workerVersion: resolveRuntimeWorkerVersionId(env, config.text.WORKER_VERSION_ID),
       routeFamily,
     });
     asyncContext.logger.info('worker.placeholder.queue', {

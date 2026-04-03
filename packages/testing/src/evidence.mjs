@@ -15,6 +15,9 @@ import {
   writeGovernanceEvidence,
 } from '../../spec-tools/src/governance.mjs';
 import {
+  normalizeRolloutSkewProbeResponse,
+} from '../../control-plane/src/index.mjs';
+import {
   getRequiredTestFiles,
   getTestEnvironmentDefinition,
   getTestEnvironmentDirectory,
@@ -105,6 +108,18 @@ const EXPECTED_WORKER_BASE_NAMES = Object.freeze([
   'jobs-worker',
   'ops-worker',
 ]);
+const PRE_RELEASE_TEST_FILE_PREFIXES = Object.freeze({
+  ops: 'test-ops-001',
+  cost: 'test-cost-001',
+});
+const PRE_RELEASE_COST_SURFACES = Object.freeze([
+  'workers',
+  'durable_objects',
+  'd1',
+  'r2',
+  'kv',
+  'queues',
+]);
 
 const L1_TEST_IMPLEMENTATION_FILES = Object.freeze({
   'TEST-CS-001': Object.freeze({
@@ -161,6 +176,7 @@ const L1_TEST_IMPLEMENTATION_FILES = Object.freeze({
       'tests/local/runtime-foundations/phase-08-runtime-controls.test.mjs',
       'tests/local/control-plane/phase-08-ops.test.mjs',
     ]),
+    'pre-release': Object.freeze(['tests/pre-release/test-ops-001.test.mjs']),
   }),
   'TEST-COST-001': Object.freeze({
     local: Object.freeze(['tests/local/runtime-foundations/phase-08-runtime-controls.test.mjs']),
@@ -506,6 +522,251 @@ function validateExpectedCloudflareResources(payloadLabel, environmentName, reso
 
 function isNonNegativeNumber(value) {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+}
+
+function listReportCoverageFiles(payload) {
+  const combined = [];
+  for (const candidate of [payload?.test_files, payload?.expanded_test_files]) {
+    if (!Array.isArray(candidate)) {
+      continue;
+    }
+    for (const entry of candidate) {
+      if (typeof entry === 'string' && entry.length > 0) {
+        combined.push(entry);
+      }
+    }
+  }
+  return [...new Set(combined)];
+}
+
+function reportCoversCanonicalTestPrefix(payload, prefix) {
+  return listReportCoverageFiles(payload).some((candidate) => {
+    const basename = path.basename(candidate).toLowerCase();
+    return basename.startsWith(prefix) && basename.endsWith('.test.mjs');
+  });
+}
+
+export function validateRolloutSkewProbeSemantics(reportLabel, normalized, {
+  expectedEnvironmentName = 'pre-release',
+  expectedProbeRunId = null,
+  expectedDualVersionDeploymentId = null,
+  expectedBaselineGatewayVersionId = null,
+  expectedCandidateGatewayVersionId = null,
+} = {}) {
+  if (normalized.environment_name !== expectedEnvironmentName) {
+    return {
+      valid: false,
+      error: `${reportLabel}.environment_name must be ${expectedEnvironmentName}`,
+    };
+  }
+  if (expectedProbeRunId != null && normalized.probe_run_id !== expectedProbeRunId) {
+    return {
+      valid: false,
+      error: `${reportLabel}.probe_run_id must match rollout state`,
+    };
+  }
+  if (expectedDualVersionDeploymentId != null && normalized.dual_version_deployment_id !== expectedDualVersionDeploymentId) {
+    return {
+      valid: false,
+      error: `${reportLabel}.dual_version_deployment_id must match rollout state`,
+    };
+  }
+  if (expectedBaselineGatewayVersionId != null && normalized.baseline_gateway_version_id !== expectedBaselineGatewayVersionId) {
+    return {
+      valid: false,
+      error: `${reportLabel}.baseline_gateway_version_id must match rollout state`,
+    };
+  }
+  if (expectedCandidateGatewayVersionId != null && normalized.candidate_gateway_version_id !== expectedCandidateGatewayVersionId) {
+    return {
+      valid: false,
+      error: `${reportLabel}.candidate_gateway_version_id must match rollout state`,
+    };
+  }
+  const requiredObservations = [
+    {
+      probe_name: 'new-worker-old-authority',
+      authority_kind: 'UserDO',
+      expected_gateway_version_id: normalized.candidate_gateway_version_id,
+      expected_authority_version_id: normalized.baseline_gateway_version_id,
+    },
+    {
+      probe_name: 'new-worker-old-authority',
+      authority_kind: 'RoomDO',
+      expected_gateway_version_id: normalized.candidate_gateway_version_id,
+      expected_authority_version_id: normalized.baseline_gateway_version_id,
+    },
+    {
+      probe_name: 'old-worker-new-authority',
+      authority_kind: 'UserDO',
+      expected_gateway_version_id: normalized.baseline_gateway_version_id,
+      expected_authority_version_id: normalized.candidate_gateway_version_id,
+    },
+    {
+      probe_name: 'old-worker-new-authority',
+      authority_kind: 'RoomDO',
+      expected_gateway_version_id: normalized.baseline_gateway_version_id,
+      expected_authority_version_id: normalized.candidate_gateway_version_id,
+    },
+  ];
+  for (const requirement of requiredObservations) {
+    const matched = normalized.observations.some((entry) => (
+      entry.probe_name === requirement.probe_name
+      && entry.authority_kind === requirement.authority_kind
+      && entry.request_gateway_version_id === requirement.expected_gateway_version_id
+      && entry.observed_gateway_version_id === requirement.expected_gateway_version_id
+      && entry.observed_authority_version_id === requirement.expected_authority_version_id
+    ));
+    if (!matched) {
+      return {
+        valid: false,
+        error: `${reportLabel} must include ${requirement.probe_name}/${requirement.authority_kind} observation`,
+      };
+    }
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validatePreReleaseRolloutSkewProbe(reportLabel, value, expected = {}) {
+  if (value == null) {
+    return {
+      valid: false,
+      error: `${reportLabel} must include rollout_skew_probe`,
+    };
+  }
+  let normalized;
+  try {
+    normalized = normalizeRolloutSkewProbeResponse(value);
+  } catch (error) {
+    return {
+      valid: false,
+      error: `${reportLabel} rollout_skew_probe is invalid: ${error.message}`,
+    };
+  }
+  if (normalized.environment_name !== 'pre-release') {
+    return {
+      valid: false,
+      error: `${reportLabel} rollout_skew_probe.environment_name must be pre-release`,
+    };
+  }
+  if (normalized.assertions.new_worker_old_authority !== true || normalized.assertions.old_worker_new_authority !== true) {
+    return {
+      valid: false,
+      error: `${reportLabel} rollout_skew_probe assertions must both be true`,
+    };
+  }
+  const semanticValidation = validateRolloutSkewProbeSemantics(
+    `${reportLabel} rollout_skew_probe`,
+    normalized,
+    expected,
+  );
+  if (!semanticValidation.valid) {
+    return semanticValidation;
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validatePreReleaseCostObservation(reportLabel, value, {
+  expectedEnvironmentName = 'pre-release',
+} = {}) {
+  if (value == null) {
+    return {
+      valid: false,
+      error: `${reportLabel} must include pre_release_cost_observation`,
+    };
+  }
+  if (!isPlainObject(value)) {
+    return {
+      valid: false,
+      error: `${reportLabel} pre_release_cost_observation must be an object`,
+    };
+  }
+  if (!isNonEmptyString(value.observation_id)) {
+    return {
+      valid: false,
+      error: `${reportLabel} pre_release_cost_observation.observation_id must be non-empty`,
+    };
+  }
+  if (value.source_environment !== expectedEnvironmentName) {
+    return {
+      valid: false,
+      error: `${reportLabel} pre_release_cost_observation.source_environment must be ${expectedEnvironmentName}`,
+    };
+  }
+  if (!isRfc3339UtcTimestamp(value.captured_at)) {
+    return {
+      valid: false,
+      error: `${reportLabel} pre_release_cost_observation.captured_at must be RFC 3339 UTC`,
+    };
+  }
+  if (!isPlainObject(value.capture_window) || !isRfc3339UtcTimestamp(value.capture_window.start) || !isRfc3339UtcTimestamp(value.capture_window.end)) {
+    return {
+      valid: false,
+      error: `${reportLabel} pre_release_cost_observation.capture_window must contain RFC 3339 UTC start/end`,
+    };
+  }
+  if (Date.parse(value.capture_window.start) > Date.parse(value.capture_window.end)) {
+    return {
+      valid: false,
+      error: `${reportLabel} pre_release_cost_observation.capture_window.start must be <= end`,
+    };
+  }
+  if (value.capture_method !== 'cloudflare-official-metrics') {
+    return {
+      valid: false,
+      error: `${reportLabel} pre_release_cost_observation.capture_method must be cloudflare-official-metrics`,
+    };
+  }
+  if (!isNonEmptyStringArray(value.source_query_uris) || value.source_query_uris.some((entry) => !isAbsoluteExternalUri(entry))) {
+    return {
+      valid: false,
+      error: `${reportLabel} pre_release_cost_observation.source_query_uris must be absolute external URIs`,
+    };
+  }
+  if (!isNonEmptyString(value.topology_kind) || value.topology_kind === 'local') {
+    return {
+      valid: false,
+      error: `${reportLabel} pre_release_cost_observation.topology_kind must be non-local`,
+    };
+  }
+  const resourceValidation = validateExpectedCloudflareResources(
+    `${reportLabel} pre_release_cost_observation`,
+    expectedEnvironmentName,
+    value.cloudflare_resources,
+  );
+  if (!resourceValidation.valid) {
+    return resourceValidation;
+  }
+  if (!isPlainObject(value.cost_surfaces) || PRE_RELEASE_COST_SURFACES.some((surface) => !isPlainObject(value.cost_surfaces[surface]))) {
+    return {
+      valid: false,
+      error: `${reportLabel} pre_release_cost_observation.cost_surfaces must include workers,durable_objects,d1,r2,kv,queues`,
+    };
+  }
+  if (
+    !isPlainObject(value.model_comparison)
+    || !isNonEmptyString(value.model_comparison.status)
+    || !isNonEmptyString(value.model_comparison.summary)
+    || !isNonNegativeNumber(value.model_comparison.actual_total_usd)
+    || !isNonNegativeNumber(value.model_comparison.modeled_total_usd)
+    || typeof value.model_comparison.drift_ratio !== 'number'
+    || !Number.isFinite(value.model_comparison.drift_ratio)
+  ) {
+    return {
+      valid: false,
+      error: `${reportLabel} pre_release_cost_observation.model_comparison is invalid`,
+    };
+  }
+  return {
+    valid: true,
+    error: null,
+  };
 }
 
 function isDisallowedLocalHostname(hostname) {
@@ -3502,6 +3763,52 @@ export function validateManualArtifactPayload(artifactId, payload, {
     if (!readinessProbeValidation.valid) {
       return readinessProbeValidation;
     }
+    const coversPreReleaseOps = expectedEnvironmentName === 'pre-release'
+      && reportCoversCanonicalTestPrefix(payload, PRE_RELEASE_TEST_FILE_PREFIXES.ops);
+    const coversPreReleaseCost = expectedEnvironmentName === 'pre-release'
+      && reportCoversCanonicalTestPrefix(payload, PRE_RELEASE_TEST_FILE_PREFIXES.cost);
+    if (expectedEnvironmentName === 'pre-release' && !coversPreReleaseOps && payload.rollout_skew_probe != null) {
+      return {
+        valid: false,
+        error: 'environment run report rollout_skew_probe must be null unless TEST-OPS-001 is covered',
+      };
+    }
+    if (expectedEnvironmentName === 'pre-release' && !coversPreReleaseCost && payload.pre_release_cost_observation != null) {
+      return {
+        valid: false,
+        error: 'environment run report pre_release_cost_observation must be null unless TEST-COST-001 is covered',
+      };
+    }
+    if (expectedEnvironmentName !== 'pre-release' && payload.rollout_skew_probe != null) {
+      return {
+        valid: false,
+        error: 'environment run report rollout_skew_probe must be null outside pre-release',
+      };
+    }
+    if (expectedEnvironmentName !== 'pre-release' && payload.pre_release_cost_observation != null) {
+      return {
+        valid: false,
+        error: 'environment run report pre_release_cost_observation must be null outside pre-release',
+      };
+    }
+    if (coversPreReleaseOps) {
+      const rolloutValidation = validatePreReleaseRolloutSkewProbe(
+        'environment run report',
+        payload.rollout_skew_probe,
+      );
+      if (!rolloutValidation.valid) {
+        return rolloutValidation;
+      }
+    }
+    if (coversPreReleaseCost) {
+      const costObservationValidation = validatePreReleaseCostObservation(
+        'environment run report',
+        payload.pre_release_cost_observation,
+      );
+      if (!costObservationValidation.valid) {
+        return costObservationValidation;
+      }
+    }
     return {
       valid: true,
       error: null,
@@ -4469,6 +4776,8 @@ function buildAttestedEnvironmentRunSource(artifactResult) {
     topology_kind: payload.topology_kind,
     cloudflare_resources: payload.cloudflare_resources,
     readiness_probe: payload.readiness_probe,
+    rollout_skew_probe: payload.rollout_skew_probe ?? null,
+    pre_release_cost_observation: payload.pre_release_cost_observation ?? null,
     deployment_identity_validation: payload.deployment_identity_validation ?? null,
     attestation_path: artifactResult.provided_path,
     attestation_origin_run_id: artifactResult.attestation_origin_run_id,
@@ -4606,6 +4915,8 @@ function serializeEnvironmentRunSource(environmentRun, evidenceRoot) {
       topology_kind: environmentRun.topology_kind,
       cloudflare_resources: environmentRun.cloudflare_resources,
       readiness_probe: environmentRun.readiness_probe ?? null,
+      rollout_skew_probe: environmentRun.rollout_skew_probe ?? null,
+      pre_release_cost_observation: environmentRun.pre_release_cost_observation ?? null,
       deployment_identity_validation: environmentRun.deployment_identity_validation ?? null,
       artifact_store_uri: environmentRun.attestation_artifact_store_uri,
       artifact_store_key: environmentRun.attestation_artifact_store_key,

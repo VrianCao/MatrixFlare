@@ -129,6 +129,12 @@ export {
   resolveWorkerResourceBindingNames,
 } from './runtime-manifest.mjs';
 export {
+  VERSION_METADATA_BINDING_NAME,
+  readRuntimeVersionMetadata,
+  resolveRuntimeWorkerVersionId,
+  resolveRuntimeWorkerVersionTag,
+} from './version-metadata.mjs';
+export {
   incrementMetric,
   instrumentEnvironmentBindings,
   listDeploymentRecords,

@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import path from 'node:path';
 import process from 'node:process';
 
 const DEFAULT_PASSWORD = 'phase08-nonlocal-password';
@@ -79,6 +81,32 @@ export function requireRemoteHarnessContext(testContext, expectedEnvironment) {
     opsAccessClientId,
     opsAccessClientSecret,
   };
+}
+
+function requireEnvironmentVariable(name, {
+  label = name,
+} = {}) {
+  const value = stableString(process.env[name]);
+  assert.notEqual(value.length, 0, `${label} must be set`);
+  return value;
+}
+
+export function requireRolloutProbeContext() {
+  return {
+    probeRunId: requireEnvironmentVariable('MATRIX_ROLLOUT_PROBE_RUN_ID'),
+    seedPrefix: requireEnvironmentVariable('MATRIX_ROLLOUT_SEED_PREFIX'),
+    baselineGatewayVersionId: requireEnvironmentVariable('MATRIX_ROLLOUT_BASELINE_GATEWAY_VERSION_ID'),
+    candidateGatewayVersionId: requireEnvironmentVariable('MATRIX_ROLLOUT_CANDIDATE_GATEWAY_VERSION_ID'),
+    dualVersionDeploymentId: requireEnvironmentVariable('MATRIX_ROLLOUT_DUAL_VERSION_DEPLOYMENT_ID'),
+    outputPath: requireEnvironmentVariable('MATRIX_TEST_RUN_ROLLOUT_SKEW_PROBE_PATH'),
+  };
+}
+
+export async function writeSuiteSidecarJson(filePath, payload) {
+  assert.equal(typeof filePath, 'string');
+  assert.notEqual(filePath.trim().length, 0, 'sidecar file path must be non-empty');
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.writeFile(filePath, JSON.stringify(payload, null, 2) + '\n');
 }
 
 export async function request(harness, pathname, {

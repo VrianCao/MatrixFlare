@@ -69,6 +69,8 @@
 | `FLOW-AS-TXN-DELIVERY` | appservice delivery | `34` | `jobs-worker`, appservice, D1 control plane | truth commit success | 顺序投递 AS transaction | 失败重试且不影响主业务提交 |
 | `FLOW-OPS-JOB-CONTROL` | control-plane job control | `42`,`40` | operator, Cloudflare Access, `ops-worker`, `jobs-worker`, D1, R2, optional DOs | Access-protected `/_ops` request | 认证、scope 裁决、审计先落盘；若为 full export，必须先冻结 `DATA-OPS-010` 为 `DATA-OPS-011` 再 fanout shard 作业；随后创建/查询/取消作业 | duplicate idempotency key 折叠或冲突拒绝；manifest/hash/authz 失败必须 fail-closed |
 | `FLOW-REPLAY-REBUILD` | replay/reindex | `42`,`34` | `ops-worker`, `jobs-worker`, DOs, D1, R2 | operator action | 从真相与归档重放衍生面 | 断点续跑并保留 manifest |
+| `FLOW-OPS-ROLLOUT-SKEW` | pre-release rollout skew probe | `42`,`43`,`44` | GitHub Actions, Cloudflare versions/deployments, `ops-worker`, `gateway-worker`, `UserDO`, `RoomDO` | `TEST-OPS-001` pre-release gate | capture current baseline deployment, upload a candidate gateway version without DO migration, create a dual-version deployment, pass the workflow-resolved dual-version deployment ID into `IF-OPS-009`, seed probe-owned authorities under explicit baseline/candidate targeting, observe `new Worker -> old DO` and `old Worker -> new DO`, then restore the baseline deployment | any upload/deploy/targeting/probe/restore failure must fail-closed; no report may claim rollout-skew coverage without both observed pair classes and a recorded restore attempt |
+| `FLOW-OPS-COST-OBSERVATION` | pre-release cost observation | `41`,`43`,`44` | GitHub Actions, optional `ops-worker`, official Cloudflare metrics/billing surfaces | `TEST-COST-001` pre-release gate | execute a bounded workload against the pre-release environment, query official Cloudflare metrics/billing surfaces for the same environment and workload window, normalize `cost_surfaces`, compare them against the model, and attach the resulting observation to the attested pre-release report | missing official metrics permission, incomplete surface coverage, window mismatch, or unresolved pricing semantics must fail-closed; production monthly snapshot remains a separate requirement under `OQ-0002` |
 
 ## 3. 状态机目录
 
@@ -88,6 +90,8 @@
 | `STATE-EXPORT-JOB` | export job | `42` | export bundle | pending, checkpointed, materializing, uploading, cancel_requested, finalized, failed, canceled | partial export cleanup |
 | `STATE-RESTORE-JOB` | restore job | `42` | restore/import job | pending, validating, importing, cutover-ready, cutover, cancel_requested, completed, failed, canceled | manifest validation and cutover safety |
 | `STATE-REPAIR-JOB` | repair job | `42` | scoped repair job | pending, scanning, applying, verifying, cancel_requested, completed, failed, canceled | bounded blast radius and re-verification |
+| `STATE-ROLLOUT-SKEW-PROBE` | rollout skew probe lifecycle | `42`,`43` | pre-release rollout probe run | baseline_captured, candidate_uploaded, dual_version_active, baseline_seeded, candidate_seeded, paired, restore_requested, restored, failed | restore guarantee and pair completeness |
+| `STATE-COST-OBSERVATION` | pre-release cost observation lifecycle | `41`,`43` | pre-release cost observation | workload_executed, metrics_queried, normalized, compared, attached, failed | permission gaps, partial metrics, and pricing ambiguity |
 
 ## 4. 图示规范
 

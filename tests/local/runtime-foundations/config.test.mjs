@@ -84,7 +84,9 @@ test('ops worker enforces Access JWT binding configuration', () => {
         ENVIRONMENT_NAME: 'staging',
         MATRIX_SERVER_NAME: 'matrix.example.test',
         RELEASE_PROFILE: 'L1',
+        MATRIX_PUBLIC_BASE_URL: 'https://matrix.example.test',
         MANAGEMENT_API_BASE_URL: 'https://ops.example.test',
+        GATEWAY_WORKER_SCRIPT_NAME: 'matrix-gateway-worker-staging',
       }),
     /ACCESS_TEAM_DOMAIN/,
   );

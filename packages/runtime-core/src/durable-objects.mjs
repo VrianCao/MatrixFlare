@@ -30,6 +30,7 @@ import {
   observeMetric,
 } from './telemetry.mjs';
 import { loadWorkerRuntimeConfig } from './runtime-manifest.mjs';
+import { resolveRuntimeWorkerVersionId } from './version-metadata.mjs';
 import { enforceSemanticQuota } from './abuse-guard.mjs';
 import {
   DEFAULT_ACCESS_TOKEN_TTL_MS,
@@ -2021,7 +2022,7 @@ export class BaseDurableObject extends DurableObjectRuntimeBase {
   createRequestContext(request, routeFamily = `${this.options.routeFamilyPrefix}.fetch`) {
     return createRequestContext({
       workerName: this.options.owningWorkerName,
-      workerVersion: this.config.text.WORKER_VERSION_ID,
+      workerVersion: resolveRuntimeWorkerVersionId(this.env, this.config.text.WORKER_VERSION_ID),
       request,
       routeFamily,
     });
@@ -2030,9 +2031,20 @@ export class BaseDurableObject extends DurableObjectRuntimeBase {
   createAsyncTaskContext(routeFamily) {
     return createAsyncTaskContext({
       workerName: this.options.owningWorkerName,
-      workerVersion: this.config.text.WORKER_VERSION_ID,
+      workerVersion: resolveRuntimeWorkerVersionId(this.env, this.config.text.WORKER_VERSION_ID),
       routeFamily,
     });
+  }
+
+  async inspectRuntimeIdentity() {
+    await this.ensureCurrentness();
+    return {
+      ok: true,
+      authority_kind: this.options.className,
+      worker_version_id: resolveRuntimeWorkerVersionId(this.env, this.config.text.WORKER_VERSION_ID),
+      deployment_id: this.config.text.DEPLOYMENT_ID,
+      environment_name: this.config.environmentName,
+    };
   }
 
   createNotImplementedEnvelope(methodName, details = null) {

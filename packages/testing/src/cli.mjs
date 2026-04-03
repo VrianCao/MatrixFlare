@@ -20,7 +20,9 @@ import {
   deployNonLocalEnvironment,
   ensureNonLocalEnvironmentResources,
   prepareNonLocalOpsAccessSession,
+  restorePreReleaseGatewayRollout,
   runEnvironmentBackedSuite,
+  startPreReleaseGatewayRollout,
   uploadImmutableArtifactToR2,
   writeEnvironmentRunProvenance,
   writeEnvironmentRunAttestation,
@@ -264,11 +266,56 @@ async function main() {
     }, null, 2)}\n`);
     return;
   }
+  if (requestedEnvironment === 'nonlocal-rollout-start') {
+    const options = parseKeyValueOptions(process.argv);
+    const provisionedEnvironment = await readJsonFile(path.resolve(process.cwd(), requireOption(options, 'provisioning')));
+    const deploymentSummary = await readJsonFile(path.resolve(process.cwd(), requireOption(options, 'deployment')));
+    const result = await startPreReleaseGatewayRollout(requireOption(options, 'environment'), {
+      repoRoot: process.cwd(),
+      provisionedEnvironment,
+      deploymentSummary,
+      workingRoot: typeof options['working-root'] === 'string'
+        ? path.resolve(process.cwd(), options['working-root'])
+        : null,
+      outputPath: typeof options.output === 'string' ? path.resolve(process.cwd(), options.output) : null,
+      deploymentId: typeof options['deployment-id'] === 'string' ? options['deployment-id'] : null,
+      accountId: typeof options['account-id'] === 'string' ? options['account-id'] : null,
+      apiToken: typeof options['api-token'] === 'string' ? options['api-token'] : null,
+    });
+    process.stdout.write(`${JSON.stringify({
+      environment_name: result.environment_name,
+      output_path: typeof options.output === 'string' ? options.output : null,
+      baseline_gateway_version_id: result.baseline_gateway_version_id,
+      candidate_gateway_version_id: result.candidate_gateway_version_id,
+      dual_version_deployment_id: result.dual_version_deployment_id,
+    }, null, 2)}\n`);
+    return;
+  }
+  if (requestedEnvironment === 'nonlocal-rollout-restore') {
+    const options = parseKeyValueOptions(process.argv);
+    const rolloutState = await readJsonFile(path.resolve(process.cwd(), requireOption(options, 'rollout-state')));
+    const result = await restorePreReleaseGatewayRollout(requireOption(options, 'environment'), {
+      repoRoot: process.cwd(),
+      rolloutState,
+      outputPath: typeof options.output === 'string' ? path.resolve(process.cwd(), options.output) : null,
+      accountId: typeof options['account-id'] === 'string' ? options['account-id'] : null,
+      apiToken: typeof options['api-token'] === 'string' ? options['api-token'] : null,
+    });
+    process.stdout.write(`${JSON.stringify({
+      environment_name: result.environment_name,
+      output_path: typeof options.output === 'string' ? options.output : null,
+      restored_deployment_id: result.restored_deployment_id,
+    }, null, 2)}\n`);
+    return;
+  }
   if (requestedEnvironment === 'nonlocal-run') {
     const options = parseKeyValueOptions(process.argv);
     const deployment = await readJsonFile(path.resolve(process.cwd(), requireOption(options, 'deployment')));
     const accessSession = typeof options['access-session'] === 'string'
       ? await readJsonFile(path.resolve(process.cwd(), options['access-session']))
+      : null;
+    const rolloutState = typeof options['rollout-state'] === 'string'
+      ? await readJsonFile(path.resolve(process.cwd(), options['rollout-state']))
       : null;
     const result = await runEnvironmentBackedSuite(requireOption(options, 'environment'), process.cwd(), {
       runTimestamp: requireOption(options, 'timestamp'),
@@ -280,6 +327,7 @@ async function main() {
       topologyKind: requireOption(options, 'topology-kind'),
       deploymentSummary: deployment,
       accessSession,
+      rolloutState,
     });
     process.stdout.write(`${JSON.stringify({
       report_path: path.relative(process.cwd(), result.report_path),

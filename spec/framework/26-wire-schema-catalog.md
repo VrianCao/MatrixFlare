@@ -226,6 +226,43 @@
 | `secret_versions` | object | 仅允许返回 secret version 摘要；禁止返回 secret material，允许嵌套对象表达 signing/encryption active version |
 | `dependencies` | array | 每项至少包含 `name`,`kind`,`status`,`detail` |
 
+### 5.2.1 `RolloutSkewProbeRequest`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `probe_run_id` | string | 非空；同一 pre-release skew probe 的稳定标识 |
+| `baseline_gateway_version_id` | string | 非空；必须属于当前 dual-version deployment |
+| `candidate_gateway_version_id` | string | 非空；必须属于当前 dual-version deployment 且不得与 baseline 相同 |
+| `dual_version_deployment_id` | string | 非空；必须由 GitHub Actions rollout harness 在 `versions deploy` 后回读当前 active dual-version deployment ID 并传入 |
+| `authority_kind` | string | 首版固定为 `matrix-core`；表示 probe 必须同时覆盖 `UserDO` 与 `RoomDO` |
+| `seed_prefix` | string | 非空；probe-owned authority identity 前缀，用于防止跨 run 混淆 |
+
+### 5.2.2 `RolloutSkewObservation`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `probe_name` | string | 非空；首版至少包含 `new-worker-old-authority` 与 `old-worker-new-authority` |
+| `request_gateway_version_id` | string | 该次请求显式 targeting 的 gateway version ID |
+| `observed_gateway_version_id` | string | 由目标 gateway request 实际回读到的 version ID |
+| `observed_authority_version_id` | string | 由 probe-owned `UserDO` / `RoomDO` 实际回读到的 version ID |
+| `authority_kind` | string | `UserDO` 或 `RoomDO` |
+| `authority_key` | string | probe-owned authority identity |
+| `request_path` | string | 非空；记录触发该 pairing 的 gateway path |
+| `observed_at` | string | RFC 3339 UTC |
+
+### 5.2.3 `RolloutSkewProbeResponse`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `environment_name` | string | 固定为 `pre-release` |
+| `probe_run_id` | string | 必须与 request 一致 |
+| `dual_version_deployment_id` | string | 非空；必须与 request 一致 |
+| `baseline_gateway_version_id` | string | 必须与 request 一致 |
+| `candidate_gateway_version_id` | string | 必须与 request 一致 |
+| `override_strategy` | string | 首版固定为 `cloudflare-version-overrides` |
+| `observations` | array | `RolloutSkewObservation[]`；至少各包含一条 `new-worker-old-authority` 与 `old-worker-new-authority` 观测 |
+| `assertions` | object | 至少包含布尔字段 `new_worker_old_authority`、`old_worker_new_authority`，两者都必须为 `true` 才能判为 pass |
+
 ### 5.3 `ExportJobRequest`
 
 | Field | Type | Rule |
@@ -377,6 +414,21 @@
 * `EnvironmentRunReport`
 * `ProdCostSnapshot`
 
+### 5.16.1 `PreReleaseCostObservation`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `observation_id` | string | 非空；同一 pre-release bounded workload 的稳定标识 |
+| `source_environment` | string | 固定为 `pre-release` |
+| `captured_at` | string | RFC 3339 UTC |
+| `capture_window` | object | 必须包含 `start`,`end` RFC 3339 UTC，且 `start <= end` |
+| `capture_method` | string | 首版固定为 `cloudflare-official-metrics` |
+| `source_query_uris` | array | 非空绝对外部 URI / locator 数组；记录本次 observation 查询的官方 surface |
+| `topology_kind` | string | 非本地拓扑标识；不得为 `local` |
+| `cloudflare_resources` | `CloudflareResourceSnapshot` | 本次 observation 绑定的 pre-release 资源快照 |
+| `cost_surfaces` | object | 至少包含 `workers`,`durable_objects`,`d1`,`r2`,`kv`,`queues`；字段集合与 `ProdCostSnapshot.cost_surfaces` 相同 |
+| `model_comparison` | object | 至少包含 `status`,`summary`,`actual_total_usd`,`modeled_total_usd`,`drift_ratio` |
+
 ### 5.16 `EnvironmentRunReport`
 
 | Field | Type | Rule |
@@ -402,6 +454,8 @@
 | `source_run_uri` | string | 绝对外部 URI / locator；必须具 authority，或使用格式完整的 `urn:<nid>:<nss>`；不得为裸 `urn:`，且不得为 `about:` / `blob:` / `file:` / `data:` / `javascript:` |
 | `topology_kind` | string | 非本地拓扑标识；不得为 `local` |
 | `cloudflare_resources` | `CloudflareResourceSnapshot` | 本次执行所绑定资源快照 |
+| `rollout_skew_probe` | `RolloutSkewProbeResponse` or null | `pre-release` 且覆盖 `TEST-OPS-001` 时必须非空；其他环境必须为 `null` |
+| `pre_release_cost_observation` | `PreReleaseCostObservation` or null | `pre-release` 且覆盖 `TEST-COST-001` 时必须非空；其他环境必须为 `null` |
 
 ### 5.17 `ProdCostSnapshot`
 
@@ -460,6 +514,8 @@
 
 * release-gate evidence 只接受 `EnvironmentRunAttestation`，不得直接接受裸 `EnvironmentRunReport`。
 * 若 `payload.expanded_test_files` 触及 `tests/local/*`、存在 repo boundary escape、或存在 unresolved dynamic import，consumer 必须 fail-closed。
+* 若 `payload.test_files` / `payload.expanded_test_files` 覆盖 `tests/pre-release/test-ops-001*.test.mjs`，则 `payload.rollout_skew_probe` 必须非空，且 `payload.rollout_skew_probe.assertions.new_worker_old_authority` 与 `payload.rollout_skew_probe.assertions.old_worker_new_authority` 都必须为 `true`。
+* 若 `payload.test_files` / `payload.expanded_test_files` 覆盖 `tests/pre-release/test-cost-001*.test.mjs`，则 `payload.pre_release_cost_observation` 必须非空，且 `payload.pre_release_cost_observation.capture_method` 必须为 `cloudflare-official-metrics`。
 
 ### 5.21 `ProdCostSnapshotAttestation`
 

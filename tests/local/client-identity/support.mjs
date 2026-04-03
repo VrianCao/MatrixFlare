@@ -53,6 +53,7 @@ function createDefaultEnv(overrides = {}) {
     CPU_LIMIT_CLASS: 'default',
     MATRIX_PUBLIC_BASE_URL: 'https://matrix.example.test',
     MANAGEMENT_API_BASE_URL: 'https://ops.example.test',
+    GATEWAY_WORKER_SCRIPT_NAME: 'matrix-gateway-worker-local',
     MATRIX_MEDIA_MAX_UPLOAD_BYTES: '104857600',
     MATRIX_MEDIA_LEGACY_UNAUTH_FREEZE_AT: '',
     HOMESERVER_SIGNING_KEY_RING: 'hs-test-key-ring',

@@ -17,9 +17,11 @@ import {
 } from '../../runtime-core/src/index.mjs';
 import {
   CONTROL_PLANE_SCHEMA_SQL,
+  normalizeRolloutSkewProbeResponse,
 } from '../../control-plane/src/index.mjs';
 import {
   assessNonLocalEnvironmentHarnessReadiness,
+  validateRolloutSkewProbeSemantics,
   validateEvidenceAttestationBundle,
   validateManualArtifactPayload,
 } from './evidence.mjs';
@@ -605,6 +607,14 @@ export function buildNonProductionSecretBundle({
     label: 'export-encryption-key',
   });
   const exportPemPair = buildDeterministicEd25519PemPair(signingKeyBytes);
+  const rolloutProbeSharedSecret = createHash('sha256')
+    .update(deriveStableSecretBytes({
+      apiToken,
+      accountId,
+      environmentName: normalizedEnvironmentName,
+      label: 'rollout-probe-shared-secret',
+    }))
+    .digest('hex');
   return Object.freeze({
     gateway: Object.freeze({
       HOMESERVER_SIGNING_KEY_RING: buildOpaqueKeyRing(deriveStableSecretBytes({
@@ -633,6 +643,7 @@ export function buildNonProductionSecretBundle({
           label: 'appservice-token-set',
         }))
         .digest('hex'),
+      ROLLOUT_PROBE_SHARED_SECRET: rolloutProbeSharedSecret,
     }),
     jobs: Object.freeze({
       EXPORT_BUNDLE_KEY_RING: JSON.stringify({
@@ -669,6 +680,7 @@ export function buildNonProductionSecretBundle({
           },
         },
       }),
+      ROLLOUT_PROBE_SHARED_SECRET: rolloutProbeSharedSecret,
     }),
   });
 }
@@ -700,6 +712,7 @@ function buildWorkerVars(workerName, plan, {
     if (!isPlainObject(access)) {
       throw new TypeError('ops-worker non-local deploy requires access metadata');
     }
+    vars.GATEWAY_WORKER_SCRIPT_NAME = plan.worker_scripts['gateway-worker'];
     if (!isNonEmptyString(access.auth_domain)) {
       throw new TypeError('ops-worker access.auth_domain must be non-empty');
     }
@@ -3097,6 +3110,273 @@ export async function deployNonLocalEnvironment(environmentName, {
   return result;
 }
 
+function buildDeploymentCompositionFromSummary(deploymentSummary) {
+  return WORKER_DEPLOYMENT_ORDER
+    .map((workerName) => {
+      const worker = deploymentSummary?.workers?.[workerName];
+      if (!isPlainObject(worker)) {
+        return null;
+      }
+      return {
+        worker_name: workerName,
+        deployment_id: worker.deployment_id ?? null,
+        worker_version_id: worker.worker_version_id ?? null,
+      };
+    })
+    .filter((entry) => isNonEmptyString(entry.deployment_id) && isNonEmptyString(entry.worker_version_id));
+}
+
+async function uploadWorkerVersion(workerName, provisionedEnvironment, {
+  repoRoot,
+  deploymentSummary,
+  workingRoot,
+  deploymentId,
+  accountId,
+  apiToken,
+}) {
+  const scriptName = provisionedEnvironment.plan.worker_scripts[workerName];
+  const previousState = await fetchWorkerDeploymentState({
+    accountId,
+    apiToken,
+    scriptName,
+  });
+  const configPath = path.join(workingRoot, `${workerName}.wrangler.json`);
+  const secretsPath = path.join(workingRoot, `${workerName}.secrets.json`);
+  await writeEnvironmentWranglerConfig(workerName, provisionedEnvironment.plan, {
+    outputPath: configPath,
+    repoRoot,
+    d1DatabaseId: provisionedEnvironment.resources.d1_database.id,
+    kvNamespaceId: provisionedEnvironment.resources.kv_namespace.id,
+    deploymentId,
+    workerVersionId: `pending-runtime-version-${slugifyLabel(deploymentId)}`,
+    activeDeploymentComposition: buildDeploymentCompositionFromSummary(deploymentSummary),
+    access: provisionedEnvironment.access,
+  });
+  const secretBundle = buildNonProductionSecretBundle({
+    environmentName: provisionedEnvironment.environment_name,
+    accountId,
+    apiToken,
+  });
+  await writeWorkerSecretsFile(workerName, secretBundle, secretsPath);
+  await runWrangler([
+    'versions',
+    'upload',
+    '--config',
+    configPath,
+    '--env',
+    provisionedEnvironment.environment_name,
+    '--message',
+    `${deploymentId}:${workerName}:rollout-candidate`,
+    '--tag',
+    buildRuntimeWorkerVersionTag(deploymentId, workerName),
+    '--secrets-file',
+    secretsPath,
+  ], {
+    repoRoot,
+    accountId,
+  });
+  const currentState = await fetchWorkerDeploymentState({
+    accountId,
+    apiToken,
+    scriptName,
+  });
+  return {
+    script_name: scriptName,
+    config_path: configPath,
+    secrets_path: secretsPath,
+    worker_version_id: resolveFreshCloudflareIdentity(previousState.worker_version_ids, currentState.worker_version_ids, `${workerName} candidate worker version id`),
+  };
+}
+
+function buildWranglerVersionsDeployArguments({
+  environmentName,
+  configPath,
+  versionSpecs,
+  message,
+}) {
+  return [
+    'versions',
+    'deploy',
+    '--config',
+    configPath,
+    '--env',
+    assertNonLocalEnvironmentName(environmentName),
+    '--yes',
+    ...(isNonEmptyString(message) ? ['--message', message] : []),
+    ...versionSpecs,
+  ];
+}
+
+export async function startPreReleaseGatewayRollout(environmentName, {
+  repoRoot = process.cwd(),
+  provisionedEnvironment,
+  deploymentSummary,
+  workingRoot,
+  outputPath = null,
+  deploymentId = null,
+  accountId: explicitAccountId = null,
+  apiToken: explicitApiToken = null,
+} = {}) {
+  const normalizedEnvironmentName = assertNonLocalEnvironmentName(environmentName);
+  await requireGitHubActionsExecution('startPreReleaseGatewayRollout', {
+    expectedEnvironmentName: normalizedEnvironmentName,
+  });
+  if (normalizedEnvironmentName !== 'pre-release') {
+    throw new RangeError('startPreReleaseGatewayRollout only supports pre-release');
+  }
+  if (!isPlainObject(provisionedEnvironment) || provisionedEnvironment.environment_name !== normalizedEnvironmentName) {
+    throw new TypeError('provisionedEnvironment must be the pre-release provisioning payload');
+  }
+  if (!isPlainObject(deploymentSummary) || deploymentSummary.environment_name !== normalizedEnvironmentName) {
+    throw new TypeError('deploymentSummary must be the pre-release deployment payload');
+  }
+  const { accountId, apiToken } = requireCloudflareCredentials({
+    accountId: explicitAccountId,
+    apiToken: explicitApiToken,
+  });
+  const validation = await validateDeploymentSummaryAgainstCurrentCloudflareState(deploymentSummary, {
+    accountId,
+    apiToken,
+  });
+  const gatewayWorker = deploymentSummary.workers?.['gateway-worker'];
+  if (!isPlainObject(gatewayWorker) || !isNonEmptyString(gatewayWorker.script_name)) {
+    throw new TypeError('deployment summary workers.gateway-worker must be present');
+  }
+  const currentGatewayState = validation.workers?.['gateway-worker'];
+  if (!isPlainObject(currentGatewayState)) {
+    throw new TypeError('validated deployment state must include gateway-worker');
+  }
+  if (!Array.isArray(currentGatewayState.active_worker_version_ids) || currentGatewayState.active_worker_version_ids.length !== 1) {
+    throw new Error('pre-release rollout start requires a single-version baseline gateway deployment');
+  }
+  const baselineGatewayVersionId = gatewayWorker.worker_version_id;
+  const baselineGatewayDeploymentId = gatewayWorker.deployment_id;
+  const resolvedWorkingRoot = path.resolve(workingRoot ?? path.join(repoRoot, '.tmp', 'nonlocal-rollout', normalizedEnvironmentName));
+  await fs.mkdir(resolvedWorkingRoot, { recursive: true });
+  const resolvedDeploymentId = deploymentId ?? `gha-${normalizedEnvironmentName}-rollout-${Date.now().toString(36)}`;
+  const probeRunId = sanitizeFileName(`rollout-${resolvedDeploymentId}`);
+  const seedPrefix = sanitizeFileName(`probe-${resolvedDeploymentId}`).slice(0, 48);
+  const candidate = await uploadWorkerVersion('gateway-worker', provisionedEnvironment, {
+    repoRoot,
+    deploymentSummary,
+    workingRoot: path.join(resolvedWorkingRoot, 'gateway-worker'),
+    deploymentId: resolvedDeploymentId,
+    accountId,
+    apiToken,
+  });
+  const preDeployState = await fetchWorkerDeploymentState({
+    accountId,
+    apiToken,
+    scriptName: gatewayWorker.script_name,
+  });
+  await runWrangler(buildWranglerVersionsDeployArguments({
+    environmentName: normalizedEnvironmentName,
+    configPath: candidate.config_path,
+    versionSpecs: [`${baselineGatewayVersionId}@100`, `${candidate.worker_version_id}@0`],
+    message: `${resolvedDeploymentId}:gateway-rollout-start`,
+  }), {
+    repoRoot,
+    accountId,
+  });
+  const currentState = await fetchWorkerDeploymentState({
+    accountId,
+    apiToken,
+    scriptName: gatewayWorker.script_name,
+  });
+  const dualVersionDeploymentId = resolveFreshCloudflareIdentity(
+    preDeployState.latest_active_deployment_id == null ? [] : [preDeployState.latest_active_deployment_id],
+    [currentState.latest_active_deployment_id],
+    'gateway dual-version deployment id',
+  );
+  const activeVersionSet = new Set(currentState.active_worker_version_ids);
+  if (!activeVersionSet.has(baselineGatewayVersionId) || !activeVersionSet.has(candidate.worker_version_id)) {
+    throw new Error('gateway dual-version deployment did not expose both baseline and candidate worker versions');
+  }
+  const result = {
+    environment_name: normalizedEnvironmentName,
+    worker_name: 'gateway-worker',
+    script_name: gatewayWorker.script_name,
+    working_root: resolvedWorkingRoot,
+    config_path: candidate.config_path,
+    baseline_gateway_version_id: baselineGatewayVersionId,
+    baseline_gateway_deployment_id: baselineGatewayDeploymentId,
+    candidate_gateway_version_id: candidate.worker_version_id,
+    dual_version_deployment_id: dualVersionDeploymentId,
+    probe_run_id: probeRunId,
+    seed_prefix: seedPrefix,
+    restore_version_specs: [`${baselineGatewayVersionId}@100`],
+    started_at: new Date().toISOString(),
+  };
+  if (outputPath != null) {
+    await fs.mkdir(path.dirname(outputPath), { recursive: true });
+    await fs.writeFile(outputPath, stableJson(result));
+  }
+  return result;
+}
+
+export async function restorePreReleaseGatewayRollout(environmentName, {
+  repoRoot = process.cwd(),
+  rolloutState,
+  outputPath = null,
+  accountId: explicitAccountId = null,
+  apiToken: explicitApiToken = null,
+} = {}) {
+  const normalizedEnvironmentName = assertNonLocalEnvironmentName(environmentName);
+  await requireGitHubActionsExecution('restorePreReleaseGatewayRollout', {
+    expectedEnvironmentName: normalizedEnvironmentName,
+  });
+  if (normalizedEnvironmentName !== 'pre-release') {
+    throw new RangeError('restorePreReleaseGatewayRollout only supports pre-release');
+  }
+  if (!isPlainObject(rolloutState) || rolloutState.environment_name !== normalizedEnvironmentName) {
+    throw new TypeError('rolloutState must be the pre-release rollout payload');
+  }
+  const { accountId, apiToken } = requireCloudflareCredentials({
+    accountId: explicitAccountId,
+    apiToken: explicitApiToken,
+  });
+  const beforeState = await fetchWorkerDeploymentState({
+    accountId,
+    apiToken,
+    scriptName: rolloutState.script_name,
+  });
+  await runWrangler(buildWranglerVersionsDeployArguments({
+    environmentName: normalizedEnvironmentName,
+    configPath: rolloutState.config_path,
+    versionSpecs: rolloutState.restore_version_specs,
+    message: `${rolloutState.dual_version_deployment_id}:gateway-rollout-restore`,
+  }), {
+    repoRoot,
+    accountId,
+  });
+  const afterState = await fetchWorkerDeploymentState({
+    accountId,
+    apiToken,
+    scriptName: rolloutState.script_name,
+  });
+  const restoredDeploymentId = resolveFreshCloudflareIdentity(
+    beforeState.latest_active_deployment_id == null ? [] : [beforeState.latest_active_deployment_id],
+    [afterState.latest_active_deployment_id],
+    'restored gateway deployment id',
+  );
+  if (afterState.active_worker_version_ids.length !== 1 || afterState.active_worker_version_ids[0] !== rolloutState.baseline_gateway_version_id) {
+    throw new Error('gateway rollout restore did not return to a single baseline worker version');
+  }
+  const result = {
+    environment_name: normalizedEnvironmentName,
+    worker_name: rolloutState.worker_name,
+    script_name: rolloutState.script_name,
+    restored_at: new Date().toISOString(),
+    restored_deployment_id: restoredDeploymentId,
+    baseline_gateway_version_id: rolloutState.baseline_gateway_version_id,
+  };
+  if (outputPath != null) {
+    await fs.mkdir(path.dirname(outputPath), { recursive: true });
+    await fs.writeFile(outputPath, stableJson(result));
+  }
+  return result;
+}
+
 export async function uploadImmutableArtifactToR2({
   repoRoot = process.cwd(),
   bucketName,
@@ -3218,6 +3498,42 @@ export async function writeEnvironmentRunProvenance(outputPath, options) {
   };
 }
 
+function buildSuiteRunArtifactPaths(outputRoot, environmentName) {
+  const outputDirectory = path.resolve(outputRoot);
+  return {
+    output_directory: outputDirectory,
+    log_path: path.join(outputDirectory, `${environmentName}.log`),
+    report_path: path.join(outputDirectory, `${environmentName}.json`),
+    rollout_skew_probe_path: path.join(outputDirectory, 'rollout-skew-probe.json'),
+    pre_release_cost_observation_path: path.join(outputDirectory, 'pre-release-cost-observation.json'),
+  };
+}
+
+function buildSuiteRolloutEnvironmentVariables(rolloutState) {
+  if (!isPlainObject(rolloutState)) {
+    return {};
+  }
+  return {
+    MATRIX_ROLLOUT_PROBE_RUN_ID: rolloutState.probe_run_id,
+    MATRIX_ROLLOUT_SEED_PREFIX: rolloutState.seed_prefix,
+    MATRIX_ROLLOUT_BASELINE_GATEWAY_VERSION_ID: rolloutState.baseline_gateway_version_id,
+    MATRIX_ROLLOUT_CANDIDATE_GATEWAY_VERSION_ID: rolloutState.candidate_gateway_version_id,
+    MATRIX_ROLLOUT_DUAL_VERSION_DEPLOYMENT_ID: rolloutState.dual_version_deployment_id,
+  };
+}
+
+async function readOptionalJsonArtifact(filePath) {
+  try {
+    const raw = await fs.readFile(filePath, 'utf8');
+    return JSON.parse(raw);
+  } catch (error) {
+    if (error?.code === 'ENOENT') {
+      return null;
+    }
+    throw error;
+  }
+}
+
 export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
   runTimestamp,
   outputRoot,
@@ -3228,6 +3544,7 @@ export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
   topologyKind,
   deploymentSummary,
   accessSession = null,
+  rolloutState = null,
 } = {}, {
   requireGitHubActionsExecutionImpl = requireGitHubActionsExecution,
   assessNonLocalEnvironmentHarnessReadinessImpl = assessNonLocalEnvironmentHarnessReadiness,
@@ -3273,6 +3590,16 @@ export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
     accessSession,
   );
   assertRequiredOpsAccessRemoteHarnessEnv(normalizedEnvironmentName, remoteHarnessEnv);
+  if (rolloutState != null) {
+    if (normalizedEnvironmentName !== 'pre-release') {
+      throw new TypeError('rolloutState is only supported for pre-release suites');
+    }
+    if (!isPlainObject(rolloutState) || rolloutState.environment_name !== normalizedEnvironmentName) {
+      throw new TypeError('rolloutState must be the pre-release rollout payload');
+    }
+  }
+  const suiteArtifacts = buildSuiteRunArtifactPaths(outputRoot, normalizedEnvironmentName);
+  await fs.mkdir(suiteArtifacts.output_directory, { recursive: true });
   const deploymentIdentityValidation = {
     before_readiness: await validateDeploymentSummaryAgainstCurrentCloudflareStateImpl(deploymentSummary, {
       accountId,
@@ -3314,6 +3641,9 @@ export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
           ...process.env,
           ...remoteHarnessEnv,
           MATRIX_TEST_ENVIRONMENT: normalizedEnvironmentName,
+          MATRIX_TEST_RUN_ROLLOUT_SKEW_PROBE_PATH: suiteArtifacts.rollout_skew_probe_path,
+          MATRIX_TEST_RUN_PRE_RELEASE_COST_OBSERVATION_PATH: suiteArtifacts.pre_release_cost_observation_path,
+          ...buildSuiteRolloutEnvironmentVariables(rolloutState),
         },
         stdio: ['ignore', 'pipe', 'pipe'],
       });
@@ -3328,10 +3658,43 @@ export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
   }
   const completedAt = new Date().toISOString();
   const durationMs = Date.now() - startedMs;
-  const logText = Buffer.concat(combinedChunks).toString('utf8');
-  const outputDirectory = path.resolve(outputRoot);
-  const logPath = path.join(outputDirectory, `${normalizedEnvironmentName}.log`);
-  const reportPath = path.join(outputDirectory, `${normalizedEnvironmentName}.json`);
+  let rolloutSkewProbe = null;
+  let preReleaseCostObservation = null;
+  let artifactFailureMessage = null;
+  try {
+    const rolloutProbeArtifact = await readOptionalJsonArtifact(suiteArtifacts.rollout_skew_probe_path);
+    if (rolloutProbeArtifact != null) {
+      rolloutSkewProbe = normalizeRolloutSkewProbeResponse(rolloutProbeArtifact);
+      if (
+        rolloutSkewProbe.assertions.new_worker_old_authority !== true
+        || rolloutSkewProbe.assertions.old_worker_new_authority !== true
+      ) {
+        throw new Error('rollout_skew_probe assertions must both be true');
+      }
+      if (rolloutState != null) {
+        const rolloutValidation = validateRolloutSkewProbeSemantics(
+          'rollout_skew_probe',
+          rolloutSkewProbe,
+          {
+            expectedEnvironmentName: normalizedEnvironmentName,
+            expectedProbeRunId: rolloutState.probe_run_id,
+            expectedDualVersionDeploymentId: rolloutState.dual_version_deployment_id,
+            expectedBaselineGatewayVersionId: rolloutState.baseline_gateway_version_id,
+            expectedCandidateGatewayVersionId: rolloutState.candidate_gateway_version_id,
+          },
+        );
+        if (!rolloutValidation.valid) {
+          throw new Error(rolloutValidation.error);
+        }
+      }
+    } else if (rolloutState != null) {
+      throw new Error('rollout_skew_probe sidecar is required when rolloutState is provided');
+    }
+    preReleaseCostObservation = await readOptionalJsonArtifact(suiteArtifacts.pre_release_cost_observation_path);
+  } catch (error) {
+    artifactFailureMessage = `Suite artifact parsing failed: ${error.message}`;
+    exitCode = 1;
+  }
   const report = {
     environment_name: normalizedEnvironmentName,
     status: exitCode === 0 ? 'pass' : 'fail',
@@ -3348,7 +3711,7 @@ export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
     expanded_test_file_count: readiness.expanded_test_files.length,
     expanded_test_files: readiness.expanded_test_files,
     readiness_probe: readinessProbe,
-    output_sha256: sha256Hex(logText),
+    output_sha256: null,
     error_message: exitCode === 0
       ? null
       : (readinessProbe.ready
@@ -3360,13 +3723,27 @@ export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
     source_run_uri: sourceRunUri,
     topology_kind: topologyKind,
     cloudflare_resources: validatedCloudflareResources,
+    rollout_skew_probe: rolloutSkewProbe,
+    pre_release_cost_observation: preReleaseCostObservation,
     deployment_identity_validation: deploymentIdentityValidation,
     run_timestamp: runTimestamp,
   };
-  await fs.mkdir(outputDirectory, { recursive: true });
+  if (artifactFailureMessage != null) {
+    combinedChunks.push(Buffer.from(`${artifactFailureMessage}\n`, 'utf8'));
+    report.status = 'fail';
+    report.exit_code = 1;
+  }
+  const logText = Buffer.concat(combinedChunks).toString('utf8');
+  report.output_sha256 = sha256Hex(logText);
+  report.error_message = report.exit_code === 0
+    ? null
+    : (artifactFailureMessage
+      ?? (readinessProbe.ready
+        ? `Environment suite exited with ${report.exit_code}`
+        : `Environment readiness probe failed: ${readinessProbe.last_error}`));
   await Promise.all([
-    fs.writeFile(logPath, logText),
-    fs.writeFile(reportPath, stableJson(report)),
+    fs.writeFile(suiteArtifacts.log_path, logText),
+    fs.writeFile(suiteArtifacts.report_path, stableJson(report)),
   ]);
   const artifactId = normalizedEnvironmentName === 'ci-integration'
     ? 'ci_integration_run_report'
@@ -3380,8 +3757,8 @@ export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
     ok: exitCode === 0 && payloadValidation.valid,
     validation_error: payloadValidation.valid ? null : payloadValidation.error,
     report,
-    log_path: logPath,
-    report_path: reportPath,
+    log_path: suiteArtifacts.log_path,
+    report_path: suiteArtifacts.report_path,
   };
 }
 

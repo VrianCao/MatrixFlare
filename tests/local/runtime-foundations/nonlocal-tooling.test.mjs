@@ -45,7 +45,10 @@ function buildDeploymentSummaryFixture(environmentName) {
     environment_name: environmentName,
     account_id: 'cf-account',
     workers_subdomain: 'matrixflare',
-    cloudflare_resources: plan.cloudflare_resources,
+    cloudflare_resources: {
+      ...plan.cloudflare_resources,
+      r2_buckets: [...plan.cloudflare_resources.r2_buckets, plan.artifact_bucket_name].sort(),
+    },
     deployment_identity: {
       environment_id: environmentName,
       deployment_ids: ['dep-jobs', 'dep-ops', 'dep-gateway'],
@@ -166,6 +169,64 @@ function buildReadinessProbeFixture(environmentName, {
   };
 }
 
+function buildRolloutSkewProbeFixture(overrides = {}) {
+  return {
+    environment_name: 'pre-release',
+    probe_run_id: 'rollout-probe-1',
+    dual_version_deployment_id: 'dual-deployment-1',
+    baseline_gateway_version_id: 'gateway-baseline-v1',
+    candidate_gateway_version_id: 'gateway-candidate-v2',
+    override_strategy: 'cloudflare-version-overrides',
+    observations: [
+      {
+        probe_name: 'new-worker-old-authority',
+        request_gateway_version_id: 'gateway-candidate-v2',
+        observed_gateway_version_id: 'gateway-candidate-v2',
+        observed_authority_version_id: 'gateway-baseline-v1',
+        authority_kind: 'UserDO',
+        authority_key: '@baseline:test',
+        request_path: '/_matrix/client/v3/account/whoami',
+        observed_at: '2026-04-02T00:00:00.000Z',
+      },
+      {
+        probe_name: 'new-worker-old-authority',
+        request_gateway_version_id: 'gateway-candidate-v2',
+        observed_gateway_version_id: 'gateway-candidate-v2',
+        observed_authority_version_id: 'gateway-baseline-v1',
+        authority_kind: 'RoomDO',
+        authority_key: '!baseline:test',
+        request_path: '/_matrix/client/v3/rooms/%21baseline%3Atest/state',
+        observed_at: '2026-04-02T00:00:01.000Z',
+      },
+      {
+        probe_name: 'old-worker-new-authority',
+        request_gateway_version_id: 'gateway-baseline-v1',
+        observed_gateway_version_id: 'gateway-baseline-v1',
+        observed_authority_version_id: 'gateway-candidate-v2',
+        authority_kind: 'UserDO',
+        authority_key: '@candidate:test',
+        request_path: '/_matrix/client/v3/account/whoami',
+        observed_at: '2026-04-02T00:00:02.000Z',
+      },
+      {
+        probe_name: 'old-worker-new-authority',
+        request_gateway_version_id: 'gateway-baseline-v1',
+        observed_gateway_version_id: 'gateway-baseline-v1',
+        observed_authority_version_id: 'gateway-candidate-v2',
+        authority_kind: 'RoomDO',
+        authority_key: '!candidate:test',
+        request_path: '/_matrix/client/v3/rooms/%21candidate%3Atest/state',
+        observed_at: '2026-04-02T00:00:03.000Z',
+      },
+    ],
+    assertions: {
+      new_worker_old_authority: true,
+      old_worker_new_authority: true,
+    },
+    ...overrides,
+  };
+}
+
 test('non-local environment plan derives deterministic workers.dev scripts and resource names', () => {
   const plan = buildNonLocalEnvironmentPlan('staging', {
     workersSubdomain: 'matrixflare',
@@ -274,6 +335,7 @@ test('ops-worker non-local wrangler config requires real Access metadata and wir
 
   assert.equal(config.env.staging.vars.ACCESS_TEAM_DOMAIN, 'matrixflare.cloudflareaccess.com');
   assert.equal(config.env.staging.vars.ACCESS_AUDIENCE, 'aud-staging-ops');
+  assert.equal(config.env.staging.vars.GATEWAY_WORKER_SCRIPT_NAME, 'matrix-gateway-worker-staging');
 });
 
 test('jobs-worker non-local wrangler config preserves derived queue producers needed by remote search and media flows', () => {
@@ -1507,6 +1569,231 @@ test('runEnvironmentBackedSuite injects the prepared Access session into the chi
   }
 });
 
+test('runEnvironmentBackedSuite injects rollout skew metadata and captures the attested sidecar for pre-release', async () => {
+  const repoRoot = path.resolve('.');
+  const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-nonlocal-suite-rollout-'));
+  const deploymentSummary = buildDeploymentSummaryFixture('pre-release');
+  deploymentSummary.access = {
+    protected_ops_url: 'https://matrix-ops-worker-pre-release.matrixflare.workers.dev',
+  };
+  let capturedEnv = null;
+
+  try {
+    const result = await runEnvironmentBackedSuite('pre-release', repoRoot, {
+      runTimestamp: '20260402T220000Z',
+      outputRoot,
+      sourceRunUri: 'https://github.com/example/matrix/actions/runs/12345',
+      logArtifact: 'https://github.com/example/matrix/actions/runs/12345/artifacts/1',
+      executedBy: 'gha://example/matrix/nonlocal/pre-release',
+      reviewedBy: 'gha://example/matrix/nonlocal/pre-release',
+      topologyKind: 'cloudflare-pre-release',
+      deploymentSummary,
+      accessSession: {
+        access: {
+          service_token_client_id: 'service-token-id.access',
+          service_token_client_secret: 'service-token-secret',
+        },
+      },
+      rolloutState: {
+        environment_name: 'pre-release',
+        probe_run_id: 'rollout-probe-1',
+        seed_prefix: 'seed-pre',
+        baseline_gateway_version_id: 'gateway-baseline-v1',
+        candidate_gateway_version_id: 'gateway-candidate-v2',
+        dual_version_deployment_id: 'dual-deployment-1',
+      },
+    }, {
+      requireGitHubActionsExecutionImpl: async () => ({ environment: 'pre-release' }),
+      assessNonLocalEnvironmentHarnessReadinessImpl: async () => ({
+        ready: true,
+        reason: null,
+        expanded_test_files: ['tests/pre-release/test-ops-001.test.mjs'],
+      }),
+      requireCloudflareCredentialsImpl: () => ({ accountId: 'cf-account', apiToken: 'cf-token' }),
+      readWorkersSubdomainImpl: async () => 'matrixflare',
+      validateDeploymentSummaryAgainstCurrentCloudflareStateImpl: async () => (
+        buildDeploymentIdentityValidationFixture('pre-release')
+      ),
+      getRequiredTestFilesImpl: async () => [path.join(repoRoot, 'tests/pre-release/test-ops-001.test.mjs')],
+      waitForNonLocalDeploymentReadinessImpl: async () => buildReadinessProbeFixture('pre-release'),
+      spawnImpl: (_command, _args, options) => {
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        capturedEnv = options?.env ?? null;
+        queueMicrotask(async () => {
+          await fs.writeFile(
+            capturedEnv.MATRIX_TEST_RUN_ROLLOUT_SKEW_PROBE_PATH,
+            JSON.stringify(buildRolloutSkewProbeFixture(), null, 2),
+          );
+          child.stdout.emit('data', Buffer.from('suite ok\n', 'utf8'));
+          child.emit('close', 0);
+        });
+        return child;
+      },
+    });
+
+    assert.ok(capturedEnv);
+    assert.equal(capturedEnv.MATRIX_ROLLOUT_PROBE_RUN_ID, 'rollout-probe-1');
+    assert.equal(capturedEnv.MATRIX_ROLLOUT_SEED_PREFIX, 'seed-pre');
+    assert.equal(capturedEnv.MATRIX_ROLLOUT_BASELINE_GATEWAY_VERSION_ID, 'gateway-baseline-v1');
+    assert.equal(capturedEnv.MATRIX_ROLLOUT_CANDIDATE_GATEWAY_VERSION_ID, 'gateway-candidate-v2');
+    assert.equal(capturedEnv.MATRIX_ROLLOUT_DUAL_VERSION_DEPLOYMENT_ID, 'dual-deployment-1');
+    assert.equal(result.ok, true);
+    assert.equal(result.report.status, 'pass');
+    assert.equal(result.report.exit_code, 0);
+    assert.equal(result.report.rollout_skew_probe?.dual_version_deployment_id, 'dual-deployment-1');
+  } finally {
+    await fs.rm(outputRoot, { recursive: true, force: true });
+  }
+});
+
+test('runEnvironmentBackedSuite fails closed when the rollout skew sidecar is malformed', async () => {
+  const repoRoot = path.resolve('.');
+  const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-nonlocal-suite-rollout-malformed-'));
+  const deploymentSummary = buildDeploymentSummaryFixture('pre-release');
+  deploymentSummary.access = {
+    protected_ops_url: 'https://matrix-ops-worker-pre-release.matrixflare.workers.dev',
+  };
+
+  try {
+    const result = await runEnvironmentBackedSuite('pre-release', repoRoot, {
+      runTimestamp: '20260402T220500Z',
+      outputRoot,
+      sourceRunUri: 'https://github.com/example/matrix/actions/runs/12345',
+      logArtifact: 'https://github.com/example/matrix/actions/runs/12345/artifacts/1',
+      executedBy: 'gha://example/matrix/nonlocal/pre-release',
+      reviewedBy: 'gha://example/matrix/nonlocal/pre-release',
+      topologyKind: 'cloudflare-pre-release',
+      deploymentSummary,
+      accessSession: {
+        access: {
+          service_token_client_id: 'service-token-id.access',
+          service_token_client_secret: 'service-token-secret',
+        },
+      },
+      rolloutState: {
+        environment_name: 'pre-release',
+        probe_run_id: 'rollout-probe-2',
+        seed_prefix: 'seed-pre',
+        baseline_gateway_version_id: 'gateway-baseline-v1',
+        candidate_gateway_version_id: 'gateway-candidate-v2',
+        dual_version_deployment_id: 'dual-deployment-2',
+      },
+    }, {
+      requireGitHubActionsExecutionImpl: async () => ({ environment: 'pre-release' }),
+      assessNonLocalEnvironmentHarnessReadinessImpl: async () => ({
+        ready: true,
+        reason: null,
+        expanded_test_files: ['tests/pre-release/test-ops-001.test.mjs'],
+      }),
+      requireCloudflareCredentialsImpl: () => ({ accountId: 'cf-account', apiToken: 'cf-token' }),
+      readWorkersSubdomainImpl: async () => 'matrixflare',
+      validateDeploymentSummaryAgainstCurrentCloudflareStateImpl: async () => (
+        buildDeploymentIdentityValidationFixture('pre-release')
+      ),
+      getRequiredTestFilesImpl: async () => [path.join(repoRoot, 'tests/pre-release/test-ops-001.test.mjs')],
+      waitForNonLocalDeploymentReadinessImpl: async () => buildReadinessProbeFixture('pre-release'),
+      spawnImpl: (_command, _args, options) => {
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        queueMicrotask(async () => {
+          await fs.writeFile(options.env.MATRIX_TEST_RUN_ROLLOUT_SKEW_PROBE_PATH, '{bad-json');
+          child.stdout.emit('data', Buffer.from('suite ok\n', 'utf8'));
+          child.emit('close', 0);
+        });
+        return child;
+      },
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.report.status, 'fail');
+    assert.equal(result.report.exit_code, 1);
+    assert.match(result.report.error_message ?? '', /Suite artifact parsing failed/);
+    const writtenLog = await fs.readFile(result.log_path, 'utf8');
+    assert.match(writtenLog, /Suite artifact parsing failed/);
+  } finally {
+    await fs.rm(outputRoot, { recursive: true, force: true });
+  }
+});
+
+test('runEnvironmentBackedSuite fails closed when the rollout skew sidecar is semantically inconsistent with rollout state', async () => {
+  const repoRoot = path.resolve('.');
+  const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-nonlocal-suite-rollout-mismatch-'));
+  const deploymentSummary = buildDeploymentSummaryFixture('pre-release');
+  deploymentSummary.access = {
+    protected_ops_url: 'https://matrix-ops-worker-pre-release.matrixflare.workers.dev',
+  };
+
+  try {
+    const result = await runEnvironmentBackedSuite('pre-release', repoRoot, {
+      runTimestamp: '20260402T220700Z',
+      outputRoot,
+      sourceRunUri: 'https://github.com/example/matrix/actions/runs/12345',
+      logArtifact: 'https://github.com/example/matrix/actions/runs/12345/artifacts/1',
+      executedBy: 'gha://example/matrix/nonlocal/pre-release',
+      reviewedBy: 'gha://example/matrix/nonlocal/pre-release',
+      topologyKind: 'cloudflare-pre-release',
+      deploymentSummary,
+      accessSession: {
+        access: {
+          service_token_client_id: 'service-token-id.access',
+          service_token_client_secret: 'service-token-secret',
+        },
+      },
+      rolloutState: {
+        environment_name: 'pre-release',
+        probe_run_id: 'rollout-probe-3',
+        seed_prefix: 'seed-pre',
+        baseline_gateway_version_id: 'gateway-baseline-v1',
+        candidate_gateway_version_id: 'gateway-candidate-v2',
+        dual_version_deployment_id: 'dual-deployment-3',
+      },
+    }, {
+      requireGitHubActionsExecutionImpl: async () => ({ environment: 'pre-release' }),
+      assessNonLocalEnvironmentHarnessReadinessImpl: async () => ({
+        ready: true,
+        reason: null,
+        expanded_test_files: ['tests/pre-release/test-ops-001.test.mjs'],
+      }),
+      requireCloudflareCredentialsImpl: () => ({ accountId: 'cf-account', apiToken: 'cf-token' }),
+      readWorkersSubdomainImpl: async () => 'matrixflare',
+      validateDeploymentSummaryAgainstCurrentCloudflareStateImpl: async () => (
+        buildDeploymentIdentityValidationFixture('pre-release')
+      ),
+      getRequiredTestFilesImpl: async () => [path.join(repoRoot, 'tests/pre-release/test-ops-001.test.mjs')],
+      waitForNonLocalDeploymentReadinessImpl: async () => buildReadinessProbeFixture('pre-release'),
+      spawnImpl: (_command, _args, options) => {
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        queueMicrotask(async () => {
+          await fs.writeFile(
+            options.env.MATRIX_TEST_RUN_ROLLOUT_SKEW_PROBE_PATH,
+            JSON.stringify(buildRolloutSkewProbeFixture({
+              probe_run_id: 'forged-probe-id',
+              dual_version_deployment_id: 'forged-deployment',
+              observations: [],
+            }), null, 2),
+          );
+          child.stdout.emit('data', Buffer.from('suite ok\n', 'utf8'));
+          child.emit('close', 0);
+        });
+        return child;
+      },
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.report.status, 'fail');
+    assert.equal(result.report.exit_code, 1);
+    assert.match(result.report.error_message ?? '', /Suite artifact parsing failed/);
+    assert.match(result.report.error_message ?? '', /must match rollout state|must include new-worker-old-authority\/UserDO observation/);
+  } finally {
+    await fs.rm(outputRoot, { recursive: true, force: true });
+  }
+});
+
 test('remote harness env vars must target an external HTTPS deployment and match the remote server host', () => {
   const validated = validateRemoteHarnessEnvironmentVariables({
     MATRIX_REMOTE_BASE_URL: 'https://matrix-gateway-worker-staging.matrixflare.workers.dev/',
@@ -1805,5 +2092,48 @@ test('prod cost attestation writing requires the GitHub Actions prod environment
       },
     }),
     /stop after verifying expected prod environment/,
+  );
+});
+
+test('nonlocal workflow keeps pre-release restore failures from generating or uploading attestations', async () => {
+  const workflowPath = new URL('../../../.github/workflows/nonlocal-phase08.yml', import.meta.url);
+  const workflow = await fs.readFile(workflowPath, 'utf8');
+
+  const environmentGateStep = "      - name: Enforce pre-attestation environment gate\n";
+  const attestStep = "      - name: Write environment attestation\n";
+  const uploadStep = "      - name: Upload attestation artifact\n";
+  const finalGateStep = "      - name: Enforce environment gate\n";
+
+  const environmentGateIndex = workflow.indexOf(environmentGateStep);
+  const attestIndex = workflow.indexOf(attestStep);
+  const uploadIndex = workflow.indexOf(uploadStep);
+  const finalGateIndex = workflow.indexOf(finalGateStep);
+
+  assert.notEqual(environmentGateIndex, -1, 'workflow must define a pre-attestation environment gate');
+  assert.notEqual(attestIndex, -1, 'workflow must define an attestation step');
+  assert.notEqual(uploadIndex, -1, 'workflow must define an attestation upload step');
+  assert.notEqual(finalGateIndex, -1, 'workflow must define the final environment gate');
+  assert.ok(environmentGateIndex < attestIndex, 'pre-attestation environment gate must run before attestation generation');
+  assert.ok(attestIndex < uploadIndex, 'attestation upload must remain downstream of attestation generation');
+  assert.ok(uploadIndex < finalGateIndex, 'final gate must still verify attestation after upload gating');
+  assert.match(
+    workflow,
+    /- name: Enforce pre-attestation environment gate[\s\S]*?\n\s+id: environment_gate\n\s+continue-on-error: true\n/s,
+    'workflow must preserve a pre-attestation environment gate outcome for downstream gating',
+  );
+  assert.match(
+    workflow,
+    /- name: Write environment attestation[\s\S]*?\n\s+if: steps\.environment_gate\.outcome == 'success'\n/s,
+    'attestation generation must require a successful pre-attestation environment gate',
+  );
+  assert.match(
+    workflow,
+    /- name: Upload attestation artifact[\s\S]*?\n\s+if: steps\.environment_gate\.outcome == 'success' && steps\.attest\.outcome == 'success'\n/s,
+    'attestation upload must require both environment gate success and attestation success',
+  );
+  assert.match(
+    workflow,
+    /if \[ "\$\{\{ steps\.environment_gate\.outcome \}\}" != "success" \]; then\n\s+echo "Pre-attestation environment gate did not pass for \$\{\{ matrix\.environment \}\}" >&2\n\s+exit 1\n/s,
+    'final gate must fail closed when the pre-attestation environment gate fails',
   );
 });

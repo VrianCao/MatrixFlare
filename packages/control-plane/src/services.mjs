@@ -12,6 +12,7 @@ import {
   loadWorkerRuntimeConfig,
   makeId,
   recordJobMetric,
+  resolveRuntimeWorkerVersionId,
 } from '../../runtime-core/src/index.mjs';
 import {
   canonicalHash,
@@ -1811,7 +1812,7 @@ export function makeOpsContext(workerName, request, env, { routeFamily }) {
   });
   const requestContext = createRequestContext({
     workerName,
-    workerVersion: config.text.WORKER_VERSION_ID,
+    workerVersion: resolveRuntimeWorkerVersionId(env, config.text.WORKER_VERSION_ID),
     request,
     routeFamily,
   });

@@ -40,6 +40,7 @@ import {
   teeBodyStreamWithDigest,
   uploadStreamToR2MultipartWithDigest,
   classifyGatewayRequest,
+  resolveRuntimeWorkerVersionId,
 } from '../../../packages/runtime-core/src/index.mjs';
 import {
   buildProfileCapabilities,
@@ -125,6 +126,37 @@ function matrixErrorResponse(status, errcode, error, extra = null, headers = {})
     status,
     headers,
   );
+}
+
+const ROLLOUT_PROBE_SECRET_HEADER = 'x-matrix-rollout-probe-secret';
+const ROLLOUT_PROBE_GATEWAY_VERSION_ID_HEADER = 'x-matrix-rollout-probe-gateway-version-id';
+const ROLLOUT_PROBE_GATEWAY_VERSION_TAG_HEADER = 'x-matrix-rollout-probe-gateway-version-tag';
+
+function shouldExposeRolloutProbeHeaders(request, env) {
+  const configuredSecret = typeof env.ROLLOUT_PROBE_SHARED_SECRET === 'string'
+    ? env.ROLLOUT_PROBE_SHARED_SECRET.trim()
+    : '';
+  const providedSecret = request.headers.get(ROLLOUT_PROBE_SECRET_HEADER)?.trim() ?? '';
+  return configuredSecret.length > 0 && providedSecret.length > 0 && configuredSecret === providedSecret;
+}
+
+function attachRolloutProbeHeaders(request, env, response, workerVersionId) {
+  if (!shouldExposeRolloutProbeHeaders(request, env)) {
+    return response;
+  }
+  const headers = new Headers(response.headers);
+  headers.set(ROLLOUT_PROBE_GATEWAY_VERSION_ID_HEADER, workerVersionId);
+  const versionTag = typeof env.CF_VERSION_METADATA?.tag === 'string'
+    ? env.CF_VERSION_METADATA.tag.trim()
+    : '';
+  if (versionTag.length > 0) {
+    headers.set(ROLLOUT_PROBE_GATEWAY_VERSION_TAG_HEADER, versionTag);
+  }
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
 }
 
 function stubRouteResponse() {
@@ -4664,19 +4696,20 @@ async function handleRequest(request, env) {
     workerName: 'gateway-worker',
     config,
   });
+  const observedWorkerVersionId = resolveRuntimeWorkerVersionId(env, config.text.WORKER_VERSION_ID);
   const url = new URL(request.url);
   const { pathname } = url;
   const method = request.method.toUpperCase();
   const classification = classifyGatewayRequest(method, pathname);
   const requestContext = createRequestContext({
     workerName: 'gateway-worker',
-    workerVersion: config.text.WORKER_VERSION_ID,
+    workerVersion: observedWorkerVersionId,
     request,
     routeFamily: classification.route_family,
   });
   const requestMetrics = startRequestMetrics(env, {
     workerName: 'gateway-worker',
-    workerVersion: config.text.WORKER_VERSION_ID,
+    workerVersion: observedWorkerVersionId,
     routeFamily: classification.route_family,
   });
   const finalizeResponse = (response, {
@@ -4698,7 +4731,7 @@ async function handleRequest(request, env) {
         : { cpu_ms: Math.round(completed.cpu_ms) }),
       ...(errorClass == null ? {} : { error_class: errorClass }),
     });
-    return response;
+    return attachRolloutProbeHeaders(request, env, response, observedWorkerVersionId);
   };
 
   requestContext.logger.info('gateway.request.start', {

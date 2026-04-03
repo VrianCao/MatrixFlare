@@ -99,6 +99,98 @@ function buildPhase08ArtifactStoreUri(environmentName, runTimestamp, fileName) {
   return `r2://matrix-evidence-${environmentName}/${buildPhase08ArtifactStoreKey(environmentName, runTimestamp, fileName)}`;
 }
 
+function buildValidRolloutSkewProbe(runTimestamp, overrides = {}) {
+  return {
+    environment_name: 'pre-release',
+    probe_run_id: `rollout-${runTimestamp.toLowerCase()}`,
+    dual_version_deployment_id: 'pre-release-gateway-dual-deployment',
+    baseline_gateway_version_id: 'gateway@pre-release-v1',
+    candidate_gateway_version_id: 'gateway@pre-release-v2',
+    override_strategy: 'cloudflare-version-overrides',
+    observations: [
+      {
+        probe_name: 'new-worker-old-authority',
+        request_gateway_version_id: 'gateway@pre-release-v2',
+        observed_gateway_version_id: 'gateway@pre-release-v2',
+        observed_authority_version_id: 'gateway@pre-release-v1',
+        authority_kind: 'UserDO',
+        authority_key: '@baseline-user:matrix.example.test',
+        request_path: '/_matrix/client/v3/account/whoami',
+        observed_at: '2026-03-31T14:03:00.000Z',
+      },
+      {
+        probe_name: 'new-worker-old-authority',
+        request_gateway_version_id: 'gateway@pre-release-v2',
+        observed_gateway_version_id: 'gateway@pre-release-v2',
+        observed_authority_version_id: 'gateway@pre-release-v1',
+        authority_kind: 'RoomDO',
+        authority_key: '!baseline-room:matrix.example.test',
+        request_path: '/_matrix/client/v3/rooms/%21baseline-room%3Amatrix.example.test/state',
+        observed_at: '2026-03-31T14:03:01.000Z',
+      },
+      {
+        probe_name: 'old-worker-new-authority',
+        request_gateway_version_id: 'gateway@pre-release-v1',
+        observed_gateway_version_id: 'gateway@pre-release-v1',
+        observed_authority_version_id: 'gateway@pre-release-v2',
+        authority_kind: 'UserDO',
+        authority_key: '@candidate-user:matrix.example.test',
+        request_path: '/_matrix/client/v3/account/whoami',
+        observed_at: '2026-03-31T14:03:02.000Z',
+      },
+      {
+        probe_name: 'old-worker-new-authority',
+        request_gateway_version_id: 'gateway@pre-release-v1',
+        observed_gateway_version_id: 'gateway@pre-release-v1',
+        observed_authority_version_id: 'gateway@pre-release-v2',
+        authority_kind: 'RoomDO',
+        authority_key: '!candidate-room:matrix.example.test',
+        request_path: '/_matrix/client/v3/rooms/%21candidate-room%3Amatrix.example.test/state',
+        observed_at: '2026-03-31T14:03:03.000Z',
+      },
+    ],
+    assertions: {
+      new_worker_old_authority: true,
+      old_worker_new_authority: true,
+    },
+    ...overrides,
+  };
+}
+
+function buildValidPreReleaseCostObservation(runTimestamp, overrides = {}) {
+  return {
+    observation_id: `pre-release-cost-${runTimestamp.toLowerCase()}`,
+    source_environment: 'pre-release',
+    captured_at: '2026-03-31T14:04:00.000Z',
+    capture_window: {
+      start: '2026-03-31T14:00:00.000Z',
+      end: '2026-03-31T14:05:00.000Z',
+    },
+    capture_method: 'cloudflare-official-metrics',
+    source_query_uris: [
+      `https://example.invalid/cloudflare/pre-release/cost/${runTimestamp}`,
+    ],
+    topology_kind: 'cloudflare-pre-release',
+    cloudflare_resources: buildExpectedCloudflareResources('pre-release'),
+    cost_surfaces: {
+      workers: { requests: 1000, cpu_ms: 250000 },
+      durable_objects: { requests: 400, duration_gb_s: 12 },
+      d1: { read_rows: 20000, write_rows: 1500 },
+      r2: { storage_gb_month: 3, class_a_ops: 120, class_b_ops: 400 },
+      kv: { read_ops: 500, write_ops: 40, delete_ops: 3, list_ops: 2 },
+      queues: { write_ops: 80, read_ops: 80, delete_ops: 80 },
+    },
+    model_comparison: {
+      status: 'within_expected',
+      summary: 'No bounded-workload budget drift detected.',
+      actual_total_usd: 1.2,
+      modeled_total_usd: 1.1,
+      drift_ratio: 0.09,
+    },
+    ...overrides,
+  };
+}
+
 function buildValidEnvironmentReport(environmentName, runTimestamp, overrides = {}) {
   const directory = getTestEnvironmentDefinition(environmentName).directory;
   const readinessSteps = [
@@ -139,6 +231,8 @@ function buildValidEnvironmentReport(environmentName, runTimestamp, overrides = 
     source_run_uri: `https://example.invalid/runs/${environmentName}/${runTimestamp}`,
     topology_kind: `cloudflare-${environmentName}`,
     cloudflare_resources: buildExpectedCloudflareResources(environmentName),
+    rollout_skew_probe: null,
+    pre_release_cost_observation: null,
     readiness_probe: {
       ready: true,
       environment_name: environmentName,
@@ -205,6 +299,30 @@ function buildValidEnvironmentReport(environmentName, runTimestamp, overrides = 
     run_timestamp: runTimestamp,
     ...overrides,
   };
+}
+
+function buildValidPreReleaseOpsReport(runTimestamp, overrides = {}) {
+  return buildValidEnvironmentReport('pre-release', runTimestamp, {
+    test_directory: 'tests/pre-release',
+    test_file_count: 1,
+    test_files: ['tests/pre-release/test-ops-001.test.mjs'],
+    expanded_test_file_count: 1,
+    expanded_test_files: ['tests/pre-release/test-ops-001.test.mjs'],
+    rollout_skew_probe: buildValidRolloutSkewProbe(runTimestamp),
+    ...overrides,
+  });
+}
+
+function buildValidPreReleaseCostReport(runTimestamp, overrides = {}) {
+  return buildValidEnvironmentReport('pre-release', runTimestamp, {
+    test_directory: 'tests/pre-release',
+    test_file_count: 1,
+    test_files: ['tests/pre-release/test-cost-001.test.mjs'],
+    expanded_test_file_count: 1,
+    expanded_test_files: ['tests/pre-release/test-cost-001.test.mjs'],
+    pre_release_cost_observation: buildValidPreReleaseCostObservation(runTimestamp),
+    ...overrides,
+  });
 }
 
 function buildValidProdCostSnapshot(runTimestamp, overrides = {}) {
@@ -501,15 +619,30 @@ async function createEnvironmentBackedManualArtifacts(fixtureRoot, runTimestamp,
     const environmentTopLevelTestFiles = [...new Set(Object.values(environmentTestFiles[environmentName]))].sort();
     const environmentTestDirectory = path.dirname(environmentTopLevelTestFiles[0]).replaceAll(path.sep, '/');
     const expandedTestFiles = [...environmentTopLevelTestFiles];
+    const reportOverrides = {
+      test_directory: environmentTestDirectory,
+      test_files: environmentTopLevelTestFiles,
+      test_file_count: environmentTopLevelTestFiles.length,
+      expanded_test_files: expandedTestFiles,
+      expanded_test_file_count: expandedTestFiles.length,
+      log_artifact: `https://example.invalid/logs/fixture/${runTimestamp}/${environmentName}.log`,
+    };
+    if (
+      environmentName === 'pre-release'
+      && environmentTopLevelTestFiles.some((file) => path.basename(file).startsWith('test-ops-001'))
+    ) {
+      reportOverrides.rollout_skew_probe = buildValidRolloutSkewProbe(runTimestamp);
+    }
+    if (
+      environmentName === 'pre-release'
+      && environmentTopLevelTestFiles.some((file) => path.basename(file).startsWith('test-cost-001'))
+    ) {
+      reportOverrides.pre_release_cost_observation = buildValidPreReleaseCostObservation(runTimestamp);
+    }
     await fs.writeFile(
       artifactPath,
       JSON.stringify(buildValidEnvironmentAttestation(environmentName, runTimestamp, {
-        test_directory: environmentTestDirectory,
-        test_files: environmentTopLevelTestFiles,
-        test_file_count: environmentTopLevelTestFiles.length,
-        expanded_test_files: expandedTestFiles,
-        expanded_test_file_count: expandedTestFiles.length,
-        log_artifact: `https://example.invalid/logs/fixture/${runTimestamp}/${environmentName}.log`,
+        ...reportOverrides,
       }), null, 2),
     );
     manualArtifacts[artifactId] = path.relative(fixtureRoot, artifactPath);
@@ -649,7 +782,7 @@ test('L1 evidence bundle set includes governance and canonical test implementati
   );
 });
 
-test('non-local coverage fails closed when a required environment has no canonical implementation mapping yet', async () => {
+test('non-local coverage fails closed when a required environment report does not execute the canonical implementation', async () => {
   const results = await collectTestCoverageResults(
     getL1EvidenceDefinition('EVID-OPS-001'),
     {
@@ -663,7 +796,8 @@ test('non-local coverage fails closed when a required environment has no canonic
 
   assert.equal(results.length, 1);
   assert.equal(results[0].satisfied, false);
-  assert.match(results[0].mapping_error ?? '', /Missing L1 test implementation mapping/);
+  assert.equal(results[0].mapping_error, null);
+  assert.deepEqual(results[0].missing_files, ['tests/pre-release/test-ops-001.test.mjs']);
 });
 
 test('non-local coverage fails closed when a required environment mapping points at generic or shared non-local files', async () => {
@@ -844,10 +978,21 @@ test('non-local coverage fails closed when a canonical suite symlink escapes rep
 test('manual artifact payload validation requires structured non-local reports and typed prod snapshots', () => {
   const runTimestamp = '20260331T140000Z';
   const validStagingReport = buildValidEnvironmentReport('staging', runTimestamp);
+  const validPreReleaseReport = buildValidEnvironmentReport('pre-release', runTimestamp);
+  const validPreReleaseOpsReport = buildValidPreReleaseOpsReport(runTimestamp);
+  const validPreReleaseCostReport = buildValidPreReleaseCostReport(runTimestamp);
   const validProdCostSnapshot = buildValidProdCostSnapshot(runTimestamp);
 
   assert.deepEqual(
     validateManualArtifactPayload('staging_run_report', validStagingReport, { runTimestamp }),
+    {
+      valid: true,
+      error: null,
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('pre_release_run_report', validPreReleaseReport, { runTimestamp }),
     {
       valid: true,
       error: null,
@@ -1172,6 +1317,109 @@ test('manual artifact payload validation requires structured non-local reports a
     {
       valid: false,
       error: 'environment run report must not expand local test implementations',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('pre_release_run_report', {
+      ...validPreReleaseReport,
+      rollout_skew_probe: buildValidRolloutSkewProbe(runTimestamp),
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'environment run report rollout_skew_probe must be null unless TEST-OPS-001 is covered',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('pre_release_run_report', {
+      ...validPreReleaseReport,
+      pre_release_cost_observation: buildValidPreReleaseCostObservation(runTimestamp),
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'environment run report pre_release_cost_observation must be null unless TEST-COST-001 is covered',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('pre_release_run_report', {
+      ...validPreReleaseOpsReport,
+      rollout_skew_probe: null,
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'environment run report must include rollout_skew_probe',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('pre_release_run_report', {
+      ...validPreReleaseOpsReport,
+      rollout_skew_probe: {
+        ...validPreReleaseOpsReport.rollout_skew_probe,
+        assertions: {
+          new_worker_old_authority: true,
+          old_worker_new_authority: false,
+        },
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'environment run report rollout_skew_probe assertions must both be true',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('pre_release_run_report', validPreReleaseOpsReport, { runTimestamp }),
+    {
+      valid: true,
+      error: null,
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('pre_release_run_report', {
+      ...validPreReleaseCostReport,
+      pre_release_cost_observation: null,
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'environment run report must include pre_release_cost_observation',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('pre_release_run_report', {
+      ...validPreReleaseCostReport,
+      pre_release_cost_observation: {
+        ...validPreReleaseCostReport.pre_release_cost_observation,
+        capture_method: 'estimated-local-model',
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'environment run report pre_release_cost_observation.capture_method must be cloudflare-official-metrics',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('pre_release_run_report', validPreReleaseCostReport, { runTimestamp }),
+    {
+      valid: true,
+      error: null,
     },
   );
 

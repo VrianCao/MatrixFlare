@@ -1,4 +1,5 @@
 import { GATEWAY_RATE_LIMIT_BINDING_DEFINITIONS } from './abuse-guard.mjs';
+import { VERSION_METADATA_BINDING_NAME } from './version-metadata.mjs';
 
 const COMPATIBILITY_DATE = '2026-03-26';
 const COMPATIBILITY_FLAGS = Object.freeze([
@@ -64,6 +65,7 @@ const DEFAULT_RESOURCE_BINDING_NAMES = Object.freeze({
 const WORKER_RUNTIME_MANIFEST = Object.freeze({
   'gateway-worker': Object.freeze({
     compatibilityDate: COMPATIBILITY_DATE,
+    versionMetadataBinding: VERSION_METADATA_BINDING_NAME,
     vars: Object.freeze({
       ...SHARED_TEXT_BINDINGS,
       MATRIX_PUBLIC_BASE_URL: { type: 'string', required: true },
@@ -145,6 +147,7 @@ const WORKER_RUNTIME_MANIFEST = Object.freeze({
   }),
   'jobs-worker': Object.freeze({
     compatibilityDate: COMPATIBILITY_DATE,
+    versionMetadataBinding: VERSION_METADATA_BINDING_NAME,
     vars: Object.freeze({
       ...SHARED_TEXT_BINDINGS,
       MANAGEMENT_API_BASE_URL: { type: 'string', required: true },
@@ -206,9 +209,12 @@ const WORKER_RUNTIME_MANIFEST = Object.freeze({
   }),
   'ops-worker': Object.freeze({
     compatibilityDate: COMPATIBILITY_DATE,
+    versionMetadataBinding: VERSION_METADATA_BINDING_NAME,
     vars: Object.freeze({
       ...SHARED_TEXT_BINDINGS,
+      MATRIX_PUBLIC_BASE_URL: { type: 'string', required: true },
       MANAGEMENT_API_BASE_URL: { type: 'string', required: true },
+      GATEWAY_WORKER_SCRIPT_NAME: { type: 'string', required: true },
       ACCESS_TEAM_DOMAIN: { type: 'string', required: true },
       ACCESS_AUDIENCE: { type: 'string', required: true },
     }),
@@ -453,6 +459,12 @@ export function createWranglerConfigSnapshot(workerName) {
       tag: migration.tag,
       new_sqlite_classes: [...migration.newSqliteClasses],
     }));
+  }
+
+  if (typeof manifest.versionMetadataBinding === 'string' && manifest.versionMetadataBinding.length > 0) {
+    config.version_metadata = {
+      binding: manifest.versionMetadataBinding,
+    };
   }
 
   if (manifest.bindings.services.length > 0) {

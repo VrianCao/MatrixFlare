@@ -1,5 +1,6 @@
 import { getWorkerRuntimeManifest } from './runtime-manifest.mjs';
 import { recordDeploymentRecord } from './telemetry.mjs';
+import { resolveRuntimeWorkerVersionId } from './version-metadata.mjs';
 
 function parseJsonString(value) {
   if (typeof value !== 'string' || value.trim().length === 0) {
@@ -61,6 +62,7 @@ function resolveDeploymentComposition(config) {
 export function buildDeploymentRecord({
   workerName,
   config,
+  env = {},
   startupTimeMs = null,
   observedAt = new Date().toISOString(),
 }) {
@@ -68,9 +70,10 @@ export function buildDeploymentRecord({
   const resolvedStartupTimeMs = Number.isInteger(startupTimeMs)
     ? startupTimeMs
     : config.text.STARTUP_TIME_MS;
+  const observedWorkerVersionId = resolveRuntimeWorkerVersionId(env, config.text.WORKER_VERSION_ID);
   return {
     worker_name: workerName,
-    worker_version_id: config.text.WORKER_VERSION_ID,
+    worker_version_id: observedWorkerVersionId,
     deployment_id: config.text.DEPLOYMENT_ID,
     compatibility_date: config.compatibilityDate,
     cpu_limit_class: config.text.CPU_LIMIT_CLASS,
@@ -94,6 +97,7 @@ export function ensureDeploymentRecord(env, {
   const record = buildDeploymentRecord({
     workerName,
     config,
+    env,
     startupTimeMs,
     observedAt,
   });

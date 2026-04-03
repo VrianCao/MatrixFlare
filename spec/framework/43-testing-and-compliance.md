@@ -48,11 +48,11 @@
 | `TEST-AS-001` | appservice namespace, query, transaction delivery and retry | staging | `L3 when enabled` | appservice 开启时才进入门禁。 |
 | `TEST-SEC-001` | token revocation, UIA challenge binding, secret handling, baseline abuse guards, federation auth failures | staging + pre-release | `L1-L3` | 重点验证 auth invalidation、`auth_version` 推进、route-bound UIA challenge 不可跨路由重放、secret boundaries，以及对始终开启的注册、登录、媒体、房间发送、搜索和本地公开入口的 baseline rate-limit / quota guard。对于 `gateway-worker` 基于 Workers `ratelimits` binding 的 coarse public-entry shaping，断言必须与 `CF-WKR-027` 一致：允许 bounded eventual consistency / permissive 行为，但在同一 bounded retry window 内必须观察到 `429`，且不得漂移成 `5xx` 或无界放行。 |
 | `TEST-SEC-002` | advanced abuse resistance, SSRF, provider trust, and conditional external integrations | staging + pre-release | `L3` | 在 `TEST-SEC-001` baseline 之上，覆盖 URL preview 的 SSRF / fetch guard；若启用 pushers / external push gateway、email/SMS `requestToken` bootstrap 或 TURN credential issuance，也必须把对应 provider trust、鉴权、回调/credential 边界纳入同一门禁。 |
-| `TEST-OPS-001` | new Worker -> old DO and old Worker -> new DO compatibility | pre-release | `L1-L3` | 版本偏斜门禁。 |
+| `TEST-OPS-001` | new Worker -> old DO and old Worker -> new DO compatibility | pre-release | `L1-L3` | 版本偏斜门禁；必须以 dual-version deployment + explicit version targeting + attested `RolloutSkewProbeResponse` 证明两类 pairing，不能退化为 healthz/deployment smoke。 |
 | `TEST-OPS-002` | replay, rebuild, export, restore, scoped repair | pre-release + periodic drill | `L3` | 恢复门禁；必须显式注入“shard truth 已提交但 `DATA-OPS-010` registry upsert 失败”的故障，并验证同一幂等请求或内部 pending-marker 重试会补齐 registry row 而不会重复创建 shard truth。 |
 | `TEST-PERF-001` | `/sync` concurrency and online device scaling | pre-release | `L3` | 重点看 Worker wall time、wake latency。 |
 | `TEST-PERF-002` | hot room send / receipt / typing / derived lag | pre-release | `L3` | 重点看单房间热点；`L2` 可选执行但不构成 release gate。 |
-| `TEST-COST-001` | quota accounting and budget guardrail validation | monthly + pre-release | `L1-L3` | 对比实际指标与定价模型。 |
+| `TEST-COST-001` | quota accounting and budget guardrail validation | monthly + pre-release | `L1-L3` | pre-release half 必须对 bounded workload 执行 official Cloudflare metrics/billing query 并产出 attested `PreReleaseCostObservation`；monthly half 继续要求 production `ProdCostSnapshotAttestation`。 |
 
 ## 4. Unit and Property Testing
 
@@ -120,6 +120,7 @@
 * 必须验证旧 Worker 调新 DO。
 * 必须验证 gradual deployment 期间 `/sync`、房间写入、联邦发送不破坏语义。
 * 必须验证 deploy 时 DO wake websocket 断开后的 `/sync` 重试行为。
+* `TEST-OPS-001` 的 canonical non-local pass 还必须证明 dual-version deployment 被真实创建并恢复，且 `RolloutSkewProbeResponse.assertions.new_worker_old_authority == true`、`old_worker_new_authority == true`。
 
 ## 9. Release Gates
 

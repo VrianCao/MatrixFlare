@@ -6,6 +6,8 @@ import {
   normalizeJobCancelRequest,
   normalizeRebuildJobRequest,
   normalizeRepairJobRequest,
+  normalizeRolloutSkewProbeRequest,
+  normalizeRolloutSkewProbeResponse,
   normalizeRestoreJobRequest,
   mapInternalJobStateToPublicState,
 } from './schemas.mjs';
@@ -32,8 +34,8 @@ function buildHealthResponse(config, deploymentRecord, dependencies, status) {
     service: 'ops-worker',
     status,
     observed_at: new Date().toISOString(),
-    worker_version_id: config.text.WORKER_VERSION_ID,
-    deployment_id: config.text.DEPLOYMENT_ID,
+    worker_version_id: deploymentRecord.worker_version_id,
+    deployment_id: deploymentRecord.deployment_id,
     compatibility_date: config.compatibilityDate,
     release_profile: config.releaseProfile,
     cpu_limit_class: deploymentRecord.cpu_limit_class,
@@ -64,6 +66,9 @@ function routeInfo(url) {
   }
   if (pathname === ROUTE_TEMPLATES.repairs) {
     return { kind: 'job-create', routeTemplate: ROUTE_TEMPLATES.repairs, requiredScope: 'ops.repair.write' };
+  }
+  if (pathname === ROUTE_TEMPLATES.rolloutSkewProbe) {
+    return { kind: 'rollout-skew-probe', routeTemplate: ROUTE_TEMPLATES.rolloutSkewProbe, requiredScope: 'ops.rebuild.write' };
   }
   if (pathname === ROUTE_TEMPLATES.jobsList) {
     return { kind: 'jobs-list', routeTemplate: ROUTE_TEMPLATES.jobsList, requiredScope: 'ops.read' };
@@ -127,6 +132,552 @@ async function buildHealthDependencies(env, persistence) {
     });
   }
   return dependencies;
+}
+
+const ROLLOUT_PROBE_SECRET_HEADER = 'x-matrix-rollout-probe-secret';
+const ROLLOUT_PROBE_GATEWAY_VERSION_ID_HEADER = 'x-matrix-rollout-probe-gateway-version-id';
+const PROBE_PASSWORD_SUFFIX = '-password';
+
+function stableString(value) {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function sanitizeProbeToken(value, {
+  fallback = 'probe',
+  maxLength = 48,
+} = {}) {
+  const normalized = String(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9._=-]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  const resolved = normalized.length > 0 ? normalized : fallback;
+  return resolved.slice(0, Math.max(1, maxLength));
+}
+
+function sanitizeDeviceId(value) {
+  const normalized = String(value)
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, '')
+    .slice(0, 16);
+  return normalized.length > 0 ? normalized : 'ROLLPROBE01';
+}
+
+function createOpsValidationError(message, {
+  status = 422,
+  code = 'validation_failed',
+  retryable = false,
+} = {}) {
+  const error = new Error(message);
+  error.status = status;
+  error.code = code;
+  error.retryable = retryable;
+  return error;
+}
+
+function createOpsPreconditionError(message, {
+  status = 409,
+  code = 'precondition_failed',
+  retryable = false,
+} = {}) {
+  const error = new Error(message);
+  error.status = status;
+  error.code = code;
+  error.retryable = retryable;
+  return error;
+}
+
+function requireGatewayProbeConfiguration(env) {
+  const baseUrl = stableString(env.MATRIX_PUBLIC_BASE_URL).replace(/\/+$/, '');
+  const scriptName = stableString(env.GATEWAY_WORKER_SCRIPT_NAME);
+  const sharedSecret = stableString(env.ROLLOUT_PROBE_SHARED_SECRET);
+  if (baseUrl.length === 0) {
+      throw createOpsPreconditionError('ops-worker requires MATRIX_PUBLIC_BASE_URL for rollout-skew probing', {
+        status: 503,
+        code: 'internal',
+        retryable: true,
+      });
+  }
+  if (scriptName.length === 0) {
+      throw createOpsPreconditionError('ops-worker requires GATEWAY_WORKER_SCRIPT_NAME for rollout-skew probing', {
+        status: 503,
+        code: 'internal',
+        retryable: true,
+      });
+  }
+  if (sharedSecret.length === 0) {
+      throw createOpsPreconditionError('ops-worker requires ROLLOUT_PROBE_SHARED_SECRET for rollout-skew probing', {
+        status: 503,
+        code: 'internal',
+        retryable: true,
+      });
+  }
+  return {
+    base_url: baseUrl,
+    script_name: scriptName,
+    shared_secret: sharedSecret,
+  };
+}
+
+function buildVersionOverrideHeader(scriptName, versionId) {
+  return `${scriptName}="${String(versionId).replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"`;
+}
+
+async function readGatewayPayload(response) {
+  const contentType = response.headers.get('content-type') ?? '';
+  if (contentType.toLowerCase().includes('json')) {
+    return response.json();
+  }
+  return response.text();
+}
+
+async function fetchGatewayWithVersionOverride(env, gatewayConfig, {
+  versionId,
+  pathname,
+  method = 'GET',
+  accessToken = null,
+  json = undefined,
+} = {}) {
+  const headers = new Headers();
+  headers.set('Cloudflare-Workers-Version-Overrides', buildVersionOverrideHeader(gatewayConfig.script_name, versionId));
+  headers.set(ROLLOUT_PROBE_SECRET_HEADER, gatewayConfig.shared_secret);
+  if (accessToken != null) {
+    headers.set('authorization', `Bearer ${accessToken}`);
+  }
+  if (json !== undefined) {
+    headers.set('content-type', 'application/json; charset=utf-8');
+  }
+  const response = await fetch(`${gatewayConfig.base_url}${pathname}`, {
+    method,
+    headers,
+    body: json === undefined ? undefined : JSON.stringify(json),
+  });
+  const payload = await readGatewayPayload(response);
+  const observedGatewayVersionId = stableString(response.headers.get(ROLLOUT_PROBE_GATEWAY_VERSION_ID_HEADER));
+  if (observedGatewayVersionId.length === 0) {
+    throw createOpsPreconditionError(`Gateway response for ${pathname} did not include ${ROLLOUT_PROBE_GATEWAY_VERSION_ID_HEADER}`);
+  }
+  if (observedGatewayVersionId !== versionId) {
+    throw createOpsPreconditionError(
+      `Gateway version override mismatch for ${pathname}: requested ${versionId}, observed ${observedGatewayVersionId}`,
+    );
+  }
+  return {
+    response,
+    payload,
+    observed_gateway_version_id: observedGatewayVersionId,
+  };
+}
+
+function getUserDoStub(env, userId) {
+  const namespace = env.USER_DO;
+  if (!namespace || typeof namespace.idFromName !== 'function' || typeof namespace.get !== 'function') {
+      throw createOpsPreconditionError('ops-worker requires USER_DO binding for rollout-skew probing', {
+        status: 503,
+        code: 'internal',
+        retryable: true,
+      });
+  }
+  return namespace.get(namespace.idFromName(userId));
+}
+
+function getRoomDoStub(env, roomId) {
+  const namespace = env.ROOM_DO;
+  if (!namespace || typeof namespace.idFromName !== 'function' || typeof namespace.get !== 'function') {
+      throw createOpsPreconditionError('ops-worker requires ROOM_DO binding for rollout-skew probing', {
+        status: 503,
+        code: 'internal',
+        retryable: true,
+      });
+  }
+  return namespace.get(namespace.idFromName(roomId));
+}
+
+async function inspectUserAuthority(env, userId) {
+  const result = await getUserDoStub(env, userId).inspectRuntimeIdentity();
+  if (!result?.ok || stableString(result.worker_version_id).length === 0) {
+    throw createOpsPreconditionError(`UserDO ${userId} did not expose a usable runtime identity`);
+  }
+  return result;
+}
+
+async function inspectRoomAuthority(env, roomId) {
+  const result = await getRoomDoStub(env, roomId).inspectRuntimeIdentity();
+  if (!result?.ok || stableString(result.worker_version_id).length === 0) {
+    throw createOpsPreconditionError(`RoomDO ${roomId} did not expose a usable runtime identity`);
+  }
+  return result;
+}
+
+async function loginProbeUser(env, gatewayConfig, {
+  username,
+  password,
+  deviceId,
+  gatewayVersionId,
+} = {}) {
+  const result = await fetchGatewayWithVersionOverride(env, gatewayConfig, {
+    versionId: gatewayVersionId,
+    pathname: '/_matrix/client/v3/login',
+    method: 'POST',
+    json: {
+      type: 'm.login.password',
+      identifier: {
+        type: 'm.id.user',
+        user: username,
+      },
+      password,
+      device_id: deviceId,
+    },
+  });
+  if (result.response.status !== 200 || typeof result.payload?.access_token !== 'string' || typeof result.payload?.user_id !== 'string') {
+    throw createOpsPreconditionError(`Probe login failed for ${username}: ${JSON.stringify(result.payload)}`);
+  }
+  return {
+    username,
+    password,
+    device_id: deviceId,
+    access_token: result.payload.access_token,
+    user_id: result.payload.user_id,
+  };
+}
+
+async function ensureProbeUser(env, gatewayConfig, probeRequest, {
+  userLabel,
+  gatewayVersionId,
+} = {}) {
+  const username = sanitizeProbeToken(`${probeRequest.seed_prefix}-${userLabel}`, {
+    fallback: userLabel,
+    maxLength: 32,
+  });
+  const password = sanitizeProbeToken(`${probeRequest.probe_run_id}${PROBE_PASSWORD_SUFFIX}`, {
+    fallback: 'phase08-rollout-password',
+    maxLength: 48,
+  });
+  const deviceId = sanitizeDeviceId(`${userLabel}${probeRequest.probe_run_id}`);
+  const challenge = await fetchGatewayWithVersionOverride(env, gatewayConfig, {
+    versionId: gatewayVersionId,
+    pathname: '/_matrix/client/v3/register',
+    method: 'POST',
+    json: {
+      username,
+      password,
+      device_id: deviceId,
+    },
+  });
+  if (challenge.response.status === 401 && typeof challenge.payload?.session === 'string') {
+    const completed = await fetchGatewayWithVersionOverride(env, gatewayConfig, {
+      versionId: gatewayVersionId,
+      pathname: '/_matrix/client/v3/register',
+      method: 'POST',
+      json: {
+        username,
+        password,
+        device_id: deviceId,
+        auth: {
+          type: 'm.login.dummy',
+          session: challenge.payload.session,
+        },
+      },
+    });
+    if (completed.response.status === 200 && typeof completed.payload?.access_token === 'string' && typeof completed.payload?.user_id === 'string') {
+      return {
+        username,
+        password,
+        device_id: deviceId,
+        access_token: completed.payload.access_token,
+        user_id: completed.payload.user_id,
+      };
+    }
+  }
+  return loginProbeUser(env, gatewayConfig, {
+    username,
+    password,
+    deviceId,
+    gatewayVersionId,
+  });
+}
+
+async function ensureProbeRoom(env, gatewayConfig, probeRequest, {
+  roomLabel,
+  gatewayVersionId,
+  accessToken,
+  serverName,
+} = {}) {
+  const aliasLocalpart = sanitizeProbeToken(`${probeRequest.seed_prefix}-${roomLabel}`, {
+    fallback: roomLabel,
+    maxLength: 48,
+  });
+  const roomAlias = `#${aliasLocalpart}:${serverName}`;
+  const created = await fetchGatewayWithVersionOverride(env, gatewayConfig, {
+    versionId: gatewayVersionId,
+    pathname: '/_matrix/client/v3/createRoom',
+    method: 'POST',
+    accessToken,
+    json: {
+      visibility: 'public',
+      preset: 'public_chat',
+      room_alias_name: aliasLocalpart,
+      name: `Phase08 rollout ${roomLabel}`,
+    },
+  });
+  if (created.response.status === 200 && typeof created.payload?.room_id === 'string') {
+    return {
+      room_id: created.payload.room_id,
+      room_alias: roomAlias,
+    };
+  }
+  const joined = await fetchGatewayWithVersionOverride(env, gatewayConfig, {
+    versionId: gatewayVersionId,
+    pathname: `/_matrix/client/v3/join/${encodeURIComponent(roomAlias)}`,
+    method: 'POST',
+    accessToken,
+    json: {},
+  });
+  if (joined.response.status !== 200 || typeof joined.payload?.room_id !== 'string') {
+    throw createOpsPreconditionError(`Probe room setup failed for ${roomAlias}: ${JSON.stringify(created.payload)}`);
+  }
+  return {
+    room_id: joined.payload.room_id,
+    room_alias: roomAlias,
+  };
+}
+
+function buildRolloutObservation({
+  probeName,
+  requestGatewayVersionId,
+  observedGatewayVersionId,
+  authorityVersionId,
+  authorityKind,
+  authorityKey,
+  requestPath,
+}) {
+  return {
+    probe_name: probeName,
+    request_gateway_version_id: requestGatewayVersionId,
+    observed_gateway_version_id: observedGatewayVersionId,
+    observed_authority_version_id: authorityVersionId,
+    authority_kind: authorityKind,
+    authority_key: authorityKey,
+    request_path: requestPath,
+    observed_at: new Date().toISOString(),
+  };
+}
+
+function evaluateRolloutAssertions(observations, {
+  baselineGatewayVersionId,
+  candidateGatewayVersionId,
+} = {}) {
+  const hasExpectedObservation = (probeName, authorityKind, expectedGatewayVersionId, expectedAuthorityVersionId) => observations.some((entry) => (
+    entry.probe_name === probeName
+    && entry.authority_kind === authorityKind
+    && entry.observed_gateway_version_id === expectedGatewayVersionId
+    && entry.observed_authority_version_id === expectedAuthorityVersionId
+  ));
+  return {
+    new_worker_old_authority: ['UserDO', 'RoomDO'].every((authorityKind) => hasExpectedObservation(
+      'new-worker-old-authority',
+      authorityKind,
+      candidateGatewayVersionId,
+      baselineGatewayVersionId,
+    )),
+    old_worker_new_authority: ['UserDO', 'RoomDO'].every((authorityKind) => hasExpectedObservation(
+      'old-worker-new-authority',
+      authorityKind,
+      baselineGatewayVersionId,
+      candidateGatewayVersionId,
+    )),
+  };
+}
+
+async function handleRolloutSkewProbe(request, env, config, requestContext) {
+  const operator = await authenticateOperatorIdentity({
+    request,
+    env,
+    config,
+    requiredScope: 'ops.rebuild.write',
+  });
+  if (request.method !== 'POST') {
+    return opsErrorResponse({
+      requestId: requestContext.requestId,
+      code: 'not_found',
+      message: 'Unsupported rollout skew probe method',
+    });
+  }
+  authorizeOperatorRequest({
+    operator,
+    targetScope: {
+      scope_kind: 'global',
+      scope_id: null,
+    },
+  });
+  if (config.environmentName !== 'pre-release') {
+    return opsErrorResponse({
+      requestId: requestContext.requestId,
+      code: 'precondition_failed',
+      message: 'Rollout skew probing is only supported in pre-release',
+    });
+  }
+
+  try {
+    const probeRequest = normalizeRolloutSkewProbeRequest(await readJsonBody(request));
+    const gatewayConfig = requireGatewayProbeConfiguration(env);
+    const serverName = stableString(env.MATRIX_SERVER_NAME);
+    if (serverName.length === 0) {
+      throw createOpsPreconditionError('ops-worker requires MATRIX_SERVER_NAME for rollout-skew probing', {
+        status: 503,
+        code: 'internal',
+        retryable: true,
+      });
+    }
+
+    const baselineUser = await ensureProbeUser(env, gatewayConfig, probeRequest, {
+      userLabel: 'baseline-user',
+      gatewayVersionId: probeRequest.baseline_gateway_version_id,
+    });
+    const baselineUserIdentity = await inspectUserAuthority(env, baselineUser.user_id);
+    if (baselineUserIdentity.worker_version_id !== probeRequest.baseline_gateway_version_id) {
+      throw createOpsPreconditionError(
+        `Baseline seed user resolved to ${baselineUserIdentity.worker_version_id} instead of ${probeRequest.baseline_gateway_version_id}`,
+      );
+    }
+
+    const baselineRoom = await ensureProbeRoom(env, gatewayConfig, probeRequest, {
+      roomLabel: 'baseline-room',
+      gatewayVersionId: probeRequest.baseline_gateway_version_id,
+      accessToken: baselineUser.access_token,
+      serverName,
+    });
+    const baselineRoomIdentity = await inspectRoomAuthority(env, baselineRoom.room_id);
+    if (baselineRoomIdentity.worker_version_id !== probeRequest.baseline_gateway_version_id) {
+      throw createOpsPreconditionError(
+        `Baseline seed room resolved to ${baselineRoomIdentity.worker_version_id} instead of ${probeRequest.baseline_gateway_version_id}`,
+      );
+    }
+
+    const candidateUser = await ensureProbeUser(env, gatewayConfig, probeRequest, {
+      userLabel: 'candidate-user',
+      gatewayVersionId: probeRequest.candidate_gateway_version_id,
+    });
+    const candidateUserIdentity = await inspectUserAuthority(env, candidateUser.user_id);
+    if (candidateUserIdentity.worker_version_id !== probeRequest.candidate_gateway_version_id) {
+      throw createOpsPreconditionError(
+        `Candidate seed user resolved to ${candidateUserIdentity.worker_version_id} instead of ${probeRequest.candidate_gateway_version_id}`,
+      );
+    }
+
+    const candidateRoom = await ensureProbeRoom(env, gatewayConfig, probeRequest, {
+      roomLabel: 'candidate-room',
+      gatewayVersionId: probeRequest.candidate_gateway_version_id,
+      accessToken: candidateUser.access_token,
+      serverName,
+    });
+    const candidateRoomIdentity = await inspectRoomAuthority(env, candidateRoom.room_id);
+    if (candidateRoomIdentity.worker_version_id !== probeRequest.candidate_gateway_version_id) {
+      throw createOpsPreconditionError(
+        `Candidate seed room resolved to ${candidateRoomIdentity.worker_version_id} instead of ${probeRequest.candidate_gateway_version_id}`,
+      );
+    }
+
+    const observations = [];
+
+    const candidateWhoAmI = await fetchGatewayWithVersionOverride(env, gatewayConfig, {
+      versionId: probeRequest.candidate_gateway_version_id,
+      pathname: '/_matrix/client/v3/account/whoami',
+      accessToken: baselineUser.access_token,
+    });
+    if (candidateWhoAmI.response.status !== 200) {
+      throw createOpsPreconditionError(`Candidate-targeted whoami probe failed: ${JSON.stringify(candidateWhoAmI.payload)}`);
+    }
+    const postCandidateUserIdentity = await inspectUserAuthority(env, baselineUser.user_id);
+    observations.push(buildRolloutObservation({
+      probeName: 'new-worker-old-authority',
+      requestGatewayVersionId: probeRequest.candidate_gateway_version_id,
+      observedGatewayVersionId: candidateWhoAmI.observed_gateway_version_id,
+      authorityVersionId: postCandidateUserIdentity.worker_version_id,
+      authorityKind: 'UserDO',
+      authorityKey: baselineUser.user_id,
+      requestPath: '/_matrix/client/v3/account/whoami',
+    }));
+
+    const candidateRoomState = await fetchGatewayWithVersionOverride(env, gatewayConfig, {
+      versionId: probeRequest.candidate_gateway_version_id,
+      pathname: `/_matrix/client/v3/rooms/${encodeURIComponent(baselineRoom.room_id)}/state`,
+      accessToken: baselineUser.access_token,
+    });
+    if (candidateRoomState.response.status !== 200) {
+      throw createOpsPreconditionError(`Candidate-targeted room state probe failed: ${JSON.stringify(candidateRoomState.payload)}`);
+    }
+    const postCandidateRoomIdentity = await inspectRoomAuthority(env, baselineRoom.room_id);
+    observations.push(buildRolloutObservation({
+      probeName: 'new-worker-old-authority',
+      requestGatewayVersionId: probeRequest.candidate_gateway_version_id,
+      observedGatewayVersionId: candidateRoomState.observed_gateway_version_id,
+      authorityVersionId: postCandidateRoomIdentity.worker_version_id,
+      authorityKind: 'RoomDO',
+      authorityKey: baselineRoom.room_id,
+      requestPath: `/_matrix/client/v3/rooms/${baselineRoom.room_id}/state`,
+    }));
+
+    const baselineWhoAmI = await fetchGatewayWithVersionOverride(env, gatewayConfig, {
+      versionId: probeRequest.baseline_gateway_version_id,
+      pathname: '/_matrix/client/v3/account/whoami',
+      accessToken: candidateUser.access_token,
+    });
+    if (baselineWhoAmI.response.status !== 200) {
+      throw createOpsPreconditionError(`Baseline-targeted whoami probe failed: ${JSON.stringify(baselineWhoAmI.payload)}`);
+    }
+    const postBaselineUserIdentity = await inspectUserAuthority(env, candidateUser.user_id);
+    observations.push(buildRolloutObservation({
+      probeName: 'old-worker-new-authority',
+      requestGatewayVersionId: probeRequest.baseline_gateway_version_id,
+      observedGatewayVersionId: baselineWhoAmI.observed_gateway_version_id,
+      authorityVersionId: postBaselineUserIdentity.worker_version_id,
+      authorityKind: 'UserDO',
+      authorityKey: candidateUser.user_id,
+      requestPath: '/_matrix/client/v3/account/whoami',
+    }));
+
+    const baselineRoomState = await fetchGatewayWithVersionOverride(env, gatewayConfig, {
+      versionId: probeRequest.baseline_gateway_version_id,
+      pathname: `/_matrix/client/v3/rooms/${encodeURIComponent(candidateRoom.room_id)}/state`,
+      accessToken: candidateUser.access_token,
+    });
+    if (baselineRoomState.response.status !== 200) {
+      throw createOpsPreconditionError(`Baseline-targeted room state probe failed: ${JSON.stringify(baselineRoomState.payload)}`);
+    }
+    const postBaselineRoomIdentity = await inspectRoomAuthority(env, candidateRoom.room_id);
+    observations.push(buildRolloutObservation({
+      probeName: 'old-worker-new-authority',
+      requestGatewayVersionId: probeRequest.baseline_gateway_version_id,
+      observedGatewayVersionId: baselineRoomState.observed_gateway_version_id,
+      authorityVersionId: postBaselineRoomIdentity.worker_version_id,
+      authorityKind: 'RoomDO',
+      authorityKey: candidateRoom.room_id,
+      requestPath: `/_matrix/client/v3/rooms/${candidateRoom.room_id}/state`,
+    }));
+
+    const assertions = evaluateRolloutAssertions(observations, {
+      baselineGatewayVersionId: probeRequest.baseline_gateway_version_id,
+      candidateGatewayVersionId: probeRequest.candidate_gateway_version_id,
+    });
+
+    return jsonResponse(normalizeRolloutSkewProbeResponse({
+      environment_name: config.environmentName,
+      probe_run_id: probeRequest.probe_run_id,
+      dual_version_deployment_id: probeRequest.dual_version_deployment_id,
+      baseline_gateway_version_id: probeRequest.baseline_gateway_version_id,
+      candidate_gateway_version_id: probeRequest.candidate_gateway_version_id,
+      override_strategy: 'cloudflare-version-overrides',
+      observations,
+      assertions,
+    }));
+  } catch (error) {
+    return opsErrorResponse({
+      requestId: requestContext.requestId,
+      code: stableString(error?.code) || 'validation_failed',
+      message: error?.message ?? 'Rollout skew probe failed',
+      retryable: error?.retryable === true,
+    });
+  }
 }
 
 async function handleAppserviceList(request, env, config, requestContext, persistence) {
@@ -389,6 +940,10 @@ export function createOpsWorkerFetchHandler() {
           request,
           requestBody: parsed,
         });
+      }
+
+      if (info.kind === 'rollout-skew-probe') {
+        return await handleRolloutSkewProbe(request, env, config, requestContext);
       }
 
       if (info.kind === 'jobs-list') {

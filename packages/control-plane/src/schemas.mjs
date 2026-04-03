@@ -100,6 +100,7 @@ export const ROUTE_TEMPLATES = Object.freeze({
   restores: '/_ops/v1/restores',
   rebuilds: '/_ops/v1/rebuilds',
   repairs: '/_ops/v1/repairs',
+  rolloutSkewProbe: '/_ops/v1/rollout-skew/probe',
   jobsList: '/_ops/v1/jobs',
   jobsItem: '/_ops/v1/jobs/{jobId}',
   jobsCancel: '/_ops/v1/jobs/{jobId}/cancel',
@@ -244,6 +245,66 @@ export function normalizeOpsHealthResponse(value) {
       ? {}
       : (assertObject(value.secret_versions, 'secret_versions'), structuredClone(value.secret_versions)),
     dependencies,
+  };
+}
+
+const ROLLOUT_SKEW_PROBE_NAMES = Object.freeze([
+  'new-worker-old-authority',
+  'old-worker-new-authority',
+]);
+
+const ROLLOUT_SKEW_AUTHORITY_KINDS = Object.freeze([
+  'UserDO',
+  'RoomDO',
+]);
+
+export function normalizeRolloutSkewProbeRequest(value) {
+  assertObject(value, 'RolloutSkewProbeRequest');
+  const normalized = {
+    probe_run_id: normalizeString(value.probe_run_id, 'probe_run_id'),
+    baseline_gateway_version_id: normalizeString(value.baseline_gateway_version_id, 'baseline_gateway_version_id'),
+    candidate_gateway_version_id: normalizeString(value.candidate_gateway_version_id, 'candidate_gateway_version_id'),
+    dual_version_deployment_id: normalizeString(value.dual_version_deployment_id, 'dual_version_deployment_id'),
+    authority_kind: normalizeEnum(value.authority_kind, 'authority_kind', ['matrix-core']),
+    seed_prefix: normalizeString(value.seed_prefix, 'seed_prefix'),
+  };
+  if (normalized.baseline_gateway_version_id === normalized.candidate_gateway_version_id) {
+    throw new RangeError('candidate_gateway_version_id must differ from baseline_gateway_version_id');
+  }
+  return normalized;
+}
+
+export function normalizeRolloutSkewObservation(value, label = 'RolloutSkewObservation') {
+  assertObject(value, label);
+  return {
+    probe_name: normalizeEnum(value.probe_name, `${label}.probe_name`, ROLLOUT_SKEW_PROBE_NAMES),
+    request_gateway_version_id: normalizeString(value.request_gateway_version_id, `${label}.request_gateway_version_id`),
+    observed_gateway_version_id: normalizeString(value.observed_gateway_version_id, `${label}.observed_gateway_version_id`),
+    observed_authority_version_id: normalizeString(value.observed_authority_version_id, `${label}.observed_authority_version_id`),
+    authority_kind: normalizeEnum(value.authority_kind, `${label}.authority_kind`, ROLLOUT_SKEW_AUTHORITY_KINDS),
+    authority_key: normalizeString(value.authority_key, `${label}.authority_key`),
+    request_path: normalizeString(value.request_path, `${label}.request_path`),
+    observed_at: normalizeString(value.observed_at, `${label}.observed_at`),
+  };
+}
+
+export function normalizeRolloutSkewProbeResponse(value) {
+  assertObject(value, 'RolloutSkewProbeResponse');
+  const observations = (value.observations ?? []).map((entry, index) => normalizeRolloutSkewObservation(entry, `observations[${index}]`));
+  assertObject(value.assertions, 'assertions');
+  const assertions = {
+    new_worker_old_authority: normalizeBoolean(value.assertions.new_worker_old_authority, 'assertions.new_worker_old_authority'),
+    old_worker_new_authority: normalizeBoolean(value.assertions.old_worker_new_authority, 'assertions.old_worker_new_authority'),
+  };
+  return {
+    environment_name: normalizeString(value.environment_name, 'environment_name'),
+    probe_run_id: normalizeString(value.probe_run_id, 'probe_run_id'),
+    dual_version_deployment_id: normalizeString(value.dual_version_deployment_id, 'dual_version_deployment_id'),
+    baseline_gateway_version_id: normalizeString(value.baseline_gateway_version_id, 'baseline_gateway_version_id'),
+    candidate_gateway_version_id: normalizeString(value.candidate_gateway_version_id, 'candidate_gateway_version_id'),
+    override_strategy: normalizeString(value.override_strategy, 'override_strategy'),
+    observations,
+    assertions,
   };
 }
 

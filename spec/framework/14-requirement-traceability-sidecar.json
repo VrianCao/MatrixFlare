@@ -219,9 +219,9 @@
     },
     "REQ-OPS-003": {
       "runtime_owners": ["gateway-worker", "jobs-worker", "ops-worker"],
-      "if_ids": ["IF-OPS-001", "IF-OPS-006"],
-      "data_ids": ["DATA-OPS-004", "DATA-D1-006"],
-      "flow_state_ids": ["FLOW-OPS-JOB-CONTROL"],
+      "if_ids": ["IF-OPS-001", "IF-OPS-006", "IF-OPS-010"],
+      "data_ids": ["DATA-OPS-004", "DATA-D1-006", "DATA-OPS-013"],
+      "flow_state_ids": ["FLOW-OPS-JOB-CONTROL", "FLOW-OPS-COST-OBSERVATION", "STATE-COST-OBSERVATION"],
       "test_ids": ["TEST-COST-001"],
       "evid_ids": ["EVID-COST-001"]
     },
@@ -243,25 +243,25 @@
     },
     "REQ-OPS-010": {
       "runtime_owners": ["ops-worker", "jobs-worker"],
-      "if_ids": ["IF-OPS-001", "IF-INT-WKR-002", "IF-INT-WKR-003"],
-      "data_ids": ["DATA-OPS-001", "DATA-OPS-004"],
-      "flow_state_ids": ["FLOW-OPS-JOB-CONTROL"],
+      "if_ids": ["IF-OPS-001", "IF-OPS-009", "IF-INT-WKR-002", "IF-INT-WKR-003"],
+      "data_ids": ["DATA-OPS-001", "DATA-OPS-004", "DATA-OPS-012"],
+      "flow_state_ids": ["FLOW-OPS-JOB-CONTROL", "FLOW-OPS-ROLLOUT-SKEW", "STATE-ROLLOUT-SKEW-PROBE"],
       "test_ids": ["TEST-OPS-001"],
       "evid_ids": ["EVID-OPS-001"]
     },
     "REQ-OPS-011": {
       "runtime_owners": ["gateway-worker", "jobs-worker", "ops-worker", "UserDO", "RoomDO", "RemoteServerDO"],
-      "if_ids": ["IF-INT-USER-001", "IF-INT-ROOM-001", "IF-INT-WKR-002"],
-      "data_ids": ["DATA-OPS-001", "DATA-USER-017", "DATA-ROOM-001"],
-      "flow_state_ids": ["FLOW-OPS-JOB-CONTROL"],
+      "if_ids": ["IF-OPS-009", "IF-INT-USER-001", "IF-INT-ROOM-001", "IF-INT-WKR-002"],
+      "data_ids": ["DATA-OPS-001", "DATA-OPS-012", "DATA-USER-017", "DATA-ROOM-001"],
+      "flow_state_ids": ["FLOW-OPS-JOB-CONTROL", "FLOW-OPS-ROLLOUT-SKEW", "STATE-ROLLOUT-SKEW-PROBE"],
       "test_ids": ["TEST-OPS-001"],
       "evid_ids": ["EVID-OPS-001"]
     },
     "REQ-OPS-012": {
       "runtime_owners": ["ops-worker", "jobs-worker"],
-      "if_ids": ["IF-OPS-004", "IF-OPS-005", "IF-INT-WKR-002"],
-      "data_ids": ["DATA-OPS-001", "DATA-OPS-002", "DATA-OPS-003"],
-      "flow_state_ids": ["FLOW-REPLAY-REBUILD", "FLOW-OPS-JOB-CONTROL"],
+      "if_ids": ["IF-OPS-004", "IF-OPS-005", "IF-OPS-009", "IF-INT-WKR-002"],
+      "data_ids": ["DATA-OPS-001", "DATA-OPS-002", "DATA-OPS-003", "DATA-OPS-012"],
+      "flow_state_ids": ["FLOW-REPLAY-REBUILD", "FLOW-OPS-JOB-CONTROL", "FLOW-OPS-ROLLOUT-SKEW", "STATE-ROLLOUT-SKEW-PROBE"],
       "test_ids": ["TEST-OPS-001", "TEST-OPS-002"],
       "evid_ids": ["EVID-OPS-001", "EVID-OPS-002"]
     },

@@ -18,6 +18,7 @@ import {
   parseLegacyUnauthFreezeAt,
   recordCostAttribution,
   resolveWorkerResourceBindingNames,
+  resolveRuntimeWorkerVersionId,
   resolveThumbnailAnimationPreference,
   RUNTIME_JOB_SCHEMA_VERSION,
   setGaugeMetric,
@@ -420,13 +421,14 @@ const fetch = async (request, env) => {
     workerName: 'jobs-worker',
     config,
   });
+  const observedWorkerVersionId = resolveRuntimeWorkerVersionId(env, config.text.WORKER_VERSION_ID);
   const pathname = new URL(request.url).pathname;
   const routeFamily = pathname === INTERNAL_RUNTIME_DERIVED_WORK_PATH
     ? 'runtime-derived'
     : 'jobs-control-plane';
   const requestMetrics = startRequestMetrics(env, {
     workerName: 'jobs-worker',
-    workerVersion: config.text.WORKER_VERSION_ID,
+    workerVersion: observedWorkerVersionId,
     routeFamily,
   });
   try {
@@ -453,10 +455,11 @@ const queue = async (batch, env) => {
     workerName: 'jobs-worker',
     config,
   });
+  const observedWorkerVersionId = resolveRuntimeWorkerVersionId(env, config.text.WORKER_VERSION_ID);
   const routeFamily = `queue:${batch.queue}`;
   const requestMetrics = startRequestMetrics(env, {
     workerName: 'jobs-worker',
-    workerVersion: config.text.WORKER_VERSION_ID,
+    workerVersion: observedWorkerVersionId,
     routeFamily,
   });
   const instrumentedBatch = instrumentQueueBatch(batch, env);

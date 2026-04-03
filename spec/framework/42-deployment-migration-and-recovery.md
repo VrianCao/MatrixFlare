@@ -136,6 +136,17 @@ DO 内部 SQLite schema 演进规则：
 * federation 请求建议按 `server_name` 稳定选路；
 * 目标是减少同一用户或同一远端服务器在 rollout 期间的版本抖动。
 
+### 7.3 Pre-release Rollout-Skew Gate Contract
+
+* `TEST-OPS-001` 的 pre-release gate 必须以 Cloudflare Worker versions/deployments 为基础，而不是把单 deployment smoke、`/_ops/v1/healthz` 或 active deployment identity revalidation 误写成 skew proof。
+* 对不含 DO migration 的 skew gate，pre-release harness 必须先记录 baseline gateway deployment/version，再使用 `wrangler versions upload` 上传 candidate gateway version，并创建一个同时包含 baseline + candidate 的 dual-version deployment；为减少 incidental public traffic，首版可以使用 `baseline=100%`、`candidate=0%` 的 deployment composition，再用显式 version targeting 命中两侧。
+* 当前官方 `version_metadata` runtime binding 只暴露 Worker version ID/tag/timestamp，不暴露 deployment ID；因此 `IF-OPS-009` 不得在 worker 内伪造 dual-version deployment ID，也不得为了读取该 ID 把 Cloudflare account API token 下放进 worker。GitHub Actions rollout harness 必须在 `versions deploy` 后回读 active dual-version deployment ID，并把它作为 probe request 的显式输入传给 `ops-worker`。
+* skew proof 必须对至少两组 probe-owned authority identities 分别完成：
+  * baseline-targeted seed 后，再由 candidate-targeted request 观测 `new Worker -> old DO`；
+  * candidate-targeted seed 后，再由 baseline-targeted request 观测 `old Worker -> new DO`。
+* 上述观测必须导出为 `RolloutSkewProbeResponse`，并随同 pre-release `EnvironmentRunReport` attestation 化；缺少 dual-version deployment ID、baseline/candidate version IDs、或任一 pairing assertion 时必须 fail-closed。
+* skew gate 完成后必须在 `finally` / `always()` 路径请求恢复 baseline deployment；恢复失败同样必须使该次 pre-release gate 失败，不得把“probe 成功但环境未恢复”记为 pass。
+
 ## 8. Secret Rotation and Deploy Coupling
 
 * secret 变更本质上是新的 Worker version。引用：`CF-WKR-014`。
