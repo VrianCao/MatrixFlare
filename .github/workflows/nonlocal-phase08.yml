@@ -192,16 +192,17 @@ jobs:
         if: always()
         shell: bash
         run: |
+          bundle_tmp="${{ steps.paths.outputs.state_root }}/run-bundle.tgz"
           if [ -f "${{ steps.paths.outputs.rollout_state }}" ]; then
             cp "${{ steps.paths.outputs.rollout_state }}" "${{ steps.paths.outputs.artifact_root }}/rollout-state.json"
           fi
           if [ -f "${{ steps.paths.outputs.rollout_restore }}" ]; then
             cp "${{ steps.paths.outputs.rollout_restore }}" "${{ steps.paths.outputs.artifact_root }}/rollout-restore.json"
           fi
-          tar -czf "${{ steps.paths.outputs.artifact_root }}/run-bundle.tgz" \
-            --exclude='./run-bundle.tgz' \
+          tar -czf "$bundle_tmp" \
             -C "${{ steps.paths.outputs.artifact_root }}" \
             .
+          mv "$bundle_tmp" "${{ steps.paths.outputs.artifact_root }}/run-bundle.tgz"
 
       - name: Upload raw workflow artifacts
         if: always()
@@ -232,11 +233,21 @@ jobs:
 
       - name: Upload suite log to R2
         if: always()
+        shell: bash
         run: |
+          log_path="${{ steps.paths.outputs.artifact_root }}/${{ matrix.environment }}.log"
+          if [ ! -f "$log_path" ]; then
+            if [ "${{ steps.suite.outcome }}" = "success" ]; then
+              echo "Missing suite log for successful suite in ${{ matrix.environment }}" >&2
+              exit 1
+            fi
+            echo "Suite log missing because suite did not complete; skipping R2 log upload for ${{ matrix.environment }}" >&2
+            exit 0
+          fi
           node packages/testing/src/cli.mjs nonlocal-upload-r2 \
             --bucket "matrix-evidence-${{ matrix.environment }}" \
             --key "${{ steps.paths.outputs.log_key }}" \
-            --file "${{ steps.paths.outputs.artifact_root }}/${{ matrix.environment }}.log" \
+            --file "$log_path" \
             --content-type "text/plain; charset=utf-8" \
             --output "${{ steps.paths.outputs.log_upload }}"
 

@@ -2136,4 +2136,30 @@ test('nonlocal workflow keeps pre-release restore failures from generating or up
     /if \[ "\$\{\{ steps\.environment_gate\.outcome \}\}" != "success" \]; then\n\s+echo "Pre-attestation environment gate did not pass for \$\{\{ matrix\.environment \}\}" >&2\n\s+exit 1\n/s,
     'final gate must fail closed when the pre-attestation environment gate fails',
   );
+  assert.match(
+    workflow,
+    /bundle_tmp="\$\{\{ steps\.paths\.outputs\.state_root \}\}\/run-bundle\.tgz"\n[\s\S]*?tar -czf "\$bundle_tmp"\s+\\\n[\s\S]*?mv "\$bundle_tmp" "\$\{\{ steps\.paths\.outputs\.artifact_root \}\}\/run-bundle\.tgz"/s,
+    'workflow must build raw bundles outside the source directory before moving them into artifact storage',
+  );
+  assert.match(
+    workflow,
+    /if \[ ! -f "\$log_path" \]; then\n\s+if \[ "\$\{\{ steps\.suite\.outcome \}\}" = "success" \]; then\n\s+echo "Missing suite log for successful suite in \$\{\{ matrix\.environment \}\}" >&2\n\s+exit 1\n\s+fi\n\s+echo "Suite log missing because suite did not complete; skipping R2 log upload for \$\{\{ matrix\.environment \}\}" >&2\n\s+exit 0\n\s+fi/s,
+    'workflow must only tolerate missing suite logs when the environment-backed suite did not complete',
+  );
+});
+
+test('pre-release rollout start uses the in-module slug helper instead of an undefined filename sanitizer', async () => {
+  const nonlocalModulePath = new URL('../../../packages/testing/src/nonlocal.mjs', import.meta.url);
+  const source = await fs.readFile(nonlocalModulePath, 'utf8');
+
+  assert.match(
+    source,
+    /const probeRunId = slugifyLabel\(`rollout-\$\{resolvedDeploymentId\}`\);\n\s+const seedPrefix = slugifyLabel\(`probe-\$\{resolvedDeploymentId\}`\)\.slice\(0, 48\);/,
+    'rollout start must derive probe identifiers from the defined slugifyLabel helper',
+  );
+  assert.doesNotMatch(
+    source,
+    /sanitizeFileName\(/,
+    'nonlocal rollout code must not reference an undefined filename sanitizer helper',
+  );
 });

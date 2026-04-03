@@ -3254,8 +3254,8 @@ export async function startPreReleaseGatewayRollout(environmentName, {
   const resolvedWorkingRoot = path.resolve(workingRoot ?? path.join(repoRoot, '.tmp', 'nonlocal-rollout', normalizedEnvironmentName));
   await fs.mkdir(resolvedWorkingRoot, { recursive: true });
   const resolvedDeploymentId = deploymentId ?? `gha-${normalizedEnvironmentName}-rollout-${Date.now().toString(36)}`;
-  const probeRunId = sanitizeFileName(`rollout-${resolvedDeploymentId}`);
-  const seedPrefix = sanitizeFileName(`probe-${resolvedDeploymentId}`).slice(0, 48);
+  const probeRunId = slugifyLabel(`rollout-${resolvedDeploymentId}`);
+  const seedPrefix = slugifyLabel(`probe-${resolvedDeploymentId}`).slice(0, 48);
   const candidate = await uploadWorkerVersion('gateway-worker', provisionedEnvironment, {
     repoRoot,
     deploymentSummary,
