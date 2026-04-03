@@ -1569,7 +1569,7 @@ test('runEnvironmentBackedSuite injects the prepared Access session into the chi
   }
 });
 
-test('runEnvironmentBackedSuite serializes pre-release node tests, revalidates against the dual-version deployment, and captures the attested sidecar', async () => {
+test('runEnvironmentBackedSuite serializes pre-release node tests, validates rollout-scoped deployment identity before readiness and before suite, and captures the attested sidecar', async () => {
   const repoRoot = path.resolve('.');
   const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-nonlocal-suite-rollout-'));
   const deploymentSummary = buildDeploymentSummaryFixture('pre-release');
@@ -1648,7 +1648,7 @@ test('runEnvironmentBackedSuite serializes pre-release node tests, revalidates a
       '--test-concurrency=1',
       path.join(repoRoot, 'tests/pre-release/test-ops-001.test.mjs'),
     ]);
-    assert.deepEqual(validatedGatewayDeploymentIds, ['dep-gateway', 'dual-deployment-1']);
+    assert.deepEqual(validatedGatewayDeploymentIds, ['dual-deployment-1', 'dual-deployment-1']);
     assert.equal(result.ok, true);
     assert.equal(result.report.status, 'pass');
     assert.equal(result.report.exit_code, 0);

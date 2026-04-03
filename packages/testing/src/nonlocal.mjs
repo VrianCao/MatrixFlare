@@ -3613,10 +3613,11 @@ export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
       throw new TypeError('rolloutState must be the pre-release rollout payload');
     }
   }
+  const validationDeploymentSummary = buildSuiteDeploymentSummaryForValidation(deploymentSummary, rolloutState);
   const suiteArtifacts = buildSuiteRunArtifactPaths(outputRoot, normalizedEnvironmentName);
   await fs.mkdir(suiteArtifacts.output_directory, { recursive: true });
   const deploymentIdentityValidation = {
-    before_readiness: await validateDeploymentSummaryAgainstCurrentCloudflareStateImpl(deploymentSummary, {
+    before_readiness: await validateDeploymentSummaryAgainstCurrentCloudflareStateImpl(validationDeploymentSummary, {
       accountId,
       apiToken,
     }),
@@ -3642,8 +3643,7 @@ export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
   const combinedChunks = [Buffer.from(`${readinessLogText}\n`, 'utf8')];
   let exitCode = 1;
   if (readinessProbe.ready) {
-    const suiteValidationDeploymentSummary = buildSuiteDeploymentSummaryForValidation(deploymentSummary, rolloutState);
-    deploymentIdentityValidation.before_suite = await validateDeploymentSummaryAgainstCurrentCloudflareStateImpl(suiteValidationDeploymentSummary, {
+    deploymentIdentityValidation.before_suite = await validateDeploymentSummaryAgainstCurrentCloudflareStateImpl(validationDeploymentSummary, {
       accountId,
       apiToken,
     });

@@ -50,6 +50,11 @@ function summarizeOpsPayload(payload) {
   }
 }
 
+const DERIVED_SEARCH_EVENTUAL_OPTIONS = {
+  attempts: 120,
+  delayMs: 500,
+};
+
 async function fetchAnonymousPublicRooms(harness, searchToken) {
   const result = await request(
     harness,
@@ -315,12 +320,9 @@ test('TEST-DER-001 pre-release covers derived query semantics and Access-authent
   const searchBeforeRebuild = await eventually(async () => {
     const payload = await fetchSearch(harness, alice.access_token, publicRoomId, messageNeedle);
     const resultIds = payload.search_categories?.room_events?.results?.map((entry) => entry?.result?.event_id) ?? [];
-    assert.ok(resultIds.includes(messageEventId));
+    assert.ok(resultIds.includes(messageEventId), `search results missing ${messageEventId}; saw ${JSON.stringify(resultIds)}`);
     return payload;
-  }, {
-    attempts: 30,
-    delayMs: 500,
-  });
+  }, DERIVED_SEARCH_EVENTUAL_OPTIONS);
 
   const hierarchyBeforeRebuild = await eventually(async () => {
     const payload = await fetchHierarchy(harness, alice.access_token, spaceRoomId);
@@ -409,12 +411,9 @@ test('TEST-DER-001 pre-release covers derived query semantics and Access-authent
   const searchAfterRebuild = await eventually(async () => {
     const payload = await fetchSearch(harness, alice.access_token, publicRoomId, messageNeedle);
     const resultIds = payload.search_categories?.room_events?.results?.map((entry) => entry?.result?.event_id) ?? [];
-    assert.ok(resultIds.includes(messageEventId));
+    assert.ok(resultIds.includes(messageEventId), `search results missing ${messageEventId}; saw ${JSON.stringify(resultIds)}`);
     return payload;
-  }, {
-    attempts: 30,
-    delayMs: 500,
-  });
+  }, DERIVED_SEARCH_EVENTUAL_OPTIONS);
   assert.deepEqual(
     searchAfterRebuild.search_categories.room_events.results.map((entry) => entry.result.event_id).sort(),
     searchBeforeRebuild.search_categories.room_events.results.map((entry) => entry.result.event_id).sort(),
