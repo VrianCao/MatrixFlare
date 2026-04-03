@@ -3522,6 +3522,21 @@ function buildSuiteRolloutEnvironmentVariables(rolloutState) {
   };
 }
 
+function buildSuiteDeploymentSummaryForValidation(deploymentSummary, rolloutState) {
+  if (rolloutState == null) {
+    return deploymentSummary;
+  }
+  const suiteDeploymentSummary = structuredCloneJson(deploymentSummary);
+  if (!isPlainObject(suiteDeploymentSummary.workers?.['gateway-worker'])) {
+    throw new TypeError('deployment summary workers.gateway-worker must be present');
+  }
+  suiteDeploymentSummary.workers['gateway-worker'] = {
+    ...suiteDeploymentSummary.workers['gateway-worker'],
+    deployment_id: rolloutState.dual_version_deployment_id,
+  };
+  return suiteDeploymentSummary;
+}
+
 async function readOptionalJsonArtifact(filePath) {
   try {
     const raw = await fs.readFile(filePath, 'utf8');
@@ -3618,7 +3633,7 @@ export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
   const files = await getRequiredTestFilesImpl(normalizedEnvironmentName, repoRoot);
   const startedAt = new Date().toISOString();
   const startedMs = Date.now();
-  const commandArgs = ['--test', ...files];
+  const commandArgs = ['--test', '--test-concurrency=1', ...files];
   const readinessProbe = await waitForNonLocalDeploymentReadinessImpl(
     normalizedEnvironmentName,
     remoteHarnessEnv,
@@ -3627,7 +3642,8 @@ export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
   const combinedChunks = [Buffer.from(`${readinessLogText}\n`, 'utf8')];
   let exitCode = 1;
   if (readinessProbe.ready) {
-    deploymentIdentityValidation.before_suite = await validateDeploymentSummaryAgainstCurrentCloudflareStateImpl(deploymentSummary, {
+    const suiteValidationDeploymentSummary = buildSuiteDeploymentSummaryForValidation(deploymentSummary, rolloutState);
+    deploymentIdentityValidation.before_suite = await validateDeploymentSummaryAgainstCurrentCloudflareStateImpl(suiteValidationDeploymentSummary, {
       accountId,
       apiToken,
     });

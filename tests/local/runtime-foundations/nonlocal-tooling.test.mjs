@@ -1569,7 +1569,7 @@ test('runEnvironmentBackedSuite injects the prepared Access session into the chi
   }
 });
 
-test('runEnvironmentBackedSuite injects rollout skew metadata and captures the attested sidecar for pre-release', async () => {
+test('runEnvironmentBackedSuite serializes pre-release node tests, revalidates against the dual-version deployment, and captures the attested sidecar', async () => {
   const repoRoot = path.resolve('.');
   const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-nonlocal-suite-rollout-'));
   const deploymentSummary = buildDeploymentSummaryFixture('pre-release');
@@ -1577,6 +1577,8 @@ test('runEnvironmentBackedSuite injects rollout skew metadata and captures the a
     protected_ops_url: 'https://matrix-ops-worker-pre-release.matrixflare.workers.dev',
   };
   let capturedEnv = null;
+  let capturedArgs = null;
+  const validatedGatewayDeploymentIds = [];
 
   try {
     const result = await runEnvironmentBackedSuite('pre-release', repoRoot, {
@@ -1611,15 +1613,17 @@ test('runEnvironmentBackedSuite injects rollout skew metadata and captures the a
       }),
       requireCloudflareCredentialsImpl: () => ({ accountId: 'cf-account', apiToken: 'cf-token' }),
       readWorkersSubdomainImpl: async () => 'matrixflare',
-      validateDeploymentSummaryAgainstCurrentCloudflareStateImpl: async () => (
-        buildDeploymentIdentityValidationFixture('pre-release')
-      ),
+      validateDeploymentSummaryAgainstCurrentCloudflareStateImpl: async (summary) => {
+        validatedGatewayDeploymentIds.push(summary.workers['gateway-worker'].deployment_id);
+        return buildDeploymentIdentityValidationFixture('pre-release');
+      },
       getRequiredTestFilesImpl: async () => [path.join(repoRoot, 'tests/pre-release/test-ops-001.test.mjs')],
       waitForNonLocalDeploymentReadinessImpl: async () => buildReadinessProbeFixture('pre-release'),
-      spawnImpl: (_command, _args, options) => {
+      spawnImpl: (_command, args, options) => {
         const child = new EventEmitter();
         child.stdout = new EventEmitter();
         child.stderr = new EventEmitter();
+        capturedArgs = args;
         capturedEnv = options?.env ?? null;
         queueMicrotask(async () => {
           await fs.writeFile(
@@ -1639,6 +1643,12 @@ test('runEnvironmentBackedSuite injects rollout skew metadata and captures the a
     assert.equal(capturedEnv.MATRIX_ROLLOUT_BASELINE_GATEWAY_VERSION_ID, 'gateway-baseline-v1');
     assert.equal(capturedEnv.MATRIX_ROLLOUT_CANDIDATE_GATEWAY_VERSION_ID, 'gateway-candidate-v2');
     assert.equal(capturedEnv.MATRIX_ROLLOUT_DUAL_VERSION_DEPLOYMENT_ID, 'dual-deployment-1');
+    assert.deepEqual(capturedArgs, [
+      '--test',
+      '--test-concurrency=1',
+      path.join(repoRoot, 'tests/pre-release/test-ops-001.test.mjs'),
+    ]);
+    assert.deepEqual(validatedGatewayDeploymentIds, ['dep-gateway', 'dual-deployment-1']);
     assert.equal(result.ok, true);
     assert.equal(result.report.status, 'pass');
     assert.equal(result.report.exit_code, 0);
