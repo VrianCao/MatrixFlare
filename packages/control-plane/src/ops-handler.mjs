@@ -250,6 +250,7 @@ async function fetchGatewayWithVersionOverride(env, gatewayConfig, {
   method = 'GET',
   accessToken = null,
   json = undefined,
+  requireObservedGatewayVersionId = true,
 } = {}) {
   const headers = new Headers();
   headers.set('Cloudflare-Workers-Version-Overrides', buildVersionOverrideHeader(gatewayConfig.script_name, versionId));
@@ -267,10 +268,10 @@ async function fetchGatewayWithVersionOverride(env, gatewayConfig, {
   });
   const payload = await readGatewayPayload(response);
   const observedGatewayVersionId = stableString(response.headers.get(ROLLOUT_PROBE_GATEWAY_VERSION_ID_HEADER));
-  if (observedGatewayVersionId.length === 0) {
+  if (observedGatewayVersionId.length === 0 && requireObservedGatewayVersionId) {
     throw createOpsPreconditionError(`Gateway response for ${pathname} did not include ${ROLLOUT_PROBE_GATEWAY_VERSION_ID_HEADER}`);
   }
-  if (observedGatewayVersionId !== versionId) {
+  if (observedGatewayVersionId.length > 0 && observedGatewayVersionId !== versionId) {
     throw createOpsPreconditionError(
       `Gateway version override mismatch for ${pathname}: requested ${versionId}, observed ${observedGatewayVersionId}`,
     );
@@ -332,6 +333,7 @@ async function loginProbeUser(env, gatewayConfig, {
     versionId: gatewayVersionId,
     pathname: '/_matrix/client/v3/login',
     method: 'POST',
+    requireObservedGatewayVersionId: false,
     json: {
       type: 'm.login.password',
       identifier: {
@@ -371,6 +373,7 @@ async function ensureProbeUser(env, gatewayConfig, probeRequest, {
     versionId: gatewayVersionId,
     pathname: '/_matrix/client/v3/register',
     method: 'POST',
+    requireObservedGatewayVersionId: false,
     json: {
       username,
       password,
@@ -382,6 +385,7 @@ async function ensureProbeUser(env, gatewayConfig, probeRequest, {
       versionId: gatewayVersionId,
       pathname: '/_matrix/client/v3/register',
       method: 'POST',
+      requireObservedGatewayVersionId: false,
       json: {
         username,
         password,
@@ -426,6 +430,7 @@ async function ensureProbeRoom(env, gatewayConfig, probeRequest, {
     pathname: '/_matrix/client/v3/createRoom',
     method: 'POST',
     accessToken,
+    requireObservedGatewayVersionId: false,
     json: {
       visibility: 'public',
       preset: 'public_chat',
@@ -444,6 +449,7 @@ async function ensureProbeRoom(env, gatewayConfig, probeRequest, {
     pathname: `/_matrix/client/v3/join/${encodeURIComponent(roomAlias)}`,
     method: 'POST',
     accessToken,
+    requireObservedGatewayVersionId: false,
     json: {},
   });
   if (joined.response.status !== 200 || typeof joined.payload?.room_id !== 'string') {
