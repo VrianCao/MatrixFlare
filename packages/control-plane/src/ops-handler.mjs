@@ -143,16 +143,51 @@ function stableString(value) {
   return typeof value === 'string' ? value.trim() : '';
 }
 
-function sanitizeProbeToken(value, {
+function normalizeProbeToken(value, {
   fallback = 'probe',
-  maxLength = 48,
 } = {}) {
   const normalized = String(value)
     .toLowerCase()
     .replace(/[^a-z0-9._=-]+/g, '-')
     .replace(/^-+|-+$/g, '');
-  const resolved = normalized.length > 0 ? normalized : fallback;
+  return normalized.length > 0 ? normalized : fallback;
+}
+
+function sanitizeProbeToken(value, {
+  fallback = 'probe',
+  maxLength = 48,
+} = {}) {
+  const resolved = normalizeProbeToken(value, {
+    fallback,
+  });
   return resolved.slice(0, Math.max(1, maxLength));
+}
+
+function buildProbeScopedToken(baseLabel, uniqueScope, {
+  fallback = 'probe',
+  maxLength = 48,
+  uniqueTailLength = 8,
+} = {}) {
+  const resolvedMaxLength = Math.max(1, maxLength);
+  const baseToken = sanitizeProbeToken(baseLabel, {
+    fallback,
+    maxLength: resolvedMaxLength,
+  });
+  const compactScopeToken = normalizeProbeToken(uniqueScope, {
+    fallback: 'scope',
+  }).replace(/[^a-z0-9]+/g, '');
+  if (compactScopeToken.length === 0 || resolvedMaxLength <= 1) {
+    return baseToken.slice(0, resolvedMaxLength);
+  }
+  const suffixLength = Math.min(
+    Math.max(1, uniqueTailLength),
+    compactScopeToken.length,
+    Math.max(1, resolvedMaxLength - 2),
+  );
+  const suffix = compactScopeToken.slice(-suffixLength);
+  const prefixBudget = Math.max(0, resolvedMaxLength - 1 - suffix.length);
+  const prefix = prefixBudget > 0 ? baseToken.slice(0, prefixBudget) : '';
+  return prefix.length > 0 ? `${prefix}-${suffix}` : suffix;
 }
 
 function sanitizeDeviceId(value) {
@@ -360,9 +395,10 @@ async function ensureProbeUser(env, gatewayConfig, probeRequest, {
   userLabel,
   gatewayVersionId,
 } = {}) {
-  const username = sanitizeProbeToken(`${userLabel}-${probeRequest.seed_prefix}`, {
+  const username = buildProbeScopedToken(userLabel, `${probeRequest.seed_prefix}-${probeRequest.probe_run_id}`, {
     fallback: userLabel,
     maxLength: 32,
+    uniqueTailLength: 8,
   });
   const password = sanitizeProbeToken(`${probeRequest.probe_run_id}${PROBE_PASSWORD_SUFFIX}`, {
     fallback: 'phase08-rollout-password',
@@ -420,9 +456,10 @@ async function ensureProbeRoom(env, gatewayConfig, probeRequest, {
   accessToken,
   serverName,
 } = {}) {
-  const aliasLocalpart = sanitizeProbeToken(`${roomLabel}-${probeRequest.seed_prefix}`, {
+  const aliasLocalpart = buildProbeScopedToken(roomLabel, `${probeRequest.seed_prefix}-${probeRequest.probe_run_id}`, {
     fallback: roomLabel,
     maxLength: 48,
+    uniqueTailLength: 12,
   });
   const roomAlias = `#${aliasLocalpart}:${serverName}`;
   const created = await fetchGatewayWithVersionOverride(env, gatewayConfig, {
