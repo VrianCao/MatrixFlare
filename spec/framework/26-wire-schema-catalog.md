@@ -487,9 +487,10 @@
 | Field | Type | Rule |
 | --- | --- | --- |
 | `origin_system` | string | 非空；产出 attestation 的 workflow / capture system 名称 |
+| `origin_repository` | string | 非空；GitHub `owner/repo` slug。对 Phase 08 GitHub Actions provenance，它必须与 `origin_run_uri` 中编码的 repository 一致 |
 | `origin_run_id` | string | 非空；workflow / capture run ID |
 | `origin_run_attempt` | integer | 正整数；同一 run 的重试序号 |
-| `origin_run_uri` | string | 绝对外部 URI / locator；必须具 authority，或使用格式完整的 `urn:<nid>:<nss>`；不得为裸 `urn:`，且不得为 `about:` / `blob:` / `file:` / `data:` / `javascript:` |
+| `origin_run_uri` | string | 绝对外部 URI / locator；必须具 authority，或使用格式完整的 `urn:<nid>:<nss>`；不得为裸 `urn:`，且不得为 `about:` / `blob:` / `file:` / `data:` / `javascript:`。对 Phase 08 GitHub Actions provenance，它必须等于 `https://github.com/<origin_repository>/actions/runs/<origin_run_id>` |
 | `artifact_store_uri` | string | 绝对外部 URI / locator；必须具 authority，或使用格式完整的 `urn:<nid>:<nss>`；不得为裸 `urn:`，且不得为 `about:` / `blob:` / `file:` / `data:` / `javascript:` |
 | `artifact_store_key` | string | 非空；对象键或等价 immutable locator。对 Phase 08 GitHub Actions + R2 provenance，必须编码为 `gha/<origin_run_id>/<origin_run_attempt>/<source_environment>/<run_timestamp>/...` |
 | `artifact_sha256` | string | 64 字符小写 hex；对应外部原始工件摘要 |

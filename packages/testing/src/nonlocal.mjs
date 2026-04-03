@@ -98,6 +98,8 @@ const NON_LOCAL_READINESS_MAX_ATTEMPTS = 7;
 const NON_LOCAL_READINESS_INITIAL_DELAY_MS = 2_000;
 const NON_LOCAL_READINESS_MAX_DELAY_MS = 15_000;
 const NON_LOCAL_READINESS_REQUEST_TIMEOUT_MS = 10_000;
+const PRE_RELEASE_ROLLOUT_BASELINE_PERCENTAGE = 50;
+const PRE_RELEASE_ROLLOUT_CANDIDATE_PERCENTAGE = 50;
 let githubActionsOidcIdentityPromise = null;
 let githubActionsJwksPromise = null;
 
@@ -3207,6 +3209,28 @@ function buildWranglerVersionsDeployArguments({
   ];
 }
 
+export function buildPreReleaseRolloutVersionSpecs(baselineGatewayVersionId, candidateGatewayVersionId) {
+  if (!isNonEmptyString(baselineGatewayVersionId)) {
+    throw new TypeError('baselineGatewayVersionId must be non-empty');
+  }
+  if (!isNonEmptyString(candidateGatewayVersionId)) {
+    throw new TypeError('candidateGatewayVersionId must be non-empty');
+  }
+  if (baselineGatewayVersionId === candidateGatewayVersionId) {
+    throw new TypeError('candidateGatewayVersionId must differ from baselineGatewayVersionId');
+  }
+  if (PRE_RELEASE_ROLLOUT_BASELINE_PERCENTAGE <= 0 || PRE_RELEASE_ROLLOUT_CANDIDATE_PERCENTAGE <= 0) {
+    throw new Error('pre-release rollout percentages must both be non-zero');
+  }
+  if ((PRE_RELEASE_ROLLOUT_BASELINE_PERCENTAGE + PRE_RELEASE_ROLLOUT_CANDIDATE_PERCENTAGE) !== 100) {
+    throw new Error('pre-release rollout percentages must sum to 100');
+  }
+  return Object.freeze([
+    `${baselineGatewayVersionId}@${PRE_RELEASE_ROLLOUT_BASELINE_PERCENTAGE}`,
+    `${candidateGatewayVersionId}@${PRE_RELEASE_ROLLOUT_CANDIDATE_PERCENTAGE}`,
+  ]);
+}
+
 export async function startPreReleaseGatewayRollout(environmentName, {
   repoRoot = process.cwd(),
   provisionedEnvironment,
@@ -3272,7 +3296,10 @@ export async function startPreReleaseGatewayRollout(environmentName, {
   await runWrangler(buildWranglerVersionsDeployArguments({
     environmentName: normalizedEnvironmentName,
     configPath: candidate.config_path,
-    versionSpecs: [`${baselineGatewayVersionId}@100`, `${candidate.worker_version_id}@0`],
+    versionSpecs: buildPreReleaseRolloutVersionSpecs(
+      baselineGatewayVersionId,
+      candidate.worker_version_id,
+    ),
     message: `${resolvedDeploymentId}:gateway-rollout-start`,
   }), {
     repoRoot,
@@ -3463,6 +3490,7 @@ export function buildEnvironmentRunProvenance({
   const originRunUri = buildGitHubRunUrl(githubRepository, githubRunId);
   const provenance = {
     origin_system: 'github-actions',
+    origin_repository: String(githubRepository),
     origin_run_id: String(githubRunId),
     origin_run_attempt: Number(githubRunAttempt),
     origin_run_uri: originRunUri,

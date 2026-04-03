@@ -367,6 +367,7 @@ function buildValidEnvironmentAttestation(environmentName, runTimestamp, reportO
   const artifactId = ENVIRONMENT_MANUAL_ARTIFACT_IDS[environmentName];
   const baseProvenance = {
     origin_system: 'github-actions',
+    origin_repository: 'example/matrix',
     origin_run_id: originRunId,
     origin_run_attempt: 1,
     origin_run_uri: originRunUri,
@@ -413,6 +414,7 @@ function buildValidProdCostSnapshotAttestation(runTimestamp, payloadOverrides = 
   const originRunUri = buildGitHubRunUri('prod', runTimestamp);
   const baseProvenance = {
     origin_system: 'github-actions',
+    origin_repository: 'example/matrix',
     origin_run_id: originRunId,
     origin_run_attempt: 1,
     origin_run_uri: originRunUri,
@@ -1723,6 +1725,49 @@ test('manual artifact attestation validation requires immutable provenance plus 
     {
       valid: false,
       error: 'attestation bundle must include RFC 3339 UTC attested_at',
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('staging_run_report', {
+      ...validStagingAttestation,
+      provenance: {
+        ...validStagingAttestation.provenance,
+        origin_repository: '',
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'attestation bundle provenance.origin_repository must be a GitHub owner/repo slug',
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('staging_run_report', {
+      ...validStagingAttestation,
+      provenance: {
+        ...validStagingAttestation.provenance,
+        origin_repository: 'example/other',
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'attestation bundle provenance.origin_repository must match provenance.origin_run_uri',
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('staging_run_report', validStagingAttestation, {
+      runTimestamp,
+      expectedGitHubRepository: 'example/other',
+    }),
+    {
+      valid: false,
+      error: 'attestation bundle provenance.origin_repository must match the current repository',
     },
   );
 
@@ -4335,6 +4380,47 @@ test('manual artifact collection rejects symlinked _test-runs reports even when 
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.match(results[0].validation_error, /external non-local evidence/);
+});
+
+test('manual artifact collection rejects GitHub Actions attestations from another repository when the current repository is known', async () => {
+  const runTimestamp = '20260331T141605Z';
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-testing-harness-foreign-repo-'));
+  const testFile = path.join(tempRoot, 'tests', 'pre-release', 'remote.test.mjs');
+  const externalDir = path.join(tempRoot, 'external');
+  const foreignRunUri = `https://github.com/example/other/actions/runs/${buildGitHubRunId('pre-release', runTimestamp)}`;
+  const reportPath = path.join(externalDir, 'pre-release.json');
+
+  await fs.mkdir(path.dirname(testFile), { recursive: true });
+  await fs.mkdir(externalDir, { recursive: true });
+  await fs.writeFile(testFile, 'export const remote = true;\n');
+  await fs.writeFile(
+    reportPath,
+    JSON.stringify(buildValidEnvironmentAttestation('pre-release', runTimestamp, {
+      source_run_uri: foreignRunUri,
+    }, {
+      provenance: {
+        origin_repository: 'example/other',
+        origin_run_uri: foreignRunUri,
+        review_record_uri: foreignRunUri,
+      },
+    }), null, 2),
+  );
+
+  const results = await collectManualArtifactResults(
+    getL1EvidenceDefinition('EVID-OPS-001'),
+    tempRoot,
+    {
+      pre_release_run_report: path.relative(tempRoot, reportPath),
+    },
+    runTimestamp,
+    {
+      expectedGitHubRepository: 'example/matrix',
+    },
+  );
+
+  assert.equal(results.length, 1);
+  assert.equal(results[0].valid, false);
+  assert.equal(results[0].validation_error, 'attestation bundle provenance.origin_repository must match the current repository');
 });
 
 test('manual artifact collection rejects hard-linked _test-runs reports even when the provided path looks external', async () => {

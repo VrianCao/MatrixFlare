@@ -7,6 +7,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 import {
+  buildPreReleaseRolloutVersionSpecs,
   buildEnvironmentRunProvenance,
   buildGitHubRunUrl,
   buildNonLocalEnvironmentPlan,
@@ -1873,6 +1874,7 @@ test('environment attestation provenance links GitHub run identity to immutable 
   });
 
   assert.equal(provenance.origin_system, 'github-actions');
+  assert.equal(provenance.origin_repository, 'example/matrix');
   assert.equal(provenance.origin_run_uri, 'https://github.com/example/matrix/actions/runs/81234');
   assert.equal(provenance.artifact_store_uri, 'r2://matrix-evidence-staging/gha/81234/2/staging/20260331T140000Z/run-bundle.tgz');
   assert.equal(provenance.review_record_uri, 'https://github.com/example/matrix/actions/runs/81234');
@@ -2103,6 +2105,16 @@ test('prod cost attestation writing requires the GitHub Actions prod environment
     }),
     /stop after verifying expected prod environment/,
   );
+});
+
+test('pre-release rollout deployment retains non-zero share for both baseline and candidate versions', () => {
+  const versionSpecs = buildPreReleaseRolloutVersionSpecs('gateway-baseline-v1', 'gateway-candidate-v2');
+
+  assert.deepEqual(versionSpecs, [
+    'gateway-baseline-v1@50',
+    'gateway-candidate-v2@50',
+  ]);
+  assert.ok(versionSpecs.every((entry) => !entry.endsWith('@0')), 'rollout skew proof must not zero out either version');
 });
 
 test('nonlocal workflow keeps pre-release restore failures from generating or uploading attestations', async () => {

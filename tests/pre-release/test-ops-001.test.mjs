@@ -44,7 +44,11 @@ test('TEST-OPS-001 pre-release proves worker/authority rollout skew compatibilit
     },
   });
 
-  assert.equal(result.response.status, 200);
+  assert.equal(
+    result.response.status,
+    200,
+    `rollout skew probe returned ${result.response.status}: ${JSON.stringify(result.payload)}`,
+  );
   const payload = result.payload;
   assert.equal(payload?.environment_name, 'pre-release');
   assert.equal(payload?.probe_run_id, rollout.probeRunId);

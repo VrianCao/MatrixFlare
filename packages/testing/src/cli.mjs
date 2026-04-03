@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
+import { promisify } from 'node:util';
 
 import {
   buildRunEnvironmentVariables,
@@ -36,6 +37,42 @@ const EVIDENCE_L1_MANUAL_ARTIFACT_FLAGS = Object.freeze({
   '--pre-release-attestation': 'pre_release_run_report',
   '--prod-cost-attestation': 'prod_cost_snapshot',
 });
+
+const execFileAsync = promisify(execFile);
+
+function parseGitHubRepositoryFromRemoteUrl(remoteUrl) {
+  if (typeof remoteUrl !== 'string' || remoteUrl.trim().length === 0) {
+    return null;
+  }
+  const normalized = remoteUrl.trim();
+  const patterns = [
+    /^https:\/\/github\.com\/([^/]+\/[^/]+?)(?:\.git)?$/u,
+    /^git@github\.com:([^/]+\/[^/]+?)(?:\.git)?$/u,
+    /^ssh:\/\/git@github\.com\/([^/]+\/[^/]+?)(?:\.git)?$/u,
+  ];
+  for (const pattern of patterns) {
+    const match = pattern.exec(normalized);
+    if (match) {
+      return match[1];
+    }
+  }
+  return null;
+}
+
+async function resolveExpectedGitHubRepository(repoRoot) {
+  const envRepository = typeof process.env.GITHUB_REPOSITORY === 'string'
+    ? process.env.GITHUB_REPOSITORY.trim()
+    : '';
+  if (envRepository.length > 0) {
+    return envRepository;
+  }
+  try {
+    const { stdout } = await execFileAsync('git', ['remote', 'get-url', 'origin'], { cwd: repoRoot });
+    return parseGitHubRepositoryFromRemoteUrl(stdout) ?? null;
+  } catch {
+    return null;
+  }
+}
 
 async function runEnvironment(environmentName, options = {}) {
   const repoRoot = process.cwd();
@@ -133,9 +170,11 @@ async function main() {
   const requestedEnvironment = process.argv[2] ?? 'local';
   if (requestedEnvironment === 'evidence-l1') {
     const { timestamp, manualArtifacts } = parseEvidenceL1Options(process.argv);
+    const expectedGitHubRepository = await resolveExpectedGitHubRepository(process.cwd());
     const result = await writeL1Evidence(process.cwd(), {
       timestamp,
       manualArtifacts,
+      expectedGitHubRepository,
     });
     console.log(`Wrote L1 evidence bundles for run ${result.run_timestamp}`);
     console.log(`Shared test-run artifacts: ${path.relative(process.cwd(), result.shared_run_root)}`);

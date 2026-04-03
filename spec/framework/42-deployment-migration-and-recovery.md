@@ -126,7 +126,7 @@ DO 内部 SQLite schema 演进规则：
 ### 7.1 渐进发布规则
 
 * 若使用 gradual deployment，必须打开版本监测与异常回滚门禁。
-* 对同一 Durable Object，在任一部署下只会运行一个版本；但不同对象可在 rollout 期间处于不同版本。引用：`CF-DO-005`。
+* 对同一 Durable Object，在任一部署下只会运行一个版本；但不同对象可在 rollout 期间处于不同版本，且这些对象在该 deployment 中的 version assignment 由 deployment percentages 决定。引用：`CF-DO-005`,`CF-DO-021`。
 
 ### 7.2 版本亲和建议
 
@@ -139,11 +139,12 @@ DO 内部 SQLite schema 演进规则：
 ### 7.3 Pre-release Rollout-Skew Gate Contract
 
 * `TEST-OPS-001` 的 pre-release gate 必须以 Cloudflare Worker versions/deployments 为基础，而不是把单 deployment smoke、`/_ops/v1/healthz` 或 active deployment identity revalidation 误写成 skew proof。
-* 对不含 DO migration 的 skew gate，pre-release harness 必须先记录 baseline gateway deployment/version，再使用 `wrangler versions upload` 上传 candidate gateway version，并创建一个同时包含 baseline + candidate 的 dual-version deployment；为减少 incidental public traffic，首版可以使用 `baseline=100%`、`candidate=0%` 的 deployment composition，再用显式 version targeting 命中两侧。
+* 对不含 DO migration 的 skew gate，pre-release harness 必须先记录 baseline gateway deployment/version，再使用 `wrangler versions upload` 上传 candidate gateway version，并创建一个同时包含 baseline + candidate 的 dual-version deployment。由于 Cloudflare 对 gradual deployment 中的 Durable Object version assignment 取决于 deployment percentages，dual-version deployment 必须给 baseline 与 candidate 都保留非零份额；`baseline=100%`、`candidate=0%` 再配合 version override 只能证明 Worker request routing，不能诚实地产生 candidate-side DO assignment。
 * 当前官方 `version_metadata` runtime binding 只暴露 Worker version ID/tag/timestamp，不暴露 deployment ID；因此 `IF-OPS-009` 不得在 worker 内伪造 dual-version deployment ID，也不得为了读取该 ID 把 Cloudflare account API token 下放进 worker。GitHub Actions rollout harness 必须在 `versions deploy` 后回读 active dual-version deployment ID，并把它作为 probe request 的显式输入传给 `ops-worker`。
 * skew proof 必须对至少两组 probe-owned authority identities 分别完成：
-  * baseline-targeted seed 后，再由 candidate-targeted request 观测 `new Worker -> old DO`；
-  * candidate-targeted seed 后，再由 baseline-targeted request 观测 `old Worker -> new DO`。
+  * 先在同一 dual-version deployment 中以 baseline-targeted seed request 做 bounded sampling，直到 probe-owned `UserDO` 与 `RoomDO` 都真实落到 baseline version，再由 candidate-targeted request 观测 `new Worker -> old DO`；
+  * 再以 candidate-targeted seed request 做 bounded sampling，直到 probe-owned `UserDO` 与 `RoomDO` 都真实落到 candidate version，再由 baseline-targeted request 观测 `old Worker -> new DO`。
+* `Cloudflare-Workers-Version-Key` / `Cloudflare-Workers-Version-Overrides` 只用于控制哪一个 Worker version 处理该次 gateway request；probe contract 不得把它们误当作“指定 Durable Object version”的能力。若 bounded sampling 在门限内仍拿不到四类所需 pairing 前置 identity，则必须 fail-closed。
 * 上述观测必须导出为 `RolloutSkewProbeResponse`，并随同 pre-release `EnvironmentRunReport` attestation 化；缺少 dual-version deployment ID、baseline/candidate version IDs、或任一 pairing assertion 时必须 fail-closed。
 * skew gate 完成后必须在 `finally` / `always()` 路径请求恢复 baseline deployment；恢复失败同样必须使该次 pre-release gate 失败，不得把“probe 成功但环境未恢复”记为 pass。
 

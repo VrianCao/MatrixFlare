@@ -137,6 +137,7 @@ async function buildHealthDependencies(env, persistence) {
 const ROLLOUT_PROBE_SECRET_HEADER = 'x-matrix-rollout-probe-secret';
 const ROLLOUT_PROBE_GATEWAY_VERSION_ID_HEADER = 'x-matrix-rollout-probe-gateway-version-id';
 const PROBE_PASSWORD_SUFFIX = '-password';
+const ROLLOUT_PROBE_MAX_SEED_ATTEMPTS = 24;
 
 function stableString(value) {
   return typeof value === 'string' ? value.trim() : '';
@@ -160,6 +161,19 @@ function sanitizeDeviceId(value) {
     .replace(/[^A-Z0-9]+/g, '')
     .slice(0, 16);
   return normalized.length > 0 ? normalized : 'ROLLPROBE01';
+}
+
+function buildSeedAttemptLabel(baseLabel, attemptIndex) {
+  return `${baseLabel}-${attemptIndex}`;
+}
+
+function summarizeObservedProbeVersions(observedVersionIds) {
+  const uniqueVersionIds = [...new Set(
+    observedVersionIds
+      .filter((value) => typeof value === 'string' && value.length > 0)
+      .map((value) => String(value)),
+  )];
+  return uniqueVersionIds.length === 0 ? 'none' : uniqueVersionIds.join(', ');
 }
 
 function createOpsValidationError(message, {
@@ -344,7 +358,7 @@ async function ensureProbeUser(env, gatewayConfig, probeRequest, {
   userLabel,
   gatewayVersionId,
 } = {}) {
-  const username = sanitizeProbeToken(`${probeRequest.seed_prefix}-${userLabel}`, {
+  const username = sanitizeProbeToken(`${userLabel}-${probeRequest.seed_prefix}`, {
     fallback: userLabel,
     maxLength: 32,
   });
@@ -352,7 +366,7 @@ async function ensureProbeUser(env, gatewayConfig, probeRequest, {
     fallback: 'phase08-rollout-password',
     maxLength: 48,
   });
-  const deviceId = sanitizeDeviceId(`${userLabel}${probeRequest.probe_run_id}`);
+  const deviceId = sanitizeDeviceId(`${userLabel}-${probeRequest.probe_run_id}`);
   const challenge = await fetchGatewayWithVersionOverride(env, gatewayConfig, {
     versionId: gatewayVersionId,
     pathname: '/_matrix/client/v3/register',
@@ -402,7 +416,7 @@ async function ensureProbeRoom(env, gatewayConfig, probeRequest, {
   accessToken,
   serverName,
 } = {}) {
-  const aliasLocalpart = sanitizeProbeToken(`${probeRequest.seed_prefix}-${roomLabel}`, {
+  const aliasLocalpart = sanitizeProbeToken(`${roomLabel}-${probeRequest.seed_prefix}`, {
     fallback: roomLabel,
     maxLength: 48,
   });
@@ -439,6 +453,56 @@ async function ensureProbeRoom(env, gatewayConfig, probeRequest, {
     room_id: joined.payload.room_id,
     room_alias: roomAlias,
   };
+}
+
+async function seedProbeUserForVersion(env, gatewayConfig, probeRequest, {
+  userLabel,
+  gatewayVersionId,
+  expectedAuthorityVersionId,
+} = {}) {
+  const observedVersionIds = [];
+  for (let attemptIndex = 1; attemptIndex <= ROLLOUT_PROBE_MAX_SEED_ATTEMPTS; attemptIndex += 1) {
+    const seededUser = await ensureProbeUser(env, gatewayConfig, probeRequest, {
+      userLabel: buildSeedAttemptLabel(userLabel, attemptIndex),
+      gatewayVersionId,
+    });
+    const identity = await inspectUserAuthority(env, seededUser.user_id);
+    observedVersionIds.push(identity.worker_version_id);
+    if (identity.worker_version_id === expectedAuthorityVersionId) {
+      return seededUser;
+    }
+  }
+  throw createOpsPreconditionError(
+    `Unable to seed ${userLabel} on ${expectedAuthorityVersionId} within ${ROLLOUT_PROBE_MAX_SEED_ATTEMPTS} attempts; observed ${summarizeObservedProbeVersions(observedVersionIds)}`,
+    { retryable: true },
+  );
+}
+
+async function seedProbeRoomForVersion(env, gatewayConfig, probeRequest, {
+  roomLabel,
+  gatewayVersionId,
+  accessToken,
+  serverName,
+  expectedAuthorityVersionId,
+} = {}) {
+  const observedVersionIds = [];
+  for (let attemptIndex = 1; attemptIndex <= ROLLOUT_PROBE_MAX_SEED_ATTEMPTS; attemptIndex += 1) {
+    const seededRoom = await ensureProbeRoom(env, gatewayConfig, probeRequest, {
+      roomLabel: buildSeedAttemptLabel(roomLabel, attemptIndex),
+      gatewayVersionId,
+      accessToken,
+      serverName,
+    });
+    const identity = await inspectRoomAuthority(env, seededRoom.room_id);
+    observedVersionIds.push(identity.worker_version_id);
+    if (identity.worker_version_id === expectedAuthorityVersionId) {
+      return seededRoom;
+    }
+  }
+  throw createOpsPreconditionError(
+    `Unable to seed ${roomLabel} on ${expectedAuthorityVersionId} within ${ROLLOUT_PROBE_MAX_SEED_ATTEMPTS} attempts; observed ${summarizeObservedProbeVersions(observedVersionIds)}`,
+    { retryable: true },
+  );
 }
 
 function buildRolloutObservation({
@@ -529,53 +593,33 @@ async function handleRolloutSkewProbe(request, env, config, requestContext) {
       });
     }
 
-    const baselineUser = await ensureProbeUser(env, gatewayConfig, probeRequest, {
+    const baselineUser = await seedProbeUserForVersion(env, gatewayConfig, probeRequest, {
       userLabel: 'baseline-user',
       gatewayVersionId: probeRequest.baseline_gateway_version_id,
+      expectedAuthorityVersionId: probeRequest.baseline_gateway_version_id,
     });
-    const baselineUserIdentity = await inspectUserAuthority(env, baselineUser.user_id);
-    if (baselineUserIdentity.worker_version_id !== probeRequest.baseline_gateway_version_id) {
-      throw createOpsPreconditionError(
-        `Baseline seed user resolved to ${baselineUserIdentity.worker_version_id} instead of ${probeRequest.baseline_gateway_version_id}`,
-      );
-    }
 
-    const baselineRoom = await ensureProbeRoom(env, gatewayConfig, probeRequest, {
+    const baselineRoom = await seedProbeRoomForVersion(env, gatewayConfig, probeRequest, {
       roomLabel: 'baseline-room',
       gatewayVersionId: probeRequest.baseline_gateway_version_id,
       accessToken: baselineUser.access_token,
       serverName,
+      expectedAuthorityVersionId: probeRequest.baseline_gateway_version_id,
     });
-    const baselineRoomIdentity = await inspectRoomAuthority(env, baselineRoom.room_id);
-    if (baselineRoomIdentity.worker_version_id !== probeRequest.baseline_gateway_version_id) {
-      throw createOpsPreconditionError(
-        `Baseline seed room resolved to ${baselineRoomIdentity.worker_version_id} instead of ${probeRequest.baseline_gateway_version_id}`,
-      );
-    }
 
-    const candidateUser = await ensureProbeUser(env, gatewayConfig, probeRequest, {
+    const candidateUser = await seedProbeUserForVersion(env, gatewayConfig, probeRequest, {
       userLabel: 'candidate-user',
       gatewayVersionId: probeRequest.candidate_gateway_version_id,
+      expectedAuthorityVersionId: probeRequest.candidate_gateway_version_id,
     });
-    const candidateUserIdentity = await inspectUserAuthority(env, candidateUser.user_id);
-    if (candidateUserIdentity.worker_version_id !== probeRequest.candidate_gateway_version_id) {
-      throw createOpsPreconditionError(
-        `Candidate seed user resolved to ${candidateUserIdentity.worker_version_id} instead of ${probeRequest.candidate_gateway_version_id}`,
-      );
-    }
 
-    const candidateRoom = await ensureProbeRoom(env, gatewayConfig, probeRequest, {
+    const candidateRoom = await seedProbeRoomForVersion(env, gatewayConfig, probeRequest, {
       roomLabel: 'candidate-room',
       gatewayVersionId: probeRequest.candidate_gateway_version_id,
       accessToken: candidateUser.access_token,
       serverName,
+      expectedAuthorityVersionId: probeRequest.candidate_gateway_version_id,
     });
-    const candidateRoomIdentity = await inspectRoomAuthority(env, candidateRoom.room_id);
-    if (candidateRoomIdentity.worker_version_id !== probeRequest.candidate_gateway_version_id) {
-      throw createOpsPreconditionError(
-        `Candidate seed room resolved to ${candidateRoomIdentity.worker_version_id} instead of ${probeRequest.candidate_gateway_version_id}`,
-      );
-    }
 
     const observations = [];
 

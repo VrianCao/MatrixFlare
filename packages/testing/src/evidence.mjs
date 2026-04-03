@@ -847,6 +847,28 @@ function isGitHubActionsRunUri(value) {
   }
 }
 
+function extractGitHubActionsRunRepository(value) {
+  if (!isGitHubActionsRunUri(value)) {
+    return null;
+  }
+  try {
+    const parsed = new URL(value);
+    const [, owner, repository, actionsLiteral, runsLiteral, runId] = parsed.pathname.split('/');
+    if (
+      !isNonEmptyString(owner)
+      || !isNonEmptyString(repository)
+      || actionsLiteral !== 'actions'
+      || runsLiteral !== 'runs'
+      || !isNonEmptyString(runId)
+    ) {
+      return null;
+    }
+    return `${owner}/${repository}`;
+  } catch {
+    return null;
+  }
+}
+
 function extractGitHubActionsRunId(value) {
   if (!isGitHubActionsRunUri(value)) {
     return null;
@@ -3979,6 +4001,7 @@ export function validateManualArtifactPayload(artifactId, payload, {
 
 export function validateEvidenceAttestationBundle(artifactId, payload, {
   runTimestamp = null,
+  expectedGitHubRepository = null,
 } = {}) {
   if (!isPlainObject(payload)) {
     return {
@@ -4058,16 +4081,34 @@ export function validateEvidenceAttestationBundle(artifactId, payload, {
       error: 'attestation bundle provenance.origin_run_attempt must be a positive integer',
     };
   }
+  if (!isNonEmptyString(provenance.origin_repository) || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(provenance.origin_repository)) {
+    return {
+      valid: false,
+      error: 'attestation bundle provenance.origin_repository must be a GitHub owner/repo slug',
+    };
+  }
   if (!isGitHubActionsRunUri(provenance.origin_run_uri)) {
     return {
       valid: false,
       error: 'attestation bundle provenance.origin_run_uri must be a GitHub Actions run URL',
     };
   }
+  if (provenance.origin_repository !== extractGitHubActionsRunRepository(provenance.origin_run_uri)) {
+    return {
+      valid: false,
+      error: 'attestation bundle provenance.origin_repository must match provenance.origin_run_uri',
+    };
+  }
   if (provenance.origin_run_id !== extractGitHubActionsRunId(provenance.origin_run_uri)) {
     return {
       valid: false,
       error: 'attestation bundle provenance.origin_run_id must match provenance.origin_run_uri',
+    };
+  }
+  if (isNonEmptyString(expectedGitHubRepository) && provenance.origin_repository !== expectedGitHubRepository) {
+    return {
+      valid: false,
+      error: 'attestation bundle provenance.origin_repository must match the current repository',
     };
   }
   const artifactStoreLocator = parseR2ObjectLocator(provenance.artifact_store_uri);
@@ -4618,7 +4659,9 @@ function buildApplicableSourceIds(definition, expandedSourceIds) {
   return expandedSourceIds.filter((sourceId) => !excluded.has(sourceId));
 }
 
-export async function collectManualArtifactResults(definition, repoRoot, manualArtifacts = {}, runTimestamp) {
+export async function collectManualArtifactResults(definition, repoRoot, manualArtifacts = {}, runTimestamp, {
+  expectedGitHubRepository = null,
+} = {}) {
   const requiredManualArtifacts = buildRequiredManualArtifactDefinitions(definition);
   return Promise.all(requiredManualArtifacts.map(async (artifactRequirement) => {
     const resolvedPath = normalizeOptionalArtifactPath(repoRoot, manualArtifacts[artifactRequirement.artifact_id]);
@@ -4667,6 +4710,7 @@ export async function collectManualArtifactResults(definition, repoRoot, manualA
         }
         const validation = validateEvidenceAttestationBundle(artifactRequirement.artifact_id, parsedPayload, {
           runTimestamp,
+          expectedGitHubRepository,
         });
         valid = validation.valid;
         validation_error = validation.error;
@@ -4941,12 +4985,15 @@ async function writeEvidenceBundle(repoRoot, {
   sharedRunRoot,
   environmentRuns,
   manualArtifacts,
+  expectedGitHubRepository,
 }) {
   const evidenceRoot = path.join(repoRoot, `evidence/${definition.scope}/${definition.id}/${runTimestamp}`);
   const artifactsDir = path.join(evidenceRoot, 'artifacts');
   const expandedSourceIds = expandDeclaredSourceIds(definition.declared_source_ids, analysis);
   const applicableSourceIds = buildApplicableSourceIds(definition, expandedSourceIds);
-  const manualArtifactResults = await collectManualArtifactResults(definition, repoRoot, manualArtifacts, runTimestamp);
+  const manualArtifactResults = await collectManualArtifactResults(definition, repoRoot, manualArtifacts, runTimestamp, {
+    expectedGitHubRepository,
+  });
   const coverageEnvironmentRuns = {};
   if (environmentRuns.local) {
     coverageEnvironmentRuns.local = buildLocalEnvironmentRunSource(environmentRuns.local);
@@ -5159,6 +5206,7 @@ export async function writeL1Evidence(repoRoot = process.cwd(), options = {}) {
       sharedRunRoot,
       environmentRuns,
       manualArtifacts: options.manualArtifacts ?? {},
+      expectedGitHubRepository: options.expectedGitHubRepository ?? null,
     }));
   }
 
