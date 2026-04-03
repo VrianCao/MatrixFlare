@@ -6793,6 +6793,10 @@ test('CLI evidence-l1 forwards attestation paths into the evidence writer', asyn
       manualArtifacts.prod_cost_snapshot,
     ], {
       cwd: fixtureRoot,
+      env: {
+        ...process.env,
+        GITHUB_REPOSITORY: 'example/matrix',
+      },
     });
 
     assert.match(stdout, /Wrote L1 evidence bundles/);
