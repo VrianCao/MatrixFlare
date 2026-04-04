@@ -4468,10 +4468,16 @@ function buildL1EvidenceOutputPaths(repoRoot, runTimestamp) {
   ];
 }
 
-export async function assessNonLocalEnvironmentHarnessReadiness(environmentName, repoRoot = process.cwd()) {
+export async function assessNonLocalEnvironmentHarnessReadiness(
+  environmentName,
+  repoRoot = process.cwd(),
+  {
+    getRequiredTestFilesImpl = getRequiredTestFiles,
+  } = {},
+) {
   let result;
   try {
-    const testFiles = await getRequiredTestFiles(environmentName, repoRoot);
+    const testFiles = await getRequiredTestFilesImpl(environmentName, repoRoot);
     const relativeTestFiles = testFiles.map((file) => normalizePathForMarkdown(path.relative(repoRoot, file)));
     const {
       expanded_test_files: expandedTestFiles,

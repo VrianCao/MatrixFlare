@@ -1477,6 +1477,65 @@ test('runEnvironmentBackedSuite does not spawn the suite when readiness fails', 
   }
 });
 
+test('runEnvironmentBackedSuite passes release-gate file selection into harness assessment', async () => {
+  const repoRoot = path.resolve('.');
+  const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-nonlocal-suite-release-gate-assess-'));
+  const deploymentSummary = buildDeploymentSummaryFixture('ci-integration');
+  let readinessSelectorCalls = 0;
+
+  try {
+    const result = await runEnvironmentBackedSuite('ci-integration', repoRoot, {
+      runTimestamp: '20260404T162500Z',
+      outputRoot,
+      sourceRunUri: 'https://github.com/example/matrix/actions/runs/12345',
+      logArtifact: 'https://github.com/example/matrix/actions/runs/12345/artifacts/1',
+      executedBy: 'gha://example/matrix/nonlocal/ci-integration',
+      reviewedBy: 'gha://example/matrix/nonlocal/ci-integration',
+      topologyKind: 'cloudflare-ci-integration',
+      deploymentSummary,
+    }, {
+      requireGitHubActionsExecutionImpl: async () => ({ environment: 'ci-integration' }),
+      assessNonLocalEnvironmentHarnessReadinessImpl: async (environmentName, root, options = {}) => {
+        assert.equal(environmentName, 'ci-integration');
+        assert.equal(root, repoRoot);
+        assert.equal(typeof options.getRequiredTestFilesImpl, 'function');
+        const files = await options.getRequiredTestFilesImpl(environmentName, root);
+        readinessSelectorCalls += 1;
+        assert.deepEqual(files, [path.join(repoRoot, 'tests/integration/test-cs-001.test.mjs')]);
+        return {
+          ready: true,
+          reason: null,
+          expanded_test_files: ['tests/integration/test-cs-001.test.mjs'],
+        };
+      },
+      requireCloudflareCredentialsImpl: () => ({ accountId: 'cf-account', apiToken: 'cf-token' }),
+      readWorkersSubdomainImpl: async () => 'matrixflare',
+      validateDeploymentSummaryAgainstCurrentCloudflareStateImpl: async () => (
+        buildDeploymentIdentityValidationFixture('ci-integration')
+      ),
+      getRequiredTestFilesImpl: async () => [path.join(repoRoot, 'tests/integration/test-cs-001.test.mjs')],
+      waitForNonLocalDeploymentReadinessImpl: async () => buildReadinessProbeFixture('ci-integration'),
+      spawnImpl: () => {
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        queueMicrotask(() => {
+          child.stdout.emit('data', Buffer.from('suite ok\n', 'utf8'));
+          child.emit('close', 0);
+        });
+        return child;
+      },
+    });
+
+    assert.equal(readinessSelectorCalls, 1);
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.report.expanded_test_files, ['tests/integration/test-cs-001.test.mjs']);
+    assert.equal(result.report.expanded_test_file_count, 1);
+  } finally {
+    await fs.rm(outputRoot, { recursive: true, force: true });
+  }
+});
+
 test('runEnvironmentBackedSuite revalidates deployment identity after readiness before spawning the suite', async () => {
   const repoRoot = path.resolve('.');
   const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-nonlocal-suite-identity-'));

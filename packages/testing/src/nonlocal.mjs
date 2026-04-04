@@ -3683,7 +3683,9 @@ export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
   await requireGitHubActionsExecutionImpl('runEnvironmentBackedSuite', {
     expectedEnvironmentName: normalizedEnvironmentName,
   });
-  const readiness = await assessNonLocalEnvironmentHarnessReadinessImpl(normalizedEnvironmentName, repoRoot);
+  const readiness = await assessNonLocalEnvironmentHarnessReadinessImpl(normalizedEnvironmentName, repoRoot, {
+    getRequiredTestFilesImpl,
+  });
   if (readiness.ready !== true) {
     throw new Error(`${normalizedEnvironmentName} harness is not environment-backed: ${readiness.reason}`);
   }

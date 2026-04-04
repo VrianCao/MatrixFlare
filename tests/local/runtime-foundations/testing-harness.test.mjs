@@ -2377,6 +2377,17 @@ test('current non-local harness readiness reports environment-backed dedicated h
   assert.deepEqual(preReleaseReadiness.local_test_expansions, []);
 });
 
+test('non-local harness readiness can scope expansion to release-gate file selection', async () => {
+  const integrationReadiness = await assessNonLocalEnvironmentHarnessReadiness('ci-integration', repoRoot, {
+    getRequiredTestFilesImpl: getReleaseGateTestFiles,
+  });
+  assert.equal(integrationReadiness.ready, true);
+  assert.deepEqual(integrationReadiness.local_test_expansions, []);
+  assert.ok(!integrationReadiness.expanded_test_files.includes('tests/integration/bootstrap.test.mjs'));
+  assert.ok(!integrationReadiness.expanded_test_files.includes('tests/integration/l1-mandatory.test.mjs'));
+  assert.ok(!integrationReadiness.expanded_test_files.includes('tests/shared/nonlocal/support.mjs'));
+});
+
 test('non-local harness readiness does not treat exported object string literals as module imports', async () => {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-testing-harness-export-strings-'));
   await fs.mkdir(path.join(tempRoot, 'tests', 'staging'), { recursive: true });
