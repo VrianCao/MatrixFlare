@@ -122,6 +122,7 @@ test('Phase 08 ops health response exposes deployment compatibility and secret-v
   assert.equal(payload.startup_time_ms, 17);
   assert.equal(payload.deployment_composition.length, 2);
   assert.equal(payload.deployment_composition[0].worker_name, 'ops-worker');
+  assert.ok(payload.compatibility_flags.includes('global_fetch_strictly_public'));
   assert.deepEqual(payload.feature_gates, {
     appservice_api: false,
     otel_export: false,

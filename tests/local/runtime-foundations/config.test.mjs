@@ -42,6 +42,7 @@ function makeGatewayEnv(overrides = {}) {
 test('gateway runtime config validates explicit vars, feature gates, and secrets', () => {
   const config = loadWorkerRuntimeConfig('gateway-worker', makeGatewayEnv());
   assert.equal(config.compatibilityDate, '2026-03-26');
+  assert.ok(config.compatibilityFlags.includes('nodejs_compat'));
   assert.equal(config.environmentName, 'local');
   assert.equal(config.releaseProfile, 'L1');
   assert.equal(config.text.MATRIX_MEDIA_MAX_UPLOAD_BYTES, 1048576);

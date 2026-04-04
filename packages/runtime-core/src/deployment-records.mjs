@@ -76,6 +76,7 @@ export function buildDeploymentRecord({
     worker_version_id: observedWorkerVersionId,
     deployment_id: config.text.DEPLOYMENT_ID,
     compatibility_date: config.compatibilityDate,
+    compatibility_flags: [...config.compatibilityFlags],
     cpu_limit_class: config.text.CPU_LIMIT_CLASS,
     startup_time_ms: resolvedStartupTimeMs,
     release_profile: config.releaseProfile,

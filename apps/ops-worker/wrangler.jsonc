@@ -4,7 +4,8 @@
   "compatibility_date": "2026-03-26",
   "compatibility_flags": [
     "nodejs_compat",
-    "nodejs_compat_do_not_populate_process_env"
+    "nodejs_compat_do_not_populate_process_env",
+    "global_fetch_strictly_public"
   ],
   "version_metadata": {
     "binding": "CF_VERSION_METADATA"

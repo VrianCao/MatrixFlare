@@ -384,6 +384,7 @@ test('ops-worker non-local wrangler config requires real Access metadata and wir
   assert.equal(config.env.staging.vars.ACCESS_TEAM_DOMAIN, 'matrixflare.cloudflareaccess.com');
   assert.equal(config.env.staging.vars.ACCESS_AUDIENCE, 'aud-staging-ops');
   assert.equal(config.env.staging.vars.GATEWAY_WORKER_SCRIPT_NAME, 'matrix-gateway-worker-staging');
+  assert.ok(config.compatibility_flags.includes('global_fetch_strictly_public'));
 });
 
 test('jobs-worker non-local wrangler config preserves derived queue producers needed by remote search and media flows', () => {

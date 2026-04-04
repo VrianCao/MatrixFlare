@@ -37,6 +37,7 @@ function buildHealthResponse(config, deploymentRecord, dependencies, status) {
     worker_version_id: deploymentRecord.worker_version_id,
     deployment_id: deploymentRecord.deployment_id,
     compatibility_date: config.compatibilityDate,
+    compatibility_flags: deploymentRecord.compatibility_flags,
     release_profile: config.releaseProfile,
     cpu_limit_class: deploymentRecord.cpu_limit_class,
     startup_time_ms: deploymentRecord.startup_time_ms,

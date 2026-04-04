@@ -218,6 +218,7 @@
 | `worker_version_id` | string | 当前 Worker version ID |
 | `deployment_id` | string | 当前 deployment ID |
 | `compatibility_date` | string | 当前 compatibility date |
+| `compatibility_flags` | array | 当前部署显式启用的 compatibility flags；必须与 deployment record / wrangler manifest 一致 |
 | `release_profile` | string | `L1`,`L2`,`L3` 之一 |
 | `cpu_limit_class` | string | 当前 Worker 的显式 CPU limit class |
 | `startup_time_ms` | integer | 当前 Worker 的启动校验耗时；若未采样则必须返回 `0` |

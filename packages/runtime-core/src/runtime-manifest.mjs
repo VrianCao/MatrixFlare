@@ -2,7 +2,7 @@ import { GATEWAY_RATE_LIMIT_BINDING_DEFINITIONS } from './abuse-guard.mjs';
 import { VERSION_METADATA_BINDING_NAME } from './version-metadata.mjs';
 
 const COMPATIBILITY_DATE = '2026-03-26';
-const COMPATIBILITY_FLAGS = Object.freeze([
+const DEFAULT_COMPATIBILITY_FLAGS = Object.freeze([
   'nodejs_compat',
   'nodejs_compat_do_not_populate_process_env',
 ]);
@@ -65,6 +65,7 @@ const DEFAULT_RESOURCE_BINDING_NAMES = Object.freeze({
 const WORKER_RUNTIME_MANIFEST = Object.freeze({
   'gateway-worker': Object.freeze({
     compatibilityDate: COMPATIBILITY_DATE,
+    compatibilityFlags: DEFAULT_COMPATIBILITY_FLAGS,
     versionMetadataBinding: VERSION_METADATA_BINDING_NAME,
     vars: Object.freeze({
       ...SHARED_TEXT_BINDINGS,
@@ -147,6 +148,7 @@ const WORKER_RUNTIME_MANIFEST = Object.freeze({
   }),
   'jobs-worker': Object.freeze({
     compatibilityDate: COMPATIBILITY_DATE,
+    compatibilityFlags: DEFAULT_COMPATIBILITY_FLAGS,
     versionMetadataBinding: VERSION_METADATA_BINDING_NAME,
     vars: Object.freeze({
       ...SHARED_TEXT_BINDINGS,
@@ -209,6 +211,10 @@ const WORKER_RUNTIME_MANIFEST = Object.freeze({
   }),
   'ops-worker': Object.freeze({
     compatibilityDate: COMPATIBILITY_DATE,
+    compatibilityFlags: Object.freeze([
+      ...DEFAULT_COMPATIBILITY_FLAGS,
+      'global_fetch_strictly_public',
+    ]),
     versionMetadataBinding: VERSION_METADATA_BINDING_NAME,
     vars: Object.freeze({
       ...SHARED_TEXT_BINDINGS,
@@ -377,6 +383,7 @@ export function loadWorkerRuntimeConfig(workerName, env = {}) {
   return Object.freeze({
     workerName,
     compatibilityDate: manifest.compatibilityDate,
+    compatibilityFlags: Object.freeze([...manifest.compatibilityFlags]),
     bindings: manifest.bindings,
     text: Object.freeze(text),
     environmentName: text.ENVIRONMENT_NAME,
@@ -432,7 +439,7 @@ export function createWranglerConfigSnapshot(workerName) {
     name: `matrix-${workerName}`,
     main: 'src/index.mjs',
     compatibility_date: manifest.compatibilityDate,
-    compatibility_flags: [...COMPATIBILITY_FLAGS],
+    compatibility_flags: [...manifest.compatibilityFlags],
     vars: {},
   };
 

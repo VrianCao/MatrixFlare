@@ -248,6 +248,9 @@ export function normalizeOpsHealthResponse(value) {
     worker_version_id: normalizeString(value.worker_version_id, 'worker_version_id'),
     deployment_id: normalizeString(value.deployment_id, 'deployment_id'),
     compatibility_date: normalizeString(value.compatibility_date, 'compatibility_date'),
+    compatibility_flags: value.compatibility_flags == null
+      ? []
+      : normalizeNullableStringArray(value.compatibility_flags, 'compatibility_flags') ?? [],
     release_profile: normalizeString(value.release_profile, 'release_profile'),
     cpu_limit_class: normalizeString(value.cpu_limit_class, 'cpu_limit_class'),
     startup_time_ms: normalizeInteger(value.startup_time_ms, 'startup_time_ms', { min: 0 }),

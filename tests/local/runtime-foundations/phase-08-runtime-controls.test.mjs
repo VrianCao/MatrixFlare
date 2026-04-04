@@ -444,6 +444,7 @@ test('Phase 08 telemetry records deployment, binding, derived-lag, and cost attr
   assert.ok(gatewayRecord);
   assert.equal(gatewayRecord.startup_time_ms, 12);
   assert.equal(gatewayRecord.deployment_composition.length, 2);
+  assert.ok(gatewayRecord.compatibility_flags.includes('nodejs_compat'));
   assert.equal(gatewayRecord.feature_gates.otel_persist, true);
 });
 
