@@ -22,6 +22,7 @@ import {
 } from '../../control-plane/src/index.mjs';
 import {
   assessNonLocalEnvironmentHarnessReadiness,
+  validateEnvironmentRunExecutionProof,
   validateRolloutSkewProbeSemantics,
   validateEvidenceAttestationBundle,
   validateManualArtifactPayload,
@@ -855,6 +856,11 @@ export function createEnvironmentWranglerConfig(workerName, plan, {
     compatibility_date: baseConfig.compatibility_date,
     compatibility_flags: baseConfig.compatibility_flags,
     migrations: baseConfig.migrations,
+    ...(baseConfig.version_metadata == null
+      ? {}
+      : {
+        version_metadata: structuredCloneJson(baseConfig.version_metadata),
+      }),
     env: {
       [envName]: envConfig,
     },
@@ -3745,7 +3751,7 @@ export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
   validatedCloudflareResources.ratelimit_namespaces = [
     ...deploymentIdentityValidation.before_readiness.cloudflare_resources.ratelimit_namespaces,
   ];
-  const files = await getRequiredTestFilesImpl(normalizedEnvironmentName, repoRoot);
+  const files = readiness.test_files.map((file) => path.join(repoRoot, file));
   const startedAt = new Date().toISOString();
   const startedMs = Date.now();
   const commandArgs = ['--test', '--test-concurrency=1', ...files];
@@ -3910,9 +3916,12 @@ export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
   const payloadValidation = validateManualArtifactPayload(artifactId, report, {
     runTimestamp,
   });
+  const executionProofValidation = await validateEnvironmentRunExecutionProof(artifactId, report, repoRoot);
   return {
-    ok: exitCode === 0 && payloadValidation.valid,
-    validation_error: payloadValidation.valid ? null : payloadValidation.error,
+    ok: exitCode === 0 && payloadValidation.valid && executionProofValidation.valid,
+    validation_error: payloadValidation.valid
+      ? executionProofValidation.error
+      : payloadValidation.error,
     report,
     log_path: suiteArtifacts.log_path,
     report_path: suiteArtifacts.report_path,
@@ -3944,6 +3953,16 @@ export async function writeEnvironmentRunAttestation(environmentName, {
   });
   const artifactId = resolveEnvironmentArtifactId(normalizedEnvironmentName);
   const report = JSON.parse(await fs.readFile(reportPath, 'utf8'));
+  const payloadValidation = validateManualArtifactPayload(artifactId, report, {
+    runTimestamp,
+  });
+  if (!payloadValidation.valid) {
+    throw new Error(`Generated ${artifactId} report is invalid: ${payloadValidation.error}`);
+  }
+  const executionProofValidation = await validateEnvironmentRunExecutionProof(artifactId, report, process.cwd());
+  if (!executionProofValidation.valid) {
+    throw new Error(`Generated ${artifactId} report execution proof is invalid: ${executionProofValidation.error}`);
+  }
   const bundle = {
     schema_version: 1,
     artifact_id: artifactId,

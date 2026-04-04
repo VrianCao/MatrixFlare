@@ -25,6 +25,7 @@ import {
   getL1EvidenceDefinition,
   getRequiredTestImplementationFiles,
   listL1EvidenceBundleIds,
+  validateEnvironmentRunExecutionProof,
   validateEvidenceAttestationBundle,
   validateManualArtifactPayload,
   writeL1Evidence,
@@ -217,14 +218,14 @@ function buildValidEnvironmentReport(environmentName, runTimestamp, overrides = 
       { step: 'ops_rebuild_start', ok: true, detail: { job_id_present: true, job_type: 'rebuild', state: 'accepted' } },
     );
   }
-  return {
+  const report = {
     environment_name: environmentName,
     status: 'pass',
     exit_code: 0,
     started_at: '2026-03-31T14:00:00.000Z',
     completed_at: '2026-03-31T14:05:00.000Z',
     duration_ms: 300000,
-    command: `/usr/bin/node --test /tmp/${environmentName}.test.mjs`,
+    command: null,
     test_directory: directory,
     test_file_count: 1,
     test_files: [`${directory}/remote.test.mjs`],
@@ -309,6 +310,10 @@ function buildValidEnvironmentReport(environmentName, runTimestamp, overrides = 
     run_timestamp: runTimestamp,
     ...overrides,
   };
+  report.command = Object.prototype.hasOwnProperty.call(overrides, 'command')
+    ? overrides.command
+    : `/usr/bin/node --test ${report.test_files.map((file) => path.join(repoRoot, file)).join(' ')}`;
+  return report;
 }
 
 function buildValidPreReleaseOpsReport(runTimestamp, overrides = {}) {
@@ -462,6 +467,23 @@ function buildValidProdCostSnapshotAttestation(runTimestamp, payloadOverrides = 
       ...payloadOverrides,
     }),
   };
+}
+
+function buildSingleFileEnvironmentReportOverrides(relativeTestFile, overrides = {}) {
+  return {
+    test_files: [relativeTestFile],
+    test_file_count: 1,
+    expanded_test_files: [relativeTestFile],
+    expanded_test_file_count: 1,
+    ...overrides,
+  };
+}
+
+function assertEnvironmentBackedProofRejected(validationError) {
+  assert.match(
+    validationError ?? '',
+    /(harness is not environment-backed|attested payload invalid: environment run report must not expand local test implementations|test_files must not contain unresolved or non-literal dynamic imports|expanded_test_files must equal the repo-owned transitive closure of test_files)/,
+  );
 }
 
 function normalizeForImportPath(relativePath) {
@@ -1097,6 +1119,33 @@ test('manual artifact payload validation requires structured non-local reports a
     {
       valid: false,
       error: 'environment run report must include test_files matching test_file_count',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('staging_run_report', {
+      ...validStagingReport,
+      command: '/usr/bin/node --test /tmp/tests/staging/not-the-real-suite.test.mjs',
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'environment run report command must enumerate the same repo-relative test_files claimed by the report',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('staging_run_report', {
+      ...validStagingReport,
+      expanded_test_file_count: 1,
+      expanded_test_files: ['tests/staging/support.mjs'],
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'environment run report expanded_test_files must include claimed test_file tests/staging/remote.test.mjs',
     },
   );
 
@@ -2363,18 +2412,21 @@ test('manual artifact attestation validation requires immutable provenance plus 
   );
 });
 
-test('current non-local harness readiness reports environment-backed dedicated harnesses once local imports are removed', async () => {
+test('current non-local harness readiness fails closed on default directory discovery until it is scoped to dedicated release-gate suites', async () => {
   const integrationReadiness = await assessNonLocalEnvironmentHarnessReadiness('ci-integration', repoRoot);
-  assert.equal(integrationReadiness.ready, true);
+  assert.equal(integrationReadiness.ready, false);
   assert.deepEqual(integrationReadiness.local_test_expansions, []);
+  assert.match(integrationReadiness.reason ?? '', /generic entrypoints|dedicated environment directory closure/);
 
   const stagingReadiness = await assessNonLocalEnvironmentHarnessReadiness('staging', repoRoot);
-  assert.equal(stagingReadiness.ready, true);
+  assert.equal(stagingReadiness.ready, false);
   assert.deepEqual(stagingReadiness.local_test_expansions, []);
+  assert.match(stagingReadiness.reason ?? '', /generic entrypoints|dedicated environment directory closure/);
 
   const preReleaseReadiness = await assessNonLocalEnvironmentHarnessReadiness('pre-release', repoRoot);
-  assert.equal(preReleaseReadiness.ready, true);
+  assert.equal(preReleaseReadiness.ready, false);
   assert.deepEqual(preReleaseReadiness.local_test_expansions, []);
+  assert.match(preReleaseReadiness.reason ?? '', /generic entrypoints|dedicated environment directory closure/);
 });
 
 test('non-local harness readiness can scope expansion to release-gate file selection', async () => {
@@ -2391,13 +2443,12 @@ test('non-local harness readiness can scope expansion to release-gate file selec
 test('non-local harness readiness does not treat exported object string literals as module imports', async () => {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-testing-harness-export-strings-'));
   await fs.mkdir(path.join(tempRoot, 'tests', 'staging'), { recursive: true });
-  await fs.mkdir(path.join(tempRoot, 'tests', 'shared'), { recursive: true });
   await fs.writeFile(
     path.join(tempRoot, 'tests', 'staging', 'export-strings.test.mjs'),
-    "import '../shared/bootstrap-like.mjs';\n",
+    "import './bootstrap-like.mjs';\n",
   );
   await fs.writeFile(
-    path.join(tempRoot, 'tests', 'shared', 'bootstrap-like.mjs'),
+    path.join(tempRoot, 'tests', 'staging', 'bootstrap-like.mjs'),
     [
       'export const TEST_ENVIRONMENTS = Object.freeze({',
       "  'ci-integration': Object.freeze({ directory: 'tests/integration' }),",
@@ -4274,12 +4325,8 @@ test('non-local harness readiness fails closed on package-import aliases that ca
     }, null, 2),
   );
   await fs.writeFile(
-    path.join(tempRoot, 'tests', 'staging', 'bootstrap.test.mjs'),
+    path.join(tempRoot, 'tests', 'staging', 'test-cs-002.test.mjs'),
     "import '#local-probe';\n",
-  );
-  await fs.writeFile(
-    path.join(tempRoot, 'tests', 'staging', 'l1-mandatory.test.mjs'),
-    'export const marker = true;\n',
   );
   await fs.writeFile(
     path.join(tempRoot, 'tests', 'local', 'probe.test.mjs'),
@@ -4289,10 +4336,10 @@ test('non-local harness readiness fails closed on package-import aliases that ca
   const readiness = await assessNonLocalEnvironmentHarnessReadiness('staging', tempRoot);
   assert.equal(readiness.ready, false);
   assert.match(readiness.reason, /non-literal dynamic imports/);
-  assert.ok(readiness.unresolved_dynamic_imports.includes('tests/staging/bootstrap.test.mjs'));
+  assert.ok(readiness.unresolved_dynamic_imports.includes('tests/staging/test-cs-002.test.mjs'));
 });
 
-test('non-local harness readiness allows node builtin imports while tracking repo-owned shared proofs', async () => {
+test('non-local harness readiness still fails closed when node builtin imports coexist with shared proofs outside the environment directory', async () => {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-testing-harness-node-builtin-'));
   await fs.mkdir(path.join(tempRoot, 'tests', 'staging'), { recursive: true });
   await fs.mkdir(path.join(tempRoot, 'tests', 'shared'), { recursive: true });
@@ -4315,10 +4362,11 @@ test('non-local harness readiness allows node builtin imports while tracking rep
   );
 
   const readiness = await assessNonLocalEnvironmentHarnessReadiness('staging', tempRoot);
-  assert.equal(readiness.ready, true);
-  assert.equal(readiness.reason, null);
+  assert.equal(readiness.ready, false);
+  assert.match(readiness.reason, /escapes dedicated environment directory closure/);
   assert.deepEqual(readiness.unresolved_dynamic_imports, []);
   assert.deepEqual(readiness.repo_boundary_escapes, []);
+  assert.deepEqual(readiness.environment_boundary_escapes, ['tests/shared/proof.mjs']);
   assert.ok(readiness.expanded_test_files.includes('tests/shared/proof.mjs'));
 });
 
@@ -4446,7 +4494,11 @@ test('manual artifact collection rejects _test-runs paths even when payload stru
   await fs.mkdir(path.dirname(reportPath), { recursive: true });
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentAttestation('pre-release', runTimestamp), null, 2),
+    JSON.stringify(buildValidEnvironmentAttestation(
+      'pre-release',
+      runTimestamp,
+      buildSingleFileEnvironmentReportOverrides('tests/pre-release/remote.test.mjs'),
+    ), null, 2),
   );
 
   const results = await collectManualArtifactResults(
@@ -4477,7 +4529,11 @@ test('manual artifact collection rejects symlinked _test-runs reports even when 
   await fs.writeFile(testFile, 'export const remote = true;\n');
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentAttestation('pre-release', runTimestamp), null, 2),
+    JSON.stringify(buildValidEnvironmentAttestation(
+      'pre-release',
+      runTimestamp,
+      buildSingleFileEnvironmentReportOverrides('tests/pre-release/remote.test.mjs'),
+    ), null, 2),
   );
   await fs.symlink(reportPath, symlinkPath);
 
@@ -4550,7 +4606,11 @@ test('manual artifact collection rejects hard-linked _test-runs reports even whe
   await fs.writeFile(testFile, 'export const remote = true;\n');
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentAttestation('pre-release', runTimestamp), null, 2),
+    JSON.stringify(buildValidEnvironmentAttestation(
+      'pre-release',
+      runTimestamp,
+      buildSingleFileEnvironmentReportOverrides('tests/pre-release/remote.test.mjs'),
+    ), null, 2),
   );
   await fs.link(reportPath, linkedPath);
 
@@ -4583,7 +4643,11 @@ test('manual artifact collection rejects hard-linked _test-runs reports from oth
   await fs.writeFile(testFile, 'export const remote = true;\n');
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentAttestation('pre-release', runTimestamp), null, 2),
+    JSON.stringify(buildValidEnvironmentAttestation(
+      'pre-release',
+      runTimestamp,
+      buildSingleFileEnvironmentReportOverrides('tests/pre-release/remote.test.mjs'),
+    ), null, 2),
   );
   await fs.link(reportPath, linkedPath);
 
@@ -4615,7 +4679,11 @@ test('manual artifact collection rejects hard-linked _test-runs artifacts even w
   await fs.writeFile(testFile, 'export const remote = true;\n');
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentAttestation('pre-release', runTimestamp), null, 2),
+    JSON.stringify(buildValidEnvironmentAttestation(
+      'pre-release',
+      runTimestamp,
+      buildSingleFileEnvironmentReportOverrides('tests/pre-release/remote.test.mjs'),
+    ), null, 2),
   );
   await fs.link(reportPath, linkedPath);
 
@@ -4647,7 +4715,11 @@ test('manual artifact collection rejects prod cost snapshots from _test-runs eve
   await fs.writeFile(testFile, 'export const remote = true;\n');
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentAttestation('pre-release', runTimestamp), null, 2),
+    JSON.stringify(buildValidEnvironmentAttestation(
+      'pre-release',
+      runTimestamp,
+      buildSingleFileEnvironmentReportOverrides('tests/pre-release/remote.test.mjs'),
+    ), null, 2),
   );
   await fs.writeFile(
     prodCostSnapshotPath,
@@ -4687,7 +4759,11 @@ test('manual artifact collection rejects hard-linked prod cost snapshots from _t
   await fs.writeFile(testFile, 'export const remote = true;\n');
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentAttestation('pre-release', runTimestamp), null, 2),
+    JSON.stringify(buildValidEnvironmentAttestation(
+      'pre-release',
+      runTimestamp,
+      buildSingleFileEnvironmentReportOverrides('tests/pre-release/remote.test.mjs'),
+    ), null, 2),
   );
   await fs.writeFile(
     sharedProdCostSnapshotPath,
@@ -4733,8 +4809,8 @@ test('manual artifact collection rejects otherwise valid external reports when t
     JSON.stringify(buildValidEnvironmentAttestation('pre-release', runTimestamp, {
       test_files: ['tests/pre-release/bridge.test.mjs'],
       test_file_count: 1,
-      expanded_test_files: ['tests/pre-release/bridge.test.mjs'],
-      expanded_test_file_count: 1,
+      expanded_test_files: ['tests/local/probe.test.mjs', 'tests/pre-release/bridge.test.mjs'],
+      expanded_test_file_count: 2,
     }), null, 2),
   );
 
@@ -4750,7 +4826,7 @@ test('manual artifact collection rejects otherwise valid external reports when t
 
     assert.equal(results.length, 1);
     assert.equal(results[0].valid, false);
-    assert.match(results[0].validation_error, /harness is not environment-backed/);
+    assertEnvironmentBackedProofRejected(results[0].validation_error);
   } finally {
     await fs.rm(tempRoot, { recursive: true, force: true });
   }
@@ -4788,6 +4864,71 @@ test('manual artifact collection accepts valid external reports when the harness
   assert.equal(results[0].valid, true);
   assert.equal(results[0].environment_harness_ready, true);
   assert.equal(results[0].validation_error, null);
+});
+
+test('environment run execution proof rejects expanded_test_files that drift from the repo-owned transitive closure', async () => {
+  const runTimestamp = '20260331T141725Z';
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-testing-harness-execution-proof-drift-'));
+  const testFile = path.join(tempRoot, 'tests', 'staging', 'remote.test.mjs');
+  const supportFile = path.join(tempRoot, 'tests', 'staging', 'support.mjs');
+
+  await fs.mkdir(path.dirname(testFile), { recursive: true });
+  await fs.writeFile(testFile, "import './support.mjs';\n");
+  await fs.writeFile(supportFile, 'export const support = true;\n');
+
+  try {
+    const validation = await validateEnvironmentRunExecutionProof('staging_run_report', buildValidEnvironmentReport('staging', runTimestamp, {
+      test_files: ['tests/staging/remote.test.mjs'],
+      test_file_count: 1,
+      expanded_test_files: ['tests/staging/remote.test.mjs'],
+      expanded_test_file_count: 1,
+      command: `/usr/bin/node --test ${testFile}`,
+    }), tempRoot);
+
+    assert.deepEqual(validation, {
+      valid: false,
+      error: 'environment run report expanded_test_files must equal the repo-owned transitive closure of test_files',
+    });
+  } finally {
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('manual artifact collection rejects attestation whose execution proof drifts from the claimed expanded test closure', async () => {
+  const runTimestamp = '20260331T141725Z';
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-testing-harness-manual-drift-'));
+  const testFile = path.join(tempRoot, 'tests', 'staging', 'remote.test.mjs');
+  const supportFile = path.join(tempRoot, 'tests', 'staging', 'support.mjs');
+  const reportPath = path.join(tempRoot, 'external', 'staging.json');
+
+  await fs.mkdir(path.dirname(testFile), { recursive: true });
+  await fs.mkdir(path.dirname(reportPath), { recursive: true });
+  await fs.writeFile(testFile, "import './support.mjs';\n");
+  await fs.writeFile(supportFile, 'export const support = true;\n');
+  await fs.writeFile(
+    reportPath,
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
+      test_files: ['tests/staging/remote.test.mjs'],
+      test_file_count: 1,
+      expanded_test_files: ['tests/staging/remote.test.mjs'],
+      expanded_test_file_count: 1,
+      command: `/usr/bin/node --test ${testFile}`,
+    }), null, 2),
+  );
+
+  const results = await collectManualArtifactResults(
+    getL1EvidenceDefinition('EVID-CS-002'),
+    tempRoot,
+    {
+      staging_run_report: reportPath,
+    },
+    runTimestamp,
+  );
+
+  assert.equal(results.length, 1);
+  assert.equal(results[0].valid, false);
+  assert.equal(results[0].environment_harness_ready, true);
+  assert.equal(results[0].validation_error, 'environment run report expanded_test_files must equal the repo-owned transitive closure of test_files');
 });
 
 test('manual artifact collection rejects raw run reports even when the harness is environment-backed', async () => {
@@ -4888,7 +5029,7 @@ test('manual artifact collection rejects getter-based Reflect.get object members
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects method-based Reflect.get object members that only look environment-backed on the report surface', async () => {
@@ -4930,7 +5071,7 @@ test('manual artifact collection rejects method-based Reflect.get object members
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects parenthesized reassigned getter-based Reflect.get object members that only look environment-backed on the report surface', async () => {
@@ -4972,7 +5113,7 @@ test('manual artifact collection rejects parenthesized reassigned getter-based R
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects aliased createRequire harnesses that only look environment-backed on the report surface', async () => {
@@ -5014,7 +5155,7 @@ test('manual artifact collection rejects aliased createRequire harnesses that on
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects parenthesized reassigned createRequire harnesses that only look environment-backed on the report surface', async () => {
@@ -5056,7 +5197,7 @@ test('manual artifact collection rejects parenthesized reassigned createRequire 
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects namespace-aliased createRequire harnesses that only look environment-backed on the report surface', async () => {
@@ -5098,7 +5239,7 @@ test('manual artifact collection rejects namespace-aliased createRequire harness
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects parenthesized namespace-member createRequire harnesses that only look environment-backed on the report surface', async () => {
@@ -5140,7 +5281,7 @@ test('manual artifact collection rejects parenthesized namespace-member createRe
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects optional-chained createRequire harnesses that only look environment-backed on the report surface', async () => {
@@ -5182,7 +5323,7 @@ test('manual artifact collection rejects optional-chained createRequire harnesse
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects escaped createRequire harnesses that only look environment-backed on the report surface', async () => {
@@ -5224,7 +5365,7 @@ test('manual artifact collection rejects escaped createRequire harnesses that on
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects destructuring-reassigned createRequire harnesses that only look environment-backed on the report surface', async () => {
@@ -5266,7 +5407,7 @@ test('manual artifact collection rejects destructuring-reassigned createRequire 
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects spread-backed destructuring-reassigned createRequire harnesses that only look environment-backed on the report surface', async () => {
@@ -5308,7 +5449,7 @@ test('manual artifact collection rejects spread-backed destructuring-reassigned 
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects spread-sourced destructuring-reassigned createRequire harnesses that only look environment-backed on the report surface', async () => {
@@ -5350,7 +5491,7 @@ test('manual artifact collection rejects spread-sourced destructuring-reassigned
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects expression-built spread-sourced destructuring-reassigned createRequire harnesses that only look environment-backed on the report surface', async () => {
@@ -5392,7 +5533,7 @@ test('manual artifact collection rejects expression-built spread-sourced destruc
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects spread-sourced object-member createRequire harnesses that only look environment-backed on the report surface', async () => {
@@ -5434,7 +5575,7 @@ test('manual artifact collection rejects spread-sourced object-member createRequ
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects expression-built spread-sourced object-member createRequire harnesses that only look environment-backed on the report surface', async () => {
@@ -5476,7 +5617,7 @@ test('manual artifact collection rejects expression-built spread-sourced object-
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects object-member createRequire harnesses that only look environment-backed on the report surface', async () => {
@@ -5518,7 +5659,7 @@ test('manual artifact collection rejects object-member createRequire harnesses t
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects parenthesized object-member createRequire harnesses that only look environment-backed on the report surface', async () => {
@@ -5560,7 +5701,7 @@ test('manual artifact collection rejects parenthesized object-member createRequi
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects static bracket createRequire harnesses that only look environment-backed on the report surface', async () => {
@@ -5602,7 +5743,7 @@ test('manual artifact collection rejects static bracket createRequire harnesses 
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects createRequire.call harnesses that only look environment-backed on the report surface', async () => {
@@ -5644,7 +5785,7 @@ test('manual artifact collection rejects createRequire.call harnesses that only 
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects aliased createRequire.bind harnesses that only look environment-backed on the report surface', async () => {
@@ -5686,7 +5827,7 @@ test('manual artifact collection rejects aliased createRequire.bind harnesses th
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects inline object-literal receiver createRequire harnesses built from expression spreads that only look environment-backed on the report surface', async () => {
@@ -5728,7 +5869,7 @@ test('manual artifact collection rejects inline object-literal receiver createRe
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects numeric bracket createRequire object-member harnesses that only look environment-backed on the report surface', async () => {
@@ -5770,7 +5911,7 @@ test('manual artifact collection rejects numeric bracket createRequire object-me
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects numeric bracket inline object-literal receiver createRequire harnesses that only look environment-backed on the report surface', async () => {
@@ -5812,7 +5953,7 @@ test('manual artifact collection rejects numeric bracket inline object-literal r
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects computed numeric bracket createRequire object-member harnesses that only look environment-backed on the report surface', async () => {
@@ -5854,7 +5995,7 @@ test('manual artifact collection rejects computed numeric bracket createRequire 
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects computed numeric bracket inline object-literal receiver createRequire harnesses that only look environment-backed on the report surface', async () => {
@@ -5896,7 +6037,7 @@ test('manual artifact collection rejects computed numeric bracket inline object-
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects extracted computed numeric bracket createRequire aliases that only look environment-backed on the report surface', async () => {
@@ -5938,7 +6079,7 @@ test('manual artifact collection rejects extracted computed numeric bracket crea
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects extracted inline object-literal createRequire aliases that only look environment-backed on the report surface', async () => {
@@ -5980,7 +6121,7 @@ test('manual artifact collection rejects extracted inline object-literal createR
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects non-finite computed numeric bracket createRequire object-member harnesses that only look environment-backed on the report surface', async () => {
@@ -6022,7 +6163,7 @@ test('manual artifact collection rejects non-finite computed numeric bracket cre
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects non-finite computed numeric bracket inline object-literal receiver createRequire harnesses that only look environment-backed on the report surface', async () => {
@@ -6064,7 +6205,7 @@ test('manual artifact collection rejects non-finite computed numeric bracket inl
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects extracted non-finite computed numeric bracket createRequire aliases that only look environment-backed on the report surface', async () => {
@@ -6106,7 +6247,7 @@ test('manual artifact collection rejects extracted non-finite computed numeric b
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects extracted non-finite inline object-literal createRequire aliases that only look environment-backed on the report surface', async () => {
@@ -6148,7 +6289,7 @@ test('manual artifact collection rejects extracted non-finite inline object-lite
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects aliased constructor.call harnesses that only look environment-backed on the report surface', async () => {
@@ -6190,7 +6331,7 @@ test('manual artifact collection rejects aliased constructor.call harnesses that
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects escaped constructor property aliases that only look environment-backed on the report surface', async () => {
@@ -6232,7 +6373,7 @@ test('manual artifact collection rejects escaped constructor property aliases th
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects destructuring-reassigned constructor property aliases that only look environment-backed on the report surface', async () => {
@@ -6274,7 +6415,7 @@ test('manual artifact collection rejects destructuring-reassigned constructor pr
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects computed-key destructuring-reassigned constructor aliases that only look environment-backed on the report surface', async () => {
@@ -6316,7 +6457,7 @@ test('manual artifact collection rejects computed-key destructuring-reassigned c
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects spread-sourced destructuring-reassigned constructor aliases that only look environment-backed on the report surface', async () => {
@@ -6358,7 +6499,7 @@ test('manual artifact collection rejects spread-sourced destructuring-reassigned
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects spread-sourced object-member constructor aliases that only look environment-backed on the report surface', async () => {
@@ -6400,7 +6541,7 @@ test('manual artifact collection rejects spread-sourced object-member constructo
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects object-member constructor aliases that only look environment-backed on the report surface', async () => {
@@ -6442,7 +6583,7 @@ test('manual artifact collection rejects object-member constructor aliases that 
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects parenthesized object-member constructor aliases that only look environment-backed on the report surface', async () => {
@@ -6484,7 +6625,7 @@ test('manual artifact collection rejects parenthesized object-member constructor
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects reassigned constructor.call harnesses that only look environment-backed on the report surface', async () => {
@@ -6526,7 +6667,7 @@ test('manual artifact collection rejects reassigned constructor.call harnesses t
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects parenthesized reassigned constructor harnesses that only look environment-backed on the report surface', async () => {
@@ -6568,7 +6709,7 @@ test('manual artifact collection rejects parenthesized reassigned constructor ha
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('non-local harness readiness is recomputed after files change and manual artifact validation reuses the fresh result', async () => {
@@ -6613,7 +6754,7 @@ test('non-local harness readiness is recomputed after files change and manual ar
 
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('writeL1Evidence keeps end-to-end bundle gating fail-closed without manual artifacts and passes once environment-backed artifacts exist', async () => {

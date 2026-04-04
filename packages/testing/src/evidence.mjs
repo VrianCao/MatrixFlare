@@ -18,6 +18,7 @@ import {
   normalizeRolloutSkewProbeResponse,
 } from '../../control-plane/src/index.mjs';
 import {
+  getReleaseGateTestFiles,
   getRequiredTestFiles,
   getTestEnvironmentDefinition,
   getTestEnvironmentDirectory,
@@ -1023,6 +1024,143 @@ function pathUsesPrefix(relativePath, prefix) {
     return false;
   }
   return normalizedRelativePath === normalizedPrefix || normalizedRelativePath.startsWith(`${normalizedPrefix}/`);
+}
+
+function sortUniqueStrings(values) {
+  return [...new Set(values)].sort();
+}
+
+function haveSameSortedStrings(left, right) {
+  if (left.length !== right.length) {
+    return false;
+  }
+  return left.every((value, index) => value === right[index]);
+}
+
+function splitShellStyleCommand(command) {
+  if (!isNonEmptyString(command)) {
+    return null;
+  }
+  const tokens = [];
+  let current = '';
+  let quote = null;
+  let escaping = false;
+  for (const character of command) {
+    if (escaping) {
+      current += character;
+      escaping = false;
+      continue;
+    }
+    if (quote === '\'') {
+      if (character === '\'') {
+        quote = null;
+      } else {
+        current += character;
+      }
+      continue;
+    }
+    if (quote === '"') {
+      if (character === '"') {
+        quote = null;
+      } else if (character === '\\') {
+        escaping = true;
+      } else {
+        current += character;
+      }
+      continue;
+    }
+    if (character === '\'' || character === '"') {
+      quote = character;
+      continue;
+    }
+    if (character === '\\') {
+      escaping = true;
+      continue;
+    }
+    if (/\s/.test(character)) {
+      if (current.length > 0) {
+        tokens.push(current);
+        current = '';
+      }
+      continue;
+    }
+    current += character;
+  }
+  if (escaping || quote != null) {
+    return null;
+  }
+  if (current.length > 0) {
+    tokens.push(current);
+  }
+  return tokens.length > 0 ? tokens : null;
+}
+
+function normalizeCommandTokenToRepoRelativePath(token) {
+  if (!isNonEmptyString(token)) {
+    return null;
+  }
+  let normalizedToken = String(token).trim();
+  if (normalizedToken.startsWith('file://')) {
+    try {
+      normalizedToken = fileURLToPath(normalizedToken);
+    } catch {
+      return null;
+    }
+  }
+  const repoRelative = normalizeRepoRelativePath(normalizedToken);
+  if (repoRelative != null) {
+    return repoRelative;
+  }
+  const commandPath = normalizedToken.replaceAll('\\', '/');
+  const match = commandPath.match(/(?:^|\/)(tests\/.+)$/);
+  return match == null ? null : normalizeRepoRelativePath(match[1]);
+}
+
+function extractCommandClaimedTestFiles(command) {
+  const tokens = splitShellStyleCommand(command);
+  if (tokens == null) {
+    return {
+      valid: false,
+      error: 'environment run report command must be a parseable shell-style string',
+      files: [],
+    };
+  }
+  const claimedFiles = sortUniqueStrings(tokens
+    .filter((token) => !token.startsWith('-'))
+    .map((token) => normalizeCommandTokenToRepoRelativePath(token))
+    .filter((token) => token != null && token.endsWith('.test.mjs')));
+  if (claimedFiles.length === 0) {
+    return {
+      valid: false,
+      error: 'environment run report command must enumerate repo-relative .test.mjs files',
+      files: [],
+    };
+  }
+  return {
+    valid: true,
+    error: null,
+    files: claimedFiles,
+  };
+}
+
+function validateEnvironmentRunCommandClaims(command, normalizedTestFiles) {
+  const commandFilesResult = extractCommandClaimedTestFiles(command);
+  if (!commandFilesResult.valid) {
+    return commandFilesResult;
+  }
+  const normalizedClaimedFiles = sortUniqueStrings(normalizedTestFiles);
+  if (!haveSameSortedStrings(commandFilesResult.files, normalizedClaimedFiles)) {
+    return {
+      valid: false,
+      error: 'environment run report command must enumerate the same repo-relative test_files claimed by the report',
+      files: commandFilesResult.files,
+    };
+  }
+  return {
+    valid: true,
+    error: null,
+    files: commandFilesResult.files,
+  };
 }
 
 function pathIsWithinRoot(targetPath, rootPath) {
@@ -3736,10 +3874,23 @@ export function validateManualArtifactPayload(artifactId, payload, {
         error: 'environment run report must include test_files matching test_file_count',
       };
     }
+    if (sortUniqueStrings(normalizedTestFiles).length !== normalizedTestFiles.length) {
+      return {
+        valid: false,
+        error: 'environment run report test_files must not repeat paths',
+      };
+    }
     if (!normalizedTestFiles.every((file) => pathUsesPrefix(file, environmentDefinition.directory))) {
       return {
         valid: false,
         error: `environment run report test_files must stay within ${environmentDefinition.directory}`,
+      };
+    }
+    const commandValidation = validateEnvironmentRunCommandClaims(payload.command, normalizedTestFiles);
+    if (!commandValidation.valid) {
+      return {
+        valid: false,
+        error: commandValidation.error,
       };
     }
     if (!isNonNegativeInteger(payload.expanded_test_file_count) || payload.expanded_test_file_count === 0) {
@@ -3752,6 +3903,12 @@ export function validateManualArtifactPayload(artifactId, payload, {
       return {
         valid: false,
         error: 'environment run report must include expanded_test_files matching expanded_test_file_count',
+      };
+    }
+    if (sortUniqueStrings(normalizedExpandedTestFiles).length !== normalizedExpandedTestFiles.length) {
+      return {
+        valid: false,
+        error: 'environment run report expanded_test_files must not repeat paths',
       };
     }
     if (normalizedExpandedTestFiles.some((file) => pathUsesPrefix(file, 'tests/local'))) {
@@ -3774,6 +3931,13 @@ export function validateManualArtifactPayload(artifactId, payload, {
       return {
         valid: false,
         error: `environment run report expanded_test_files must not include generic entrypoint ${genericExpandedEntrypoint}`,
+      };
+    }
+    const missingClaimedTestFile = normalizedTestFiles.find((file) => !normalizedExpandedTestFiles.includes(file));
+    if (missingClaimedTestFile != null) {
+      return {
+        valid: false,
+        error: `environment run report expanded_test_files must include claimed test_file ${missingClaimedTestFile}`,
       };
     }
     if (!isRfc3339UtcTimestamp(payload.started_at) || !isRfc3339UtcTimestamp(payload.completed_at)) {
@@ -4054,6 +4218,65 @@ export function validateManualArtifactPayload(artifactId, payload, {
     }
   }
 
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+export async function validateEnvironmentRunExecutionProof(artifactId, payload, repoRoot = process.cwd()) {
+  const expectedEnvironmentName = resolveEnvironmentNameForArtifactId(artifactId);
+  if (expectedEnvironmentName == null) {
+    return {
+      valid: true,
+      error: null,
+    };
+  }
+  const normalizedTestFiles = Array.isArray(payload?.test_files)
+    ? payload.test_files.map((entry) => normalizeRepoRelativePath(entry))
+    : null;
+  const normalizedExpandedTestFiles = Array.isArray(payload?.expanded_test_files)
+    ? payload.expanded_test_files.map((entry) => normalizeRepoRelativePath(entry))
+    : null;
+  if (
+    normalizedTestFiles == null
+    || normalizedExpandedTestFiles == null
+    || normalizedTestFiles.some((entry) => entry == null)
+    || normalizedExpandedTestFiles.some((entry) => entry == null)
+  ) {
+    return {
+      valid: false,
+      error: 'environment run report must include normalized repo-relative test_files and expanded_test_files before execution-proof validation',
+    };
+  }
+  const absoluteTestFiles = normalizedTestFiles.map((file) => path.join(repoRoot, file));
+  const expansionResult = await expandEnvironmentTestFiles(absoluteTestFiles, repoRoot);
+  if (expansionResult.missing_files.length > 0) {
+    return {
+      valid: false,
+      error: 'environment run report test_files must reference existing repo-owned files',
+    };
+  }
+  if (expansionResult.repo_boundary_escapes.length > 0) {
+    return {
+      valid: false,
+      error: 'environment run report test_files must keep repo-owned dependency closure within the repository boundary',
+    };
+  }
+  if (expansionResult.unresolved_dynamic_imports.length > 0) {
+    return {
+      valid: false,
+      error: 'environment run report test_files must not contain unresolved or non-literal dynamic imports',
+    };
+  }
+  const expectedExpandedTestFiles = sortUniqueStrings(expansionResult.expanded_test_files);
+  const claimedExpandedTestFiles = sortUniqueStrings(normalizedExpandedTestFiles);
+  if (!haveSameSortedStrings(expectedExpandedTestFiles, claimedExpandedTestFiles)) {
+    return {
+      valid: false,
+      error: 'environment run report expanded_test_files must equal the repo-owned transitive closure of test_files',
+    };
+  }
   return {
     valid: true,
     error: null,
@@ -4477,6 +4700,7 @@ export async function assessNonLocalEnvironmentHarnessReadiness(
 ) {
   let result;
   try {
+    const environmentDirectory = normalizeRepoRelativePath(getTestEnvironmentDefinition(environmentName).directory);
     const testFiles = await getRequiredTestFilesImpl(environmentName, repoRoot);
     const relativeTestFiles = testFiles.map((file) => normalizePathForMarkdown(path.relative(repoRoot, file)));
     const {
@@ -4485,7 +4709,16 @@ export async function assessNonLocalEnvironmentHarnessReadiness(
       unresolved_dynamic_imports: unresolvedDynamicImports,
     } = await expandEnvironmentTestFiles(testFiles, repoRoot);
     const localTestExpansions = expandedTestFiles.filter((file) => pathUsesPrefix(file, 'tests/local'));
+    const environmentBoundaryEscapes = environmentDirectory == null
+      ? []
+      : expandedTestFiles.filter((file) => !pathUsesPrefix(file, environmentDirectory));
+    const genericEntrypoints = expandedTestFiles.filter((file) => {
+      const basename = path.posix.basename(file);
+      return basename === 'bootstrap.test.mjs' || basename === 'l1-mandatory.test.mjs';
+    });
     result = localTestExpansions.length === 0
+      && environmentBoundaryEscapes.length === 0
+      && genericEntrypoints.length === 0
       && unresolvedDynamicImports.length === 0
       && repoBoundaryEscapes.length === 0
       ? {
@@ -4494,6 +4727,8 @@ export async function assessNonLocalEnvironmentHarnessReadiness(
           test_files: relativeTestFiles,
           expanded_test_files: expandedTestFiles,
           local_test_expansions: [],
+          environment_boundary_escapes: [],
+          generic_entrypoints: [],
           repo_boundary_escapes: [],
           unresolved_dynamic_imports: [],
         }
@@ -4504,9 +4739,35 @@ export async function assessNonLocalEnvironmentHarnessReadiness(
           test_files: relativeTestFiles,
           expanded_test_files: expandedTestFiles,
           local_test_expansions: localTestExpansions,
+          environment_boundary_escapes: environmentBoundaryEscapes,
+          generic_entrypoints: genericEntrypoints,
           repo_boundary_escapes: repoBoundaryEscapes,
           unresolved_dynamic_imports: unresolvedDynamicImports,
         }
+        : environmentBoundaryEscapes.length > 0
+          ? {
+            ready: false,
+            reason: `${environmentName} harness escapes dedicated environment directory closure`,
+            test_files: relativeTestFiles,
+            expanded_test_files: expandedTestFiles,
+            local_test_expansions: [],
+            environment_boundary_escapes: environmentBoundaryEscapes,
+            generic_entrypoints: genericEntrypoints,
+            repo_boundary_escapes: repoBoundaryEscapes,
+            unresolved_dynamic_imports: unresolvedDynamicImports,
+          }
+        : genericEntrypoints.length > 0
+          ? {
+            ready: false,
+            reason: `${environmentName} harness expands generic entrypoints`,
+            test_files: relativeTestFiles,
+            expanded_test_files: expandedTestFiles,
+            local_test_expansions: [],
+            environment_boundary_escapes: environmentBoundaryEscapes,
+            generic_entrypoints: genericEntrypoints,
+            repo_boundary_escapes: repoBoundaryEscapes,
+            unresolved_dynamic_imports: unresolvedDynamicImports,
+          }
         : repoBoundaryEscapes.length > 0
           ? {
               ready: false,
@@ -4514,6 +4775,8 @@ export async function assessNonLocalEnvironmentHarnessReadiness(
               test_files: relativeTestFiles,
               expanded_test_files: expandedTestFiles,
               local_test_expansions: [],
+              environment_boundary_escapes: environmentBoundaryEscapes,
+              generic_entrypoints: genericEntrypoints,
               repo_boundary_escapes: repoBoundaryEscapes,
               unresolved_dynamic_imports: unresolvedDynamicImports,
             }
@@ -4523,6 +4786,8 @@ export async function assessNonLocalEnvironmentHarnessReadiness(
             test_files: relativeTestFiles,
             expanded_test_files: expandedTestFiles,
             local_test_expansions: [],
+            environment_boundary_escapes: environmentBoundaryEscapes,
+            generic_entrypoints: genericEntrypoints,
             repo_boundary_escapes: repoBoundaryEscapes,
             unresolved_dynamic_imports: unresolvedDynamicImports,
           };
@@ -4533,6 +4798,8 @@ export async function assessNonLocalEnvironmentHarnessReadiness(
       test_files: [],
       expanded_test_files: [],
       local_test_expansions: [],
+      environment_boundary_escapes: [],
+      generic_entrypoints: [],
       repo_boundary_escapes: [],
       unresolved_dynamic_imports: [],
     };
@@ -4737,7 +5004,9 @@ export async function collectManualArtifactResults(definition, repoRoot, manualA
     const requiresExternalEvidence = requiresExternalManualArtifactEvidence(artifactRequirement.artifact_id);
     const harnessReadiness = expectedEnvironmentName == null
       ? null
-      : await assessNonLocalEnvironmentHarnessReadiness(expectedEnvironmentName, repoRoot);
+      : await assessNonLocalEnvironmentHarnessReadiness(expectedEnvironmentName, repoRoot, {
+        getRequiredTestFilesImpl: getReleaseGateTestFiles,
+      });
     let exists = false;
     let sha256 = null;
     let valid = false;
@@ -4781,25 +5050,20 @@ export async function collectManualArtifactResults(definition, repoRoot, manualA
         });
         valid = validation.valid;
         validation_error = validation.error;
-        if (valid) {
-          attestation_kind = parsedPayload.attestation_kind ?? null;
-          attestation_origin_system = parsedPayload.provenance?.origin_system ?? null;
-          attestation_origin_run_id = parsedPayload.provenance?.origin_run_id ?? null;
-          attestation_origin_run_attempt = parsedPayload.provenance?.origin_run_attempt ?? null;
-          attestation_origin_run_uri = parsedPayload.provenance?.origin_run_uri ?? null;
-          attestation_artifact_store_uri = parsedPayload.provenance?.artifact_store_uri ?? null;
-          attestation_artifact_store_key = parsedPayload.provenance?.artifact_store_key ?? null;
-          attestation_artifact_sha256 = parsedPayload.provenance?.artifact_sha256 ?? null;
-          attestation_review_record_uri = parsedPayload.provenance?.review_record_uri ?? null;
-          attestation_topology_kind = parsedPayload.provenance?.topology_kind ?? null;
-          attestation_deployment_identity = parsedPayload.provenance?.deployment_identity ?? null;
-        }
         attestation_provenance = isPlainObject(parsedPayload?.provenance)
           ? parsedPayload.provenance
           : null;
-        attested_payload = valid && isPlainObject(parsedPayload?.payload)
-          ? parsedPayload.payload
-          : null;
+        if (valid && expectedEnvironmentName != null && isPlainObject(parsedPayload?.payload)) {
+          const executionProofValidation = await validateEnvironmentRunExecutionProof(
+            artifactRequirement.artifact_id,
+            parsedPayload.payload,
+            repoRoot,
+          );
+          if (!executionProofValidation.valid) {
+            valid = false;
+            validation_error = executionProofValidation.error;
+          }
+        }
         if (requiresExternalEvidence) {
           sharedRunArtifactAlias = await isAliasOfSharedRunArtifact(
             resolvedPath,
@@ -4821,6 +5085,24 @@ export async function collectManualArtifactResults(definition, repoRoot, manualA
         if (valid && expectedEnvironmentName != null && harnessReadiness?.ready === false) {
           valid = false;
           validation_error = `${expectedEnvironmentName} harness is not environment-backed: ${harnessReadiness.reason}`;
+        }
+        if (valid) {
+          attestation_kind = parsedPayload.attestation_kind ?? null;
+          attestation_origin_system = parsedPayload.provenance?.origin_system ?? null;
+          attestation_origin_run_id = parsedPayload.provenance?.origin_run_id ?? null;
+          attestation_origin_run_attempt = parsedPayload.provenance?.origin_run_attempt ?? null;
+          attestation_origin_run_uri = parsedPayload.provenance?.origin_run_uri ?? null;
+          attestation_artifact_store_uri = parsedPayload.provenance?.artifact_store_uri ?? null;
+          attestation_artifact_store_key = parsedPayload.provenance?.artifact_store_key ?? null;
+          attestation_artifact_sha256 = parsedPayload.provenance?.artifact_sha256 ?? null;
+          attestation_review_record_uri = parsedPayload.provenance?.review_record_uri ?? null;
+          attestation_topology_kind = parsedPayload.provenance?.topology_kind ?? null;
+          attestation_deployment_identity = parsedPayload.provenance?.deployment_identity ?? null;
+          attested_payload = isPlainObject(parsedPayload?.payload)
+            ? parsedPayload.payload
+            : null;
+        } else {
+          attested_payload = null;
         }
       } catch (error) {
         if (error && error.code === 'ENOENT') {

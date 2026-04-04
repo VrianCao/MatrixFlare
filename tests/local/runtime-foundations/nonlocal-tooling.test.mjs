@@ -173,6 +173,28 @@ function buildReadinessProbeFixture(environmentName, {
   };
 }
 
+function buildHarnessReadinessFixture(testFiles, overrides = {}) {
+  const expandedTestFiles = new Set(testFiles);
+  for (const file of testFiles) {
+    const match = /^tests\/(integration|staging|pre-release)\//.exec(file);
+    if (match) {
+      expandedTestFiles.add(`tests/${match[1]}/support.mjs`);
+    }
+  }
+  return {
+    ready: true,
+    reason: null,
+    test_files: [...testFiles],
+    expanded_test_files: [...expandedTestFiles].sort(),
+    local_test_expansions: [],
+    environment_boundary_escapes: [],
+    generic_entrypoints: [],
+    repo_boundary_escapes: [],
+    unresolved_dynamic_imports: [],
+    ...overrides,
+  };
+}
+
 function buildRolloutSkewProbeFixture(overrides = {}) {
   const baselineGatewayVersionTag = 'mx-gw-d-baseline';
   const candidateGatewayVersionTag = 'mx-gw-d-candidate';
@@ -351,6 +373,9 @@ test('environment wrangler config rewrites bindings for a specific non-local env
   });
 
   assert.equal(config.name, 'matrix-gateway-worker');
+  assert.deepEqual(config.version_metadata, {
+    binding: 'CF_VERSION_METADATA',
+  });
   assert.ok(config.env);
   assert.equal(config.env['pre-release'].workers_dev, true);
   assert.equal(config.env['pre-release'].vars.ENVIRONMENT_NAME, 'pre-release');
@@ -464,6 +489,9 @@ test('written non-local wrangler config rewrites main to a real worker entrypoin
         resolvedMainPath,
         path.join(repoRoot, 'apps', workerName, 'src', 'index.mjs'),
       );
+      assert.deepEqual(written.config.version_metadata, {
+        binding: 'CF_VERSION_METADATA',
+      });
     }
   } finally {
     await fs.rm(tempRoot, { recursive: true, force: true });
@@ -1444,11 +1472,9 @@ test('runEnvironmentBackedSuite does not spawn the suite when readiness fails', 
       deploymentSummary,
     }, {
       requireGitHubActionsExecutionImpl: async () => ({ environment: 'ci-integration' }),
-      assessNonLocalEnvironmentHarnessReadinessImpl: async () => ({
-        ready: true,
-        reason: null,
-        expanded_test_files: ['tests/integration/l1-mandatory.test.mjs'],
-      }),
+      assessNonLocalEnvironmentHarnessReadinessImpl: async () => buildHarnessReadinessFixture([
+        'tests/integration/l1-mandatory.test.mjs',
+      ]),
       requireCloudflareCredentialsImpl: () => ({ accountId: 'cf-account', apiToken: 'cf-token' }),
       readWorkersSubdomainImpl: async () => 'matrixflare',
       validateDeploymentSummaryAgainstCurrentCloudflareStateImpl: async () => (
@@ -1502,11 +1528,9 @@ test('runEnvironmentBackedSuite passes release-gate file selection into harness 
         const files = await options.getRequiredTestFilesImpl(environmentName, root);
         readinessSelectorCalls += 1;
         assert.deepEqual(files, [path.join(repoRoot, 'tests/integration/test-cs-001.test.mjs')]);
-        return {
-          ready: true,
-          reason: null,
-          expanded_test_files: ['tests/integration/test-cs-001.test.mjs'],
-        };
+        return buildHarnessReadinessFixture([
+          'tests/integration/test-cs-001.test.mjs',
+        ]);
       },
       requireCloudflareCredentialsImpl: () => ({ accountId: 'cf-account', apiToken: 'cf-token' }),
       readWorkersSubdomainImpl: async () => 'matrixflare',
@@ -1529,8 +1553,77 @@ test('runEnvironmentBackedSuite passes release-gate file selection into harness 
 
     assert.equal(readinessSelectorCalls, 1);
     assert.equal(result.ok, true);
-    assert.deepEqual(result.report.expanded_test_files, ['tests/integration/test-cs-001.test.mjs']);
-    assert.equal(result.report.expanded_test_file_count, 1);
+    assert.deepEqual(result.report.expanded_test_files, [
+      'tests/integration/support.mjs',
+      'tests/integration/test-cs-001.test.mjs',
+    ]);
+    assert.equal(result.report.expanded_test_file_count, 2);
+  } finally {
+    await fs.rm(outputRoot, { recursive: true, force: true });
+  }
+});
+
+test('runEnvironmentBackedSuite keeps report test_files aligned with the readiness-selected release-gate slice', async () => {
+  const repoRoot = path.resolve('.');
+  const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-nonlocal-suite-selector-alignment-'));
+  const deploymentSummary = buildDeploymentSummaryFixture('ci-integration');
+  let selectorCallCount = 0;
+  let spawnedArgs = null;
+
+  try {
+    const result = await runEnvironmentBackedSuite('ci-integration', repoRoot, {
+      runTimestamp: '20260404T162600Z',
+      outputRoot,
+      sourceRunUri: 'https://github.com/example/matrix/actions/runs/12345',
+      logArtifact: 'https://github.com/example/matrix/actions/runs/12345/artifacts/1',
+      executedBy: 'gha://example/matrix/nonlocal/ci-integration',
+      reviewedBy: 'gha://example/matrix/nonlocal/ci-integration',
+      topologyKind: 'cloudflare-ci-integration',
+      deploymentSummary,
+    }, {
+      requireGitHubActionsExecutionImpl: async () => ({ environment: 'ci-integration' }),
+      assessNonLocalEnvironmentHarnessReadinessImpl: async (environmentName, root, options = {}) => {
+        const selectedFiles = await options.getRequiredTestFilesImpl(environmentName, root);
+        assert.deepEqual(selectedFiles, [path.join(repoRoot, 'tests/integration/test-cs-001.test.mjs')]);
+        return buildHarnessReadinessFixture(['tests/integration/test-cs-001.test.mjs']);
+      },
+      requireCloudflareCredentialsImpl: () => ({ accountId: 'cf-account', apiToken: 'cf-token' }),
+      readWorkersSubdomainImpl: async () => 'matrixflare',
+      validateDeploymentSummaryAgainstCurrentCloudflareStateImpl: async () => (
+        buildDeploymentIdentityValidationFixture('ci-integration')
+      ),
+      getRequiredTestFilesImpl: async () => {
+        selectorCallCount += 1;
+        return selectorCallCount === 1
+          ? [path.join(repoRoot, 'tests/integration/test-cs-001.test.mjs')]
+          : [path.join(repoRoot, 'tests/integration/test-cs-004.test.mjs')];
+      },
+      waitForNonLocalDeploymentReadinessImpl: async () => buildReadinessProbeFixture('ci-integration'),
+      spawnImpl: (_command, args) => {
+        spawnedArgs = args;
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        queueMicrotask(() => {
+          child.stdout.emit('data', Buffer.from('suite ok\n', 'utf8'));
+          child.emit('close', 0);
+        });
+        return child;
+      },
+    });
+
+    assert.equal(selectorCallCount, 1);
+    assert.deepEqual(spawnedArgs, [
+      '--test',
+      '--test-concurrency=1',
+      path.join(repoRoot, 'tests/integration/test-cs-001.test.mjs'),
+    ]);
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.report.test_files, ['tests/integration/test-cs-001.test.mjs']);
+    assert.deepEqual(result.report.expanded_test_files, [
+      'tests/integration/support.mjs',
+      'tests/integration/test-cs-001.test.mjs',
+    ]);
   } finally {
     await fs.rm(outputRoot, { recursive: true, force: true });
   }
@@ -1556,11 +1649,9 @@ test('runEnvironmentBackedSuite revalidates deployment identity after readiness 
         deploymentSummary,
       }, {
         requireGitHubActionsExecutionImpl: async () => ({ environment: 'ci-integration' }),
-        assessNonLocalEnvironmentHarnessReadinessImpl: async () => ({
-          ready: true,
-          reason: null,
-          expanded_test_files: ['tests/integration/l1-mandatory.test.mjs'],
-        }),
+        assessNonLocalEnvironmentHarnessReadinessImpl: async () => buildHarnessReadinessFixture([
+          'tests/integration/l1-mandatory.test.mjs',
+        ]),
         requireCloudflareCredentialsImpl: () => ({ accountId: 'cf-account', apiToken: 'cf-token' }),
         readWorkersSubdomainImpl: async () => 'matrixflare',
         validateDeploymentSummaryAgainstCurrentCloudflareStateImpl: async () => {
@@ -1605,11 +1696,9 @@ test('runEnvironmentBackedSuite refuses to run staging without a prepared Access
         deploymentSummary,
       }, {
         requireGitHubActionsExecutionImpl: async () => ({ environment: 'staging' }),
-        assessNonLocalEnvironmentHarnessReadinessImpl: async () => ({
-          ready: true,
-          reason: null,
-          expanded_test_files: ['tests/staging/test-der-001.test.mjs'],
-        }),
+        assessNonLocalEnvironmentHarnessReadinessImpl: async () => buildHarnessReadinessFixture([
+          'tests/staging/test-der-001.test.mjs',
+        ]),
         requireCloudflareCredentialsImpl: () => ({ accountId: 'cf-account', apiToken: 'cf-token' }),
         readWorkersSubdomainImpl: async () => 'matrixflare',
         validateDeploymentSummaryAgainstCurrentCloudflareStateImpl: async () => (
@@ -1651,11 +1740,9 @@ test('runEnvironmentBackedSuite injects the prepared Access session into the chi
       },
     }, {
       requireGitHubActionsExecutionImpl: async () => ({ environment: 'staging' }),
-      assessNonLocalEnvironmentHarnessReadinessImpl: async () => ({
-        ready: true,
-        reason: null,
-        expanded_test_files: ['tests/staging/test-der-001.test.mjs'],
-      }),
+      assessNonLocalEnvironmentHarnessReadinessImpl: async () => buildHarnessReadinessFixture([
+        'tests/staging/test-der-001.test.mjs',
+      ]),
       requireCloudflareCredentialsImpl: () => ({ accountId: 'cf-account', apiToken: 'cf-token' }),
       readWorkersSubdomainImpl: async () => 'matrixflare',
       validateDeploymentSummaryAgainstCurrentCloudflareStateImpl: async () => (
@@ -1727,11 +1814,9 @@ test('runEnvironmentBackedSuite serializes pre-release node tests, validates rol
       },
     }, {
       requireGitHubActionsExecutionImpl: async () => ({ environment: 'pre-release' }),
-      assessNonLocalEnvironmentHarnessReadinessImpl: async () => ({
-        ready: true,
-        reason: null,
-        expanded_test_files: ['tests/pre-release/test-ops-001.test.mjs'],
-      }),
+      assessNonLocalEnvironmentHarnessReadinessImpl: async () => buildHarnessReadinessFixture([
+        'tests/pre-release/test-ops-001.test.mjs',
+      ]),
       requireCloudflareCredentialsImpl: () => ({ accountId: 'cf-account', apiToken: 'cf-token' }),
       readWorkersSubdomainImpl: async () => 'matrixflare',
       validateDeploymentSummaryAgainstCurrentCloudflareStateImpl: async (summary) => {
@@ -1817,11 +1902,9 @@ test('runEnvironmentBackedSuite fails closed when the rollout skew sidecar is ma
       },
     }, {
       requireGitHubActionsExecutionImpl: async () => ({ environment: 'pre-release' }),
-      assessNonLocalEnvironmentHarnessReadinessImpl: async () => ({
-        ready: true,
-        reason: null,
-        expanded_test_files: ['tests/pre-release/test-ops-001.test.mjs'],
-      }),
+      assessNonLocalEnvironmentHarnessReadinessImpl: async () => buildHarnessReadinessFixture([
+        'tests/pre-release/test-ops-001.test.mjs',
+      ]),
       requireCloudflareCredentialsImpl: () => ({ accountId: 'cf-account', apiToken: 'cf-token' }),
       readWorkersSubdomainImpl: async () => 'matrixflare',
       validateDeploymentSummaryAgainstCurrentCloudflareStateImpl: async () => (
@@ -1889,11 +1972,9 @@ test('runEnvironmentBackedSuite fails closed when the rollout skew sidecar is se
       },
     }, {
       requireGitHubActionsExecutionImpl: async () => ({ environment: 'pre-release' }),
-      assessNonLocalEnvironmentHarnessReadinessImpl: async () => ({
-        ready: true,
-        reason: null,
-        expanded_test_files: ['tests/pre-release/test-ops-001.test.mjs'],
-      }),
+      assessNonLocalEnvironmentHarnessReadinessImpl: async () => buildHarnessReadinessFixture([
+        'tests/pre-release/test-ops-001.test.mjs',
+      ]),
       requireCloudflareCredentialsImpl: () => ({ accountId: 'cf-account', apiToken: 'cf-token' }),
       readWorkersSubdomainImpl: async () => 'matrixflare',
       validateDeploymentSummaryAgainstCurrentCloudflareStateImpl: async () => (
@@ -1958,11 +2039,9 @@ test('runEnvironmentBackedSuite fails closed when TEST-OPS-001 is covered withou
         },
       }, {
         requireGitHubActionsExecutionImpl: async () => ({ environment: 'pre-release' }),
-        assessNonLocalEnvironmentHarnessReadinessImpl: async () => ({
-          ready: true,
-          reason: null,
-          expanded_test_files: ['tests/pre-release/test-ops-001.test.mjs'],
-        }),
+        assessNonLocalEnvironmentHarnessReadinessImpl: async () => buildHarnessReadinessFixture([
+          'tests/pre-release/test-ops-001.test.mjs',
+        ]),
         requireCloudflareCredentialsImpl: () => ({ accountId: 'cf-account', apiToken: 'cf-token' }),
         readWorkersSubdomainImpl: async () => 'matrixflare',
         validateDeploymentSummaryAgainstCurrentCloudflareStateImpl: async () => (
@@ -2018,11 +2097,9 @@ test('runEnvironmentBackedSuite clears stale rollout skew sidecars before rerunn
       },
     }, {
       requireGitHubActionsExecutionImpl: async () => ({ environment: 'pre-release' }),
-      assessNonLocalEnvironmentHarnessReadinessImpl: async () => ({
-        ready: true,
-        reason: null,
-        expanded_test_files: ['tests/pre-release/test-ops-001.test.mjs'],
-      }),
+      assessNonLocalEnvironmentHarnessReadinessImpl: async () => buildHarnessReadinessFixture([
+        'tests/pre-release/test-ops-001.test.mjs',
+      ]),
       requireCloudflareCredentialsImpl: () => ({ accountId: 'cf-account', apiToken: 'cf-token' }),
       readWorkersSubdomainImpl: async () => 'matrixflare',
       validateDeploymentSummaryAgainstCurrentCloudflareStateImpl: async () => (
@@ -2078,11 +2155,9 @@ test('runEnvironmentBackedSuite captures a normalized pre-release cost observati
       },
     }, {
       requireGitHubActionsExecutionImpl: async () => ({ environment: 'pre-release' }),
-      assessNonLocalEnvironmentHarnessReadinessImpl: async () => ({
-        ready: true,
-        reason: null,
-        expanded_test_files: ['tests/pre-release/test-cost-001.test.mjs'],
-      }),
+      assessNonLocalEnvironmentHarnessReadinessImpl: async () => buildHarnessReadinessFixture([
+        'tests/pre-release/test-cost-001.test.mjs',
+      ]),
       requireCloudflareCredentialsImpl: () => ({ accountId: 'cf-account', apiToken: 'cf-token' }),
       readWorkersSubdomainImpl: async () => 'matrixflare',
       validateDeploymentSummaryAgainstCurrentCloudflareStateImpl: async () => (
@@ -2145,11 +2220,9 @@ test('runEnvironmentBackedSuite fails closed when the pre-release cost observati
       },
     }, {
       requireGitHubActionsExecutionImpl: async () => ({ environment: 'pre-release' }),
-      assessNonLocalEnvironmentHarnessReadinessImpl: async () => ({
-        ready: true,
-        reason: null,
-        expanded_test_files: ['tests/pre-release/test-cost-001.test.mjs'],
-      }),
+      assessNonLocalEnvironmentHarnessReadinessImpl: async () => buildHarnessReadinessFixture([
+        'tests/pre-release/test-cost-001.test.mjs',
+      ]),
       requireCloudflareCredentialsImpl: () => ({ accountId: 'cf-account', apiToken: 'cf-token' }),
       readWorkersSubdomainImpl: async () => 'matrixflare',
       validateDeploymentSummaryAgainstCurrentCloudflareStateImpl: async () => (
@@ -2205,11 +2278,9 @@ test('runEnvironmentBackedSuite fails closed when the pre-release cost observati
       },
     }, {
       requireGitHubActionsExecutionImpl: async () => ({ environment: 'pre-release' }),
-      assessNonLocalEnvironmentHarnessReadinessImpl: async () => ({
-        ready: true,
-        reason: null,
-        expanded_test_files: ['tests/pre-release/test-cost-001.test.mjs'],
-      }),
+      assessNonLocalEnvironmentHarnessReadinessImpl: async () => buildHarnessReadinessFixture([
+        'tests/pre-release/test-cost-001.test.mjs',
+      ]),
       requireCloudflareCredentialsImpl: () => ({ accountId: 'cf-account', apiToken: 'cf-token' }),
       readWorkersSubdomainImpl: async () => 'matrixflare',
       validateDeploymentSummaryAgainstCurrentCloudflareStateImpl: async () => (
@@ -2270,11 +2341,9 @@ test('runEnvironmentBackedSuite fails closed when TEST-COST-001 is covered but t
       },
     }, {
       requireGitHubActionsExecutionImpl: async () => ({ environment: 'pre-release' }),
-      assessNonLocalEnvironmentHarnessReadinessImpl: async () => ({
-        ready: true,
-        reason: null,
-        expanded_test_files: ['tests/pre-release/test-cost-001.test.mjs'],
-      }),
+      assessNonLocalEnvironmentHarnessReadinessImpl: async () => buildHarnessReadinessFixture([
+        'tests/pre-release/test-cost-001.test.mjs',
+      ]),
       requireCloudflareCredentialsImpl: () => ({ accountId: 'cf-account', apiToken: 'cf-token' }),
       readWorkersSubdomainImpl: async () => 'matrixflare',
       validateDeploymentSummaryAgainstCurrentCloudflareStateImpl: async () => (
@@ -2333,11 +2402,9 @@ test('runEnvironmentBackedSuite clears stale pre-release cost sidecars before re
       },
     }, {
       requireGitHubActionsExecutionImpl: async () => ({ environment: 'pre-release' }),
-      assessNonLocalEnvironmentHarnessReadinessImpl: async () => ({
-        ready: true,
-        reason: null,
-        expanded_test_files: ['tests/pre-release/test-cost-001.test.mjs'],
-      }),
+      assessNonLocalEnvironmentHarnessReadinessImpl: async () => buildHarnessReadinessFixture([
+        'tests/pre-release/test-cost-001.test.mjs',
+      ]),
       requireCloudflareCredentialsImpl: () => ({ accountId: 'cf-account', apiToken: 'cf-token' }),
       readWorkersSubdomainImpl: async () => 'matrixflare',
       validateDeploymentSummaryAgainstCurrentCloudflareStateImpl: async () => (
