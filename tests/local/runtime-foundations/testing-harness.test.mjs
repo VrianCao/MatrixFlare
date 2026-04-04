@@ -43,6 +43,12 @@ import {
 
 const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../../..');
 const execFileAsync = promisify(execFile);
+const DEFAULT_TEST_GITHUB_REPOSITORY = typeof process.env.GITHUB_REPOSITORY === 'string' && process.env.GITHUB_REPOSITORY.trim().length > 0
+  ? process.env.GITHUB_REPOSITORY.trim()
+  : 'example/matrix';
+const FOREIGN_TEST_GITHUB_REPOSITORY = DEFAULT_TEST_GITHUB_REPOSITORY === 'example/other'
+  ? 'example/matrix'
+  : 'example/other';
 const ENVIRONMENT_MANUAL_ARTIFACT_IDS = Object.freeze({
   'ci-integration': 'ci_integration_run_report',
   staging: 'staging_run_report',
@@ -84,7 +90,7 @@ function buildGitHubRunId(environmentName, runTimestamp) {
 }
 
 function buildGitHubRunUri(environmentName, runTimestamp) {
-  return `https://github.com/example/matrix/actions/runs/${buildGitHubRunId(environmentName, runTimestamp)}`;
+  return `https://github.com/${DEFAULT_TEST_GITHUB_REPOSITORY}/actions/runs/${buildGitHubRunId(environmentName, runTimestamp)}`;
 }
 
 function buildPhase08ArtifactStoreKey(environmentName, runTimestamp, fileName) {
@@ -425,7 +431,7 @@ function buildValidEnvironmentAttestation(environmentName, runTimestamp, reportO
   const artifactId = ENVIRONMENT_MANUAL_ARTIFACT_IDS[environmentName];
   const baseProvenance = {
     origin_system: 'github-actions',
-    origin_repository: 'example/matrix',
+    origin_repository: DEFAULT_TEST_GITHUB_REPOSITORY,
     origin_run_id: originRunId,
     origin_run_attempt: 1,
     origin_run_uri: originRunUri,
@@ -472,7 +478,7 @@ function buildValidProdCostSnapshotAttestation(runTimestamp, payloadOverrides = 
   const originRunUri = buildGitHubRunUri('prod', runTimestamp);
   const baseProvenance = {
     origin_system: 'github-actions',
-    origin_repository: 'example/matrix',
+    origin_repository: DEFAULT_TEST_GITHUB_REPOSITORY,
     origin_run_id: originRunId,
     origin_run_attempt: 1,
     origin_run_uri: originRunUri,
@@ -2034,7 +2040,7 @@ test('manual artifact attestation validation requires immutable provenance plus 
       ...validStagingAttestation,
       provenance: {
         ...validStagingAttestation.provenance,
-        origin_repository: 'example/other',
+        origin_repository: FOREIGN_TEST_GITHUB_REPOSITORY,
       },
     }, {
       runTimestamp,
@@ -2048,7 +2054,7 @@ test('manual artifact attestation validation requires immutable provenance plus 
   assert.deepEqual(
     validateEvidenceAttestationBundle('staging_run_report', validStagingAttestation, {
       runTimestamp,
-      expectedGitHubRepository: 'example/other',
+      expectedGitHubRepository: FOREIGN_TEST_GITHUB_REPOSITORY,
     }),
     {
       valid: false,
@@ -4690,7 +4696,7 @@ test('manual artifact collection rejects GitHub Actions attestations from anothe
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-testing-harness-foreign-repo-'));
   const testFile = path.join(tempRoot, 'tests', 'pre-release', 'remote.test.mjs');
   const externalDir = path.join(tempRoot, 'external');
-  const foreignRunUri = `https://github.com/example/other/actions/runs/${buildGitHubRunId('pre-release', runTimestamp)}`;
+  const foreignRunUri = `https://github.com/${FOREIGN_TEST_GITHUB_REPOSITORY}/actions/runs/${buildGitHubRunId('pre-release', runTimestamp)}`;
   const reportPath = path.join(externalDir, 'pre-release.json');
 
   await fs.mkdir(path.dirname(testFile), { recursive: true });
@@ -4702,7 +4708,7 @@ test('manual artifact collection rejects GitHub Actions attestations from anothe
       source_run_uri: foreignRunUri,
     }, {
       provenance: {
-        origin_repository: 'example/other',
+        origin_repository: FOREIGN_TEST_GITHUB_REPOSITORY,
         origin_run_uri: foreignRunUri,
         review_record_uri: foreignRunUri,
       },
@@ -4717,7 +4723,7 @@ test('manual artifact collection rejects GitHub Actions attestations from anothe
     },
     runTimestamp,
     {
-      expectedGitHubRepository: 'example/matrix',
+      expectedGitHubRepository: DEFAULT_TEST_GITHUB_REPOSITORY,
     },
   );
 
@@ -4731,7 +4737,7 @@ test('manual artifact collection resolves the current repository from GITHUB_REP
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-testing-harness-env-repo-'));
   const testFile = path.join(tempRoot, 'tests', 'pre-release', 'remote.test.mjs');
   const externalDir = path.join(tempRoot, 'external');
-  const foreignRunUri = `https://github.com/example/other/actions/runs/${buildGitHubRunId('pre-release', runTimestamp)}`;
+  const foreignRunUri = `https://github.com/${FOREIGN_TEST_GITHUB_REPOSITORY}/actions/runs/${buildGitHubRunId('pre-release', runTimestamp)}`;
   const reportPath = path.join(externalDir, 'pre-release.json');
   const previousRepository = process.env.GITHUB_REPOSITORY;
 
@@ -4748,7 +4754,7 @@ test('manual artifact collection resolves the current repository from GITHUB_REP
       expanded_test_file_count: 1,
     }, {
       provenance: {
-        origin_repository: 'example/other',
+        origin_repository: FOREIGN_TEST_GITHUB_REPOSITORY,
         origin_run_uri: foreignRunUri,
         review_record_uri: foreignRunUri,
       },
@@ -4756,7 +4762,7 @@ test('manual artifact collection resolves the current repository from GITHUB_REP
   );
 
   try {
-    process.env.GITHUB_REPOSITORY = 'example/matrix';
+    process.env.GITHUB_REPOSITORY = DEFAULT_TEST_GITHUB_REPOSITORY;
     const results = await collectManualArtifactResults(
       getL1EvidenceDefinition('EVID-OPS-001'),
       tempRoot,
@@ -4787,7 +4793,7 @@ test('manual artifact collection rejects attestations that do not share one GitH
   const ciPath = path.join(externalDir, 'ci-integration.json');
   const stagingPath = path.join(externalDir, 'staging.json');
   const mismatchedRunId = '8903120260331141608';
-  const mismatchedRunUri = `https://github.com/example/matrix/actions/runs/${mismatchedRunId}`;
+  const mismatchedRunUri = `https://github.com/${DEFAULT_TEST_GITHUB_REPOSITORY}/actions/runs/${mismatchedRunId}`;
   const mismatchedArtifactStoreKey = `gha/${mismatchedRunId}/1/staging/${runTimestamp}/run-bundle.tgz`;
 
   await fs.mkdir(path.dirname(ciTestFile), { recursive: true });
@@ -4834,7 +4840,7 @@ test('manual artifact collection rejects attestations that do not share one GitH
     },
     runTimestamp,
     {
-      expectedGitHubRepository: 'example/matrix',
+      expectedGitHubRepository: DEFAULT_TEST_GITHUB_REPOSITORY,
     },
   );
 
@@ -7301,7 +7307,7 @@ test('CLI evidence-l1 forwards attestation paths into the evidence writer', asyn
       cwd: fixtureRoot,
       env: {
         ...process.env,
-        GITHUB_REPOSITORY: 'example/matrix',
+        GITHUB_REPOSITORY: DEFAULT_TEST_GITHUB_REPOSITORY,
       },
     });
 
