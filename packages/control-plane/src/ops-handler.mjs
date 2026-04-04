@@ -260,16 +260,28 @@ function createOpsPreconditionError(message, {
   return error;
 }
 
-function createRetryableProbeAttemptError(message) {
+function createRetryableProbeAttemptError(message, {
+  retryAfterMs = null,
+} = {}) {
   const error = createOpsPreconditionError(message, {
     retryable: true,
   });
   error.attempt_retryable = true;
+  error.retry_after_ms = Number.isInteger(retryAfterMs) && retryAfterMs > 0
+    ? retryAfterMs
+    : null;
   return error;
 }
 
 function isRetryableProbeAttemptError(error) {
   return error?.attempt_retryable === true;
+}
+
+function readRetryAfterMsFromGatewayResult(result) {
+  const retryAfterMs = result?.payload?.retry_after_ms;
+  return Number.isInteger(retryAfterMs) && retryAfterMs > 0
+    ? retryAfterMs
+    : null;
 }
 
 function requireGatewayProbeConfiguration(env) {
@@ -463,7 +475,13 @@ async function loginProbeUser(env, gatewayConfig, {
     },
   });
   if (result.response.status !== 200 || typeof result.payload?.access_token !== 'string' || typeof result.payload?.user_id !== 'string') {
-    throw createRetryableProbeAttemptError(`Probe login failed for ${username}: ${describeGatewayFailure(result)}`);
+    const retryAfterMs = readRetryAfterMsFromGatewayResult(result);
+    throw createRetryableProbeAttemptError(
+      `Probe login failed for ${username}: ${describeGatewayFailure(result)}${retryAfterMs == null ? '' : `; retry_after_ms=${retryAfterMs}`}`,
+      {
+        retryAfterMs,
+      },
+    );
   }
   return {
     username,
@@ -545,7 +563,13 @@ async function ensureProbeUser(env, gatewayConfig, probeRequest, {
         gatewayVersionTag,
       });
     }
-    throw createRetryableProbeAttemptError(`Probe register completion failed for ${username}: ${describeGatewayFailure(completed)}`);
+    const retryAfterMs = readRetryAfterMsFromGatewayResult(completed);
+    throw createRetryableProbeAttemptError(
+      `Probe register completion failed for ${username}: ${describeGatewayFailure(completed)}${retryAfterMs == null ? '' : `; retry_after_ms=${retryAfterMs}`}`,
+      {
+        retryAfterMs,
+      },
+    );
   }
   if (indicatesExistingProbeIdentity(challenge)) {
     return loginProbeUser(env, gatewayConfig, {
@@ -556,7 +580,13 @@ async function ensureProbeUser(env, gatewayConfig, probeRequest, {
       gatewayVersionTag,
     });
   }
-  throw createRetryableProbeAttemptError(`Probe register challenge failed for ${username}: ${describeGatewayFailure(challenge)}`);
+  const retryAfterMs = readRetryAfterMsFromGatewayResult(challenge);
+  throw createRetryableProbeAttemptError(
+    `Probe register challenge failed for ${username}: ${describeGatewayFailure(challenge)}${retryAfterMs == null ? '' : `; retry_after_ms=${retryAfterMs}`}`,
+    {
+      retryAfterMs,
+    },
+  );
 }
 
 async function ensureProbeRoom(env, gatewayConfig, probeRequest, {
@@ -592,6 +622,15 @@ async function ensureProbeRoom(env, gatewayConfig, probeRequest, {
       room_alias: roomAlias,
     };
   }
+  const createRetryAfterMs = readRetryAfterMsFromGatewayResult(created);
+  if (createRetryAfterMs != null) {
+    throw createRetryableProbeAttemptError(
+      `Probe room setup failed for ${roomAlias}: ${describeGatewayFailure(created)}; retry_after_ms=${createRetryAfterMs}`,
+      {
+        retryAfterMs: createRetryAfterMs,
+      },
+    );
+  }
   const joined = await fetchGatewayWithVersionOverride(env, gatewayConfig, {
     versionId: gatewayVersionId,
     versionTag: gatewayVersionTag,
@@ -602,7 +641,13 @@ async function ensureProbeRoom(env, gatewayConfig, probeRequest, {
     json: {},
   });
   if (joined.response.status !== 200 || typeof joined.payload?.room_id !== 'string') {
-    throw createRetryableProbeAttemptError(`Probe room setup failed for ${roomAlias}: ${JSON.stringify(created.payload)}`);
+    const retryAfterMs = readRetryAfterMsFromGatewayResult(joined);
+    throw createRetryableProbeAttemptError(
+      `Probe room setup failed for ${roomAlias}: ${describeGatewayFailure(joined)}${retryAfterMs == null ? '' : `; retry_after_ms=${retryAfterMs}`}`,
+      {
+        retryAfterMs,
+      },
+    );
   }
   return {
     room_id: joined.payload.room_id,
@@ -631,6 +676,12 @@ async function seedProbeUserForVersion(env, gatewayConfig, probeRequest, {
         throw error;
       }
       attemptErrors.push(`attempt ${attemptIndex}: ${error.message}`);
+      if (Number.isInteger(error.retry_after_ms) && error.retry_after_ms > 0) {
+        throw createOpsPreconditionError(
+          `Unable to seed ${userLabel} on ${expectedAuthorityVersionId}; attempt ${attemptIndex} hit rate limiting and reported retry_after_ms=${error.retry_after_ms}, so bounded sampling stopped early instead of burning the remaining attempts${attemptErrors.length > 0 ? `; setup_failures=${attemptErrors.join(' | ')}` : ''}`,
+          { retryable: true },
+        );
+      }
       continue;
     }
     const identity = await inspectUserAuthority(env, seededUser.user_id);
@@ -670,6 +721,12 @@ async function seedProbeRoomForVersion(env, gatewayConfig, probeRequest, {
         throw error;
       }
       attemptErrors.push(`attempt ${attemptIndex}: ${error.message}`);
+      if (Number.isInteger(error.retry_after_ms) && error.retry_after_ms > 0) {
+        throw createOpsPreconditionError(
+          `Unable to seed ${roomLabel} on ${expectedAuthorityVersionId}; attempt ${attemptIndex} hit rate limiting and reported retry_after_ms=${error.retry_after_ms}, so bounded sampling stopped early instead of burning the remaining attempts${attemptErrors.length > 0 ? `; setup_failures=${attemptErrors.join(' | ')}` : ''}`,
+          { retryable: true },
+        );
+      }
       continue;
     }
     const identity = await inspectRoomAuthority(env, seededRoom.room_id);

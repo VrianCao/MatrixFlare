@@ -1705,6 +1705,342 @@ test('Phase 08 rollout skew probe retries the next seed attempt when a conflicti
   assert.deepEqual(createdRoomVersionSequence, []);
 });
 
+test('Phase 08 rollout skew probe stops bounded sampling early when register challenge hits M_LIMIT_EXCEEDED with retry_after_ms', async (t) => {
+  const teamDomain = `phase08-${Date.now()}.cloudflareaccess.com`;
+  const expectedScriptName = 'matrix-gateway-worker-pre-release';
+  const sharedSecret = 'phase08-rollout-secret';
+  let registerChallengeAttempts = 0;
+
+  const parseRequestedVersion = (request) => {
+    const overrideHeader = String(request.headers['cloudflare-workers-version-overrides'] ?? '');
+    const escapedScriptName = expectedScriptName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const match = new RegExp(`^${escapedScriptName}="([^"]+)"$`, 'u').exec(overrideHeader);
+    assert.ok(match, `expected Cloudflare version override header for ${expectedScriptName}, received ${overrideHeader}`);
+    assert.equal(request.headers['x-matrix-rollout-probe-secret'], sharedSecret);
+    return match[1];
+  };
+
+  const writeJson = (response, status, payload, observedVersionId) => {
+    response.writeHead(status, {
+      'content-type': 'application/json; charset=utf-8',
+      'x-matrix-rollout-probe-gateway-version-id': observedVersionId,
+      'x-matrix-rollout-probe-gateway-version-tag': resolveRolloutGatewayVersionTag(observedVersionId),
+    });
+    response.end(JSON.stringify(payload));
+  };
+
+  const fakeGateway = createServer((request, response) => {
+    try {
+      const observedVersionId = parseRequestedVersion(request);
+      const url = new URL(request.url, 'http://127.0.0.1');
+      if (request.method === 'POST' && url.pathname === '/_matrix/client/v3/register') {
+        registerChallengeAttempts += 1;
+        writeJson(response, 429, {
+          errcode: 'M_LIMIT_EXCEEDED',
+          error: 'Too many requests',
+          retry_after_ms: 60000,
+        }, observedVersionId);
+        return;
+      }
+      writeJson(response, 404, {
+        errcode: 'M_UNRECOGNIZED',
+        error: 'Not found',
+      }, observedVersionId);
+    } catch (error) {
+      response.writeHead(500, {
+        'content-type': 'application/json; charset=utf-8',
+      });
+      response.end(JSON.stringify({
+        error: error.message,
+      }));
+    }
+  });
+
+  await new Promise((resolve) => fakeGateway.listen(0, '127.0.0.1', resolve));
+  t.after(async () => {
+    await new Promise((resolve, reject) => {
+      fakeGateway.close((error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve();
+      });
+    });
+  });
+
+  class FakeRuntimeIdentityNamespace {
+    idFromName(name) {
+      return String(name);
+    }
+
+    get() {
+      return {
+        async inspectRuntimeIdentity() {
+          assert.fail('runtime identity inspection should not be reached when register challenge rate limits immediately');
+        },
+      };
+    }
+  }
+
+  const address = fakeGateway.address();
+  assert.ok(address && typeof address === 'object');
+  const rig = await createControlPlaneRig({
+    teamDomain,
+    envOverrides: {
+      ENVIRONMENT_NAME: 'pre-release',
+      MATRIX_SERVER_NAME: 'matrix.example.test',
+      MATRIX_PUBLIC_BASE_URL: `http://127.0.0.1:${address.port}`,
+      GATEWAY_WORKER_SCRIPT_NAME: expectedScriptName,
+      ROLLOUT_PROBE_SHARED_SECRET: sharedSecret,
+      USER_DO: new FakeRuntimeIdentityNamespace(),
+      ROOM_DO: new FakeRuntimeIdentityNamespace(),
+    },
+    policies: [
+      defaultPolicy({
+        principalId: 'svc-ci',
+        principalType: 'service',
+        subjectValue: 'svc-ci',
+        teamDomain,
+        audience: 'aud-ops',
+      }),
+    ],
+  });
+  t.after(() => rig.close());
+
+  const response = await rig.opsWorker(
+    rig.makeOpsRequest('/_ops/v1/rollout-skew/probe', {
+      method: 'POST',
+      body: {
+        probe_run_id: 'rollout-probe-rate-limited-register-challenge',
+        baseline_gateway_version_id: BASELINE_GATEWAY_VERSION_ID,
+        baseline_gateway_version_tag: BASELINE_GATEWAY_VERSION_TAG,
+        candidate_gateway_version_id: CANDIDATE_GATEWAY_VERSION_ID,
+        candidate_gateway_version_tag: CANDIDATE_GATEWAY_VERSION_TAG,
+        dual_version_deployment_id: 'dual-deployment-rate-limited-register-challenge',
+        authority_kind: 'matrix-core',
+        seed_prefix: 'probe-gha-pre-release-rollout-rate-limited-register-challenge',
+      },
+      assertion: rig.createAccessJwt({
+        subject: 'service-subject',
+        commonName: 'svc-ci',
+      }),
+    }),
+    rig.opsEnv,
+  );
+
+  assert.equal(response.status, 409);
+  const payload = await response.json();
+  assert.equal(payload.code, 'precondition_failed');
+  assert.equal(payload.retryable, true);
+  assert.match(payload.message, /Unable to seed baseline-user on gateway-baseline-v1; attempt 1 hit rate limiting and reported retry_after_ms=60000/u);
+  assert.match(payload.message, /setup_failures=attempt 1: Probe register challenge failed/u);
+  assert.equal(registerChallengeAttempts, 1);
+});
+
+test('Phase 08 rollout skew probe stops bounded sampling early when createRoom hits M_LIMIT_EXCEEDED with retry_after_ms', async (t) => {
+  const teamDomain = `phase08-${Date.now()}.cloudflareaccess.com`;
+  const expectedScriptName = 'matrix-gateway-worker-pre-release';
+  const sharedSecret = 'phase08-rollout-secret';
+  const serverName = 'matrix.example.test';
+  const userVersionById = new Map();
+  const usersByUsername = new Map();
+  const usersByToken = new Map();
+  let createRoomAttempts = 0;
+  let joinAttempts = 0;
+
+  const readRequestJson = async (request) => {
+    const chunks = [];
+    for await (const chunk of request) {
+      chunks.push(Buffer.from(chunk));
+    }
+    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  };
+
+  const parseRequestedVersion = (request) => {
+    const overrideHeader = String(request.headers['cloudflare-workers-version-overrides'] ?? '');
+    const escapedScriptName = expectedScriptName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const match = new RegExp(`^${escapedScriptName}="([^"]+)"$`, 'u').exec(overrideHeader);
+    assert.ok(match, `expected Cloudflare version override header for ${expectedScriptName}, received ${overrideHeader}`);
+    assert.equal(request.headers['x-matrix-rollout-probe-secret'], sharedSecret);
+    return match[1];
+  };
+
+  const writeJson = (response, status, payload, observedVersionId) => {
+    response.writeHead(status, {
+      'content-type': 'application/json; charset=utf-8',
+      'x-matrix-rollout-probe-gateway-version-id': observedVersionId,
+      'x-matrix-rollout-probe-gateway-version-tag': resolveRolloutGatewayVersionTag(observedVersionId),
+    });
+    response.end(JSON.stringify(payload));
+  };
+
+  const fakeGateway = createServer(async (request, response) => {
+    try {
+      const observedVersionId = parseRequestedVersion(request);
+      const url = new URL(request.url, 'http://127.0.0.1');
+      const authorization = String(request.headers.authorization ?? '');
+      const accessToken = authorization.replace(/^Bearer\s+/iu, '');
+      const authenticatedUser = usersByToken.get(accessToken) ?? null;
+
+      if (request.method === 'POST' && url.pathname === '/_matrix/client/v3/register') {
+        const body = await readRequestJson(request);
+        if (body.auth == null) {
+          writeJson(response, 401, {
+            session: `uia-${body.username}`,
+            flows: [{ stages: ['m.login.dummy'] }],
+          }, observedVersionId);
+          return;
+        }
+        let user = usersByUsername.get(body.username) ?? null;
+        if (user == null) {
+          user = {
+            username: body.username,
+            password: body.password,
+            userId: `@${body.username}:${serverName}`,
+            accessToken: `atk-${body.username}`,
+          };
+          usersByUsername.set(user.username, user);
+          usersByToken.set(user.accessToken, user);
+          userVersionById.set(user.userId, observedVersionId);
+        }
+        writeJson(response, 200, {
+          user_id: user.userId,
+          access_token: user.accessToken,
+        }, observedVersionId);
+        return;
+      }
+
+      if (request.method === 'POST' && url.pathname === '/_matrix/client/v3/createRoom') {
+        assert.ok(authenticatedUser, 'createRoom requires authenticated probe user');
+        createRoomAttempts += 1;
+        writeJson(response, 429, {
+          errcode: 'M_LIMIT_EXCEEDED',
+          error: 'Too many requests',
+          retry_after_ms: 45000,
+        }, observedVersionId);
+        return;
+      }
+
+      if (request.method === 'POST' && url.pathname.startsWith('/_matrix/client/v3/join/')) {
+        joinAttempts += 1;
+        writeJson(response, 200, {
+          room_id: '!unexpected:matrix.example.test',
+        }, observedVersionId);
+        return;
+      }
+
+      writeJson(response, 404, {
+        errcode: 'M_UNRECOGNIZED',
+        error: 'Not found',
+      }, observedVersionId);
+    } catch (error) {
+      response.writeHead(500, {
+        'content-type': 'application/json; charset=utf-8',
+      });
+      response.end(JSON.stringify({
+        error: error.message,
+      }));
+    }
+  });
+
+  await new Promise((resolve) => fakeGateway.listen(0, '127.0.0.1', resolve));
+  t.after(async () => {
+    await new Promise((resolve, reject) => {
+      fakeGateway.close((error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve();
+      });
+    });
+  });
+
+  class FakeRuntimeIdentityNamespace {
+    constructor(authorityKind, versionMap) {
+      this.authorityKind = authorityKind;
+      this.versionMap = versionMap;
+    }
+
+    idFromName(name) {
+      return String(name);
+    }
+
+    get(id) {
+      const authorityKind = this.authorityKind;
+      const versionMap = this.versionMap;
+      return {
+        async inspectRuntimeIdentity() {
+          const workerVersionId = versionMap.get(String(id)) ?? null;
+          return {
+            ok: true,
+            authority_kind: authorityKind,
+            worker_version_id: workerVersionId,
+            deployment_id: workerVersionId == null ? null : `dep-${workerVersionId}`,
+            environment_name: 'pre-release',
+          };
+        },
+      };
+    }
+  }
+
+  const address = fakeGateway.address();
+  assert.ok(address && typeof address === 'object');
+  const rig = await createControlPlaneRig({
+    teamDomain,
+    envOverrides: {
+      ENVIRONMENT_NAME: 'pre-release',
+      MATRIX_SERVER_NAME: serverName,
+      MATRIX_PUBLIC_BASE_URL: `http://127.0.0.1:${address.port}`,
+      GATEWAY_WORKER_SCRIPT_NAME: expectedScriptName,
+      ROLLOUT_PROBE_SHARED_SECRET: sharedSecret,
+      USER_DO: new FakeRuntimeIdentityNamespace('UserDO', userVersionById),
+      ROOM_DO: new FakeRuntimeIdentityNamespace('RoomDO', new Map()),
+    },
+    policies: [
+      defaultPolicy({
+        principalId: 'svc-ci',
+        principalType: 'service',
+        subjectValue: 'svc-ci',
+        teamDomain,
+        audience: 'aud-ops',
+      }),
+    ],
+  });
+  t.after(() => rig.close());
+
+  const response = await rig.opsWorker(
+    rig.makeOpsRequest('/_ops/v1/rollout-skew/probe', {
+      method: 'POST',
+      body: {
+        probe_run_id: 'rollout-probe-rate-limited-create-room',
+        baseline_gateway_version_id: BASELINE_GATEWAY_VERSION_ID,
+        baseline_gateway_version_tag: BASELINE_GATEWAY_VERSION_TAG,
+        candidate_gateway_version_id: CANDIDATE_GATEWAY_VERSION_ID,
+        candidate_gateway_version_tag: CANDIDATE_GATEWAY_VERSION_TAG,
+        dual_version_deployment_id: 'dual-deployment-rate-limited-create-room',
+        authority_kind: 'matrix-core',
+        seed_prefix: 'probe-gha-pre-release-rollout-rate-limited-create-room',
+      },
+      assertion: rig.createAccessJwt({
+        subject: 'service-subject',
+        commonName: 'svc-ci',
+      }),
+    }),
+    rig.opsEnv,
+  );
+
+  assert.equal(response.status, 409);
+  const payload = await response.json();
+  assert.equal(payload.code, 'precondition_failed');
+  assert.equal(payload.retryable, true);
+  assert.match(payload.message, /Unable to seed baseline-room on gateway-baseline-v1; attempt 1 hit rate limiting and reported retry_after_ms=45000/u);
+  assert.match(payload.message, /setup_failures=attempt 1: Probe room setup failed/u);
+  assert.equal(createRoomAttempts, 1);
+  assert.equal(joinAttempts, 0);
+});
+
 test('Phase 08 rollout skew probe fails retryably when bounded sampling cannot reach the requested authority version', async (t) => {
   const teamDomain = `phase08-${Date.now()}.cloudflareaccess.com`;
   const expectedScriptName = 'matrix-gateway-worker-pre-release';

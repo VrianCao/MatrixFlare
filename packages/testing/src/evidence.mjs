@@ -122,6 +122,43 @@ const PRE_RELEASE_COST_SURFACES = Object.freeze([
   'queues',
 ]);
 
+function parseGitHubRepositoryFromRemoteUrl(remoteUrl) {
+  if (typeof remoteUrl !== 'string' || remoteUrl.trim().length === 0) {
+    return null;
+  }
+  const normalized = remoteUrl.trim();
+  const patterns = [
+    /^https:\/\/github\.com\/([^/]+\/[^/]+?)(?:\.git)?$/u,
+    /^git@github\.com:([^/]+\/[^/]+?)(?:\.git)?$/u,
+    /^ssh:\/\/git@github\.com\/([^/]+\/[^/]+?)(?:\.git)?$/u,
+  ];
+  for (const pattern of patterns) {
+    const match = pattern.exec(normalized);
+    if (match) {
+      return match[1];
+    }
+  }
+  return null;
+}
+
+async function resolveExpectedGitHubRepositoryForRepoRoot(repoRoot, expectedGitHubRepository = null) {
+  if (typeof expectedGitHubRepository === 'string' && expectedGitHubRepository.trim().length > 0) {
+    return expectedGitHubRepository.trim();
+  }
+  const envRepository = typeof process.env.GITHUB_REPOSITORY === 'string'
+    ? process.env.GITHUB_REPOSITORY.trim()
+    : '';
+  if (envRepository.length > 0) {
+    return envRepository;
+  }
+  try {
+    const { stdout } = await execFileAsync('git', ['remote', 'get-url', 'origin'], { cwd: repoRoot });
+    return parseGitHubRepositoryFromRemoteUrl(stdout) ?? null;
+  } catch {
+    return null;
+  }
+}
+
 const L1_TEST_IMPLEMENTATION_FILES = Object.freeze({
   'TEST-CS-001': Object.freeze({
     local: Object.freeze(['tests/local/client-identity/phase-04.test.mjs']),
@@ -695,6 +732,102 @@ function validatePreReleaseRolloutSkewProbe(reportLabel, value, expected = {}) {
   );
   if (!semanticValidation.valid) {
     return semanticValidation;
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validatePreReleaseRolloutDeploymentAudit(reportLabel, rolloutSkewProbe, deploymentIdentityValidation) {
+  if (!isPlainObject(deploymentIdentityValidation)) {
+    return {
+      valid: false,
+      error: `${reportLabel} must include deployment_identity_validation when TEST-OPS-001 is covered`,
+    };
+  }
+  for (const phase of ['before_readiness', 'before_suite']) {
+    const phaseRecord = deploymentIdentityValidation[phase];
+    if (!isPlainObject(phaseRecord)) {
+      return {
+        valid: false,
+        error: `${reportLabel} deployment_identity_validation.${phase} must be an object when TEST-OPS-001 is covered`,
+      };
+    }
+    const gatewayWorker = phaseRecord?.workers?.['gateway-worker'];
+    if (!isPlainObject(gatewayWorker)) {
+      return {
+        valid: false,
+        error: `${reportLabel} deployment_identity_validation.${phase}.workers.gateway-worker must be present when TEST-OPS-001 is covered`,
+      };
+    }
+    if (!isNonEmptyString(gatewayWorker.latest_active_deployment_id)) {
+      return {
+        valid: false,
+        error: `${reportLabel} deployment_identity_validation.${phase}.workers.gateway-worker.latest_active_deployment_id must be non-empty`,
+      };
+    }
+    if (!isNonEmptyStringArray(gatewayWorker.active_worker_version_ids)) {
+      return {
+        valid: false,
+        error: `${reportLabel} deployment_identity_validation.${phase}.workers.gateway-worker.active_worker_version_ids must be a non-empty string array`,
+      };
+    }
+    if (gatewayWorker.latest_active_deployment_id !== rolloutSkewProbe.dual_version_deployment_id) {
+      return {
+        valid: false,
+        error: `${reportLabel} deployment_identity_validation.${phase}.workers.gateway-worker.latest_active_deployment_id must match rollout_skew_probe.dual_version_deployment_id`,
+      };
+    }
+    if (!gatewayWorker.active_worker_version_ids.includes(rolloutSkewProbe.baseline_gateway_version_id)) {
+      return {
+        valid: false,
+        error: `${reportLabel} deployment_identity_validation.${phase}.workers.gateway-worker.active_worker_version_ids must include rollout_skew_probe.baseline_gateway_version_id`,
+      };
+    }
+    if (!gatewayWorker.active_worker_version_ids.includes(rolloutSkewProbe.candidate_gateway_version_id)) {
+      return {
+        valid: false,
+        error: `${reportLabel} deployment_identity_validation.${phase}.workers.gateway-worker.active_worker_version_ids must include rollout_skew_probe.candidate_gateway_version_id`,
+      };
+    }
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validatePreReleaseRolloutProvenance(reportLabel, rolloutSkewProbe, deploymentIdentity) {
+  if (!isPlainObject(deploymentIdentity)) {
+    return {
+      valid: false,
+      error: `${reportLabel} provenance.deployment_identity must be an object when TEST-OPS-001 is covered`,
+    };
+  }
+  if (!isNonEmptyStringArray(deploymentIdentity.deployment_ids) || !deploymentIdentity.deployment_ids.includes(rolloutSkewProbe.dual_version_deployment_id)) {
+    return {
+      valid: false,
+      error: `${reportLabel} provenance.deployment_identity.deployment_ids must include rollout_skew_probe.dual_version_deployment_id`,
+    };
+  }
+  if (!isNonEmptyStringArray(deploymentIdentity.worker_version_ids)) {
+    return {
+      valid: false,
+      error: `${reportLabel} provenance.deployment_identity.worker_version_ids must be a non-empty string array when TEST-OPS-001 is covered`,
+    };
+  }
+  if (!deploymentIdentity.worker_version_ids.includes(rolloutSkewProbe.baseline_gateway_version_id)) {
+    return {
+      valid: false,
+      error: `${reportLabel} provenance.deployment_identity.worker_version_ids must include rollout_skew_probe.baseline_gateway_version_id`,
+    };
+  }
+  if (!deploymentIdentity.worker_version_ids.includes(rolloutSkewProbe.candidate_gateway_version_id)) {
+    return {
+      valid: false,
+      error: `${reportLabel} provenance.deployment_identity.worker_version_ids must include rollout_skew_probe.candidate_gateway_version_id`,
+    };
   }
   return {
     valid: true,
@@ -4046,6 +4179,14 @@ export function validateManualArtifactPayload(artifactId, payload, {
       if (!rolloutValidation.valid) {
         return rolloutValidation;
       }
+      const deploymentAuditValidation = validatePreReleaseRolloutDeploymentAudit(
+        'environment run report',
+        payload.rollout_skew_probe,
+        payload.deployment_identity_validation,
+      );
+      if (!deploymentAuditValidation.valid) {
+        return deploymentAuditValidation;
+      }
     }
     if (coversPreReleaseCost) {
       const costObservationValidation = validatePreReleaseCostObservation(
@@ -4536,6 +4677,19 @@ export function validateEvidenceAttestationBundle(artifactId, payload, {
       error: 'attestation bundle payload source_run_uri must equal provenance.origin_run_uri',
     };
   }
+  if (
+    artifactId === 'pre_release_run_report'
+    && reportCoversCanonicalTestPrefix(payload.payload, PRE_RELEASE_TEST_FILE_PREFIXES.ops)
+  ) {
+    const rolloutProvenanceValidation = validatePreReleaseRolloutProvenance(
+      'attestation bundle',
+      payload.payload.rollout_skew_probe,
+      provenance.deployment_identity,
+    );
+    if (!rolloutProvenanceValidation.valid) {
+      return rolloutProvenanceValidation;
+    }
+  }
 
   return {
     valid: true,
@@ -4997,7 +5151,11 @@ export async function collectManualArtifactResults(definition, repoRoot, manualA
   expectedGitHubRepository = null,
 } = {}) {
   const requiredManualArtifacts = buildRequiredManualArtifactDefinitions(definition);
-  return Promise.all(requiredManualArtifacts.map(async (artifactRequirement) => {
+  const resolvedExpectedGitHubRepository = await resolveExpectedGitHubRepositoryForRepoRoot(
+    repoRoot,
+    expectedGitHubRepository,
+  );
+  const results = await Promise.all(requiredManualArtifacts.map(async (artifactRequirement) => {
     const resolvedPath = normalizeOptionalArtifactPath(repoRoot, manualArtifacts[artifactRequirement.artifact_id]);
     const providedPath = resolvedPath == null ? null : normalizePathForMarkdown(path.relative(repoRoot, resolvedPath));
     const expectedEnvironmentName = resolveEnvironmentNameForArtifactId(artifactRequirement.artifact_id);
@@ -5046,7 +5204,7 @@ export async function collectManualArtifactResults(definition, repoRoot, manualA
         }
         const validation = validateEvidenceAttestationBundle(artifactRequirement.artifact_id, parsedPayload, {
           runTimestamp,
-          expectedGitHubRepository,
+          expectedGitHubRepository: resolvedExpectedGitHubRepository,
         });
         valid = validation.valid;
         validation_error = validation.error;
@@ -5139,6 +5297,30 @@ export async function collectManualArtifactResults(definition, repoRoot, manualA
       environment_harness_reason: harnessReadiness?.reason ?? null,
     };
   }));
+  const referenceArtifact = results.find((artifact) => (
+    artifact.valid
+    && isNonEmptyString(artifact.attestation_origin_run_id)
+    && Number.isInteger(artifact.attestation_origin_run_attempt)
+  )) ?? null;
+  if (referenceArtifact == null) {
+    return results;
+  }
+  return results.map((artifact) => {
+    if (!artifact.valid) {
+      return artifact;
+    }
+    if (
+      artifact.attestation_origin_run_id === referenceArtifact.attestation_origin_run_id
+      && artifact.attestation_origin_run_attempt === referenceArtifact.attestation_origin_run_attempt
+    ) {
+      return artifact;
+    }
+    return {
+      ...artifact,
+      valid: false,
+      validation_error: `${artifact.artifact_id} must come from GitHub Actions run ${referenceArtifact.attestation_origin_run_id} attempt ${referenceArtifact.attestation_origin_run_attempt}, matching the other manual artifacts for this evidence run`,
+    };
+  });
 }
 
 function buildAttestedEnvironmentRunSource(artifactResult) {
@@ -5529,6 +5711,10 @@ export async function writeL1Evidence(repoRoot = process.cwd(), options = {}) {
     label: `L1 evidence output paths for run ${runTimestamp}`,
   });
   const governanceBundle = await writeGovernanceEvidence(repoRoot, { timestamp: runTimestamp });
+  const expectedGitHubRepository = await resolveExpectedGitHubRepositoryForRepoRoot(
+    repoRoot,
+    options.expectedGitHubRepository ?? null,
+  );
 
   await fs.mkdir(sharedRunRoot, { recursive: true });
 
@@ -5555,7 +5741,7 @@ export async function writeL1Evidence(repoRoot = process.cwd(), options = {}) {
       sharedRunRoot,
       environmentRuns,
       manualArtifacts: options.manualArtifacts ?? {},
-      expectedGitHubRepository: options.expectedGitHubRepository ?? null,
+      expectedGitHubRepository,
     }));
   }
 

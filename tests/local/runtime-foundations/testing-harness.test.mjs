@@ -79,14 +79,8 @@ function buildExpectedCloudflareResources(environmentName) {
 }
 
 function buildGitHubRunId(environmentName, runTimestamp) {
-  const environmentPrefixes = {
-    'ci-integration': '1',
-    staging: '2',
-    'pre-release': '3',
-    prod: '4',
-  };
-  const prefix = environmentPrefixes[environmentName] ?? '9';
-  return `${prefix}${runTimestamp.replace(/\D/g, '')}`;
+  void environmentName;
+  return `9${runTimestamp.replace(/\D/g, '')}`;
 }
 
 function buildGitHubRunUri(environmentName, runTimestamp) {
@@ -317,13 +311,62 @@ function buildValidEnvironmentReport(environmentName, runTimestamp, overrides = 
 }
 
 function buildValidPreReleaseOpsReport(runTimestamp, overrides = {}) {
+  const rolloutSkewProbe = buildValidRolloutSkewProbe(runTimestamp);
   return buildValidEnvironmentReport('pre-release', runTimestamp, {
     test_directory: 'tests/pre-release',
     test_file_count: 1,
     test_files: ['tests/pre-release/test-ops-001.test.mjs'],
     expanded_test_file_count: 1,
     expanded_test_files: ['tests/pre-release/test-ops-001.test.mjs'],
-    rollout_skew_probe: buildValidRolloutSkewProbe(runTimestamp),
+    rollout_skew_probe: rolloutSkewProbe,
+    deployment_identity_validation: {
+      before_readiness: {
+        validated_at: '2026-03-31T13:58:30.000Z',
+        workers: {
+          'jobs-worker': {
+            script_name: 'matrix-jobs-worker-pre-release',
+            latest_active_deployment_id: 'pre-release-jobs-deployment',
+            active_worker_version_ids: ['jobs@pre-release-v1'],
+          },
+          'ops-worker': {
+            script_name: 'matrix-ops-worker-pre-release',
+            latest_active_deployment_id: 'pre-release-ops-deployment',
+            active_worker_version_ids: ['ops@pre-release-v1'],
+          },
+          'gateway-worker': {
+            script_name: 'matrix-gateway-worker-pre-release',
+            latest_active_deployment_id: rolloutSkewProbe.dual_version_deployment_id,
+            active_worker_version_ids: [
+              rolloutSkewProbe.baseline_gateway_version_id,
+              rolloutSkewProbe.candidate_gateway_version_id,
+            ],
+          },
+        },
+      },
+      before_suite: {
+        validated_at: '2026-03-31T13:59:31.000Z',
+        workers: {
+          'jobs-worker': {
+            script_name: 'matrix-jobs-worker-pre-release',
+            latest_active_deployment_id: 'pre-release-jobs-deployment',
+            active_worker_version_ids: ['jobs@pre-release-v1'],
+          },
+          'ops-worker': {
+            script_name: 'matrix-ops-worker-pre-release',
+            latest_active_deployment_id: 'pre-release-ops-deployment',
+            active_worker_version_ids: ['ops@pre-release-v1'],
+          },
+          'gateway-worker': {
+            script_name: 'matrix-gateway-worker-pre-release',
+            latest_active_deployment_id: rolloutSkewProbe.dual_version_deployment_id,
+            active_worker_version_ids: [
+              rolloutSkewProbe.baseline_gateway_version_id,
+              rolloutSkewProbe.candidate_gateway_version_id,
+            ],
+          },
+        },
+      },
+    },
     ...overrides,
   });
 }
@@ -653,7 +696,7 @@ async function createEnvironmentBackedManualArtifacts(fixtureRoot, runTimestamp,
     const environmentTopLevelTestFiles = [...new Set(Object.values(environmentTestFiles[environmentName]))].sort();
     const environmentTestDirectory = path.dirname(environmentTopLevelTestFiles[0]).replaceAll(path.sep, '/');
     const expandedTestFiles = [...environmentTopLevelTestFiles];
-    const reportOverrides = {
+    let reportOverrides = {
       test_directory: environmentTestDirectory,
       test_files: environmentTopLevelTestFiles,
       test_file_count: environmentTopLevelTestFiles.length,
@@ -661,23 +704,47 @@ async function createEnvironmentBackedManualArtifacts(fixtureRoot, runTimestamp,
       expanded_test_file_count: expandedTestFiles.length,
       log_artifact: `https://example.invalid/logs/fixture/${runTimestamp}/${environmentName}.log`,
     };
-    if (
-      environmentName === 'pre-release'
-      && environmentTopLevelTestFiles.some((file) => path.basename(file).startsWith('test-ops-001'))
-    ) {
-      reportOverrides.rollout_skew_probe = buildValidRolloutSkewProbe(runTimestamp);
-    }
-    if (
-      environmentName === 'pre-release'
-      && environmentTopLevelTestFiles.some((file) => path.basename(file).startsWith('test-cost-001'))
-    ) {
-      reportOverrides.pre_release_cost_observation = buildValidPreReleaseCostObservation(runTimestamp);
+    let attestationOverrides = {};
+    const coversPreReleaseOps = environmentName === 'pre-release'
+      && environmentTopLevelTestFiles.some((file) => path.basename(file).startsWith('test-ops-001'));
+    const coversPreReleaseCost = environmentName === 'pre-release'
+      && environmentTopLevelTestFiles.some((file) => path.basename(file).startsWith('test-cost-001'));
+    if (coversPreReleaseOps) {
+      const validPreReleaseOpsReport = buildValidPreReleaseOpsReport(runTimestamp, reportOverrides);
+      reportOverrides = {
+        ...validPreReleaseOpsReport,
+        source_run_uri: buildGitHubRunUri(environmentName, runTimestamp),
+        ...(coversPreReleaseCost
+          ? {
+            pre_release_cost_observation: buildValidPreReleaseCostObservation(runTimestamp),
+          }
+          : {}),
+      };
+      attestationOverrides = {
+        provenance: {
+          deployment_identity: {
+            environment_id: 'pre-release',
+            deployment_ids: [validPreReleaseOpsReport.rollout_skew_probe.dual_version_deployment_id],
+            worker_version_ids: [
+              validPreReleaseOpsReport.rollout_skew_probe.baseline_gateway_version_id,
+              validPreReleaseOpsReport.rollout_skew_probe.candidate_gateway_version_id,
+              'jobs@pre-release-v1',
+              'ops@pre-release-v1',
+            ],
+          },
+        },
+      };
+    } else if (coversPreReleaseCost) {
+      reportOverrides = {
+        ...reportOverrides,
+        pre_release_cost_observation: buildValidPreReleaseCostObservation(runTimestamp),
+      };
     }
     await fs.writeFile(
       artifactPath,
       JSON.stringify(buildValidEnvironmentAttestation(environmentName, runTimestamp, {
         ...reportOverrides,
-      }), null, 2),
+      }, attestationOverrides), null, 2),
     );
     manualArtifacts[artifactId] = path.relative(fixtureRoot, artifactPath);
   }
@@ -1843,6 +1910,30 @@ test('manual artifact payload validation requires structured non-local reports a
 test('manual artifact attestation validation requires immutable provenance plus typed payloads', () => {
   const runTimestamp = '20260331T140000Z';
   const validStagingAttestation = buildValidEnvironmentAttestation('staging', runTimestamp);
+  const validPreReleaseOpsReport = buildValidPreReleaseOpsReport(runTimestamp);
+  const validPreReleaseOpsAttestation = buildValidEnvironmentAttestation(
+    'pre-release',
+    runTimestamp,
+    {
+      ...validPreReleaseOpsReport,
+      source_run_uri: buildGitHubRunUri('pre-release', runTimestamp),
+      topology_kind: 'cloudflare-pre-release',
+    },
+    {
+      provenance: {
+        deployment_identity: {
+          environment_id: 'pre-release',
+          deployment_ids: [validPreReleaseOpsReport.rollout_skew_probe.dual_version_deployment_id],
+          worker_version_ids: [
+            validPreReleaseOpsReport.rollout_skew_probe.baseline_gateway_version_id,
+            validPreReleaseOpsReport.rollout_skew_probe.candidate_gateway_version_id,
+            'jobs@pre-release-v1',
+            'ops@pre-release-v1',
+          ],
+        },
+      },
+    },
+  );
   const validProdCostAttestation = buildValidProdCostSnapshotAttestation(runTimestamp);
 
   assert.deepEqual(
@@ -1850,6 +1941,49 @@ test('manual artifact attestation validation requires immutable provenance plus 
     {
       valid: true,
       error: null,
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('pre_release_run_report', validPreReleaseOpsAttestation, { runTimestamp }),
+    {
+      valid: true,
+      error: null,
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('pre_release_run_report', {
+      ...validPreReleaseOpsAttestation,
+      payload: {
+        ...validPreReleaseOpsAttestation.payload,
+        deployment_identity_validation: null,
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'attested payload invalid: environment run report must include deployment_identity_validation when TEST-OPS-001 is covered',
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('pre_release_run_report', {
+      ...validPreReleaseOpsAttestation,
+      provenance: {
+        ...validPreReleaseOpsAttestation.provenance,
+        deployment_identity: {
+          ...validPreReleaseOpsAttestation.provenance.deployment_identity,
+          deployment_ids: ['wrong-deployment-id'],
+        },
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'attestation bundle provenance.deployment_identity.deployment_ids must include rollout_skew_probe.dual_version_deployment_id',
     },
   );
 
@@ -2181,8 +2315,8 @@ test('manual artifact attestation validation requires immutable provenance plus 
       ...validStagingAttestation,
       provenance: {
         ...validStagingAttestation.provenance,
-        artifact_store_uri: 'r2://matrix-evidence-staging/gha/220260331140000/1/pre-release/20260331T140000Z/run-bundle.tgz',
-        artifact_store_key: 'gha/220260331140000/1/pre-release/20260331T140000Z/run-bundle.tgz',
+        artifact_store_uri: `r2://matrix-evidence-staging/gha/${buildGitHubRunId('staging', runTimestamp)}/1/pre-release/${runTimestamp}/run-bundle.tgz`,
+        artifact_store_key: `gha/${buildGitHubRunId('staging', runTimestamp)}/1/pre-release/${runTimestamp}/run-bundle.tgz`,
       },
     }, {
       runTimestamp,
@@ -2198,8 +2332,8 @@ test('manual artifact attestation validation requires immutable provenance plus 
       ...validStagingAttestation,
       provenance: {
         ...validStagingAttestation.provenance,
-        artifact_store_uri: 'r2://matrix-evidence-staging/gha/220260331140000/1/staging/20260331T140001Z/run-bundle.tgz',
-        artifact_store_key: 'gha/220260331140000/1/staging/20260331T140001Z/run-bundle.tgz',
+        artifact_store_uri: `r2://matrix-evidence-staging/gha/${buildGitHubRunId('staging', runTimestamp)}/1/staging/20260331T140001Z/run-bundle.tgz`,
+        artifact_store_key: `gha/${buildGitHubRunId('staging', runTimestamp)}/1/staging/20260331T140001Z/run-bundle.tgz`,
       },
     }, {
       runTimestamp,
@@ -4590,6 +4724,124 @@ test('manual artifact collection rejects GitHub Actions attestations from anothe
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].validation_error, 'attestation bundle provenance.origin_repository must match the current repository');
+});
+
+test('manual artifact collection resolves the current repository from GITHUB_REPOSITORY when no explicit repository option is supplied', async () => {
+  const runTimestamp = '20260331T141607Z';
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-testing-harness-env-repo-'));
+  const testFile = path.join(tempRoot, 'tests', 'pre-release', 'remote.test.mjs');
+  const externalDir = path.join(tempRoot, 'external');
+  const foreignRunUri = `https://github.com/example/other/actions/runs/${buildGitHubRunId('pre-release', runTimestamp)}`;
+  const reportPath = path.join(externalDir, 'pre-release.json');
+  const previousRepository = process.env.GITHUB_REPOSITORY;
+
+  await fs.mkdir(path.dirname(testFile), { recursive: true });
+  await fs.mkdir(externalDir, { recursive: true });
+  await fs.writeFile(testFile, 'export const remote = true;\n');
+  await fs.writeFile(
+    reportPath,
+    JSON.stringify(buildValidEnvironmentAttestation('pre-release', runTimestamp, {
+      test_directory: 'tests/pre-release',
+      test_files: ['tests/pre-release/remote.test.mjs'],
+      test_file_count: 1,
+      expanded_test_files: ['tests/pre-release/remote.test.mjs'],
+      expanded_test_file_count: 1,
+    }, {
+      provenance: {
+        origin_repository: 'example/other',
+        origin_run_uri: foreignRunUri,
+        review_record_uri: foreignRunUri,
+      },
+    }), null, 2),
+  );
+
+  try {
+    process.env.GITHUB_REPOSITORY = 'example/matrix';
+    const results = await collectManualArtifactResults(
+      getL1EvidenceDefinition('EVID-OPS-001'),
+      tempRoot,
+      {
+        pre_release_run_report: path.relative(tempRoot, reportPath),
+      },
+      runTimestamp,
+    );
+
+    assert.equal(results.length, 1);
+    assert.equal(results[0].valid, false);
+    assert.equal(results[0].validation_error, 'attestation bundle provenance.origin_repository must match the current repository');
+  } finally {
+    if (previousRepository == null) {
+      delete process.env.GITHUB_REPOSITORY;
+    } else {
+      process.env.GITHUB_REPOSITORY = previousRepository;
+    }
+  }
+});
+
+test('manual artifact collection rejects attestations that do not share one GitHub Actions run and attempt', async () => {
+  const runTimestamp = '20260331T141608Z';
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-testing-harness-same-run-'));
+  const ciTestFile = path.join(tempRoot, 'tests', 'integration', 'remote.test.mjs');
+  const stagingTestFile = path.join(tempRoot, 'tests', 'staging', 'remote.test.mjs');
+  const externalDir = path.join(tempRoot, 'external');
+  const ciPath = path.join(externalDir, 'ci-integration.json');
+  const stagingPath = path.join(externalDir, 'staging.json');
+  const mismatchedRunId = '8903120260331141608';
+  const mismatchedRunUri = `https://github.com/example/matrix/actions/runs/${mismatchedRunId}`;
+  const mismatchedArtifactStoreKey = `gha/${mismatchedRunId}/1/staging/${runTimestamp}/run-bundle.tgz`;
+
+  await fs.mkdir(path.dirname(ciTestFile), { recursive: true });
+  await fs.mkdir(path.dirname(stagingTestFile), { recursive: true });
+  await fs.mkdir(externalDir, { recursive: true });
+  await fs.writeFile(ciTestFile, 'export const remote = true;\n');
+  await fs.writeFile(stagingTestFile, 'export const remote = true;\n');
+  await fs.writeFile(
+    ciPath,
+    JSON.stringify(buildValidEnvironmentAttestation('ci-integration', runTimestamp, {
+      test_directory: 'tests/integration',
+      test_files: ['tests/integration/remote.test.mjs'],
+      test_file_count: 1,
+      expanded_test_files: ['tests/integration/remote.test.mjs'],
+      expanded_test_file_count: 1,
+    }), null, 2),
+  );
+  await fs.writeFile(
+    stagingPath,
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
+      source_run_uri: mismatchedRunUri,
+      test_directory: 'tests/staging',
+      test_files: ['tests/staging/remote.test.mjs'],
+      test_file_count: 1,
+      expanded_test_files: ['tests/staging/remote.test.mjs'],
+      expanded_test_file_count: 1,
+    }, {
+      provenance: {
+        origin_run_id: mismatchedRunId,
+        origin_run_uri: mismatchedRunUri,
+        artifact_store_uri: `r2://matrix-evidence-staging/${mismatchedArtifactStoreKey}`,
+        artifact_store_key: mismatchedArtifactStoreKey,
+        review_record_uri: mismatchedRunUri,
+      },
+    }), null, 2),
+  );
+
+  const results = await collectManualArtifactResults(
+    getL1EvidenceDefinition('EVID-CS-001'),
+    tempRoot,
+    {
+      ci_integration_run_report: path.relative(tempRoot, ciPath),
+      staging_run_report: path.relative(tempRoot, stagingPath),
+    },
+    runTimestamp,
+    {
+      expectedGitHubRepository: 'example/matrix',
+    },
+  );
+
+  assert.equal(results.length, 2);
+  assert.equal(results[0].valid, true);
+  assert.equal(results[1].valid, false);
+  assert.match(results[1].validation_error, /must come from GitHub Actions run/);
 });
 
 test('manual artifact collection rejects hard-linked _test-runs reports even when the provided path looks external', async () => {

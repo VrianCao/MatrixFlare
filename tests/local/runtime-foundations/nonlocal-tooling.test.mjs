@@ -84,10 +84,17 @@ function buildDeploymentSummaryFixture(environmentName) {
   };
 }
 
-function buildDeploymentIdentityValidationFixture(environmentName) {
+function buildDeploymentIdentityValidationFixture(environmentName, rolloutSkewProbe = null) {
   const plan = buildNonLocalEnvironmentPlan(environmentName, {
     workersSubdomain: 'matrixflare',
   });
+  const gatewayDeploymentId = rolloutSkewProbe?.dual_version_deployment_id ?? 'dep-gateway';
+  const gatewayWorkerVersionIds = rolloutSkewProbe == null
+    ? ['ver-gateway']
+    : [
+      rolloutSkewProbe.baseline_gateway_version_id,
+      rolloutSkewProbe.candidate_gateway_version_id,
+    ];
   return {
     validated_at: '2026-04-01T16:00:00.000Z',
     cloudflare_resources: {
@@ -106,8 +113,8 @@ function buildDeploymentIdentityValidationFixture(environmentName) {
       },
       'gateway-worker': {
         script_name: buildWorkerScriptName('gateway-worker', environmentName),
-        latest_active_deployment_id: 'dep-gateway',
-        active_worker_version_ids: ['ver-gateway'],
+        latest_active_deployment_id: gatewayDeploymentId,
+        active_worker_version_ids: gatewayWorkerVersionIds,
       },
     },
   };
@@ -373,7 +380,8 @@ test('environment wrangler config rewrites bindings for a specific non-local env
   });
 
   assert.equal(config.name, 'matrix-gateway-worker');
-  assert.deepEqual(config.version_metadata, {
+  assert.equal(config.version_metadata, undefined);
+  assert.deepEqual(config.env['pre-release'].version_metadata, {
     binding: 'CF_VERSION_METADATA',
   });
   assert.ok(config.env);
@@ -489,7 +497,8 @@ test('written non-local wrangler config rewrites main to a real worker entrypoin
         resolvedMainPath,
         path.join(repoRoot, 'apps', workerName, 'src', 'index.mjs'),
       );
-      assert.deepEqual(written.config.version_metadata, {
+      assert.equal(written.config.version_metadata, undefined);
+      assert.deepEqual(written.config.env.staging.version_metadata, {
         binding: 'CF_VERSION_METADATA',
       });
     }
@@ -1821,7 +1830,7 @@ test('runEnvironmentBackedSuite serializes pre-release node tests, validates rol
       readWorkersSubdomainImpl: async () => 'matrixflare',
       validateDeploymentSummaryAgainstCurrentCloudflareStateImpl: async (summary) => {
         validatedGatewayDeploymentIds.push(summary.workers['gateway-worker'].deployment_id);
-        return buildDeploymentIdentityValidationFixture('pre-release');
+        return buildDeploymentIdentityValidationFixture('pre-release', buildRolloutSkewProbeFixture());
       },
       getRequiredTestFilesImpl: async () => [path.join(repoRoot, 'tests/pre-release/test-ops-001.test.mjs')],
       waitForNonLocalDeploymentReadinessImpl: async () => buildReadinessProbeFixture('pre-release'),

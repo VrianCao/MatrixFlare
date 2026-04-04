@@ -780,6 +780,9 @@ export function createEnvironmentWranglerConfig(workerName, plan, {
     vars: workerVars,
     workers_dev: true,
   };
+  if (baseConfig.version_metadata != null) {
+    envConfig.version_metadata = structuredCloneJson(baseConfig.version_metadata);
+  }
 
   if (baseConfig.durable_objects) {
     envConfig.durable_objects = {
@@ -856,11 +859,6 @@ export function createEnvironmentWranglerConfig(workerName, plan, {
     compatibility_date: baseConfig.compatibility_date,
     compatibility_flags: baseConfig.compatibility_flags,
     migrations: baseConfig.migrations,
-    ...(baseConfig.version_metadata == null
-      ? {}
-      : {
-        version_metadata: structuredCloneJson(baseConfig.version_metadata),
-      }),
     env: {
       [envName]: envConfig,
     },
