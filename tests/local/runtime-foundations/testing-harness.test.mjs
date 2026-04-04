@@ -10,6 +10,7 @@ import { promisify } from 'node:util';
 import {
   buildRunEnvironmentVariables,
   discoverTestFiles,
+  getReleaseGateTestFiles,
   getTestEnvironmentDefinition,
   getTestEnvironmentDirectory,
   getRequiredTestFiles,
@@ -702,6 +703,30 @@ test('required test discovery fails closed when an environment layer is empty or
   await assert.rejects(
     () => getRequiredTestFiles('staging', tempRoot),
     /No staging tests found/,
+  );
+});
+
+test('release-gate test discovery excludes generic non-local bootstrap and smoke entrypoints', async () => {
+  const integrationFiles = await getReleaseGateTestFiles('ci-integration', repoRoot);
+  const stagingFiles = await getReleaseGateTestFiles('staging', repoRoot);
+  const preReleaseFiles = await getReleaseGateTestFiles('pre-release', repoRoot);
+
+  for (const files of [integrationFiles, stagingFiles, preReleaseFiles]) {
+    assert.ok(files.length > 0);
+    assert.ok(files.every((file) => !file.endsWith('bootstrap.test.mjs')));
+    assert.ok(files.every((file) => !file.endsWith('l1-mandatory.test.mjs')));
+  }
+});
+
+test('release-gate test discovery fails closed when a non-local environment only has generic smoke entrypoints', async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-testing-harness-release-gate-'));
+  await fs.mkdir(path.join(tempRoot, 'tests', 'staging'), { recursive: true });
+  await fs.writeFile(path.join(tempRoot, 'tests', 'staging', 'bootstrap.test.mjs'), 'export const bootstrap = true;\n');
+  await fs.writeFile(path.join(tempRoot, 'tests', 'staging', 'l1-mandatory.test.mjs'), 'export const smoke = true;\n');
+
+  await assert.rejects(
+    () => getReleaseGateTestFiles('staging', tempRoot),
+    /No staging release-gate tests found/,
   );
 });
 

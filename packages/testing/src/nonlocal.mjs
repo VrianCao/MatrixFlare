@@ -32,7 +32,7 @@ import {
 } from './cloudflare-resources.mjs';
 import {
   getTestEnvironmentDirectory,
-  getRequiredTestFiles,
+  getReleaseGateTestFiles,
 } from './bootstrap.mjs';
 
 const NON_LOCAL_ENVIRONMENT_NAMES = Object.freeze([
@@ -132,6 +132,10 @@ function assertRequiredOpsAccessRemoteHarnessEnv(environmentName, remoteHarnessE
 
 function stableJson(value) {
   return JSON.stringify(value, null, 2) + '\n';
+}
+
+function stableString(value) {
+  return typeof value === 'string' ? value.trim() : '';
 }
 
 function decodeBase64UrlToBuffer(value, label) {
@@ -3671,7 +3675,7 @@ export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
   requireCloudflareCredentialsImpl = requireCloudflareCredentials,
   readWorkersSubdomainImpl = readWorkersSubdomain,
   validateDeploymentSummaryAgainstCurrentCloudflareStateImpl = validateDeploymentSummaryAgainstCurrentCloudflareState,
-  getRequiredTestFilesImpl = getRequiredTestFiles,
+  getRequiredTestFilesImpl = getReleaseGateTestFiles,
   waitForNonLocalDeploymentReadinessImpl = waitForNonLocalDeploymentReadiness,
   spawnImpl = spawn,
 } = {}) {

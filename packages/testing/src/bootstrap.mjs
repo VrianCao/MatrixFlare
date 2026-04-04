@@ -83,6 +83,24 @@ export async function getRequiredTestFiles(input, repoRoot = process.cwd()) {
   return files;
 }
 
+export function isGenericEnvironmentSmokeTestFile(filePath) {
+  const basename = path.basename(filePath);
+  return basename === 'bootstrap.test.mjs' || basename === 'l1-mandatory.test.mjs';
+}
+
+export async function getReleaseGateTestFiles(input, repoRoot = process.cwd()) {
+  const environment = getTestEnvironmentDefinition(input);
+  const files = await getRequiredTestFiles(environment.name, repoRoot);
+  if (environment.name === 'local') {
+    return files;
+  }
+  const releaseGateFiles = files.filter((file) => !isGenericEnvironmentSmokeTestFile(file));
+  if (releaseGateFiles.length === 0) {
+    throw new Error(`No ${environment.name} release-gate tests found in ${environment.directory} after excluding generic bootstrap/smoke entrypoints`);
+  }
+  return releaseGateFiles;
+}
+
 export function skipUnlessEnvironment(testContext, expectedEnvironment) {
   const actualEnvironment = resolveTestEnvironmentName();
   const resolvedExpectedEnvironment = resolveTestEnvironmentName(expectedEnvironment);

@@ -2678,6 +2678,11 @@ test('pre-release rollout start uses the in-module slug helper instead of an und
 
   assert.match(
     source,
+    /function stableString\(value\) {\n\s+return typeof value === 'string' \? value\.trim\(\) : '';\n}/,
+    'rollout start must keep a stableString helper in module scope for version-tag normalization',
+  );
+  assert.match(
+    source,
     /const probeRunId = slugifyLabel\(`rollout-\$\{resolvedDeploymentId\}`\);\n\s+const seedPrefix = slugifyLabel\(`probe-\$\{resolvedDeploymentId\}`\)\.slice\(0, 48\);/,
     'rollout start must derive probe identifiers from the defined slugifyLabel helper',
   );
