@@ -228,6 +228,42 @@ function buildRolloutSkewProbeFixture(overrides = {}) {
   };
 }
 
+function buildPreReleaseCostObservationFixture(overrides = {}) {
+  return {
+    observation_id: 'pre-release-cost-1',
+    source_environment: 'pre-release',
+    captured_at: '2026-04-03T06:00:00.000Z',
+    capture_window: {
+      start: '2026-04-03T00:00:00.000Z',
+      end: '2026-04-03T06:00:00.000Z',
+    },
+    capture_method: 'cloudflare-official-metrics',
+    source_query_uris: [
+      'https://developers.cloudflare.com/workers/platform/pricing',
+      'https://developers.cloudflare.com/durable-objects/platform/pricing',
+      'https://api.cloudflare.com/client/v4/graphql#workersInvocationsAdaptive',
+    ],
+    topology_kind: 'cloudflare-pre-release',
+    cloudflare_resources: buildDeploymentSummaryFixture('pre-release').cloudflare_resources,
+    cost_surfaces: {
+      workers: { total_cost_usd: 0.1 },
+      durable_objects: { total_cost_usd: 0.2 },
+      d1: { total_cost_usd: 0.3 },
+      r2: { total_cost_usd: 0.4 },
+      kv: { total_cost_usd: 0.5 },
+      queues: { total_cost_usd: 0.6 },
+    },
+    model_comparison: {
+      status: 'within_expected',
+      summary: 'Official Cloudflare metrics matched the modeled bounded workload envelope.',
+      actual_total_usd: 2.1,
+      modeled_total_usd: 2.1,
+      drift_ratio: 0,
+    },
+    ...overrides,
+  };
+}
+
 test('non-local environment plan derives deterministic workers.dev scripts and resource names', () => {
   const plan = buildNonLocalEnvironmentPlan('staging', {
     workersSubdomain: 'matrixflare',
@@ -272,6 +308,17 @@ test('non-production secret bundle stays stable for the same inputs and diverges
   assert.deepEqual(repeat, baseline);
   assert.notEqual(staging.gateway.SESSION_ROOT_KEY_RING, baseline.gateway.SESSION_ROOT_KEY_RING);
   assert.notEqual(staging.jobs.EXPORT_BUNDLE_KEY_RING, baseline.jobs.EXPORT_BUNDLE_KEY_RING);
+});
+
+test('non-production secret bundle falls back to the main Cloudflare API token when the observability token is blank', () => {
+  const bundle = buildNonProductionSecretBundle({
+    environmentName: 'pre-release',
+    accountId: 'cf-account-1',
+    apiToken: 'cf-token-1',
+    observabilityApiToken: '   ',
+  });
+
+  assert.equal(bundle.ops.CLOUDFLARE_OBSERVABILITY_API_TOKEN, 'cf-token-1');
 });
 
 test('environment wrangler config rewrites bindings for a specific non-local environment without mutating committed snapshots', () => {
@@ -1800,6 +1847,193 @@ test('runEnvironmentBackedSuite fails closed when the rollout skew sidecar is se
     assert.equal(result.report.exit_code, 1);
     assert.match(result.report.error_message ?? '', /Suite artifact parsing failed/);
     assert.match(result.report.error_message ?? '', /must match rollout state|must include new-worker-old-authority\/UserDO observation/);
+  } finally {
+    await fs.rm(outputRoot, { recursive: true, force: true });
+  }
+});
+
+test('runEnvironmentBackedSuite captures a normalized pre-release cost observation sidecar when TEST-COST-001 is covered', async () => {
+  const repoRoot = path.resolve('.');
+  const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-nonlocal-suite-cost-'));
+  const deploymentSummary = buildDeploymentSummaryFixture('pre-release');
+  deploymentSummary.access = {
+    protected_ops_url: 'https://matrix-ops-worker-pre-release.matrixflare.workers.dev',
+  };
+  let capturedEnv = null;
+
+  try {
+    const result = await runEnvironmentBackedSuite('pre-release', repoRoot, {
+      runTimestamp: '20260403T060000Z',
+      outputRoot,
+      sourceRunUri: 'https://github.com/example/matrix/actions/runs/12345',
+      logArtifact: 'https://github.com/example/matrix/actions/runs/12345/artifacts/1',
+      executedBy: 'gha://example/matrix/nonlocal/pre-release',
+      reviewedBy: 'gha://example/matrix/nonlocal/pre-release',
+      topologyKind: 'cloudflare-pre-release',
+      deploymentSummary,
+      accessSession: {
+        access: {
+          service_token_client_id: 'service-token-id.access',
+          service_token_client_secret: 'service-token-secret',
+        },
+      },
+    }, {
+      requireGitHubActionsExecutionImpl: async () => ({ environment: 'pre-release' }),
+      assessNonLocalEnvironmentHarnessReadinessImpl: async () => ({
+        ready: true,
+        reason: null,
+        expanded_test_files: ['tests/pre-release/test-cost-001.test.mjs'],
+      }),
+      requireCloudflareCredentialsImpl: () => ({ accountId: 'cf-account', apiToken: 'cf-token' }),
+      readWorkersSubdomainImpl: async () => 'matrixflare',
+      validateDeploymentSummaryAgainstCurrentCloudflareStateImpl: async () => (
+        buildDeploymentIdentityValidationFixture('pre-release')
+      ),
+      getRequiredTestFilesImpl: async () => [path.join(repoRoot, 'tests/pre-release/test-cost-001.test.mjs')],
+      waitForNonLocalDeploymentReadinessImpl: async () => buildReadinessProbeFixture('pre-release'),
+      spawnImpl: (_command, _args, options) => {
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        capturedEnv = options?.env ?? null;
+        queueMicrotask(async () => {
+          await fs.writeFile(
+            options.env.MATRIX_TEST_RUN_PRE_RELEASE_COST_OBSERVATION_PATH,
+            JSON.stringify(buildPreReleaseCostObservationFixture(), null, 2),
+          );
+          child.stdout.emit('data', Buffer.from('suite ok\n', 'utf8'));
+          child.emit('close', 0);
+        });
+        return child;
+      },
+    });
+
+    assert.ok(capturedEnv);
+    assert.equal(typeof capturedEnv.MATRIX_TEST_RUN_PRE_RELEASE_COST_OBSERVATION_PATH, 'string');
+    assert.ok(capturedEnv.MATRIX_TEST_RUN_PRE_RELEASE_COST_OBSERVATION_PATH.length > 0);
+    assert.equal(result.ok, true);
+    assert.equal(result.report.status, 'pass');
+    assert.equal(result.report.exit_code, 0);
+    assert.equal(result.report.pre_release_cost_observation?.observation_id, 'pre-release-cost-1');
+  } finally {
+    await fs.rm(outputRoot, { recursive: true, force: true });
+  }
+});
+
+test('runEnvironmentBackedSuite fails closed when the pre-release cost observation sidecar is malformed', async () => {
+  const repoRoot = path.resolve('.');
+  const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-nonlocal-suite-cost-malformed-'));
+  const deploymentSummary = buildDeploymentSummaryFixture('pre-release');
+  deploymentSummary.access = {
+    protected_ops_url: 'https://matrix-ops-worker-pre-release.matrixflare.workers.dev',
+  };
+
+  try {
+    const result = await runEnvironmentBackedSuite('pre-release', repoRoot, {
+      runTimestamp: '20260403T060100Z',
+      outputRoot,
+      sourceRunUri: 'https://github.com/example/matrix/actions/runs/12345',
+      logArtifact: 'https://github.com/example/matrix/actions/runs/12345/artifacts/1',
+      executedBy: 'gha://example/matrix/nonlocal/pre-release',
+      reviewedBy: 'gha://example/matrix/nonlocal/pre-release',
+      topologyKind: 'cloudflare-pre-release',
+      deploymentSummary,
+      accessSession: {
+        access: {
+          service_token_client_id: 'service-token-id.access',
+          service_token_client_secret: 'service-token-secret',
+        },
+      },
+    }, {
+      requireGitHubActionsExecutionImpl: async () => ({ environment: 'pre-release' }),
+      assessNonLocalEnvironmentHarnessReadinessImpl: async () => ({
+        ready: true,
+        reason: null,
+        expanded_test_files: ['tests/pre-release/test-cost-001.test.mjs'],
+      }),
+      requireCloudflareCredentialsImpl: () => ({ accountId: 'cf-account', apiToken: 'cf-token' }),
+      readWorkersSubdomainImpl: async () => 'matrixflare',
+      validateDeploymentSummaryAgainstCurrentCloudflareStateImpl: async () => (
+        buildDeploymentIdentityValidationFixture('pre-release')
+      ),
+      getRequiredTestFilesImpl: async () => [path.join(repoRoot, 'tests/pre-release/test-cost-001.test.mjs')],
+      waitForNonLocalDeploymentReadinessImpl: async () => buildReadinessProbeFixture('pre-release'),
+      spawnImpl: (_command, _args, options) => {
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        queueMicrotask(async () => {
+          await fs.writeFile(options.env.MATRIX_TEST_RUN_PRE_RELEASE_COST_OBSERVATION_PATH, '{bad-json');
+          child.stdout.emit('data', Buffer.from('suite ok\n', 'utf8'));
+          child.emit('close', 0);
+        });
+        return child;
+      },
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.report.status, 'fail');
+    assert.equal(result.report.exit_code, 1);
+    assert.match(result.report.error_message ?? '', /Suite artifact parsing failed/);
+  } finally {
+    await fs.rm(outputRoot, { recursive: true, force: true });
+  }
+});
+
+test('runEnvironmentBackedSuite fails closed when TEST-COST-001 is covered but the pre-release cost observation sidecar is missing', async () => {
+  const repoRoot = path.resolve('.');
+  const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-nonlocal-suite-cost-missing-'));
+  const deploymentSummary = buildDeploymentSummaryFixture('pre-release');
+  deploymentSummary.access = {
+    protected_ops_url: 'https://matrix-ops-worker-pre-release.matrixflare.workers.dev',
+  };
+
+  try {
+    const result = await runEnvironmentBackedSuite('pre-release', repoRoot, {
+      runTimestamp: '20260403T060200Z',
+      outputRoot,
+      sourceRunUri: 'https://github.com/example/matrix/actions/runs/12345',
+      logArtifact: 'https://github.com/example/matrix/actions/runs/12345/artifacts/1',
+      executedBy: 'gha://example/matrix/nonlocal/pre-release',
+      reviewedBy: 'gha://example/matrix/nonlocal/pre-release',
+      topologyKind: 'cloudflare-pre-release',
+      deploymentSummary,
+      accessSession: {
+        access: {
+          service_token_client_id: 'service-token-id.access',
+          service_token_client_secret: 'service-token-secret',
+        },
+      },
+    }, {
+      requireGitHubActionsExecutionImpl: async () => ({ environment: 'pre-release' }),
+      assessNonLocalEnvironmentHarnessReadinessImpl: async () => ({
+        ready: true,
+        reason: null,
+        expanded_test_files: ['tests/pre-release/test-cost-001.test.mjs'],
+      }),
+      requireCloudflareCredentialsImpl: () => ({ accountId: 'cf-account', apiToken: 'cf-token' }),
+      readWorkersSubdomainImpl: async () => 'matrixflare',
+      validateDeploymentSummaryAgainstCurrentCloudflareStateImpl: async () => (
+        buildDeploymentIdentityValidationFixture('pre-release')
+      ),
+      getRequiredTestFilesImpl: async () => [path.join(repoRoot, 'tests/pre-release/test-cost-001.test.mjs')],
+      waitForNonLocalDeploymentReadinessImpl: async () => buildReadinessProbeFixture('pre-release'),
+      spawnImpl: () => {
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        queueMicrotask(() => {
+          child.stdout.emit('data', Buffer.from('suite ok\n', 'utf8'));
+          child.emit('close', 0);
+        });
+        return child;
+      },
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.report.status, 'fail');
+    assert.equal(result.report.exit_code, 1);
+    assert.match(result.report.error_message ?? '', /pre_release_cost_observation sidecar is required/);
   } finally {
     await fs.rm(outputRoot, { recursive: true, force: true });
   }

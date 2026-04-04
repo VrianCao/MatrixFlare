@@ -67,6 +67,7 @@ jobs:
     env:
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_OBSERVABILITY_API_TOKEN: ${{ secrets.CLOUDFLARE_OBSERVABILITY_API_TOKEN }}
       MATRIX_PHASE08_RUN_TIMESTAMP: ${{ needs.metadata.outputs.run_timestamp }}
       MATRIX_PHASE08_RUN_URL: ${{ needs.metadata.outputs.run_url }}
     steps:

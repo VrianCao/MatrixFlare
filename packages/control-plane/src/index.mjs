@@ -37,6 +37,7 @@ export {
   normalizeJobStatusResponse,
   normalizeJobSummary,
   normalizeOpsHealthResponse,
+  normalizePreReleaseCostObservation,
   normalizeRolloutSkewObservation,
   normalizeRolloutSkewProbeRequest,
   normalizeRolloutSkewProbeResponse,

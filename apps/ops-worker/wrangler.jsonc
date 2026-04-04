@@ -26,6 +26,8 @@
     "GATEWAY_WORKER_SCRIPT_NAME": "gateway_worker_script_name-placeholder",
     "ACCESS_TEAM_DOMAIN": "access_team_domain-placeholder",
     "ACCESS_AUDIENCE": "access_audience-placeholder",
+    "CLOUDFLARE_ACCOUNT_ID": "",
+    "CLOUDFLARE_RESOURCE_IDS_JSON": "",
     "FF_APPSERVICE_API": "false",
     "FF_OTEL_EXPORT": "false",
     "FF_OTEL_PERSIST": "true"

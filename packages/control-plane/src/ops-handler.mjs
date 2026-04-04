@@ -70,6 +70,9 @@ function routeInfo(url) {
   if (pathname === ROUTE_TEMPLATES.rolloutSkewProbe) {
     return { kind: 'rollout-skew-probe', routeTemplate: ROUTE_TEMPLATES.rolloutSkewProbe, requiredScope: 'ops.rebuild.write' };
   }
+  if (pathname === ROUTE_TEMPLATES.costObservation) {
+    return { kind: 'cost-observation', routeTemplate: ROUTE_TEMPLATES.costObservation, requiredScope: 'ops.read' };
+  }
   if (pathname === ROUTE_TEMPLATES.jobsList) {
     return { kind: 'jobs-list', routeTemplate: ROUTE_TEMPLATES.jobsList, requiredScope: 'ops.read' };
   }
@@ -138,6 +141,13 @@ const ROLLOUT_PROBE_SECRET_HEADER = 'x-matrix-rollout-probe-secret';
 const ROLLOUT_PROBE_GATEWAY_VERSION_ID_HEADER = 'x-matrix-rollout-probe-gateway-version-id';
 const PROBE_PASSWORD_SUFFIX = '-password';
 const ROLLOUT_PROBE_MAX_SEED_ATTEMPTS = 24;
+const CLOUDFLARE_API_BASE_URL = 'https://api.cloudflare.com/client/v4';
+const CLOUDFLARE_GRAPHQL_API_DOC_URI = 'https://developers.cloudflare.com/analytics/graphql-api/';
+const WORKERS_METRICS_DOC_URI = 'https://developers.cloudflare.com/workers/observability/metrics-and-analytics/';
+const DURABLE_OBJECTS_METRICS_DOC_URI = 'https://developers.cloudflare.com/durable-objects/observability/graphql-analytics/';
+const DURABLE_OBJECTS_PRICING_DOC_URI = 'https://developers.cloudflare.com/durable-objects/platform/pricing/';
+const WORKERS_SCRIPT_SETTINGS_DOC_URI = 'https://developers.cloudflare.com/api-next/resources/workers/subresources/scripts/subresources/settings/methods/get/';
+const BILLING_USAGE_API_DOC_URI = 'https://developers.cloudflare.com/api/resources/billing/subresources/usage/';
 
 function stableString(value) {
   return typeof value === 'string' ? value.trim() : '';
@@ -235,6 +245,18 @@ function createOpsPreconditionError(message, {
   return error;
 }
 
+function createRetryableProbeAttemptError(message) {
+  const error = createOpsPreconditionError(message, {
+    retryable: true,
+  });
+  error.attempt_retryable = true;
+  return error;
+}
+
+function isRetryableProbeAttemptError(error) {
+  return error?.attempt_retryable === true;
+}
+
 function requireGatewayProbeConfiguration(env) {
   const baseUrl = stableString(env.MATRIX_PUBLIC_BASE_URL).replace(/\/+$/, '');
   const scriptName = stableString(env.GATEWAY_WORKER_SCRIPT_NAME);
@@ -277,6 +299,21 @@ async function readGatewayPayload(response) {
     return response.json();
   }
   return response.text();
+}
+
+function describeGatewayFailure(result) {
+  return JSON.stringify({
+    status: result.response.status,
+    content_type: result.response.headers.get('content-type') ?? '',
+    body: result.payload,
+  });
+}
+
+function indicatesExistingProbeIdentity(result) {
+  return (
+    result.response.status === 400
+    || result.response.status === 409
+  ) && result.payload?.errcode === 'M_USER_IN_USE';
 }
 
 async function fetchGatewayWithVersionOverride(env, gatewayConfig, {
@@ -380,7 +417,7 @@ async function loginProbeUser(env, gatewayConfig, {
     },
   });
   if (result.response.status !== 200 || typeof result.payload?.access_token !== 'string' || typeof result.payload?.user_id !== 'string') {
-    throw createOpsPreconditionError(`Probe login failed for ${username}: ${JSON.stringify(result.payload)}`);
+    throw createRetryableProbeAttemptError(`Probe login failed for ${username}: ${describeGatewayFailure(result)}`);
   }
   return {
     username,
@@ -416,6 +453,15 @@ async function ensureProbeUser(env, gatewayConfig, probeRequest, {
       device_id: deviceId,
     },
   });
+  if (challenge.response.status === 200 && typeof challenge.payload?.access_token === 'string' && typeof challenge.payload?.user_id === 'string') {
+    return {
+      username,
+      password,
+      device_id: deviceId,
+      access_token: challenge.payload.access_token,
+      user_id: challenge.payload.user_id,
+    };
+  }
   if (challenge.response.status === 401 && typeof challenge.payload?.session === 'string') {
     const completed = await fetchGatewayWithVersionOverride(env, gatewayConfig, {
       versionId: gatewayVersionId,
@@ -441,13 +487,25 @@ async function ensureProbeUser(env, gatewayConfig, probeRequest, {
         user_id: completed.payload.user_id,
       };
     }
+    if (indicatesExistingProbeIdentity(completed)) {
+      return loginProbeUser(env, gatewayConfig, {
+        username,
+        password,
+        deviceId,
+        gatewayVersionId,
+      });
+    }
+    throw createRetryableProbeAttemptError(`Probe register completion failed for ${username}: ${describeGatewayFailure(completed)}`);
   }
-  return loginProbeUser(env, gatewayConfig, {
-    username,
-    password,
-    deviceId,
-    gatewayVersionId,
-  });
+  if (indicatesExistingProbeIdentity(challenge)) {
+    return loginProbeUser(env, gatewayConfig, {
+      username,
+      password,
+      deviceId,
+      gatewayVersionId,
+    });
+  }
+  throw createRetryableProbeAttemptError(`Probe register challenge failed for ${username}: ${describeGatewayFailure(challenge)}`);
 }
 
 async function ensureProbeRoom(env, gatewayConfig, probeRequest, {
@@ -490,7 +548,7 @@ async function ensureProbeRoom(env, gatewayConfig, probeRequest, {
     json: {},
   });
   if (joined.response.status !== 200 || typeof joined.payload?.room_id !== 'string') {
-    throw createOpsPreconditionError(`Probe room setup failed for ${roomAlias}: ${JSON.stringify(created.payload)}`);
+    throw createRetryableProbeAttemptError(`Probe room setup failed for ${roomAlias}: ${JSON.stringify(created.payload)}`);
   }
   return {
     room_id: joined.payload.room_id,
@@ -504,11 +562,21 @@ async function seedProbeUserForVersion(env, gatewayConfig, probeRequest, {
   expectedAuthorityVersionId,
 } = {}) {
   const observedVersionIds = [];
+  const attemptErrors = [];
   for (let attemptIndex = 1; attemptIndex <= ROLLOUT_PROBE_MAX_SEED_ATTEMPTS; attemptIndex += 1) {
-    const seededUser = await ensureProbeUser(env, gatewayConfig, probeRequest, {
-      userLabel: buildSeedAttemptLabel(userLabel, attemptIndex),
-      gatewayVersionId,
-    });
+    let seededUser;
+    try {
+      seededUser = await ensureProbeUser(env, gatewayConfig, probeRequest, {
+        userLabel: buildSeedAttemptLabel(userLabel, attemptIndex),
+        gatewayVersionId,
+      });
+    } catch (error) {
+      if (!isRetryableProbeAttemptError(error)) {
+        throw error;
+      }
+      attemptErrors.push(`attempt ${attemptIndex}: ${error.message}`);
+      continue;
+    }
     const identity = await inspectUserAuthority(env, seededUser.user_id);
     observedVersionIds.push(identity.worker_version_id);
     if (identity.worker_version_id === expectedAuthorityVersionId) {
@@ -516,7 +584,7 @@ async function seedProbeUserForVersion(env, gatewayConfig, probeRequest, {
     }
   }
   throw createOpsPreconditionError(
-    `Unable to seed ${userLabel} on ${expectedAuthorityVersionId} within ${ROLLOUT_PROBE_MAX_SEED_ATTEMPTS} attempts; observed ${summarizeObservedProbeVersions(observedVersionIds)}`,
+    `Unable to seed ${userLabel} on ${expectedAuthorityVersionId} within ${ROLLOUT_PROBE_MAX_SEED_ATTEMPTS} attempts; observed ${summarizeObservedProbeVersions(observedVersionIds)}${attemptErrors.length > 0 ? `; setup_failures=${attemptErrors.join(' | ')}` : ''}`,
     { retryable: true },
   );
 }
@@ -529,13 +597,23 @@ async function seedProbeRoomForVersion(env, gatewayConfig, probeRequest, {
   expectedAuthorityVersionId,
 } = {}) {
   const observedVersionIds = [];
+  const attemptErrors = [];
   for (let attemptIndex = 1; attemptIndex <= ROLLOUT_PROBE_MAX_SEED_ATTEMPTS; attemptIndex += 1) {
-    const seededRoom = await ensureProbeRoom(env, gatewayConfig, probeRequest, {
-      roomLabel: buildSeedAttemptLabel(roomLabel, attemptIndex),
-      gatewayVersionId,
-      accessToken,
-      serverName,
-    });
+    let seededRoom;
+    try {
+      seededRoom = await ensureProbeRoom(env, gatewayConfig, probeRequest, {
+        roomLabel: buildSeedAttemptLabel(roomLabel, attemptIndex),
+        gatewayVersionId,
+        accessToken,
+        serverName,
+      });
+    } catch (error) {
+      if (!isRetryableProbeAttemptError(error)) {
+        throw error;
+      }
+      attemptErrors.push(`attempt ${attemptIndex}: ${error.message}`);
+      continue;
+    }
     const identity = await inspectRoomAuthority(env, seededRoom.room_id);
     observedVersionIds.push(identity.worker_version_id);
     if (identity.worker_version_id === expectedAuthorityVersionId) {
@@ -543,7 +621,7 @@ async function seedProbeRoomForVersion(env, gatewayConfig, probeRequest, {
     }
   }
   throw createOpsPreconditionError(
-    `Unable to seed ${roomLabel} on ${expectedAuthorityVersionId} within ${ROLLOUT_PROBE_MAX_SEED_ATTEMPTS} attempts; observed ${summarizeObservedProbeVersions(observedVersionIds)}`,
+    `Unable to seed ${roomLabel} on ${expectedAuthorityVersionId} within ${ROLLOUT_PROBE_MAX_SEED_ATTEMPTS} attempts; observed ${summarizeObservedProbeVersions(observedVersionIds)}${attemptErrors.length > 0 ? `; setup_failures=${attemptErrors.join(' | ')}` : ''}`,
     { retryable: true },
   );
 }
@@ -593,6 +671,309 @@ function evaluateRolloutAssertions(observations, {
       candidateGatewayVersionId,
     )),
   };
+}
+
+function createOpsInternalError(message, {
+  retryable = false,
+  details = null,
+} = {}) {
+  const error = new Error(message);
+  error.code = 'internal';
+  error.retryable = retryable;
+  error.details = details;
+  return error;
+}
+
+function getObservabilityFetch(env) {
+  return env?.__CLOUDFLARE_OBSERVABILITY_FETCH__ ?? globalThis.fetch;
+}
+
+function parseJsonObjectText(rawValue, label) {
+  const normalized = stableString(rawValue);
+  if (normalized.length === 0) {
+    throw createOpsPreconditionError(`${label} is required for cost observation`, {
+      status: 503,
+      code: 'internal',
+      retryable: true,
+    });
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(normalized);
+  } catch (error) {
+    throw createOpsPreconditionError(`${label} must be valid JSON: ${error.message}`, {
+      status: 503,
+      code: 'internal',
+      retryable: false,
+    });
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw createOpsPreconditionError(`${label} must decode to an object`, {
+      status: 503,
+      code: 'internal',
+      retryable: false,
+    });
+  }
+  return parsed;
+}
+
+function normalizeStringMap(value, label) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw createOpsPreconditionError(`${label} must be an object`, {
+      status: 503,
+      code: 'internal',
+      retryable: false,
+    });
+  }
+  const normalized = {};
+  for (const [key, rawEntry] of Object.entries(value)) {
+    const normalizedKey = stableString(key);
+    const normalizedValue = stableString(rawEntry);
+    if (normalizedKey.length > 0 && normalizedValue.length > 0) {
+      normalized[normalizedKey] = normalizedValue;
+    }
+  }
+  return Object.freeze(normalized);
+}
+
+function requireCostObservationConfiguration(env, config) {
+  const accountId = stableString(env.CLOUDFLARE_ACCOUNT_ID);
+  if (accountId.length === 0) {
+    throw createOpsPreconditionError('ops-worker requires CLOUDFLARE_ACCOUNT_ID for cost observation', {
+      status: 503,
+      code: 'internal',
+      retryable: true,
+    });
+  }
+  const apiToken = stableString(
+    config?.secrets?.get?.('cloudflare_observability_api_token')
+    ?? env.CLOUDFLARE_OBSERVABILITY_API_TOKEN,
+  );
+  if (apiToken.length === 0) {
+    throw createOpsPreconditionError('ops-worker requires CLOUDFLARE_OBSERVABILITY_API_TOKEN for cost observation', {
+      status: 503,
+      code: 'internal',
+      retryable: true,
+    });
+  }
+  const rawResourceIds = parseJsonObjectText(env.CLOUDFLARE_RESOURCE_IDS_JSON, 'CLOUDFLARE_RESOURCE_IDS_JSON');
+  const workerScripts = normalizeStringMap(
+    rawResourceIds.worker_scripts ?? {
+      'gateway-worker': env.GATEWAY_WORKER_SCRIPT_NAME,
+    },
+    'CLOUDFLARE_RESOURCE_IDS_JSON.worker_scripts',
+  );
+  const queueIds = normalizeStringMap(rawResourceIds.queue_ids ?? {}, 'CLOUDFLARE_RESOURCE_IDS_JSON.queue_ids');
+  const bucketNames = normalizeStringMap(rawResourceIds.r2_bucket_names ?? {}, 'CLOUDFLARE_RESOURCE_IDS_JSON.r2_bucket_names');
+  const resourceSnapshot = rawResourceIds.cloudflare_resources;
+  if (!resourceSnapshot || typeof resourceSnapshot !== 'object' || Array.isArray(resourceSnapshot)) {
+    throw createOpsPreconditionError('CLOUDFLARE_RESOURCE_IDS_JSON.cloudflare_resources must be present for cost observation', {
+      status: 503,
+      code: 'internal',
+      retryable: false,
+    });
+  }
+  const gatewayScriptName = workerScripts['gateway-worker'] ?? stableString(env.GATEWAY_WORKER_SCRIPT_NAME);
+  const jobsScriptName = workerScripts['jobs-worker'];
+  const opsScriptName = workerScripts['ops-worker'];
+  if (gatewayScriptName.length === 0 || jobsScriptName == null || opsScriptName == null) {
+    throw createOpsPreconditionError('CLOUDFLARE_RESOURCE_IDS_JSON.worker_scripts must include gateway-worker, jobs-worker, and ops-worker', {
+      status: 503,
+      code: 'internal',
+      retryable: false,
+    });
+  }
+  const mediaBucketName = bucketNames.MATRIX_MEDIA_BUCKET;
+  const archiveBucketName = bucketNames.MATRIX_ARCHIVE_BUCKET;
+  if (mediaBucketName == null || archiveBucketName == null) {
+    throw createOpsPreconditionError('CLOUDFLARE_RESOURCE_IDS_JSON.r2_bucket_names must include MATRIX_MEDIA_BUCKET and MATRIX_ARCHIVE_BUCKET', {
+      status: 503,
+      code: 'internal',
+      retryable: false,
+    });
+  }
+  const d1DatabaseId = stableString(rawResourceIds.d1_database_id);
+  const kvNamespaceId = stableString(rawResourceIds.kv_namespace_id);
+  if (d1DatabaseId.length === 0 || kvNamespaceId.length === 0) {
+    throw createOpsPreconditionError('CLOUDFLARE_RESOURCE_IDS_JSON must include d1_database_id and kv_namespace_id', {
+      status: 503,
+      code: 'internal',
+      retryable: false,
+    });
+  }
+  if (Object.keys(queueIds).length === 0) {
+    throw createOpsPreconditionError('CLOUDFLARE_RESOURCE_IDS_JSON.queue_ids must not be empty', {
+      status: 503,
+      code: 'internal',
+      retryable: false,
+    });
+  }
+  return Object.freeze({
+    account_id: accountId,
+    api_token: apiToken,
+    worker_scripts: workerScripts,
+    gateway_script_name: gatewayScriptName,
+    d1_database_id: d1DatabaseId,
+    kv_namespace_id: kvNamespaceId,
+    queue_ids: queueIds,
+    r2_bucket_names: bucketNames,
+    cloudflare_resources: resourceSnapshot,
+  });
+}
+
+async function callCloudflareAccountApi(fetchImpl, {
+  accountId,
+  apiToken,
+  method = 'GET',
+  pathname,
+  body = null,
+}) {
+  const response = await fetchImpl(`${CLOUDFLARE_API_BASE_URL}/accounts/${accountId}${pathname}`, {
+    method,
+    headers: {
+      authorization: `Bearer ${apiToken}`,
+      accept: 'application/json',
+      ...(body == null ? {} : { 'content-type': 'application/json; charset=utf-8' }),
+    },
+    body: body == null ? undefined : JSON.stringify(body),
+  });
+  const text = await response.text();
+  let payload = null;
+  try {
+    payload = text.length === 0 ? null : JSON.parse(text);
+  } catch {
+    payload = {
+      success: false,
+      errors: [{ message: text.length === 0 ? `${method} ${pathname} returned an empty response body` : text }],
+    };
+  }
+  if (!response.ok || payload?.success === false) {
+    const errors = Array.isArray(payload?.errors) ? payload.errors : [];
+    const errorMessage = errors.length > 0
+      ? errors.map((entry) => entry?.message ?? JSON.stringify(entry)).join('; ')
+      : `${method} ${pathname} failed`;
+    throw createOpsInternalError(`Cloudflare API ${method} ${pathname} failed: ${errorMessage}`, {
+      retryable: response.status >= 500 || response.status === 429,
+    });
+  }
+  return payload;
+}
+
+async function fetchWorkerUsageModel(fetchImpl, {
+  accountId,
+  apiToken,
+  scriptName,
+}) {
+  const payload = await callCloudflareAccountApi(fetchImpl, {
+    accountId,
+    apiToken,
+    pathname: `/workers/scripts/${scriptName}/settings`,
+  });
+  const result = payload?.result;
+  if (!result || typeof result !== 'object' || Array.isArray(result)) {
+    throw createOpsInternalError('Cloudflare Worker settings did not include a result object', {
+      retryable: false,
+    });
+  }
+  const usageModel = stableString(result.usage_model ?? result.usageModel);
+  if (usageModel.length === 0) {
+    throw createOpsInternalError(`Cloudflare Worker settings for ${scriptName} did not expose usage_model`, {
+      retryable: false,
+    });
+  }
+  return usageModel.toLowerCase();
+}
+
+function buildCostObservationBlockerDetails() {
+  return Object.freeze({
+    blocker_ids: Object.freeze(['OQ-0006']),
+    blocker_reasons: Object.freeze([
+      'Cloudflare GraphQL Analytics is aggregated analytics and the official GraphQL docs say not to use it for billing.',
+      'Workers metrics expose request counts and CPU percentiles, but not a billing-safe total CPU figure for the bounded pre-release workload window.',
+      'Durable Objects pricing bills wall-clock duration GB-s, while the official Durable Objects analytics surface exposes cpuTime and storage, not billed duration.',
+      'Cloudflare Billing Usage and PayGo API automation remains beta/select-account and is not yet proven for per-environment pre-release snapshots in the current same-account topology.',
+    ]),
+    official_source_uris: Object.freeze([
+      CLOUDFLARE_GRAPHQL_API_DOC_URI,
+      WORKERS_METRICS_DOC_URI,
+      DURABLE_OBJECTS_METRICS_DOC_URI,
+      DURABLE_OBJECTS_PRICING_DOC_URI,
+      WORKERS_SCRIPT_SETTINGS_DOC_URI,
+      BILLING_USAGE_API_DOC_URI,
+    ]),
+  });
+}
+
+async function handleCostObservation(request, env, config, requestContext) {
+  const operator = await authenticateOperatorIdentity({
+    request,
+    env,
+    config,
+    requiredScope: 'ops.read',
+  });
+  if (request.method !== 'GET') {
+    return opsErrorResponse({
+      requestId: requestContext.requestId,
+      code: 'internal',
+      message: 'Unsupported cost observation method',
+    });
+  }
+  authorizeOperatorRequest({
+    operator,
+    targetScope: {
+      scope_kind: 'global',
+      scope_id: null,
+    },
+  });
+  if (config.environmentName !== 'pre-release') {
+    return opsErrorResponse({
+      requestId: requestContext.requestId,
+      code: 'internal',
+      message: 'Cost observation is only supported in pre-release',
+    });
+  }
+
+  try {
+    const fetchImpl = getObservabilityFetch(env);
+    const costConfig = requireCostObservationConfiguration(env, config);
+    const usageModels = await Promise.all(
+      [...new Set(Object.values(costConfig.worker_scripts))]
+        .map(async (scriptName) => ({
+          script_name: scriptName,
+          usage_model: await fetchWorkerUsageModel(fetchImpl, {
+            accountId: costConfig.account_id,
+            apiToken: costConfig.api_token,
+            scriptName,
+          }),
+        })),
+    );
+    const nonStandardUsageModels = usageModels.filter((entry) => entry.usage_model !== 'standard');
+    if (nonStandardUsageModels.length > 0) {
+      throw createOpsPreconditionError(
+        `Cloudflare Worker usage_model must be standard for TEST-COST-001, received ${nonStandardUsageModels.map((entry) => `${entry.script_name}=${entry.usage_model}`).join(', ')}`,
+        {
+          status: 503,
+          code: 'internal',
+          retryable: false,
+        },
+      );
+    }
+    throw createOpsInternalError(
+      'TEST-COST-001 pre-release proof remains fail-closed: current official Cloudflare surfaces do not yet support a truthful actual_total_usd and model_comparison for this bounded pre-release window; see OQ-0006.',
+      {
+        retryable: false,
+        details: buildCostObservationBlockerDetails(),
+      },
+    );
+  } catch (error) {
+    return opsErrorResponse({
+      requestId: requestContext.requestId,
+      code: stableString(error?.code) || 'internal',
+      message: error?.message ?? 'Cost observation failed',
+      retryable: error?.retryable === true,
+      details: error?.details ?? null,
+    });
+  }
 }
 
 async function handleRolloutSkewProbe(request, env, config, requestContext) {
@@ -1031,6 +1412,10 @@ export function createOpsWorkerFetchHandler() {
 
       if (info.kind === 'rollout-skew-probe') {
         return await handleRolloutSkewProbe(request, env, config, requestContext);
+      }
+
+      if (info.kind === 'cost-observation') {
+        return await handleCostObservation(request, env, config, requestContext);
       }
 
       if (info.kind === 'jobs-list') {

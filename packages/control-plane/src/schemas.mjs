@@ -101,6 +101,7 @@ export const ROUTE_TEMPLATES = Object.freeze({
   rebuilds: '/_ops/v1/rebuilds',
   repairs: '/_ops/v1/repairs',
   rolloutSkewProbe: '/_ops/v1/rollout-skew/probe',
+  costObservation: '/_ops/v1/cost/observation',
   jobsList: '/_ops/v1/jobs',
   jobsItem: '/_ops/v1/jobs/{jobId}',
   jobsCancel: '/_ops/v1/jobs/{jobId}/cancel',
@@ -153,6 +154,19 @@ function normalizeInteger(value, label, { min = 0, allowNull = false } = {}) {
   }
   if (!Number.isInteger(value) || value < min) {
     throw new TypeError(`${label} must be an integer >= ${min}`);
+  }
+  return value;
+}
+
+function normalizeNumber(value, label, { min = 0, allowNull = false } = {}) {
+  if (value == null) {
+    if (allowNull) {
+      return null;
+    }
+    throw new TypeError(`${label} must be a number`);
+  }
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < min) {
+    throw new TypeError(`${label} must be a finite number >= ${min}`);
   }
   return value;
 }
@@ -305,6 +319,108 @@ export function normalizeRolloutSkewProbeResponse(value) {
     override_strategy: normalizeString(value.override_strategy, 'override_strategy'),
     observations,
     assertions,
+  };
+}
+
+const PRE_RELEASE_COST_SURFACE_NAMES = Object.freeze([
+  'workers',
+  'durable_objects',
+  'd1',
+  'r2',
+  'kv',
+  'queues',
+]);
+
+function normalizeAbsoluteExternalUri(value, label) {
+  const normalized = normalizeString(value, label);
+  let parsed;
+  try {
+    parsed = new URL(normalized);
+  } catch (error) {
+    throw new TypeError(`${label} must be an absolute URI: ${error.message}`);
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+    throw new TypeError(`${label} must use http or https`);
+  }
+  if (parsed.host.length === 0) {
+    throw new TypeError(`${label} must include an authority`);
+  }
+  return normalized;
+}
+
+function normalizeTimestamp(value, label) {
+  const normalized = normalizeString(value, label);
+  if (!normalized.endsWith('Z') || Number.isNaN(Date.parse(normalized))) {
+    throw new TypeError(`${label} must be an RFC 3339 UTC timestamp`);
+  }
+  return normalized;
+}
+
+function normalizeStringArray(value, label) {
+  assertArray(value, label);
+  if (value.length === 0) {
+    throw new TypeError(`${label} must not be empty`);
+  }
+  return value.map((entry, index) => normalizeString(entry, `${label}[${index}]`));
+}
+
+function normalizeCloudflareResourceSnapshot(value, label = 'cloudflare_resources') {
+  assertObject(value, label);
+  return Object.freeze({
+    workers: normalizeStringArray(value.workers, `${label}.workers`),
+    durable_objects: normalizeStringArray(value.durable_objects, `${label}.durable_objects`),
+    d1_databases: normalizeStringArray(value.d1_databases, `${label}.d1_databases`),
+    r2_buckets: normalizeStringArray(value.r2_buckets, `${label}.r2_buckets`),
+    kv_namespaces: normalizeStringArray(value.kv_namespaces, `${label}.kv_namespaces`),
+    ratelimit_namespaces: normalizeStringArray(value.ratelimit_namespaces, `${label}.ratelimit_namespaces`),
+    queues: normalizeStringArray(value.queues, `${label}.queues`),
+  });
+}
+
+function normalizeCostSurfaceMap(value, label = 'cost_surfaces') {
+  assertObject(value, label);
+  const normalized = {};
+  for (const surfaceName of PRE_RELEASE_COST_SURFACE_NAMES) {
+    assertObject(value[surfaceName], `${label}.${surfaceName}`);
+    normalized[surfaceName] = structuredClone(value[surfaceName]);
+  }
+  if (value.telemetry_export != null) {
+    assertObject(value.telemetry_export, `${label}.telemetry_export`);
+    normalized.telemetry_export = structuredClone(value.telemetry_export);
+  }
+  return Object.freeze(normalized);
+}
+
+export function normalizePreReleaseCostObservation(value) {
+  assertObject(value, 'PreReleaseCostObservation');
+  assertObject(value.capture_window, 'capture_window');
+  assertObject(value.model_comparison, 'model_comparison');
+  const captureWindow = {
+    start: normalizeTimestamp(value.capture_window.start, 'capture_window.start'),
+    end: normalizeTimestamp(value.capture_window.end, 'capture_window.end'),
+  };
+  if (Date.parse(captureWindow.start) > Date.parse(captureWindow.end)) {
+    throw new RangeError('capture_window.start must be <= capture_window.end');
+  }
+  const sourceQueryUris = normalizeStringArray(value.source_query_uris, 'source_query_uris')
+    .map((entry, index) => normalizeAbsoluteExternalUri(entry, `source_query_uris[${index}]`));
+  return {
+    observation_id: normalizeString(value.observation_id, 'observation_id'),
+    source_environment: normalizeString(value.source_environment, 'source_environment'),
+    captured_at: normalizeTimestamp(value.captured_at, 'captured_at'),
+    capture_window: captureWindow,
+    capture_method: normalizeString(value.capture_method, 'capture_method'),
+    source_query_uris: sourceQueryUris,
+    topology_kind: normalizeString(value.topology_kind, 'topology_kind'),
+    cloudflare_resources: normalizeCloudflareResourceSnapshot(value.cloudflare_resources),
+    cost_surfaces: normalizeCostSurfaceMap(value.cost_surfaces),
+    model_comparison: {
+      status: normalizeString(value.model_comparison.status, 'model_comparison.status'),
+      summary: normalizeString(value.model_comparison.summary, 'model_comparison.summary'),
+      actual_total_usd: normalizeNumber(value.model_comparison.actual_total_usd, 'model_comparison.actual_total_usd'),
+      modeled_total_usd: normalizeNumber(value.model_comparison.modeled_total_usd, 'model_comparison.modeled_total_usd'),
+      drift_ratio: normalizeNumber(value.model_comparison.drift_ratio, 'model_comparison.drift_ratio'),
+    },
   };
 }
 

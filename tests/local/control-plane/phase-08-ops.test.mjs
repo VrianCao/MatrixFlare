@@ -12,6 +12,68 @@ import {
   defaultPolicy,
 } from './support.mjs';
 
+function buildPreReleaseCloudflareResources() {
+  return {
+    workers: [
+      'matrix-gateway-worker-pre-release',
+      'matrix-jobs-worker-pre-release',
+      'matrix-ops-worker-pre-release',
+    ],
+    durable_objects: ['RemoteServerDO', 'RoomDO', 'UserDO'],
+    d1_databases: ['matrix-control-and-derived-pre-release'],
+    r2_buckets: [
+      'matrix-archive-pre-release',
+      'matrix-evidence-pre-release',
+      'matrix-media-pre-release',
+    ],
+    kv_namespaces: ['matrix-edge-cache-pre-release'],
+    ratelimit_namespaces: [
+      '84283001',
+      '84283002',
+      '84283003',
+      '84283004',
+      '84283005',
+      '84283006',
+      '84283007',
+    ],
+    queues: [
+      'matrix-appservice-txn-job-pre-release',
+      'matrix-export-shard-job-pre-release',
+      'matrix-media-thumbnail-job-pre-release',
+      'matrix-rebuild-shard-job-pre-release',
+      'matrix-repair-shard-job-pre-release',
+      'matrix-restore-shard-job-pre-release',
+      'matrix-search-index-job-pre-release',
+    ],
+  };
+}
+
+function buildCostObservationResourceIds() {
+  return JSON.stringify({
+    worker_scripts: {
+      'gateway-worker': 'matrix-gateway-worker-pre-release',
+      'jobs-worker': 'matrix-jobs-worker-pre-release',
+      'ops-worker': 'matrix-ops-worker-pre-release',
+    },
+    d1_database_id: 'd1-pre-release-1',
+    kv_namespace_id: 'kv-pre-release-1',
+    r2_bucket_names: {
+      MATRIX_MEDIA_BUCKET: 'matrix-media-pre-release',
+      MATRIX_ARCHIVE_BUCKET: 'matrix-archive-pre-release',
+    },
+    queue_ids: {
+      'matrix-search-index-job-pre-release': 'queue-search-1',
+      'matrix-media-thumbnail-job-pre-release': 'queue-media-1',
+      'matrix-appservice-txn-job-pre-release': 'queue-appservice-1',
+      'matrix-rebuild-shard-job-pre-release': 'queue-rebuild-1',
+      'matrix-export-shard-job-pre-release': 'queue-export-1',
+      'matrix-restore-shard-job-pre-release': 'queue-restore-1',
+      'matrix-repair-shard-job-pre-release': 'queue-repair-1',
+    },
+    cloudflare_resources: buildPreReleaseCloudflareResources(),
+  });
+}
+
 test('Phase 08 ops health response exposes deployment compatibility and secret-version fields', async (t) => {
   const teamDomain = `phase08-${Date.now()}.cloudflareaccess.com`;
   const rig = await createControlPlaneRig({
@@ -70,6 +132,244 @@ test('Phase 08 ops health response exposes deployment compatibility and secret-v
     encryption: 'enc-v1',
   });
   assert.ok(payload.dependencies.some((entry) => entry.name === 'control-plane-schema' && entry.status === 'ok'));
+});
+
+test('Phase 08 cost observation fails closed after validating standard usage_model because the official proof surfaces remain unresolved', async (t) => {
+  const teamDomain = `phase08-${Date.now()}.cloudflareaccess.com`;
+  const settingsRequests = [];
+  const observabilityFetch = async (input) => {
+    const url = String(input);
+    if (url.startsWith('https://api.cloudflare.com/client/v4/accounts/cf-account/workers/scripts/')) {
+      settingsRequests.push(url);
+      return new Response(JSON.stringify({
+        success: true,
+        result: {
+          usage_model: 'standard',
+        },
+      }), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json; charset=utf-8',
+        },
+      });
+    }
+    throw new Error(`Unexpected observability request: ${url}`);
+  };
+
+  const rig = await createControlPlaneRig({
+    teamDomain,
+    envOverrides: {
+      ENVIRONMENT_NAME: 'pre-release',
+      CLOUDFLARE_ACCOUNT_ID: 'cf-account',
+      CLOUDFLARE_OBSERVABILITY_API_TOKEN: 'cf-observability-token',
+      CLOUDFLARE_RESOURCE_IDS_JSON: buildCostObservationResourceIds(),
+      __CLOUDFLARE_OBSERVABILITY_FETCH__: observabilityFetch,
+    },
+    policies: [
+      defaultPolicy({
+        principalId: 'svc-ci',
+        principalType: 'service',
+        subjectValue: 'svc-ci',
+        teamDomain,
+        audience: 'aud-ops',
+      }),
+    ],
+  });
+  t.after(() => rig.close());
+
+  const response = await rig.opsWorker(
+    rig.makeOpsRequest('/_ops/v1/cost/observation', {
+      assertion: rig.createAccessJwt({
+        subject: 'service-subject',
+        commonName: 'svc-ci',
+      }),
+    }),
+    rig.opsEnv,
+  );
+
+  assert.equal(response.status, 500);
+  const payload = await response.json();
+  assert.equal(payload.code, 'internal');
+  assert.equal(payload.retryable, false);
+  assert.match(payload.message, /TEST-COST-001 pre-release proof remains fail-closed/);
+  assert.deepEqual(payload.details?.blocker_ids, ['OQ-0006']);
+  assert.ok(payload.details?.blocker_reasons?.some((entry) => entry.includes('GraphQL')));
+  assert.ok(payload.details?.blocker_reasons?.some((entry) => entry.includes('wall-clock duration')));
+  assert.ok(payload.details?.official_source_uris?.some((entry) => entry.includes('/analytics/graphql-api/')));
+  assert.equal(settingsRequests.length, 3);
+});
+
+test('Phase 08 cost observation rejects non-pre-release environments', async (t) => {
+  const teamDomain = `phase08-${Date.now()}.cloudflareaccess.com`;
+  const rig = await createControlPlaneRig({
+    teamDomain,
+    envOverrides: {
+      ENVIRONMENT_NAME: 'staging',
+      CLOUDFLARE_ACCOUNT_ID: 'cf-account',
+      CLOUDFLARE_OBSERVABILITY_API_TOKEN: 'cf-observability-token',
+      CLOUDFLARE_RESOURCE_IDS_JSON: buildCostObservationResourceIds(),
+    },
+    policies: [
+      defaultPolicy({
+        principalId: 'svc-ci',
+        principalType: 'service',
+        subjectValue: 'svc-ci',
+        teamDomain,
+        audience: 'aud-ops',
+      }),
+    ],
+  });
+  t.after(() => rig.close());
+
+  const response = await rig.opsWorker(
+    rig.makeOpsRequest('/_ops/v1/cost/observation', {
+      assertion: rig.createAccessJwt({
+        subject: 'service-subject',
+        commonName: 'svc-ci',
+      }),
+    }),
+    rig.opsEnv,
+  );
+
+  assert.equal(response.status, 500);
+  const payload = await response.json();
+  assert.equal(payload.code, 'internal');
+  assert.equal(payload.retryable, false);
+  assert.match(payload.message, /only supported in pre-release/);
+});
+
+test('Phase 08 cost observation fails closed on unsupported methods', async (t) => {
+  const teamDomain = `phase08-${Date.now()}.cloudflareaccess.com`;
+  const rig = await createControlPlaneRig({
+    teamDomain,
+    envOverrides: {
+      ENVIRONMENT_NAME: 'pre-release',
+    },
+    policies: [
+      defaultPolicy({
+        principalId: 'svc-ci',
+        principalType: 'service',
+        subjectValue: 'svc-ci',
+        teamDomain,
+        audience: 'aud-ops',
+      }),
+    ],
+  });
+  t.after(() => rig.close());
+
+  const response = await rig.opsWorker(
+    rig.makeOpsRequest('/_ops/v1/cost/observation', {
+      method: 'POST',
+      assertion: rig.createAccessJwt({
+        subject: 'service-subject',
+        commonName: 'svc-ci',
+      }),
+    }),
+    rig.opsEnv,
+  );
+
+  assert.equal(response.status, 500);
+  const payload = await response.json();
+  assert.equal(payload.code, 'internal');
+  assert.equal(payload.retryable, false);
+  assert.match(payload.message, /Unsupported cost observation method/);
+});
+
+test('Phase 08 cost observation fails closed when required Cloudflare cost configuration is missing', async (t) => {
+  const teamDomain = `phase08-${Date.now()}.cloudflareaccess.com`;
+  const rig = await createControlPlaneRig({
+    teamDomain,
+    envOverrides: {
+      ENVIRONMENT_NAME: 'pre-release',
+      CLOUDFLARE_ACCOUNT_ID: 'cf-account',
+      CLOUDFLARE_RESOURCE_IDS_JSON: buildCostObservationResourceIds(),
+    },
+    policies: [
+      defaultPolicy({
+        principalId: 'svc-ci',
+        principalType: 'service',
+        subjectValue: 'svc-ci',
+        teamDomain,
+        audience: 'aud-ops',
+      }),
+    ],
+  });
+  t.after(() => rig.close());
+
+  const response = await rig.opsWorker(
+    rig.makeOpsRequest('/_ops/v1/cost/observation', {
+      assertion: rig.createAccessJwt({
+        subject: 'service-subject',
+        commonName: 'svc-ci',
+      }),
+    }),
+    rig.opsEnv,
+  );
+
+  assert.equal(response.status, 503);
+  const payload = await response.json();
+  assert.equal(payload.code, 'internal');
+  assert.equal(payload.retryable, true);
+  assert.match(payload.message, /CLOUDFLARE_OBSERVABILITY_API_TOKEN/);
+});
+
+test('Phase 08 cost observation fails closed when any worker script usage_model is not standard', async (t) => {
+  const teamDomain = `phase08-${Date.now()}.cloudflareaccess.com`;
+  const observabilityFetch = async (input) => {
+    const url = String(input);
+    if (url.startsWith('https://api.cloudflare.com/client/v4/accounts/cf-account/workers/scripts/')) {
+      const usageModel = url.endsWith('/matrix-ops-worker-pre-release/settings') ? 'bundled' : 'standard';
+      return new Response(JSON.stringify({
+        success: true,
+        result: {
+          usage_model: usageModel,
+        },
+      }), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json; charset=utf-8',
+        },
+      });
+    }
+    throw new Error(`Unexpected observability request: ${url}`);
+  };
+
+  const rig = await createControlPlaneRig({
+    teamDomain,
+    envOverrides: {
+      ENVIRONMENT_NAME: 'pre-release',
+      CLOUDFLARE_ACCOUNT_ID: 'cf-account',
+      CLOUDFLARE_OBSERVABILITY_API_TOKEN: 'cf-observability-token',
+      CLOUDFLARE_RESOURCE_IDS_JSON: buildCostObservationResourceIds(),
+      __CLOUDFLARE_OBSERVABILITY_FETCH__: observabilityFetch,
+    },
+    policies: [
+      defaultPolicy({
+        principalId: 'svc-ci',
+        principalType: 'service',
+        subjectValue: 'svc-ci',
+        teamDomain,
+        audience: 'aud-ops',
+      }),
+    ],
+  });
+  t.after(() => rig.close());
+
+  const response = await rig.opsWorker(
+    rig.makeOpsRequest('/_ops/v1/cost/observation', {
+      assertion: rig.createAccessJwt({
+        subject: 'service-subject',
+        commonName: 'svc-ci',
+      }),
+    }),
+    rig.opsEnv,
+  );
+
+  assert.equal(response.status, 500);
+  const payload = await response.json();
+  assert.equal(payload.code, 'internal');
+  assert.equal(payload.retryable, false);
+  assert.match(payload.message, /usage_model must be standard/);
 });
 
 test('Phase 08 rollout skew probe returns attested new-worker/old-authority and old-worker/new-authority observations', async (t) => {
@@ -1053,6 +1353,284 @@ test('Phase 08 rollout skew probe keeps probe-owned usernames and room aliases u
   assert.equal(loginAttempts, 0, 'probe should not fall back to login because rerun probe identities must stay unique');
   assert.equal(new Set(observedUsernames).size, observedUsernames.length, 'probe-owned usernames should remain unique across reruns');
   assert.equal(new Set(observedRoomAliasLocalparts).size, observedRoomAliasLocalparts.length, 'probe-owned room aliases should remain unique across reruns');
+  assert.deepEqual(createdUserVersionSequence, []);
+  assert.deepEqual(createdRoomVersionSequence, []);
+});
+
+test('Phase 08 rollout skew probe retries the next seed attempt when a conflicting probe username falls back to a plain-text login failure', async (t) => {
+  const teamDomain = `phase08-${Date.now()}.cloudflareaccess.com`;
+  const expectedScriptName = 'matrix-gateway-worker-pre-release';
+  const sharedSecret = 'phase08-rollout-secret';
+  const serverName = 'matrix.example.test';
+  const userVersionById = new Map();
+  const roomVersionById = new Map();
+  const usersByUsername = new Map();
+  const usersByToken = new Map();
+  const roomsByAlias = new Map();
+  const roomsById = new Map();
+  const createdUserVersionSequence = [
+    'gateway-candidate-v2',
+    'gateway-baseline-v1',
+    'gateway-baseline-v1',
+    'gateway-candidate-v2',
+  ];
+  const createdRoomVersionSequence = [
+    'gateway-candidate-v2',
+    'gateway-baseline-v1',
+    'gateway-baseline-v1',
+    'gateway-candidate-v2',
+  ];
+  let loginAttempts = 0;
+  const retryableConflictUsernames = new Set();
+
+  const readRequestJson = async (request) => {
+    const chunks = [];
+    for await (const chunk of request) {
+      chunks.push(Buffer.from(chunk));
+    }
+    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  };
+
+  const parseRequestedVersion = (request) => {
+    const overrideHeader = String(request.headers['cloudflare-workers-version-overrides'] ?? '');
+    const escapedScriptName = expectedScriptName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const match = new RegExp(`^${escapedScriptName}="([^"]+)"$`, 'u').exec(overrideHeader);
+    assert.ok(match, `expected Cloudflare version override header for ${expectedScriptName}, received ${overrideHeader}`);
+    assert.equal(request.headers['x-matrix-rollout-probe-secret'], sharedSecret);
+    return match[1];
+  };
+
+  const writeResponse = (response, status, payload, observedVersionId, {
+    contentType = 'application/json; charset=utf-8',
+  } = {}) => {
+    response.writeHead(status, {
+      'content-type': contentType,
+      'x-matrix-rollout-probe-gateway-version-id': observedVersionId,
+    });
+    response.end(contentType.includes('json') ? JSON.stringify(payload) : String(payload));
+  };
+
+  const fakeGateway = createServer(async (request, response) => {
+    try {
+      const observedVersionId = parseRequestedVersion(request);
+      const url = new URL(request.url, 'http://127.0.0.1');
+      const authorization = String(request.headers.authorization ?? '');
+      const accessToken = authorization.replace(/^Bearer\s+/iu, '');
+      const authenticatedUser = usersByToken.get(accessToken) ?? null;
+
+      if (request.method === 'POST' && url.pathname === '/_matrix/client/v3/register') {
+        const body = await readRequestJson(request);
+        if (body.auth == null) {
+          writeResponse(response, 401, {
+            session: `uia-${body.username}`,
+            flows: [{ stages: ['m.login.dummy'] }],
+          }, observedVersionId);
+          return;
+        }
+        if (body.username.startsWith('baseline-user-1-') && !retryableConflictUsernames.has(body.username)) {
+          retryableConflictUsernames.add(body.username);
+          writeResponse(response, 409, {
+            errcode: 'M_USER_IN_USE',
+            error: 'User already exists',
+          }, observedVersionId);
+          return;
+        }
+        let user = usersByUsername.get(body.username) ?? null;
+        if (user == null) {
+          const assignedVersionId = createdUserVersionSequence.shift() ?? observedVersionId;
+          user = {
+            username: body.username,
+            password: body.password,
+            userId: `@${body.username}:${serverName}`,
+            accessToken: `atk-${body.username}`,
+            versionId: assignedVersionId,
+          };
+          usersByUsername.set(user.username, user);
+          userVersionById.set(user.userId, assignedVersionId);
+        }
+        usersByToken.set(user.accessToken, user);
+        writeResponse(response, 200, {
+          user_id: user.userId,
+          access_token: user.accessToken,
+        }, observedVersionId);
+        return;
+      }
+
+      if (request.method === 'POST' && url.pathname === '/_matrix/client/v3/login') {
+        loginAttempts += 1;
+        const body = await readRequestJson(request);
+        const username = body.identifier?.user;
+        if (retryableConflictUsernames.has(username)) {
+          writeResponse(response, 403, 'error code: 1042', observedVersionId, {
+            contentType: 'text/plain; charset=utf-8',
+          });
+          return;
+        }
+        const user = usersByUsername.get(username) ?? null;
+        assert.ok(user, `expected probe user ${username} to exist`);
+        usersByToken.set(user.accessToken, user);
+        writeResponse(response, 200, {
+          user_id: user.userId,
+          access_token: user.accessToken,
+        }, observedVersionId);
+        return;
+      }
+
+      if (request.method === 'POST' && url.pathname === '/_matrix/client/v3/createRoom') {
+        assert.ok(authenticatedUser, 'createRoom requires authenticated probe user');
+        const body = await readRequestJson(request);
+        const roomAlias = `#${body.room_alias_name}:${serverName}`;
+        let room = roomsByAlias.get(roomAlias) ?? null;
+        if (room == null) {
+          const assignedVersionId = createdRoomVersionSequence.shift() ?? observedVersionId;
+          room = {
+            roomId: `!${body.room_alias_name}:${serverName}`,
+            versionId: assignedVersionId,
+          };
+          roomsByAlias.set(roomAlias, room);
+          roomsById.set(room.roomId, room);
+          roomVersionById.set(room.roomId, assignedVersionId);
+        }
+        writeResponse(response, 200, {
+          room_id: room.roomId,
+        }, observedVersionId);
+        return;
+      }
+
+      if (request.method === 'POST' && url.pathname.startsWith('/_matrix/client/v3/join/')) {
+        assert.ok(authenticatedUser, 'join requires authenticated probe user');
+        const roomAlias = decodeURIComponent(url.pathname.slice('/_matrix/client/v3/join/'.length));
+        const room = roomsByAlias.get(roomAlias) ?? null;
+        assert.ok(room, `expected probe room ${roomAlias} to exist`);
+        writeResponse(response, 200, {
+          room_id: room.roomId,
+        }, observedVersionId);
+        return;
+      }
+
+      if (request.method === 'GET' && url.pathname === '/_matrix/client/v3/account/whoami') {
+        assert.ok(authenticatedUser, 'whoami requires authenticated probe user');
+        writeResponse(response, 200, {
+          user_id: authenticatedUser.userId,
+        }, observedVersionId);
+        return;
+      }
+
+      if (request.method === 'GET' && /\/_matrix\/client\/v3\/rooms\/.+\/state$/u.test(url.pathname)) {
+        assert.ok(authenticatedUser, 'room state requires authenticated probe user');
+        const encodedRoomId = url.pathname
+          .replace('/_matrix/client/v3/rooms/', '')
+          .replace(/\/state$/u, '');
+        const roomId = decodeURIComponent(encodedRoomId);
+        assert.ok(roomsById.has(roomId), `expected probe room ${roomId} to exist`);
+        writeResponse(response, 200, [], observedVersionId);
+        return;
+      }
+
+      writeResponse(response, 404, {
+        errcode: 'M_UNRECOGNIZED',
+        error: 'Not found',
+      }, observedVersionId);
+    } catch (error) {
+      response.writeHead(500, {
+        'content-type': 'application/json; charset=utf-8',
+      });
+      response.end(JSON.stringify({
+        error: error.message,
+      }));
+    }
+  });
+
+  await new Promise((resolve) => fakeGateway.listen(0, '127.0.0.1', resolve));
+  t.after(async () => {
+    await new Promise((resolve, reject) => {
+      fakeGateway.close((error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve();
+      });
+    });
+  });
+
+  class FakeRuntimeIdentityNamespace {
+    constructor(authorityKind, versionMap) {
+      this.authorityKind = authorityKind;
+      this.versionMap = versionMap;
+    }
+
+    idFromName(name) {
+      return String(name);
+    }
+
+    get(id) {
+      const authorityKind = this.authorityKind;
+      const versionMap = this.versionMap;
+      return {
+        async inspectRuntimeIdentity() {
+          const workerVersionId = versionMap.get(String(id)) ?? null;
+          return {
+            ok: true,
+            authority_kind: authorityKind,
+            worker_version_id: workerVersionId,
+            deployment_id: workerVersionId == null ? null : `dep-${workerVersionId}`,
+            environment_name: 'pre-release',
+          };
+        },
+      };
+    }
+  }
+
+  const address = fakeGateway.address();
+  assert.ok(address && typeof address === 'object');
+  const rig = await createControlPlaneRig({
+    teamDomain,
+    envOverrides: {
+      ENVIRONMENT_NAME: 'pre-release',
+      MATRIX_SERVER_NAME: serverName,
+      MATRIX_PUBLIC_BASE_URL: `http://127.0.0.1:${address.port}`,
+      GATEWAY_WORKER_SCRIPT_NAME: expectedScriptName,
+      ROLLOUT_PROBE_SHARED_SECRET: sharedSecret,
+      USER_DO: new FakeRuntimeIdentityNamespace('UserDO', userVersionById),
+      ROOM_DO: new FakeRuntimeIdentityNamespace('RoomDO', roomVersionById),
+    },
+    policies: [
+      defaultPolicy({
+        principalId: 'svc-ci',
+        principalType: 'service',
+        subjectValue: 'svc-ci',
+        teamDomain,
+        audience: 'aud-ops',
+      }),
+    ],
+  });
+  t.after(() => rig.close());
+
+  const response = await rig.opsWorker(
+    rig.makeOpsRequest('/_ops/v1/rollout-skew/probe', {
+      method: 'POST',
+      body: {
+        probe_run_id: 'rollout-probe-plain-text-login-failure',
+        baseline_gateway_version_id: 'gateway-baseline-v1',
+        candidate_gateway_version_id: 'gateway-candidate-v2',
+        dual_version_deployment_id: 'dual-deployment-plain-text-login-failure',
+        authority_kind: 'matrix-core',
+        seed_prefix: 'probe-gha-pre-release-rollout-plain-text-login-failure',
+      },
+      assertion: rig.createAccessJwt({
+        subject: 'service-subject',
+        commonName: 'svc-ci',
+      }),
+    }),
+    rig.opsEnv,
+  );
+
+  assert.equal(response.status, 200);
+  const payload = normalizeRolloutSkewProbeResponse(await response.json());
+  assert.equal(payload.assertions.new_worker_old_authority, true);
+  assert.equal(payload.assertions.old_worker_new_authority, true);
+  assert.equal(loginAttempts, 1, 'probe should only fall back to the conflicted login once before moving to the next seed attempt');
   assert.deepEqual(createdUserVersionSequence, []);
   assert.deepEqual(createdRoomVersionSequence, []);
 });

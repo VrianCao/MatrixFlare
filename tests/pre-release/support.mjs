@@ -102,6 +102,12 @@ export function requireRolloutProbeContext() {
   };
 }
 
+export function requirePreReleaseCostObservationContext() {
+  return {
+    outputPath: requireEnvironmentVariable('MATRIX_TEST_RUN_PRE_RELEASE_COST_OBSERVATION_PATH'),
+  };
+}
+
 export async function writeSuiteSidecarJson(filePath, payload) {
   assert.equal(typeof filePath, 'string');
   assert.notEqual(filePath.trim().length, 0, 'sidecar file path must be non-empty');

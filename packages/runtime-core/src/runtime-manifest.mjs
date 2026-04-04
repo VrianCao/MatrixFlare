@@ -217,9 +217,12 @@ const WORKER_RUNTIME_MANIFEST = Object.freeze({
       GATEWAY_WORKER_SCRIPT_NAME: { type: 'string', required: true },
       ACCESS_TEAM_DOMAIN: { type: 'string', required: true },
       ACCESS_AUDIENCE: { type: 'string', required: true },
+      CLOUDFLARE_ACCOUNT_ID: { type: 'string', required: false, default: '' },
+      CLOUDFLARE_RESOURCE_IDS_JSON: { type: 'string', required: false, default: '' },
     }),
     secrets: Object.freeze({
       export_bundle_key_ring: 'EXPORT_BUNDLE_KEY_RING',
+      cloudflare_observability_api_token: 'CLOUDFLARE_OBSERVABILITY_API_TOKEN',
     }),
     featureGates: Object.freeze([
       'appservice_api',

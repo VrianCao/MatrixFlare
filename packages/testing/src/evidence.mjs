@@ -180,6 +180,7 @@ const L1_TEST_IMPLEMENTATION_FILES = Object.freeze({
   }),
   'TEST-COST-001': Object.freeze({
     local: Object.freeze(['tests/local/runtime-foundations/phase-08-runtime-controls.test.mjs']),
+    'pre-release': Object.freeze(['tests/pre-release/test-cost-001.test.mjs']),
   }),
 });
 

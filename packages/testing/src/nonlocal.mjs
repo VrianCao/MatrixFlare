@@ -17,6 +17,7 @@ import {
 } from '../../runtime-core/src/index.mjs';
 import {
   CONTROL_PLANE_SCHEMA_SQL,
+  normalizePreReleaseCostObservation,
   normalizeRolloutSkewProbeResponse,
 } from '../../control-plane/src/index.mjs';
 import {
@@ -594,7 +595,11 @@ export function buildNonProductionSecretBundle({
   environmentName,
   accountId,
   apiToken,
+  observabilityApiToken = apiToken,
 }) {
+  const resolvedObservabilityApiToken = typeof observabilityApiToken === 'string' && observabilityApiToken.trim().length > 0
+    ? observabilityApiToken
+    : apiToken;
   const normalizedEnvironmentName = assertNonLocalEnvironmentName(environmentName);
   const signingKeyBytes = deriveStableSecretBytes({
     apiToken,
@@ -683,6 +688,7 @@ export function buildNonProductionSecretBundle({
         },
       }),
       ROLLOUT_PROBE_SHARED_SECRET: rolloutProbeSharedSecret,
+      CLOUDFLARE_OBSERVABILITY_API_TOKEN: String(resolvedObservabilityApiToken),
     }),
   });
 }
@@ -696,6 +702,8 @@ function buildWorkerVars(workerName, plan, {
   workerVersionId,
   activeDeploymentComposition,
   access = null,
+  cloudflareAccountId = '',
+  cloudflareResourceIds = null,
 }) {
   const baseUrl = plan.worker_urls['gateway-worker'] ?? `https://${plan.worker_scripts['gateway-worker']}.workers.dev`;
   const opsUrl = plan.worker_urls['ops-worker'] ?? `https://${plan.worker_scripts['ops-worker']}.workers.dev`;
@@ -723,6 +731,10 @@ function buildWorkerVars(workerName, plan, {
     }
     vars.ACCESS_TEAM_DOMAIN = access.auth_domain;
     vars.ACCESS_AUDIENCE = access.application_audience;
+    vars.CLOUDFLARE_ACCOUNT_ID = String(cloudflareAccountId ?? '');
+    vars.CLOUDFLARE_RESOURCE_IDS_JSON = cloudflareResourceIds == null
+      ? ''
+      : JSON.stringify(cloudflareResourceIds);
   }
   return vars;
 }
@@ -743,6 +755,8 @@ export function createEnvironmentWranglerConfig(workerName, plan, {
   workerVersionId = 'pending-runtime-version',
   activeDeploymentComposition = [],
   access = null,
+  cloudflareAccountId = '',
+  cloudflareResourceIds = null,
 } = {}) {
   const baseConfig = structuredCloneJson(createWranglerConfigSnapshot(workerName));
   const envName = plan.environment_name;
@@ -753,6 +767,8 @@ export function createEnvironmentWranglerConfig(workerName, plan, {
       workerVersionId,
       activeDeploymentComposition,
       access,
+      cloudflareAccountId,
+      cloudflareResourceIds,
     }),
   };
   const envConfig = {
@@ -859,6 +875,40 @@ export async function writeEnvironmentWranglerConfig(workerName, plan, options) 
 
 function quoteCommand(argumentsList) {
   return argumentsList.map((argument) => (/\s/.test(argument) ? JSON.stringify(argument) : argument)).join(' ');
+}
+
+function buildOpsWorkerCloudflareResourceIds(provisionedEnvironment) {
+  const queues = Array.isArray(provisionedEnvironment?.resources?.queues)
+    ? provisionedEnvironment.resources.queues
+    : [];
+  const plan = provisionedEnvironment?.plan ?? null;
+  const cloudflareResources = plan == null
+    ? null
+    : {
+      ...plan.cloudflare_resources,
+      r2_buckets: [
+        ...plan.cloudflare_resources.r2_buckets,
+        plan.artifact_bucket_name,
+      ],
+    };
+  return Object.freeze({
+    worker_scripts: Object.freeze({
+      'gateway-worker': String(plan?.worker_scripts?.['gateway-worker'] ?? ''),
+      'jobs-worker': String(plan?.worker_scripts?.['jobs-worker'] ?? ''),
+      'ops-worker': String(plan?.worker_scripts?.['ops-worker'] ?? ''),
+    }),
+    d1_database_id: String(provisionedEnvironment?.resources?.d1_database?.id ?? ''),
+    kv_namespace_id: String(provisionedEnvironment?.resources?.kv_namespace?.id ?? ''),
+    r2_bucket_names: Object.freeze({
+      MATRIX_MEDIA_BUCKET: String(plan?.runtime_resource_binding_names?.r2_buckets?.MATRIX_MEDIA_BUCKET ?? ''),
+      MATRIX_ARCHIVE_BUCKET: String(plan?.runtime_resource_binding_names?.r2_buckets?.MATRIX_ARCHIVE_BUCKET ?? ''),
+    }),
+    queue_ids: Object.freeze(Object.fromEntries(queues.map((queue) => [
+      String(queue?.queue_name ?? queue?.name ?? ''),
+      String(queue?.id ?? ''),
+    ]).filter(([queueName, queueId]) => queueName.length > 0 && queueId.length > 0))),
+    cloudflare_resources: cloudflareResources == null ? null : Object.freeze(structuredCloneJson(cloudflareResources)),
+  });
 }
 
 function runCommand(command, args, {
@@ -2983,11 +3033,14 @@ async function deployWorker(workerName, provisionedEnvironment, {
     workerVersionId: buildRuntimeWorkerVersionId(deploymentId, workerName),
     activeDeploymentComposition: runtimeComposition,
     access: provisionedEnvironment.access,
+    cloudflareAccountId: accountId,
+    cloudflareResourceIds: buildOpsWorkerCloudflareResourceIds(provisionedEnvironment),
   });
   const secretBundle = buildNonProductionSecretBundle({
     environmentName: provisionedEnvironment.environment_name,
     accountId,
     apiToken,
+    observabilityApiToken: process.env.CLOUDFLARE_OBSERVABILITY_API_TOKEN,
   });
   await writeWorkerSecretsFile(workerName, secretBundle, secretsPath);
   await runWrangler(buildWranglerDeployArguments({
@@ -3153,11 +3206,14 @@ async function uploadWorkerVersion(workerName, provisionedEnvironment, {
     workerVersionId: `pending-runtime-version-${slugifyLabel(deploymentId)}`,
     activeDeploymentComposition: buildDeploymentCompositionFromSummary(deploymentSummary),
     access: provisionedEnvironment.access,
+    cloudflareAccountId: accountId,
+    cloudflareResourceIds: buildOpsWorkerCloudflareResourceIds(provisionedEnvironment),
   });
   const secretBundle = buildNonProductionSecretBundle({
     environmentName: provisionedEnvironment.environment_name,
     accountId,
     apiToken,
+    observabilityApiToken: process.env.CLOUDFLARE_OBSERVABILITY_API_TOKEN,
   });
   await writeWorkerSecretsFile(workerName, secretBundle, secretsPath);
   await runWrangler([
@@ -3663,6 +3719,11 @@ export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
   const startedAt = new Date().toISOString();
   const startedMs = Date.now();
   const commandArgs = ['--test', '--test-concurrency=1', ...files];
+  const coversPreReleaseCost = normalizedEnvironmentName === 'pre-release'
+    && files.some((file) => {
+      const basename = path.basename(file).toLowerCase();
+      return basename.startsWith('test-cost-001') && basename.endsWith('.test.mjs');
+    });
   const readinessProbe = await waitForNonLocalDeploymentReadinessImpl(
     normalizedEnvironmentName,
     remoteHarnessEnv,
@@ -3735,6 +3796,14 @@ export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
       throw new Error('rollout_skew_probe sidecar is required when rolloutState is provided');
     }
     preReleaseCostObservation = await readOptionalJsonArtifact(suiteArtifacts.pre_release_cost_observation_path);
+    if (preReleaseCostObservation != null) {
+      preReleaseCostObservation = normalizePreReleaseCostObservation(preReleaseCostObservation);
+      if (!coversPreReleaseCost) {
+        throw new Error('pre_release_cost_observation sidecar must be absent unless TEST-COST-001 is covered');
+      }
+    } else if (coversPreReleaseCost) {
+      throw new Error('pre_release_cost_observation sidecar is required when TEST-COST-001 is covered');
+    }
   } catch (error) {
     artifactFailureMessage = `Suite artifact parsing failed: ${error.message}`;
     exitCode = 1;
