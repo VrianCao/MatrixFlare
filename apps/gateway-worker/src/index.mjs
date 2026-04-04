@@ -140,12 +140,17 @@ function shouldExposeRolloutProbeHeaders(request, env) {
   return configuredSecret.length > 0 && providedSecret.length > 0 && configuredSecret === providedSecret;
 }
 
-function attachRolloutProbeHeaders(request, env, response, workerVersionId) {
+function attachRolloutProbeHeaders(request, env, response) {
   if (!shouldExposeRolloutProbeHeaders(request, env)) {
     return response;
   }
   const headers = new Headers(response.headers);
-  headers.set(ROLLOUT_PROBE_GATEWAY_VERSION_ID_HEADER, workerVersionId);
+  const versionId = typeof env.CF_VERSION_METADATA?.id === 'string'
+    ? env.CF_VERSION_METADATA.id.trim()
+    : '';
+  if (versionId.length > 0) {
+    headers.set(ROLLOUT_PROBE_GATEWAY_VERSION_ID_HEADER, versionId);
+  }
   const versionTag = typeof env.CF_VERSION_METADATA?.tag === 'string'
     ? env.CF_VERSION_METADATA.tag.trim()
     : '';
@@ -4731,7 +4736,7 @@ async function handleRequest(request, env) {
         : { cpu_ms: Math.round(completed.cpu_ms) }),
       ...(errorClass == null ? {} : { error_class: errorClass }),
     });
-    return attachRolloutProbeHeaders(request, env, response, observedWorkerVersionId);
+    return attachRolloutProbeHeaders(request, env, response);
   };
 
   requestContext.logger.info('gateway.request.start', {

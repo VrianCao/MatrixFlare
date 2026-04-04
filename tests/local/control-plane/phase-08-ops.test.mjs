@@ -74,6 +74,21 @@ function buildCostObservationResourceIds() {
   });
 }
 
+const BASELINE_GATEWAY_VERSION_ID = 'gateway-baseline-v1';
+const BASELINE_GATEWAY_VERSION_TAG = 'mx-gw-d-baseline';
+const CANDIDATE_GATEWAY_VERSION_ID = 'gateway-candidate-v2';
+const CANDIDATE_GATEWAY_VERSION_TAG = 'mx-gw-d-candidate';
+
+function resolveRolloutGatewayVersionTag(versionId) {
+  if (versionId === BASELINE_GATEWAY_VERSION_ID) {
+    return BASELINE_GATEWAY_VERSION_TAG;
+  }
+  if (versionId === CANDIDATE_GATEWAY_VERSION_ID) {
+    return CANDIDATE_GATEWAY_VERSION_TAG;
+  }
+  return `mx-${String(versionId).replace(/[^a-z0-9]+/giu, '-').replace(/^-+|-+$/g, '').slice(0, 20)}`;
+}
+
 test('Phase 08 ops health response exposes deployment compatibility and secret-version fields', async (t) => {
   const teamDomain = `phase08-${Date.now()}.cloudflareaccess.com`;
   const rig = await createControlPlaneRig({
@@ -133,6 +148,27 @@ test('Phase 08 ops health response exposes deployment compatibility and secret-v
     encryption: 'enc-v1',
   });
   assert.ok(payload.dependencies.some((entry) => entry.name === 'control-plane-schema' && entry.status === 'ok'));
+});
+
+test('Phase 08 ops health response fails closed when compatibility flags are missing from the payload', () => {
+  assert.throws(
+    () => normalizeOpsHealthResponse({
+      service: 'ops-worker',
+      status: 'ok',
+      observed_at: new Date().toISOString(),
+      worker_version_id: 'ops-v2',
+      deployment_id: 'deploy-phase08',
+      compatibility_date: '2026-03-26',
+      release_profile: 'L1',
+      cpu_limit_class: 'default',
+      startup_time_ms: 17,
+      deployment_composition: [],
+      feature_gates: {},
+      secret_versions: {},
+      dependencies: [],
+    }),
+    /compatibility_flags/,
+  );
 });
 
 test('Phase 08 cost observation fails closed after validating standard usage_model because the official proof surfaces remain unresolved', async (t) => {
@@ -385,16 +421,16 @@ test('Phase 08 rollout skew probe returns attested new-worker/old-authority and 
   const roomsByAlias = new Map();
   const roomsById = new Map();
   const createdUserVersionSequence = [
-    'gateway-candidate-v2',
-    'gateway-baseline-v1',
-    'gateway-baseline-v1',
-    'gateway-candidate-v2',
+    CANDIDATE_GATEWAY_VERSION_ID,
+    BASELINE_GATEWAY_VERSION_ID,
+    BASELINE_GATEWAY_VERSION_ID,
+    CANDIDATE_GATEWAY_VERSION_ID,
   ];
   const createdRoomVersionSequence = [
-    'gateway-candidate-v2',
-    'gateway-baseline-v1',
-    'gateway-baseline-v1',
-    'gateway-candidate-v2',
+    CANDIDATE_GATEWAY_VERSION_ID,
+    BASELINE_GATEWAY_VERSION_ID,
+    BASELINE_GATEWAY_VERSION_ID,
+    CANDIDATE_GATEWAY_VERSION_ID,
   ];
 
   const readRequestJson = async (request) => {
@@ -418,6 +454,7 @@ test('Phase 08 rollout skew probe returns attested new-worker/old-authority and 
     response.writeHead(status, {
       'content-type': 'application/json; charset=utf-8',
       'x-matrix-rollout-probe-gateway-version-id': observedVersionId,
+      'x-matrix-rollout-probe-gateway-version-tag': resolveRolloutGatewayVersionTag(observedVersionId),
     });
     response.end(JSON.stringify(payload));
   };
@@ -608,8 +645,10 @@ test('Phase 08 rollout skew probe returns attested new-worker/old-authority and 
       method: 'POST',
       body: {
         probe_run_id: 'rollout-probe-1',
-        baseline_gateway_version_id: 'gateway-baseline-v1',
-        candidate_gateway_version_id: 'gateway-candidate-v2',
+        baseline_gateway_version_id: BASELINE_GATEWAY_VERSION_ID,
+        baseline_gateway_version_tag: BASELINE_GATEWAY_VERSION_TAG,
+        candidate_gateway_version_id: CANDIDATE_GATEWAY_VERSION_ID,
+        candidate_gateway_version_tag: CANDIDATE_GATEWAY_VERSION_TAG,
         dual_version_deployment_id: 'dual-deployment-1',
         authority_kind: 'matrix-core',
         seed_prefix: 'probe-gha-pre-release-rollout-20260403t034058z-23932691478-1',
@@ -626,6 +665,8 @@ test('Phase 08 rollout skew probe returns attested new-worker/old-authority and 
   const payload = normalizeRolloutSkewProbeResponse(await response.json());
   assert.equal(payload.environment_name, 'pre-release');
   assert.equal(payload.dual_version_deployment_id, 'dual-deployment-1');
+  assert.equal(payload.baseline_gateway_version_tag, BASELINE_GATEWAY_VERSION_TAG);
+  assert.equal(payload.candidate_gateway_version_tag, CANDIDATE_GATEWAY_VERSION_TAG);
   assert.equal(payload.assertions.new_worker_old_authority, true);
   assert.equal(payload.assertions.old_worker_new_authority, true);
   assert.equal(payload.observations.length, 4);
@@ -637,7 +678,7 @@ test('Phase 08 rollout skew probe returns attested new-worker/old-authority and 
   assert.deepEqual(createdRoomVersionSequence, [], 'probe should sample enough distinct rooms to find both baseline and candidate authority versions');
 });
 
-test('Phase 08 rollout skew probe tolerates missing gateway version echo on seed routes when final observation routes still prove the targeted worker version', async (t) => {
+test('Phase 08 rollout skew probe tolerates missing seed-route identity when final observation routes prove the targeted worker version via official version tag fallback', async (t) => {
   const teamDomain = `phase08-${Date.now()}.cloudflareaccess.com`;
   const expectedScriptName = 'matrix-gateway-worker-pre-release';
   const sharedSecret = 'phase08-rollout-secret';
@@ -649,16 +690,16 @@ test('Phase 08 rollout skew probe tolerates missing gateway version echo on seed
   const roomsByAlias = new Map();
   const roomsById = new Map();
   const createdUserVersionSequence = [
-    'gateway-candidate-v2',
-    'gateway-baseline-v1',
-    'gateway-baseline-v1',
-    'gateway-candidate-v2',
+    CANDIDATE_GATEWAY_VERSION_ID,
+    BASELINE_GATEWAY_VERSION_ID,
+    BASELINE_GATEWAY_VERSION_ID,
+    CANDIDATE_GATEWAY_VERSION_ID,
   ];
   const createdRoomVersionSequence = [
-    'gateway-candidate-v2',
-    'gateway-baseline-v1',
-    'gateway-baseline-v1',
-    'gateway-candidate-v2',
+    CANDIDATE_GATEWAY_VERSION_ID,
+    BASELINE_GATEWAY_VERSION_ID,
+    BASELINE_GATEWAY_VERSION_ID,
+    CANDIDATE_GATEWAY_VERSION_ID,
   ];
 
   const readRequestJson = async (request) => {
@@ -680,12 +721,16 @@ test('Phase 08 rollout skew probe tolerates missing gateway version echo on seed
 
   const writeJson = (response, status, payload, observedVersionId, {
     includeGatewayVersionHeader = true,
+    includeGatewayVersionTagHeader = true,
   } = {}) => {
     const headers = {
       'content-type': 'application/json; charset=utf-8',
     };
     if (includeGatewayVersionHeader) {
       headers['x-matrix-rollout-probe-gateway-version-id'] = observedVersionId;
+    }
+    if (includeGatewayVersionTagHeader) {
+      headers['x-matrix-rollout-probe-gateway-version-tag'] = resolveRolloutGatewayVersionTag(observedVersionId);
     }
     response.writeHead(status, headers);
     response.end(JSON.stringify(payload));
@@ -707,6 +752,7 @@ test('Phase 08 rollout skew probe tolerates missing gateway version echo on seed
             flows: [{ stages: ['m.login.dummy'] }],
           }, observedVersionId, {
             includeGatewayVersionHeader: false,
+            includeGatewayVersionTagHeader: false,
           });
           return;
         }
@@ -728,6 +774,7 @@ test('Phase 08 rollout skew probe tolerates missing gateway version echo on seed
           access_token: user.accessToken,
         }, observedVersionId, {
           includeGatewayVersionHeader: false,
+          includeGatewayVersionTagHeader: false,
         });
         return;
       }
@@ -766,6 +813,7 @@ test('Phase 08 rollout skew probe tolerates missing gateway version echo on seed
           room_id: room.roomId,
         }, observedVersionId, {
           includeGatewayVersionHeader: false,
+          includeGatewayVersionTagHeader: false,
         });
         return;
       }
@@ -779,6 +827,7 @@ test('Phase 08 rollout skew probe tolerates missing gateway version echo on seed
           room_id: room.roomId,
         }, observedVersionId, {
           includeGatewayVersionHeader: false,
+          includeGatewayVersionTagHeader: false,
         });
         return;
       }
@@ -787,7 +836,9 @@ test('Phase 08 rollout skew probe tolerates missing gateway version echo on seed
         assert.ok(authenticatedUser, 'whoami requires authenticated probe user');
         writeJson(response, 200, {
           user_id: authenticatedUser.userId,
-        }, observedVersionId);
+        }, observedVersionId, {
+          includeGatewayVersionHeader: false,
+        });
         return;
       }
 
@@ -798,7 +849,9 @@ test('Phase 08 rollout skew probe tolerates missing gateway version echo on seed
           .replace(/\/state$/u, '');
         const roomId = decodeURIComponent(encodedRoomId);
         assert.ok(roomsById.has(roomId), `expected probe room ${roomId} to exist`);
-        writeJson(response, 200, [], observedVersionId);
+        writeJson(response, 200, [], observedVersionId, {
+          includeGatewayVersionHeader: false,
+        });
         return;
       }
 
@@ -887,8 +940,10 @@ test('Phase 08 rollout skew probe tolerates missing gateway version echo on seed
       method: 'POST',
       body: {
         probe_run_id: 'rollout-probe-missing-seed-header',
-        baseline_gateway_version_id: 'gateway-baseline-v1',
-        candidate_gateway_version_id: 'gateway-candidate-v2',
+        baseline_gateway_version_id: BASELINE_GATEWAY_VERSION_ID,
+        baseline_gateway_version_tag: BASELINE_GATEWAY_VERSION_TAG,
+        candidate_gateway_version_id: CANDIDATE_GATEWAY_VERSION_ID,
+        candidate_gateway_version_tag: CANDIDATE_GATEWAY_VERSION_TAG,
         dual_version_deployment_id: 'dual-deployment-1',
         authority_kind: 'matrix-core',
         seed_prefix: 'probe-gha-pre-release-rollout-missing-seed-header',
@@ -906,11 +961,15 @@ test('Phase 08 rollout skew probe tolerates missing gateway version echo on seed
   assert.equal(payload.assertions.new_worker_old_authority, true);
   assert.equal(payload.assertions.old_worker_new_authority, true);
   assert.equal(payload.observations.length, 4);
+  assert.ok(
+    payload.observations.every((entry) => entry.observed_gateway_version_id == null && typeof entry.observed_gateway_version_tag === 'string'),
+    'final observation routes should be able to prove the targeted worker version through official version tags when official ids are absent',
+  );
   assert.deepEqual(createdUserVersionSequence, []);
   assert.deepEqual(createdRoomVersionSequence, []);
 });
 
-test('Phase 08 rollout skew probe fails closed when a seed route echoes the wrong gateway version id', async (t) => {
+test('Phase 08 rollout skew probe fails closed when a seed route echoes the wrong official gateway version tag', async (t) => {
   const teamDomain = `phase08-${Date.now()}.cloudflareaccess.com`;
   const expectedScriptName = 'matrix-gateway-worker-pre-release';
   const sharedSecret = 'phase08-rollout-secret';
@@ -940,7 +999,7 @@ test('Phase 08 rollout skew probe fails closed when a seed route echoes the wron
         const body = await readRequestJson(request);
         response.writeHead(401, {
           'content-type': 'application/json; charset=utf-8',
-          'x-matrix-rollout-probe-gateway-version-id': `${requestedVersionId}-unexpected`,
+          'x-matrix-rollout-probe-gateway-version-tag': `${resolveRolloutGatewayVersionTag(requestedVersionId)}-unexpected`,
         });
         response.end(JSON.stringify({
           session: `uia-${body.username}`,
@@ -1023,8 +1082,10 @@ test('Phase 08 rollout skew probe fails closed when a seed route echoes the wron
       method: 'POST',
       body: {
         probe_run_id: 'rollout-probe-seed-header-mismatch',
-        baseline_gateway_version_id: 'gateway-baseline-v1',
-        candidate_gateway_version_id: 'gateway-candidate-v2',
+        baseline_gateway_version_id: BASELINE_GATEWAY_VERSION_ID,
+        baseline_gateway_version_tag: BASELINE_GATEWAY_VERSION_TAG,
+        candidate_gateway_version_id: CANDIDATE_GATEWAY_VERSION_ID,
+        candidate_gateway_version_tag: CANDIDATE_GATEWAY_VERSION_TAG,
         dual_version_deployment_id: 'dual-deployment-seed-mismatch',
         authority_kind: 'matrix-core',
         seed_prefix: 'probe-gha-pre-release-rollout-seed-header-mismatch',
@@ -1042,7 +1103,7 @@ test('Phase 08 rollout skew probe fails closed when a seed route echoes the wron
   assert.equal(payload.code, 'precondition_failed');
   assert.match(
     payload.message,
-    /^Gateway version override mismatch for \/_matrix\/client\/v3\/register: requested gateway-(baseline|candidate)-v[12], observed gateway-\1-v[12]-unexpected$/u,
+    /^Gateway version override mismatch for \/_matrix\/client\/v3\/register: requested gateway-(baseline|candidate)-v[12] \(mx-gw-d-(baseline|candidate)\), observed tag mx-gw-d-(baseline|candidate)-unexpected$/u,
   );
   assert.equal(typeof payload.request_id, 'string');
   assert.ok(payload.request_id.length > 0);
@@ -1065,24 +1126,24 @@ test('Phase 08 rollout skew probe keeps probe-owned usernames and room aliases u
   const observedRoomAliasLocalparts = [];
   let loginAttempts = 0;
   const createdUserVersionSequence = [
-    'gateway-candidate-v2',
-    'gateway-baseline-v1',
-    'gateway-baseline-v1',
-    'gateway-candidate-v2',
-    'gateway-candidate-v2',
-    'gateway-baseline-v1',
-    'gateway-baseline-v1',
-    'gateway-candidate-v2',
+    CANDIDATE_GATEWAY_VERSION_ID,
+    BASELINE_GATEWAY_VERSION_ID,
+    BASELINE_GATEWAY_VERSION_ID,
+    CANDIDATE_GATEWAY_VERSION_ID,
+    CANDIDATE_GATEWAY_VERSION_ID,
+    BASELINE_GATEWAY_VERSION_ID,
+    BASELINE_GATEWAY_VERSION_ID,
+    CANDIDATE_GATEWAY_VERSION_ID,
   ];
   const createdRoomVersionSequence = [
-    'gateway-candidate-v2',
-    'gateway-baseline-v1',
-    'gateway-baseline-v1',
-    'gateway-candidate-v2',
-    'gateway-candidate-v2',
-    'gateway-baseline-v1',
-    'gateway-baseline-v1',
-    'gateway-candidate-v2',
+    CANDIDATE_GATEWAY_VERSION_ID,
+    BASELINE_GATEWAY_VERSION_ID,
+    BASELINE_GATEWAY_VERSION_ID,
+    CANDIDATE_GATEWAY_VERSION_ID,
+    CANDIDATE_GATEWAY_VERSION_ID,
+    BASELINE_GATEWAY_VERSION_ID,
+    BASELINE_GATEWAY_VERSION_ID,
+    CANDIDATE_GATEWAY_VERSION_ID,
   ];
 
   const readRequestJson = async (request) => {
@@ -1106,6 +1167,7 @@ test('Phase 08 rollout skew probe keeps probe-owned usernames and room aliases u
     response.writeHead(status, {
       'content-type': 'application/json; charset=utf-8',
       'x-matrix-rollout-probe-gateway-version-id': observedVersionId,
+      'x-matrix-rollout-probe-gateway-version-tag': resolveRolloutGatewayVersionTag(observedVersionId),
     });
     response.end(JSON.stringify(payload));
   };
@@ -1316,8 +1378,10 @@ test('Phase 08 rollout skew probe keeps probe-owned usernames and room aliases u
       method: 'POST',
       body: {
         probe_run_id: 'rollout-gha-pre-release-alpha-12345678',
-        baseline_gateway_version_id: 'gateway-baseline-v1',
-        candidate_gateway_version_id: 'gateway-candidate-v2',
+        baseline_gateway_version_id: BASELINE_GATEWAY_VERSION_ID,
+        baseline_gateway_version_tag: BASELINE_GATEWAY_VERSION_TAG,
+        candidate_gateway_version_id: CANDIDATE_GATEWAY_VERSION_ID,
+        candidate_gateway_version_tag: CANDIDATE_GATEWAY_VERSION_TAG,
         dual_version_deployment_id: 'dual-deployment-alpha',
         authority_kind: 'matrix-core',
         seed_prefix: sharedSeedPrefix,
@@ -1336,8 +1400,10 @@ test('Phase 08 rollout skew probe keeps probe-owned usernames and room aliases u
       method: 'POST',
       body: {
         probe_run_id: 'rollout-gha-pre-release-beta-87654321',
-        baseline_gateway_version_id: 'gateway-baseline-v1',
-        candidate_gateway_version_id: 'gateway-candidate-v2',
+        baseline_gateway_version_id: BASELINE_GATEWAY_VERSION_ID,
+        baseline_gateway_version_tag: BASELINE_GATEWAY_VERSION_TAG,
+        candidate_gateway_version_id: CANDIDATE_GATEWAY_VERSION_ID,
+        candidate_gateway_version_tag: CANDIDATE_GATEWAY_VERSION_TAG,
         dual_version_deployment_id: 'dual-deployment-beta',
         authority_kind: 'matrix-core',
         seed_prefix: sharedSeedPrefix,
@@ -1370,16 +1436,16 @@ test('Phase 08 rollout skew probe retries the next seed attempt when a conflicti
   const roomsByAlias = new Map();
   const roomsById = new Map();
   const createdUserVersionSequence = [
-    'gateway-candidate-v2',
-    'gateway-baseline-v1',
-    'gateway-baseline-v1',
-    'gateway-candidate-v2',
+    CANDIDATE_GATEWAY_VERSION_ID,
+    BASELINE_GATEWAY_VERSION_ID,
+    BASELINE_GATEWAY_VERSION_ID,
+    CANDIDATE_GATEWAY_VERSION_ID,
   ];
   const createdRoomVersionSequence = [
-    'gateway-candidate-v2',
-    'gateway-baseline-v1',
-    'gateway-baseline-v1',
-    'gateway-candidate-v2',
+    CANDIDATE_GATEWAY_VERSION_ID,
+    BASELINE_GATEWAY_VERSION_ID,
+    BASELINE_GATEWAY_VERSION_ID,
+    CANDIDATE_GATEWAY_VERSION_ID,
   ];
   let loginAttempts = 0;
   const retryableConflictUsernames = new Set();
@@ -1407,6 +1473,7 @@ test('Phase 08 rollout skew probe retries the next seed attempt when a conflicti
     response.writeHead(status, {
       'content-type': contentType,
       'x-matrix-rollout-probe-gateway-version-id': observedVersionId,
+      'x-matrix-rollout-probe-gateway-version-tag': resolveRolloutGatewayVersionTag(observedVersionId),
     });
     response.end(contentType.includes('json') ? JSON.stringify(payload) : String(payload));
   };
@@ -1613,8 +1680,10 @@ test('Phase 08 rollout skew probe retries the next seed attempt when a conflicti
       method: 'POST',
       body: {
         probe_run_id: 'rollout-probe-plain-text-login-failure',
-        baseline_gateway_version_id: 'gateway-baseline-v1',
-        candidate_gateway_version_id: 'gateway-candidate-v2',
+        baseline_gateway_version_id: BASELINE_GATEWAY_VERSION_ID,
+        baseline_gateway_version_tag: BASELINE_GATEWAY_VERSION_TAG,
+        candidate_gateway_version_id: CANDIDATE_GATEWAY_VERSION_ID,
+        candidate_gateway_version_tag: CANDIDATE_GATEWAY_VERSION_TAG,
         dual_version_deployment_id: 'dual-deployment-plain-text-login-failure',
         authority_kind: 'matrix-core',
         seed_prefix: 'probe-gha-pre-release-rollout-plain-text-login-failure',
@@ -1666,6 +1735,7 @@ test('Phase 08 rollout skew probe fails retryably when bounded sampling cannot r
     response.writeHead(status, {
       'content-type': 'application/json; charset=utf-8',
       'x-matrix-rollout-probe-gateway-version-id': observedVersionId,
+      'x-matrix-rollout-probe-gateway-version-tag': resolveRolloutGatewayVersionTag(observedVersionId),
     });
     response.end(JSON.stringify(payload));
   };
@@ -1693,7 +1763,7 @@ test('Phase 08 rollout skew probe fails retryably when bounded sampling cannot r
           };
           usersByUsername.set(body.username, user);
           usersByToken.set(user.accessToken, user);
-          userVersionById.set(user.userId, 'gateway-candidate-v2');
+          userVersionById.set(user.userId, CANDIDATE_GATEWAY_VERSION_ID);
         }
         writeJson(response, 200, {
           user_id: user.userId,
@@ -1747,8 +1817,8 @@ test('Phase 08 rollout skew probe fails retryably when bounded sampling cannot r
           return {
             ok: true,
             authority_kind: authorityKind,
-            worker_version_id: versionMap.get(String(id)) ?? 'gateway-candidate-v2',
-            deployment_id: 'dep-gateway-candidate-v2',
+            worker_version_id: versionMap.get(String(id)) ?? CANDIDATE_GATEWAY_VERSION_ID,
+            deployment_id: `dep-${CANDIDATE_GATEWAY_VERSION_ID}`,
             environment_name: 'pre-release',
           };
         },
@@ -1786,8 +1856,10 @@ test('Phase 08 rollout skew probe fails retryably when bounded sampling cannot r
       method: 'POST',
       body: {
         probe_run_id: 'rollout-probe-exhausted',
-        baseline_gateway_version_id: 'gateway-baseline-v1',
-        candidate_gateway_version_id: 'gateway-candidate-v2',
+        baseline_gateway_version_id: BASELINE_GATEWAY_VERSION_ID,
+        baseline_gateway_version_tag: BASELINE_GATEWAY_VERSION_TAG,
+        candidate_gateway_version_id: CANDIDATE_GATEWAY_VERSION_ID,
+        candidate_gateway_version_tag: CANDIDATE_GATEWAY_VERSION_TAG,
         dual_version_deployment_id: 'dual-deployment-1',
         authority_kind: 'matrix-core',
         seed_prefix: 'probe-gha-pre-release-rollout-exhausted',

@@ -325,7 +325,9 @@ async function main() {
       environment_name: result.environment_name,
       output_path: typeof options.output === 'string' ? options.output : null,
       baseline_gateway_version_id: result.baseline_gateway_version_id,
+      baseline_gateway_version_tag: result.baseline_gateway_version_tag,
       candidate_gateway_version_id: result.candidate_gateway_version_id,
+      candidate_gateway_version_tag: result.candidate_gateway_version_tag,
       dual_version_deployment_id: result.dual_version_deployment_id,
     }, null, 2)}\n`);
     return;

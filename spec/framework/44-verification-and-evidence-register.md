@@ -55,8 +55,8 @@
 * 若 non-local harness 需要 deploy 后 readiness gate，则 raw bundle / `summary.md` / 并列机器工件还必须保留 readiness snapshot，至少包含探测目标、尝试次数、最终通过时间或最后失败原因；不得只保留最终 suite 结果而抹去 readiness 等待事实。
 * 用于证明某个 `TEST-ID` 已被 non-local gate 覆盖的 canonical implementation files，必须是对应环境目录中专门维护的 dedicated `.test.mjs` suite files；它们必须留在对应环境目录内，不得回指 `tests/shared/*` 支撑模块，也不得使用 `bootstrap.test.mjs`、`l1-mandatory.test.mjs` 这类 generic bootstrap/smoke entrypoint 充作 coverage proof。为保持 fail-closed，它们的 basename 还必须以对应 `TEST-ID` 的小写形式起始，并只允许在该前缀后追加 `.` / `-` 分隔的限定词再接 `.test.mjs`；consumer 还必须验证这些 canonical files 在仓库内真实存在，缺失 file path 必须直接判为 `mapping_error`；同时，consumer 还必须验证这些 canonical files 的 repo-owned transitive dependency closure 仍留在同一环境目录内，否则该 `TEST-ID` mapping 必须直接判为 `mapping_error`。
 * 任何来自 `evidence/common/_test-runs/` 的本地产物、或仍扩展 `tests/local/*` 的薄 harness 结果，都不得被提升为 non-local release evidence。
-* `TEST-OPS-001` 所依赖的 pre-release attested report 还必须包含 `rollout_skew_probe`，至少记录 baseline/candidate gateway version IDs、dual-version deployment ID 与两类 pairing assertion；缺失时 `EVID-OPS-001` 必须 fail-closed。
-* `TEST-COST-001` 的 pre-release half 还必须在 attested report 中包含 `pre_release_cost_observation`，并保留 official Cloudflare query source locators；缺失时 `EVID-COST-001` 必须 fail-closed，即便 production snapshot 另行提供也不例外。
+* `TEST-OPS-001` 所依赖的 pre-release attested report 还必须包含 `rollout_skew_probe`，至少记录 baseline/candidate gateway version IDs、对应 official version tags、dual-version deployment ID 与两类 pairing assertion；对每条 observation，还必须保留官方 `observed_gateway_version_id`（若 runtime 提供）和 `observed_gateway_version_tag`（若 runtime 提供）。当 runtime 未提供官方 version ID 时，consumer 必须允许 `observed_gateway_version_id = null`，并改用 official version tag 完成 override 观测；缺失两者、或把 repo-local fallback 冒充 official version ID 时，`EVID-OPS-001` 必须 fail-closed。
+* `TEST-COST-001` 的 pre-release half 还必须在 attested report 中包含 `pre_release_cost_observation`，并保留 official Cloudflare HTTPS query source locators（`cloudflare.com` 或其子域）；缺失或使用非官方 locator 时 `EVID-COST-001` 必须 fail-closed，即便 production snapshot 另行提供也不例外。
 
 ## 3. Evidence Catalog
 

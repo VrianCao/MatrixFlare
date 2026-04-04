@@ -187,6 +187,11 @@ function normalizeNullableStringArray(value, label) {
   return value.map((entry, index) => normalizeString(entry, `${label}[${index}]`));
 }
 
+function normalizeStringArray(value, label) {
+  assertArray(value, label);
+  return value.map((entry, index) => normalizeString(entry, `${label}[${index}]`));
+}
+
 export function normalizeTargetScope(value) {
   assertObject(value, 'scope');
   const scopeKind = normalizeEnum(value.scope_kind, 'scope.scope_kind', TARGET_SCOPE_KINDS);
@@ -248,9 +253,7 @@ export function normalizeOpsHealthResponse(value) {
     worker_version_id: normalizeString(value.worker_version_id, 'worker_version_id'),
     deployment_id: normalizeString(value.deployment_id, 'deployment_id'),
     compatibility_date: normalizeString(value.compatibility_date, 'compatibility_date'),
-    compatibility_flags: value.compatibility_flags == null
-      ? []
-      : normalizeNullableStringArray(value.compatibility_flags, 'compatibility_flags') ?? [],
+    compatibility_flags: normalizeStringArray(value.compatibility_flags, 'compatibility_flags'),
     release_profile: normalizeString(value.release_profile, 'release_profile'),
     cpu_limit_class: normalizeString(value.cpu_limit_class, 'cpu_limit_class'),
     startup_time_ms: normalizeInteger(value.startup_time_ms, 'startup_time_ms', { min: 0 }),
@@ -280,7 +283,9 @@ export function normalizeRolloutSkewProbeRequest(value) {
   const normalized = {
     probe_run_id: normalizeString(value.probe_run_id, 'probe_run_id'),
     baseline_gateway_version_id: normalizeString(value.baseline_gateway_version_id, 'baseline_gateway_version_id'),
+    baseline_gateway_version_tag: normalizeString(value.baseline_gateway_version_tag, 'baseline_gateway_version_tag'),
     candidate_gateway_version_id: normalizeString(value.candidate_gateway_version_id, 'candidate_gateway_version_id'),
+    candidate_gateway_version_tag: normalizeString(value.candidate_gateway_version_tag, 'candidate_gateway_version_tag'),
     dual_version_deployment_id: normalizeString(value.dual_version_deployment_id, 'dual_version_deployment_id'),
     authority_kind: normalizeEnum(value.authority_kind, 'authority_kind', ['matrix-core']),
     seed_prefix: normalizeString(value.seed_prefix, 'seed_prefix'),
@@ -288,15 +293,32 @@ export function normalizeRolloutSkewProbeRequest(value) {
   if (normalized.baseline_gateway_version_id === normalized.candidate_gateway_version_id) {
     throw new RangeError('candidate_gateway_version_id must differ from baseline_gateway_version_id');
   }
+  if (normalized.baseline_gateway_version_tag === normalized.candidate_gateway_version_tag) {
+    throw new RangeError('candidate_gateway_version_tag must differ from baseline_gateway_version_tag');
+  }
   return normalized;
 }
 
 export function normalizeRolloutSkewObservation(value, label = 'RolloutSkewObservation') {
   assertObject(value, label);
+  const observedGatewayVersionId = normalizeString(
+    value.observed_gateway_version_id,
+    `${label}.observed_gateway_version_id`,
+    { allowNull: true },
+  );
+  const observedGatewayVersionTag = normalizeString(
+    value.observed_gateway_version_tag,
+    `${label}.observed_gateway_version_tag`,
+    { allowNull: true },
+  );
+  if (observedGatewayVersionId == null && observedGatewayVersionTag == null) {
+    throw new RangeError(`${label}.observed_gateway_version_id or ${label}.observed_gateway_version_tag must be present`);
+  }
   return {
     probe_name: normalizeEnum(value.probe_name, `${label}.probe_name`, ROLLOUT_SKEW_PROBE_NAMES),
     request_gateway_version_id: normalizeString(value.request_gateway_version_id, `${label}.request_gateway_version_id`),
-    observed_gateway_version_id: normalizeString(value.observed_gateway_version_id, `${label}.observed_gateway_version_id`),
+    observed_gateway_version_id: observedGatewayVersionId,
+    observed_gateway_version_tag: observedGatewayVersionTag,
     observed_authority_version_id: normalizeString(value.observed_authority_version_id, `${label}.observed_authority_version_id`),
     authority_kind: normalizeEnum(value.authority_kind, `${label}.authority_kind`, ROLLOUT_SKEW_AUTHORITY_KINDS),
     authority_key: normalizeString(value.authority_key, `${label}.authority_key`),
@@ -318,7 +340,9 @@ export function normalizeRolloutSkewProbeResponse(value) {
     probe_run_id: normalizeString(value.probe_run_id, 'probe_run_id'),
     dual_version_deployment_id: normalizeString(value.dual_version_deployment_id, 'dual_version_deployment_id'),
     baseline_gateway_version_id: normalizeString(value.baseline_gateway_version_id, 'baseline_gateway_version_id'),
+    baseline_gateway_version_tag: normalizeString(value.baseline_gateway_version_tag, 'baseline_gateway_version_tag'),
     candidate_gateway_version_id: normalizeString(value.candidate_gateway_version_id, 'candidate_gateway_version_id'),
+    candidate_gateway_version_tag: normalizeString(value.candidate_gateway_version_tag, 'candidate_gateway_version_tag'),
     override_strategy: normalizeString(value.override_strategy, 'override_strategy'),
     observations,
     assertions,
@@ -351,6 +375,19 @@ function normalizeAbsoluteExternalUri(value, label) {
   return normalized;
 }
 
+function normalizeOfficialCloudflareUri(value, label) {
+  const normalized = normalizeAbsoluteExternalUri(value, label);
+  const parsed = new URL(normalized);
+  const hostname = parsed.hostname.toLowerCase();
+  if (
+    parsed.protocol !== 'https:'
+    || (hostname !== 'cloudflare.com' && !hostname.endsWith('.cloudflare.com'))
+  ) {
+    throw new TypeError(`${label} must be an official Cloudflare HTTPS locator`);
+  }
+  return normalized;
+}
+
 function normalizeTimestamp(value, label) {
   const normalized = normalizeString(value, label);
   if (!normalized.endsWith('Z') || Number.isNaN(Date.parse(normalized))) {
@@ -359,7 +396,7 @@ function normalizeTimestamp(value, label) {
   return normalized;
 }
 
-function normalizeStringArray(value, label) {
+function normalizeNonEmptyStringArray(value, label) {
   assertArray(value, label);
   if (value.length === 0) {
     throw new TypeError(`${label} must not be empty`);
@@ -370,13 +407,13 @@ function normalizeStringArray(value, label) {
 function normalizeCloudflareResourceSnapshot(value, label = 'cloudflare_resources') {
   assertObject(value, label);
   return Object.freeze({
-    workers: normalizeStringArray(value.workers, `${label}.workers`),
-    durable_objects: normalizeStringArray(value.durable_objects, `${label}.durable_objects`),
-    d1_databases: normalizeStringArray(value.d1_databases, `${label}.d1_databases`),
-    r2_buckets: normalizeStringArray(value.r2_buckets, `${label}.r2_buckets`),
-    kv_namespaces: normalizeStringArray(value.kv_namespaces, `${label}.kv_namespaces`),
-    ratelimit_namespaces: normalizeStringArray(value.ratelimit_namespaces, `${label}.ratelimit_namespaces`),
-    queues: normalizeStringArray(value.queues, `${label}.queues`),
+    workers: normalizeNonEmptyStringArray(value.workers, `${label}.workers`),
+    durable_objects: normalizeNonEmptyStringArray(value.durable_objects, `${label}.durable_objects`),
+    d1_databases: normalizeNonEmptyStringArray(value.d1_databases, `${label}.d1_databases`),
+    r2_buckets: normalizeNonEmptyStringArray(value.r2_buckets, `${label}.r2_buckets`),
+    kv_namespaces: normalizeNonEmptyStringArray(value.kv_namespaces, `${label}.kv_namespaces`),
+    ratelimit_namespaces: normalizeNonEmptyStringArray(value.ratelimit_namespaces, `${label}.ratelimit_namespaces`),
+    queues: normalizeNonEmptyStringArray(value.queues, `${label}.queues`),
   });
 }
 
@@ -405,8 +442,8 @@ export function normalizePreReleaseCostObservation(value) {
   if (Date.parse(captureWindow.start) > Date.parse(captureWindow.end)) {
     throw new RangeError('capture_window.start must be <= capture_window.end');
   }
-  const sourceQueryUris = normalizeStringArray(value.source_query_uris, 'source_query_uris')
-    .map((entry, index) => normalizeAbsoluteExternalUri(entry, `source_query_uris[${index}]`));
+  const sourceQueryUris = normalizeNonEmptyStringArray(value.source_query_uris, 'source_query_uris')
+    .map((entry, index) => normalizeOfficialCloudflareUri(entry, `source_query_uris[${index}]`));
   return {
     observation_id: normalizeString(value.observation_id, 'observation_id'),
     source_environment: normalizeString(value.source_environment, 'source_environment'),

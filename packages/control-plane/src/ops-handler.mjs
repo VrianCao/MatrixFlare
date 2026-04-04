@@ -140,6 +140,7 @@ async function buildHealthDependencies(env, persistence) {
 
 const ROLLOUT_PROBE_SECRET_HEADER = 'x-matrix-rollout-probe-secret';
 const ROLLOUT_PROBE_GATEWAY_VERSION_ID_HEADER = 'x-matrix-rollout-probe-gateway-version-id';
+const ROLLOUT_PROBE_GATEWAY_VERSION_TAG_HEADER = 'x-matrix-rollout-probe-gateway-version-tag';
 const PROBE_PASSWORD_SUFFIX = '-password';
 const ROLLOUT_PROBE_MAX_SEED_ATTEMPTS = 24;
 const CLOUDFLARE_API_BASE_URL = 'https://api.cloudflare.com/client/v4';
@@ -220,6 +221,19 @@ function summarizeObservedProbeVersions(observedVersionIds) {
       .map((value) => String(value)),
   )];
   return uniqueVersionIds.length === 0 ? 'none' : uniqueVersionIds.join(', ');
+}
+
+function describeObservedGatewayIdentity(observedGatewayVersionId, observedGatewayVersionTag) {
+  if (observedGatewayVersionId.length > 0 && observedGatewayVersionTag.length > 0) {
+    return `${observedGatewayVersionId} (${observedGatewayVersionTag})`;
+  }
+  if (observedGatewayVersionId.length > 0) {
+    return observedGatewayVersionId;
+  }
+  if (observedGatewayVersionTag.length > 0) {
+    return `tag ${observedGatewayVersionTag}`;
+  }
+  return 'none';
 }
 
 function createOpsValidationError(message, {
@@ -319,11 +333,12 @@ function indicatesExistingProbeIdentity(result) {
 
 async function fetchGatewayWithVersionOverride(env, gatewayConfig, {
   versionId,
+  versionTag,
   pathname,
   method = 'GET',
   accessToken = null,
   json = undefined,
-  requireObservedGatewayVersionId = true,
+  requireObservedGatewayIdentity = true,
 } = {}) {
   const headers = new Headers();
   headers.set('Cloudflare-Workers-Version-Overrides', buildVersionOverrideHeader(gatewayConfig.script_name, versionId));
@@ -341,18 +356,46 @@ async function fetchGatewayWithVersionOverride(env, gatewayConfig, {
   });
   const payload = await readGatewayPayload(response);
   const observedGatewayVersionId = stableString(response.headers.get(ROLLOUT_PROBE_GATEWAY_VERSION_ID_HEADER));
-  if (observedGatewayVersionId.length === 0 && requireObservedGatewayVersionId) {
-    throw createOpsPreconditionError(`Gateway response for ${pathname} did not include ${ROLLOUT_PROBE_GATEWAY_VERSION_ID_HEADER}`);
+  const observedGatewayVersionTag = stableString(response.headers.get(ROLLOUT_PROBE_GATEWAY_VERSION_TAG_HEADER));
+  const expectedGatewayVersionTag = stableString(versionTag);
+  if (observedGatewayVersionId.length === 0 && observedGatewayVersionTag.length === 0 && requireObservedGatewayIdentity) {
+    throw createOpsPreconditionError(
+      `Gateway response for ${pathname} did not include ${ROLLOUT_PROBE_GATEWAY_VERSION_ID_HEADER} or ${ROLLOUT_PROBE_GATEWAY_VERSION_TAG_HEADER}`,
+    );
   }
   if (observedGatewayVersionId.length > 0 && observedGatewayVersionId !== versionId) {
     throw createOpsPreconditionError(
-      `Gateway version override mismatch for ${pathname}: requested ${versionId}, observed ${observedGatewayVersionId}`,
+      `Gateway version override mismatch for ${pathname}: requested ${versionId}, observed ${describeObservedGatewayIdentity(observedGatewayVersionId, observedGatewayVersionTag)}`,
+    );
+  }
+  if (observedGatewayVersionTag.length > 0) {
+    if (expectedGatewayVersionTag.length === 0) {
+      throw createOpsPreconditionError(`Gateway response for ${pathname} included ${ROLLOUT_PROBE_GATEWAY_VERSION_TAG_HEADER} without an expected official version tag`);
+    }
+    if (observedGatewayVersionTag !== expectedGatewayVersionTag) {
+      throw createOpsPreconditionError(
+        `Gateway version override mismatch for ${pathname}: requested ${versionId} (${expectedGatewayVersionTag}), observed ${describeObservedGatewayIdentity(observedGatewayVersionId, observedGatewayVersionTag)}`,
+      );
+    }
+  }
+  if (observedGatewayVersionId.length === 0 && observedGatewayVersionTag.length === 0) {
+    return {
+      response,
+      payload,
+      observed_gateway_version_id: null,
+      observed_gateway_version_tag: null,
+    };
+  }
+  if (observedGatewayVersionId.length === 0 && observedGatewayVersionTag.length > 0 && expectedGatewayVersionTag.length === 0) {
+    throw createOpsPreconditionError(
+      `Gateway response for ${pathname} requires an expected official version tag when ${ROLLOUT_PROBE_GATEWAY_VERSION_ID_HEADER} is absent`,
     );
   }
   return {
     response,
     payload,
-    observed_gateway_version_id: observedGatewayVersionId,
+    observed_gateway_version_id: observedGatewayVersionId.length > 0 ? observedGatewayVersionId : null,
+    observed_gateway_version_tag: observedGatewayVersionTag.length > 0 ? observedGatewayVersionTag : null,
   };
 }
 
@@ -401,12 +444,14 @@ async function loginProbeUser(env, gatewayConfig, {
   password,
   deviceId,
   gatewayVersionId,
+  gatewayVersionTag,
 } = {}) {
   const result = await fetchGatewayWithVersionOverride(env, gatewayConfig, {
     versionId: gatewayVersionId,
+    versionTag: gatewayVersionTag,
     pathname: '/_matrix/client/v3/login',
     method: 'POST',
-    requireObservedGatewayVersionId: false,
+    requireObservedGatewayIdentity: false,
     json: {
       type: 'm.login.password',
       identifier: {
@@ -432,6 +477,7 @@ async function loginProbeUser(env, gatewayConfig, {
 async function ensureProbeUser(env, gatewayConfig, probeRequest, {
   userLabel,
   gatewayVersionId,
+  gatewayVersionTag,
 } = {}) {
   const username = buildProbeScopedToken(userLabel, `${probeRequest.seed_prefix}-${probeRequest.probe_run_id}`, {
     fallback: userLabel,
@@ -445,9 +491,10 @@ async function ensureProbeUser(env, gatewayConfig, probeRequest, {
   const deviceId = sanitizeDeviceId(`${userLabel}-${probeRequest.probe_run_id}`);
   const challenge = await fetchGatewayWithVersionOverride(env, gatewayConfig, {
     versionId: gatewayVersionId,
+    versionTag: gatewayVersionTag,
     pathname: '/_matrix/client/v3/register',
     method: 'POST',
-    requireObservedGatewayVersionId: false,
+    requireObservedGatewayIdentity: false,
     json: {
       username,
       password,
@@ -466,9 +513,10 @@ async function ensureProbeUser(env, gatewayConfig, probeRequest, {
   if (challenge.response.status === 401 && typeof challenge.payload?.session === 'string') {
     const completed = await fetchGatewayWithVersionOverride(env, gatewayConfig, {
       versionId: gatewayVersionId,
+      versionTag: gatewayVersionTag,
       pathname: '/_matrix/client/v3/register',
       method: 'POST',
-      requireObservedGatewayVersionId: false,
+      requireObservedGatewayIdentity: false,
       json: {
         username,
         password,
@@ -494,6 +542,7 @@ async function ensureProbeUser(env, gatewayConfig, probeRequest, {
         password,
         deviceId,
         gatewayVersionId,
+        gatewayVersionTag,
       });
     }
     throw createRetryableProbeAttemptError(`Probe register completion failed for ${username}: ${describeGatewayFailure(completed)}`);
@@ -504,6 +553,7 @@ async function ensureProbeUser(env, gatewayConfig, probeRequest, {
       password,
       deviceId,
       gatewayVersionId,
+      gatewayVersionTag,
     });
   }
   throw createRetryableProbeAttemptError(`Probe register challenge failed for ${username}: ${describeGatewayFailure(challenge)}`);
@@ -512,6 +562,7 @@ async function ensureProbeUser(env, gatewayConfig, probeRequest, {
 async function ensureProbeRoom(env, gatewayConfig, probeRequest, {
   roomLabel,
   gatewayVersionId,
+  gatewayVersionTag,
   accessToken,
   serverName,
 } = {}) {
@@ -523,10 +574,11 @@ async function ensureProbeRoom(env, gatewayConfig, probeRequest, {
   const roomAlias = `#${aliasLocalpart}:${serverName}`;
   const created = await fetchGatewayWithVersionOverride(env, gatewayConfig, {
     versionId: gatewayVersionId,
+    versionTag: gatewayVersionTag,
     pathname: '/_matrix/client/v3/createRoom',
     method: 'POST',
     accessToken,
-    requireObservedGatewayVersionId: false,
+    requireObservedGatewayIdentity: false,
     json: {
       visibility: 'public',
       preset: 'public_chat',
@@ -542,10 +594,11 @@ async function ensureProbeRoom(env, gatewayConfig, probeRequest, {
   }
   const joined = await fetchGatewayWithVersionOverride(env, gatewayConfig, {
     versionId: gatewayVersionId,
+    versionTag: gatewayVersionTag,
     pathname: `/_matrix/client/v3/join/${encodeURIComponent(roomAlias)}`,
     method: 'POST',
     accessToken,
-    requireObservedGatewayVersionId: false,
+    requireObservedGatewayIdentity: false,
     json: {},
   });
   if (joined.response.status !== 200 || typeof joined.payload?.room_id !== 'string') {
@@ -560,6 +613,7 @@ async function ensureProbeRoom(env, gatewayConfig, probeRequest, {
 async function seedProbeUserForVersion(env, gatewayConfig, probeRequest, {
   userLabel,
   gatewayVersionId,
+  gatewayVersionTag,
   expectedAuthorityVersionId,
 } = {}) {
   const observedVersionIds = [];
@@ -570,6 +624,7 @@ async function seedProbeUserForVersion(env, gatewayConfig, probeRequest, {
       seededUser = await ensureProbeUser(env, gatewayConfig, probeRequest, {
         userLabel: buildSeedAttemptLabel(userLabel, attemptIndex),
         gatewayVersionId,
+        gatewayVersionTag,
       });
     } catch (error) {
       if (!isRetryableProbeAttemptError(error)) {
@@ -593,6 +648,7 @@ async function seedProbeUserForVersion(env, gatewayConfig, probeRequest, {
 async function seedProbeRoomForVersion(env, gatewayConfig, probeRequest, {
   roomLabel,
   gatewayVersionId,
+  gatewayVersionTag,
   accessToken,
   serverName,
   expectedAuthorityVersionId,
@@ -605,6 +661,7 @@ async function seedProbeRoomForVersion(env, gatewayConfig, probeRequest, {
       seededRoom = await ensureProbeRoom(env, gatewayConfig, probeRequest, {
         roomLabel: buildSeedAttemptLabel(roomLabel, attemptIndex),
         gatewayVersionId,
+        gatewayVersionTag,
         accessToken,
         serverName,
       });
@@ -631,6 +688,7 @@ function buildRolloutObservation({
   probeName,
   requestGatewayVersionId,
   observedGatewayVersionId,
+  observedGatewayVersionTag,
   authorityVersionId,
   authorityKind,
   authorityKey,
@@ -640,6 +698,7 @@ function buildRolloutObservation({
     probe_name: probeName,
     request_gateway_version_id: requestGatewayVersionId,
     observed_gateway_version_id: observedGatewayVersionId,
+    observed_gateway_version_tag: observedGatewayVersionTag,
     observed_authority_version_id: authorityVersionId,
     authority_kind: authorityKind,
     authority_key: authorityKey,
@@ -650,12 +709,25 @@ function buildRolloutObservation({
 
 function evaluateRolloutAssertions(observations, {
   baselineGatewayVersionId,
+  baselineGatewayVersionTag,
   candidateGatewayVersionId,
+  candidateGatewayVersionTag,
 } = {}) {
-  const hasExpectedObservation = (probeName, authorityKind, expectedGatewayVersionId, expectedAuthorityVersionId) => observations.some((entry) => (
+  const hasExpectedGatewayIdentity = (entry, expectedGatewayVersionId, expectedGatewayVersionTag) => {
+    if (entry.observed_gateway_version_id === expectedGatewayVersionId) {
+      return entry.observed_gateway_version_tag == null
+        || entry.observed_gateway_version_tag === expectedGatewayVersionTag;
+    }
+    return (
+      entry.observed_gateway_version_id == null
+      && entry.observed_gateway_version_tag === expectedGatewayVersionTag
+    );
+  };
+  const hasExpectedObservation = (probeName, authorityKind, expectedGatewayVersionId, expectedGatewayVersionTag, expectedAuthorityVersionId) => observations.some((entry) => (
     entry.probe_name === probeName
     && entry.authority_kind === authorityKind
-    && entry.observed_gateway_version_id === expectedGatewayVersionId
+    && entry.request_gateway_version_id === expectedGatewayVersionId
+    && hasExpectedGatewayIdentity(entry, expectedGatewayVersionId, expectedGatewayVersionTag)
     && entry.observed_authority_version_id === expectedAuthorityVersionId
   ));
   return {
@@ -663,12 +735,14 @@ function evaluateRolloutAssertions(observations, {
       'new-worker-old-authority',
       authorityKind,
       candidateGatewayVersionId,
+      candidateGatewayVersionTag,
       baselineGatewayVersionId,
     )),
     old_worker_new_authority: ['UserDO', 'RoomDO'].every((authorityKind) => hasExpectedObservation(
       'old-worker-new-authority',
       authorityKind,
       baselineGatewayVersionId,
+      baselineGatewayVersionTag,
       candidateGatewayVersionId,
     )),
   };
@@ -1021,12 +1095,14 @@ async function handleRolloutSkewProbe(request, env, config, requestContext) {
     const baselineUser = await seedProbeUserForVersion(env, gatewayConfig, probeRequest, {
       userLabel: 'baseline-user',
       gatewayVersionId: probeRequest.baseline_gateway_version_id,
+      gatewayVersionTag: probeRequest.baseline_gateway_version_tag,
       expectedAuthorityVersionId: probeRequest.baseline_gateway_version_id,
     });
 
     const baselineRoom = await seedProbeRoomForVersion(env, gatewayConfig, probeRequest, {
       roomLabel: 'baseline-room',
       gatewayVersionId: probeRequest.baseline_gateway_version_id,
+      gatewayVersionTag: probeRequest.baseline_gateway_version_tag,
       accessToken: baselineUser.access_token,
       serverName,
       expectedAuthorityVersionId: probeRequest.baseline_gateway_version_id,
@@ -1035,12 +1111,14 @@ async function handleRolloutSkewProbe(request, env, config, requestContext) {
     const candidateUser = await seedProbeUserForVersion(env, gatewayConfig, probeRequest, {
       userLabel: 'candidate-user',
       gatewayVersionId: probeRequest.candidate_gateway_version_id,
+      gatewayVersionTag: probeRequest.candidate_gateway_version_tag,
       expectedAuthorityVersionId: probeRequest.candidate_gateway_version_id,
     });
 
     const candidateRoom = await seedProbeRoomForVersion(env, gatewayConfig, probeRequest, {
       roomLabel: 'candidate-room',
       gatewayVersionId: probeRequest.candidate_gateway_version_id,
+      gatewayVersionTag: probeRequest.candidate_gateway_version_tag,
       accessToken: candidateUser.access_token,
       serverName,
       expectedAuthorityVersionId: probeRequest.candidate_gateway_version_id,
@@ -1050,6 +1128,7 @@ async function handleRolloutSkewProbe(request, env, config, requestContext) {
 
     const candidateWhoAmI = await fetchGatewayWithVersionOverride(env, gatewayConfig, {
       versionId: probeRequest.candidate_gateway_version_id,
+      versionTag: probeRequest.candidate_gateway_version_tag,
       pathname: '/_matrix/client/v3/account/whoami',
       accessToken: baselineUser.access_token,
     });
@@ -1061,6 +1140,7 @@ async function handleRolloutSkewProbe(request, env, config, requestContext) {
       probeName: 'new-worker-old-authority',
       requestGatewayVersionId: probeRequest.candidate_gateway_version_id,
       observedGatewayVersionId: candidateWhoAmI.observed_gateway_version_id,
+      observedGatewayVersionTag: candidateWhoAmI.observed_gateway_version_tag,
       authorityVersionId: postCandidateUserIdentity.worker_version_id,
       authorityKind: 'UserDO',
       authorityKey: baselineUser.user_id,
@@ -1069,6 +1149,7 @@ async function handleRolloutSkewProbe(request, env, config, requestContext) {
 
     const candidateRoomState = await fetchGatewayWithVersionOverride(env, gatewayConfig, {
       versionId: probeRequest.candidate_gateway_version_id,
+      versionTag: probeRequest.candidate_gateway_version_tag,
       pathname: `/_matrix/client/v3/rooms/${encodeURIComponent(baselineRoom.room_id)}/state`,
       accessToken: baselineUser.access_token,
     });
@@ -1080,6 +1161,7 @@ async function handleRolloutSkewProbe(request, env, config, requestContext) {
       probeName: 'new-worker-old-authority',
       requestGatewayVersionId: probeRequest.candidate_gateway_version_id,
       observedGatewayVersionId: candidateRoomState.observed_gateway_version_id,
+      observedGatewayVersionTag: candidateRoomState.observed_gateway_version_tag,
       authorityVersionId: postCandidateRoomIdentity.worker_version_id,
       authorityKind: 'RoomDO',
       authorityKey: baselineRoom.room_id,
@@ -1088,6 +1170,7 @@ async function handleRolloutSkewProbe(request, env, config, requestContext) {
 
     const baselineWhoAmI = await fetchGatewayWithVersionOverride(env, gatewayConfig, {
       versionId: probeRequest.baseline_gateway_version_id,
+      versionTag: probeRequest.baseline_gateway_version_tag,
       pathname: '/_matrix/client/v3/account/whoami',
       accessToken: candidateUser.access_token,
     });
@@ -1099,6 +1182,7 @@ async function handleRolloutSkewProbe(request, env, config, requestContext) {
       probeName: 'old-worker-new-authority',
       requestGatewayVersionId: probeRequest.baseline_gateway_version_id,
       observedGatewayVersionId: baselineWhoAmI.observed_gateway_version_id,
+      observedGatewayVersionTag: baselineWhoAmI.observed_gateway_version_tag,
       authorityVersionId: postBaselineUserIdentity.worker_version_id,
       authorityKind: 'UserDO',
       authorityKey: candidateUser.user_id,
@@ -1107,6 +1191,7 @@ async function handleRolloutSkewProbe(request, env, config, requestContext) {
 
     const baselineRoomState = await fetchGatewayWithVersionOverride(env, gatewayConfig, {
       versionId: probeRequest.baseline_gateway_version_id,
+      versionTag: probeRequest.baseline_gateway_version_tag,
       pathname: `/_matrix/client/v3/rooms/${encodeURIComponent(candidateRoom.room_id)}/state`,
       accessToken: candidateUser.access_token,
     });
@@ -1118,6 +1203,7 @@ async function handleRolloutSkewProbe(request, env, config, requestContext) {
       probeName: 'old-worker-new-authority',
       requestGatewayVersionId: probeRequest.baseline_gateway_version_id,
       observedGatewayVersionId: baselineRoomState.observed_gateway_version_id,
+      observedGatewayVersionTag: baselineRoomState.observed_gateway_version_tag,
       authorityVersionId: postBaselineRoomIdentity.worker_version_id,
       authorityKind: 'RoomDO',
       authorityKey: candidateRoom.room_id,
@@ -1126,7 +1212,9 @@ async function handleRolloutSkewProbe(request, env, config, requestContext) {
 
     const assertions = evaluateRolloutAssertions(observations, {
       baselineGatewayVersionId: probeRequest.baseline_gateway_version_id,
+      baselineGatewayVersionTag: probeRequest.baseline_gateway_version_tag,
       candidateGatewayVersionId: probeRequest.candidate_gateway_version_id,
+      candidateGatewayVersionTag: probeRequest.candidate_gateway_version_tag,
     });
 
     return jsonResponse(normalizeRolloutSkewProbeResponse({
@@ -1134,7 +1222,9 @@ async function handleRolloutSkewProbe(request, env, config, requestContext) {
       probe_run_id: probeRequest.probe_run_id,
       dual_version_deployment_id: probeRequest.dual_version_deployment_id,
       baseline_gateway_version_id: probeRequest.baseline_gateway_version_id,
+      baseline_gateway_version_tag: probeRequest.baseline_gateway_version_tag,
       candidate_gateway_version_id: probeRequest.candidate_gateway_version_id,
+      candidate_gateway_version_tag: probeRequest.candidate_gateway_version_tag,
       override_strategy: 'cloudflare-version-overrides',
       observations,
       assertions,

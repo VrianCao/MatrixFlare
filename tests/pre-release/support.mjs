@@ -96,7 +96,9 @@ export function requireRolloutProbeContext() {
     probeRunId: requireEnvironmentVariable('MATRIX_ROLLOUT_PROBE_RUN_ID'),
     seedPrefix: requireEnvironmentVariable('MATRIX_ROLLOUT_SEED_PREFIX'),
     baselineGatewayVersionId: requireEnvironmentVariable('MATRIX_ROLLOUT_BASELINE_GATEWAY_VERSION_ID'),
+    baselineGatewayVersionTag: requireEnvironmentVariable('MATRIX_ROLLOUT_BASELINE_GATEWAY_VERSION_TAG'),
     candidateGatewayVersionId: requireEnvironmentVariable('MATRIX_ROLLOUT_CANDIDATE_GATEWAY_VERSION_ID'),
+    candidateGatewayVersionTag: requireEnvironmentVariable('MATRIX_ROLLOUT_CANDIDATE_GATEWAY_VERSION_TAG'),
     dualVersionDeploymentId: requireEnvironmentVariable('MATRIX_ROLLOUT_DUAL_VERSION_DEPLOYMENT_ID'),
     outputPath: requireEnvironmentVariable('MATRIX_TEST_RUN_ROLLOUT_SKEW_PROBE_PATH'),
   };

@@ -233,7 +233,9 @@
 | --- | --- | --- |
 | `probe_run_id` | string | 非空；同一 pre-release skew probe 的稳定标识 |
 | `baseline_gateway_version_id` | string | 非空；必须属于当前 dual-version deployment |
+| `baseline_gateway_version_tag` | string | 非空；必须对应 `baseline_gateway_version_id` 的 official version tag |
 | `candidate_gateway_version_id` | string | 非空；必须属于当前 dual-version deployment 且不得与 baseline 相同 |
+| `candidate_gateway_version_tag` | string | 非空；必须对应 `candidate_gateway_version_id` 的 official version tag，且不得与 baseline 相同 |
 | `dual_version_deployment_id` | string | 非空；必须由 GitHub Actions rollout harness 在 `versions deploy` 后回读当前 active dual-version deployment ID 并传入 |
 | `authority_kind` | string | 首版固定为 `matrix-core`；表示 probe 必须同时覆盖 `UserDO` 与 `RoomDO` |
 | `seed_prefix` | string | 非空；probe-owned authority identity 前缀，用于防止跨 run 混淆 |
@@ -244,7 +246,8 @@
 | --- | --- | --- |
 | `probe_name` | string | 非空；首版至少包含 `new-worker-old-authority` 与 `old-worker-new-authority` |
 | `request_gateway_version_id` | string | 该次请求显式 targeting 的 gateway version ID |
-| `observed_gateway_version_id` | string | 由目标 gateway request 实际回读到的 version ID |
+| `observed_gateway_version_id` | string or null | 由目标 gateway request 实际回读到的 official version ID；若 runtime 未提供 official ID，则必须为 `null`，不得改塞 repo-local fallback |
+| `observed_gateway_version_tag` | string or null | 由目标 gateway request 实际回读到的 official version tag；当 `observed_gateway_version_id = null` 时必须非空 |
 | `observed_authority_version_id` | string | 由 probe-owned `UserDO` / `RoomDO` 实际回读到的 version ID |
 | `authority_kind` | string | `UserDO` 或 `RoomDO` |
 | `authority_key` | string | probe-owned authority identity |
@@ -259,7 +262,9 @@
 | `probe_run_id` | string | 必须与 request 一致 |
 | `dual_version_deployment_id` | string | 非空；必须与 request 一致 |
 | `baseline_gateway_version_id` | string | 必须与 request 一致 |
+| `baseline_gateway_version_tag` | string | 必须与 request 一致 |
 | `candidate_gateway_version_id` | string | 必须与 request 一致 |
+| `candidate_gateway_version_tag` | string | 必须与 request 一致 |
 | `override_strategy` | string | 首版固定为 `cloudflare-version-overrides` |
 | `observations` | array | `RolloutSkewObservation[]`；至少各包含一条 `new-worker-old-authority` 与 `old-worker-new-authority` 观测 |
 | `assertions` | object | 至少包含布尔字段 `new_worker_old_authority`、`old_worker_new_authority`，两者都必须为 `true` 才能判为 pass |
@@ -424,7 +429,7 @@
 | `captured_at` | string | RFC 3339 UTC |
 | `capture_window` | object | 必须包含 `start`,`end` RFC 3339 UTC，且 `start <= end` |
 | `capture_method` | string | 首版固定为 `cloudflare-official-metrics` |
-| `source_query_uris` | array | 非空绝对外部 URI / locator 数组；记录本次 observation 查询的官方 surface |
+| `source_query_uris` | array | 非空绝对 `https:` URI 数组；host 必须是 `cloudflare.com` 或其子域，记录本次 observation 查询的官方 Cloudflare surface |
 | `topology_kind` | string | 非本地拓扑标识；不得为 `local` |
 | `cloudflare_resources` | `CloudflareResourceSnapshot` | 本次 observation 绑定的 pre-release 资源快照 |
 | `cost_surfaces` | object | 至少包含 `workers`,`durable_objects`,`d1`,`r2`,`kv`,`queues`；字段集合与 `ProdCostSnapshot.cost_surfaces` 相同 |
@@ -455,7 +460,7 @@
 | `source_run_uri` | string | 绝对外部 URI / locator；必须具 authority，或使用格式完整的 `urn:<nid>:<nss>`；不得为裸 `urn:`，且不得为 `about:` / `blob:` / `file:` / `data:` / `javascript:` |
 | `topology_kind` | string | 非本地拓扑标识；不得为 `local` |
 | `cloudflare_resources` | `CloudflareResourceSnapshot` | 本次执行所绑定资源快照 |
-| `rollout_skew_probe` | `RolloutSkewProbeResponse` or null | `pre-release` 且覆盖 `TEST-OPS-001` 时必须非空；其他环境必须为 `null` |
+| `rollout_skew_probe` | `RolloutSkewProbeResponse` or null | `pre-release` 且覆盖 `TEST-OPS-001` 时必须非空；其他环境必须为 `null`。有效 payload 必须保留 targeted version IDs、对应 official version tags，以及 observation 中的 official version ID / tag 观测结果；若 runtime 未提供 official version ID，则 `observed_gateway_version_id` 必须为 `null` 并改由 `observed_gateway_version_tag` 承载 override 观测。 |
 | `pre_release_cost_observation` | `PreReleaseCostObservation` or null | `pre-release` 且覆盖 `TEST-COST-001` 时必须非空；其他环境必须为 `null` |
 
 ### 5.17 `ProdCostSnapshot`

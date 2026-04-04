@@ -3015,6 +3015,9 @@ async function deployWorker(workerName, provisionedEnvironment, {
   apiToken,
 }) {
   const scriptName = provisionedEnvironment.plan.worker_scripts[workerName];
+  const workerVersionTag = buildRuntimeWorkerVersionTag(deploymentId, workerName, {
+    gatewayBootstrapMode,
+  });
   const previousState = await fetchWorkerDeploymentState({
     accountId,
     apiToken,
@@ -3071,6 +3074,7 @@ async function deployWorker(workerName, provisionedEnvironment, {
       `${workerName} deployment id`,
     ),
     worker_version_id: resolveFreshCloudflareIdentity(previousState.worker_version_ids, currentState.active_worker_version_ids, `${workerName} worker version id`),
+    worker_version_tag: workerVersionTag,
     config_path: configPath,
     secrets_path: secretsPath,
     url: provisionedEnvironment.plan.worker_urls[workerName] ?? `https://${scriptName}.workers.dev`,
@@ -3190,6 +3194,7 @@ async function uploadWorkerVersion(workerName, provisionedEnvironment, {
   apiToken,
 }) {
   const scriptName = provisionedEnvironment.plan.worker_scripts[workerName];
+  const workerVersionTag = buildRuntimeWorkerVersionTag(deploymentId, workerName);
   const previousState = await fetchWorkerDeploymentState({
     accountId,
     apiToken,
@@ -3226,7 +3231,7 @@ async function uploadWorkerVersion(workerName, provisionedEnvironment, {
     '--message',
     `${deploymentId}:${workerName}:rollout-candidate`,
     '--tag',
-    buildRuntimeWorkerVersionTag(deploymentId, workerName),
+    workerVersionTag,
     '--secrets-file',
     secretsPath,
   ], {
@@ -3243,6 +3248,7 @@ async function uploadWorkerVersion(workerName, provisionedEnvironment, {
     config_path: configPath,
     secrets_path: secretsPath,
     worker_version_id: resolveFreshCloudflareIdentity(previousState.worker_version_ids, currentState.worker_version_ids, `${workerName} candidate worker version id`),
+    worker_version_tag: workerVersionTag,
   };
 }
 
@@ -3330,7 +3336,11 @@ export async function startPreReleaseGatewayRollout(environmentName, {
     throw new Error('pre-release rollout start requires a single-version baseline gateway deployment');
   }
   const baselineGatewayVersionId = gatewayWorker.worker_version_id;
+  const baselineGatewayVersionTag = stableString(gatewayWorker.worker_version_tag);
   const baselineGatewayDeploymentId = gatewayWorker.deployment_id;
+  if (baselineGatewayVersionTag.length === 0) {
+    throw new TypeError('deployment summary workers.gateway-worker.worker_version_tag must be present for rollout probing');
+  }
   const resolvedWorkingRoot = path.resolve(workingRoot ?? path.join(repoRoot, '.tmp', 'nonlocal-rollout', normalizedEnvironmentName));
   await fs.mkdir(resolvedWorkingRoot, { recursive: true });
   const resolvedDeploymentId = deploymentId ?? `gha-${normalizedEnvironmentName}-rollout-${Date.now().toString(36)}`;
@@ -3382,8 +3392,10 @@ export async function startPreReleaseGatewayRollout(environmentName, {
     working_root: resolvedWorkingRoot,
     config_path: candidate.config_path,
     baseline_gateway_version_id: baselineGatewayVersionId,
+    baseline_gateway_version_tag: baselineGatewayVersionTag,
     baseline_gateway_deployment_id: baselineGatewayDeploymentId,
     candidate_gateway_version_id: candidate.worker_version_id,
+    candidate_gateway_version_tag: candidate.worker_version_tag,
     dual_version_deployment_id: dualVersionDeploymentId,
     probe_run_id: probeRunId,
     seed_prefix: seedPrefix,
@@ -3593,6 +3605,13 @@ function buildSuiteRunArtifactPaths(outputRoot, environmentName) {
   };
 }
 
+async function clearSuiteSidecarArtifacts(suiteArtifacts) {
+  await Promise.all([
+    fs.rm(suiteArtifacts.rollout_skew_probe_path, { force: true }),
+    fs.rm(suiteArtifacts.pre_release_cost_observation_path, { force: true }),
+  ]);
+}
+
 function buildSuiteRolloutEnvironmentVariables(rolloutState) {
   if (!isPlainObject(rolloutState)) {
     return {};
@@ -3601,7 +3620,9 @@ function buildSuiteRolloutEnvironmentVariables(rolloutState) {
     MATRIX_ROLLOUT_PROBE_RUN_ID: rolloutState.probe_run_id,
     MATRIX_ROLLOUT_SEED_PREFIX: rolloutState.seed_prefix,
     MATRIX_ROLLOUT_BASELINE_GATEWAY_VERSION_ID: rolloutState.baseline_gateway_version_id,
+    MATRIX_ROLLOUT_BASELINE_GATEWAY_VERSION_TAG: rolloutState.baseline_gateway_version_tag,
     MATRIX_ROLLOUT_CANDIDATE_GATEWAY_VERSION_ID: rolloutState.candidate_gateway_version_id,
+    MATRIX_ROLLOUT_CANDIDATE_GATEWAY_VERSION_TAG: rolloutState.candidate_gateway_version_tag,
     MATRIX_ROLLOUT_DUAL_VERSION_DEPLOYMENT_ID: rolloutState.dual_version_deployment_id,
   };
 }
@@ -3696,6 +3717,9 @@ export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
     if (!isPlainObject(rolloutState) || rolloutState.environment_name !== normalizedEnvironmentName) {
       throw new TypeError('rolloutState must be the pre-release rollout payload');
     }
+    if (!isNonEmptyString(rolloutState.baseline_gateway_version_tag) || !isNonEmptyString(rolloutState.candidate_gateway_version_tag)) {
+      throw new TypeError('rolloutState must include baseline_gateway_version_tag and candidate_gateway_version_tag');
+    }
   }
   const validationDeploymentSummary = buildSuiteDeploymentSummaryForValidation(deploymentSummary, rolloutState);
   const suiteArtifacts = buildSuiteRunArtifactPaths(outputRoot, normalizedEnvironmentName);
@@ -3719,11 +3743,20 @@ export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
   const startedAt = new Date().toISOString();
   const startedMs = Date.now();
   const commandArgs = ['--test', '--test-concurrency=1', ...files];
+  const coversPreReleaseOps = normalizedEnvironmentName === 'pre-release'
+    && files.some((file) => {
+      const basename = path.basename(file).toLowerCase();
+      return basename.startsWith('test-ops-001') && basename.endsWith('.test.mjs');
+    });
   const coversPreReleaseCost = normalizedEnvironmentName === 'pre-release'
     && files.some((file) => {
       const basename = path.basename(file).toLowerCase();
       return basename.startsWith('test-cost-001') && basename.endsWith('.test.mjs');
     });
+  if (coversPreReleaseOps && rolloutState == null) {
+    throw new TypeError('pre-release suite covering TEST-OPS-001 requires rolloutState');
+  }
+  await clearSuiteSidecarArtifacts(suiteArtifacts);
   const readinessProbe = await waitForNonLocalDeploymentReadinessImpl(
     normalizedEnvironmentName,
     remoteHarnessEnv,
@@ -3769,6 +3802,9 @@ export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
   try {
     const rolloutProbeArtifact = await readOptionalJsonArtifact(suiteArtifacts.rollout_skew_probe_path);
     if (rolloutProbeArtifact != null) {
+      if (!coversPreReleaseOps) {
+        throw new Error('rollout_skew_probe sidecar must be absent unless TEST-OPS-001 is covered');
+      }
       rolloutSkewProbe = normalizeRolloutSkewProbeResponse(rolloutProbeArtifact);
       if (
         rolloutSkewProbe.assertions.new_worker_old_authority !== true
@@ -3785,15 +3821,17 @@ export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
             expectedProbeRunId: rolloutState.probe_run_id,
             expectedDualVersionDeploymentId: rolloutState.dual_version_deployment_id,
             expectedBaselineGatewayVersionId: rolloutState.baseline_gateway_version_id,
+            expectedBaselineGatewayVersionTag: rolloutState.baseline_gateway_version_tag,
             expectedCandidateGatewayVersionId: rolloutState.candidate_gateway_version_id,
+            expectedCandidateGatewayVersionTag: rolloutState.candidate_gateway_version_tag,
           },
         );
         if (!rolloutValidation.valid) {
           throw new Error(rolloutValidation.error);
         }
       }
-    } else if (rolloutState != null) {
-      throw new Error('rollout_skew_probe sidecar is required when rolloutState is provided');
+    } else if (coversPreReleaseOps || rolloutState != null) {
+      throw new Error('rollout_skew_probe sidecar is required when TEST-OPS-001 is covered');
     }
     preReleaseCostObservation = await readOptionalJsonArtifact(suiteArtifacts.pre_release_cost_observation_path);
     if (preReleaseCostObservation != null) {

@@ -100,18 +100,23 @@ function buildPhase08ArtifactStoreUri(environmentName, runTimestamp, fileName) {
 }
 
 function buildValidRolloutSkewProbe(runTimestamp, overrides = {}) {
+  const baselineGatewayVersionTag = 'mx-gw-d-baseline';
+  const candidateGatewayVersionTag = 'mx-gw-d-candidate';
   return {
     environment_name: 'pre-release',
     probe_run_id: `rollout-${runTimestamp.toLowerCase()}`,
     dual_version_deployment_id: 'pre-release-gateway-dual-deployment',
     baseline_gateway_version_id: 'gateway@pre-release-v1',
+    baseline_gateway_version_tag: baselineGatewayVersionTag,
     candidate_gateway_version_id: 'gateway@pre-release-v2',
+    candidate_gateway_version_tag: candidateGatewayVersionTag,
     override_strategy: 'cloudflare-version-overrides',
     observations: [
       {
         probe_name: 'new-worker-old-authority',
         request_gateway_version_id: 'gateway@pre-release-v2',
         observed_gateway_version_id: 'gateway@pre-release-v2',
+        observed_gateway_version_tag: candidateGatewayVersionTag,
         observed_authority_version_id: 'gateway@pre-release-v1',
         authority_kind: 'UserDO',
         authority_key: '@baseline-user:matrix.example.test',
@@ -122,6 +127,7 @@ function buildValidRolloutSkewProbe(runTimestamp, overrides = {}) {
         probe_name: 'new-worker-old-authority',
         request_gateway_version_id: 'gateway@pre-release-v2',
         observed_gateway_version_id: 'gateway@pre-release-v2',
+        observed_gateway_version_tag: candidateGatewayVersionTag,
         observed_authority_version_id: 'gateway@pre-release-v1',
         authority_kind: 'RoomDO',
         authority_key: '!baseline-room:matrix.example.test',
@@ -132,6 +138,7 @@ function buildValidRolloutSkewProbe(runTimestamp, overrides = {}) {
         probe_name: 'old-worker-new-authority',
         request_gateway_version_id: 'gateway@pre-release-v1',
         observed_gateway_version_id: 'gateway@pre-release-v1',
+        observed_gateway_version_tag: baselineGatewayVersionTag,
         observed_authority_version_id: 'gateway@pre-release-v2',
         authority_kind: 'UserDO',
         authority_key: '@candidate-user:matrix.example.test',
@@ -142,6 +149,7 @@ function buildValidRolloutSkewProbe(runTimestamp, overrides = {}) {
         probe_name: 'old-worker-new-authority',
         request_gateway_version_id: 'gateway@pre-release-v1',
         observed_gateway_version_id: 'gateway@pre-release-v1',
+        observed_gateway_version_tag: baselineGatewayVersionTag,
         observed_authority_version_id: 'gateway@pre-release-v2',
         authority_kind: 'RoomDO',
         authority_key: '!candidate-room:matrix.example.test',
@@ -168,7 +176,8 @@ function buildValidPreReleaseCostObservation(runTimestamp, overrides = {}) {
     },
     capture_method: 'cloudflare-official-metrics',
     source_query_uris: [
-      `https://example.invalid/cloudflare/pre-release/cost/${runTimestamp}`,
+      'https://api.cloudflare.com/client/v4/graphql#workersInvocationsAdaptive',
+      'https://developers.cloudflare.com/workers/platform/pricing',
     ],
     topology_kind: 'cloudflare-pre-release',
     cloudflare_resources: buildExpectedCloudflareResources('pre-release'),
@@ -221,7 +230,7 @@ function buildValidEnvironmentReport(environmentName, runTimestamp, overrides = 
     expanded_test_file_count: 2,
     expanded_test_files: [
       `${directory}/remote.test.mjs`,
-      'packages/testing/src/bootstrap.mjs',
+      `${directory}/support.mjs`,
     ],
     output_sha256: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
     error_message: null,
@@ -1390,6 +1399,42 @@ test('manual artifact payload validation requires structured non-local reports a
 
   assert.deepEqual(
     validateManualArtifactPayload('pre_release_run_report', {
+      ...validPreReleaseOpsReport,
+      rollout_skew_probe: {
+        ...validPreReleaseOpsReport.rollout_skew_probe,
+        observations: validPreReleaseOpsReport.rollout_skew_probe.observations.map((entry, index) => index === 0
+          ? {
+            ...entry,
+            observed_gateway_version_tag: `${entry.observed_gateway_version_tag}-unexpected`,
+          }
+          : entry),
+      },
+    }, { runTimestamp }),
+    {
+      valid: false,
+      error: 'environment run report rollout_skew_probe must include new-worker-old-authority/UserDO observation',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('pre_release_run_report', {
+      ...validPreReleaseOpsReport,
+      rollout_skew_probe: {
+        ...validPreReleaseOpsReport.rollout_skew_probe,
+        observations: validPreReleaseOpsReport.rollout_skew_probe.observations.map((entry) => ({
+          ...entry,
+          observed_gateway_version_id: null,
+        })),
+      },
+    }, { runTimestamp }),
+    {
+      valid: true,
+      error: null,
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('pre_release_run_report', {
       ...validPreReleaseCostReport,
       pre_release_cost_observation: null,
     }, {
@@ -1418,10 +1463,42 @@ test('manual artifact payload validation requires structured non-local reports a
   );
 
   assert.deepEqual(
+    validateManualArtifactPayload('pre_release_run_report', {
+      ...validPreReleaseCostReport,
+      pre_release_cost_observation: {
+        ...validPreReleaseCostReport.pre_release_cost_observation,
+        source_query_uris: ['https://example.invalid/cloudflare/pre-release/cost'],
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'environment run report pre_release_cost_observation.source_query_uris must be official Cloudflare HTTPS locators',
+    },
+  );
+
+  assert.deepEqual(
     validateManualArtifactPayload('pre_release_run_report', validPreReleaseCostReport, { runTimestamp }),
     {
       valid: true,
       error: null,
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('staging_run_report', {
+      ...validStagingReport,
+      expanded_test_files: [
+        'tests/staging/remote.test.mjs',
+        'packages/testing/src/bootstrap.mjs',
+      ],
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'environment run report expanded_test_files must stay within tests/staging',
     },
   );
 

@@ -552,7 +552,9 @@ export function validateRolloutSkewProbeSemantics(reportLabel, normalized, {
   expectedProbeRunId = null,
   expectedDualVersionDeploymentId = null,
   expectedBaselineGatewayVersionId = null,
+  expectedBaselineGatewayVersionTag = null,
   expectedCandidateGatewayVersionId = null,
+  expectedCandidateGatewayVersionTag = null,
 } = {}) {
   if (normalized.environment_name !== expectedEnvironmentName) {
     return {
@@ -578,10 +580,22 @@ export function validateRolloutSkewProbeSemantics(reportLabel, normalized, {
       error: `${reportLabel}.baseline_gateway_version_id must match rollout state`,
     };
   }
+  if (expectedBaselineGatewayVersionTag != null && normalized.baseline_gateway_version_tag !== expectedBaselineGatewayVersionTag) {
+    return {
+      valid: false,
+      error: `${reportLabel}.baseline_gateway_version_tag must match rollout state`,
+    };
+  }
   if (expectedCandidateGatewayVersionId != null && normalized.candidate_gateway_version_id !== expectedCandidateGatewayVersionId) {
     return {
       valid: false,
       error: `${reportLabel}.candidate_gateway_version_id must match rollout state`,
+    };
+  }
+  if (expectedCandidateGatewayVersionTag != null && normalized.candidate_gateway_version_tag !== expectedCandidateGatewayVersionTag) {
+    return {
+      valid: false,
+      error: `${reportLabel}.candidate_gateway_version_tag must match rollout state`,
     };
   }
   const requiredObservations = [
@@ -589,34 +603,48 @@ export function validateRolloutSkewProbeSemantics(reportLabel, normalized, {
       probe_name: 'new-worker-old-authority',
       authority_kind: 'UserDO',
       expected_gateway_version_id: normalized.candidate_gateway_version_id,
+      expected_gateway_version_tag: normalized.candidate_gateway_version_tag,
       expected_authority_version_id: normalized.baseline_gateway_version_id,
     },
     {
       probe_name: 'new-worker-old-authority',
       authority_kind: 'RoomDO',
       expected_gateway_version_id: normalized.candidate_gateway_version_id,
+      expected_gateway_version_tag: normalized.candidate_gateway_version_tag,
       expected_authority_version_id: normalized.baseline_gateway_version_id,
     },
     {
       probe_name: 'old-worker-new-authority',
       authority_kind: 'UserDO',
       expected_gateway_version_id: normalized.baseline_gateway_version_id,
+      expected_gateway_version_tag: normalized.baseline_gateway_version_tag,
       expected_authority_version_id: normalized.candidate_gateway_version_id,
     },
     {
       probe_name: 'old-worker-new-authority',
       authority_kind: 'RoomDO',
       expected_gateway_version_id: normalized.baseline_gateway_version_id,
+      expected_gateway_version_tag: normalized.baseline_gateway_version_tag,
       expected_authority_version_id: normalized.candidate_gateway_version_id,
     },
   ];
   for (const requirement of requiredObservations) {
+    const matchesObservedGatewayIdentity = (entry) => {
+      if (entry.observed_gateway_version_id === requirement.expected_gateway_version_id) {
+        return entry.observed_gateway_version_tag == null
+          || entry.observed_gateway_version_tag === requirement.expected_gateway_version_tag;
+      }
+      return (
+        entry.observed_gateway_version_id == null
+        && entry.observed_gateway_version_tag === requirement.expected_gateway_version_tag
+      );
+    };
     const matched = normalized.observations.some((entry) => (
       entry.probe_name === requirement.probe_name
       && entry.authority_kind === requirement.authority_kind
       && entry.request_gateway_version_id === requirement.expected_gateway_version_id
-      && entry.observed_gateway_version_id === requirement.expected_gateway_version_id
       && entry.observed_authority_version_id === requirement.expected_authority_version_id
+      && matchesObservedGatewayIdentity(entry)
     ));
     if (!matched) {
       return {
@@ -724,10 +752,10 @@ function validatePreReleaseCostObservation(reportLabel, value, {
       error: `${reportLabel} pre_release_cost_observation.capture_method must be cloudflare-official-metrics`,
     };
   }
-  if (!isNonEmptyStringArray(value.source_query_uris) || value.source_query_uris.some((entry) => !isAbsoluteExternalUri(entry))) {
+  if (!isNonEmptyStringArray(value.source_query_uris) || value.source_query_uris.some((entry) => !isOfficialCloudflareLocator(entry))) {
     return {
       valid: false,
-      error: `${reportLabel} pre_release_cost_observation.source_query_uris must be absolute external URIs`,
+      error: `${reportLabel} pre_release_cost_observation.source_query_uris must be official Cloudflare HTTPS locators`,
     };
   }
   if (!isNonEmptyString(value.topology_kind) || value.topology_kind === 'local') {
@@ -828,6 +856,22 @@ function isAbsoluteExternalUri(value) {
       return WELL_FORMED_URN_RE.test(value);
     }
     return parsed.host.length > 0 && !isDisallowedLocalHostname(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
+function isOfficialCloudflareLocator(value) {
+  if (!isAbsoluteExternalUri(value)) {
+    return false;
+  }
+  try {
+    const parsed = new URL(value);
+    const hostname = parsed.hostname.toLowerCase();
+    return (
+      parsed.protocol === 'https:'
+      && (hostname === 'cloudflare.com' || hostname.endsWith('.cloudflare.com'))
+    );
   } catch {
     return false;
   }
@@ -3714,6 +3758,22 @@ export function validateManualArtifactPayload(artifactId, payload, {
       return {
         valid: false,
         error: 'environment run report must not expand local test implementations',
+      };
+    }
+    if (!normalizedExpandedTestFiles.every((file) => pathUsesPrefix(file, environmentDefinition.directory))) {
+      return {
+        valid: false,
+        error: `environment run report expanded_test_files must stay within ${environmentDefinition.directory}`,
+      };
+    }
+    const genericExpandedEntrypoint = normalizedExpandedTestFiles.find((file) => {
+      const basename = path.posix.basename(file);
+      return basename === 'bootstrap.test.mjs' || basename === 'l1-mandatory.test.mjs';
+    });
+    if (genericExpandedEntrypoint != null) {
+      return {
+        valid: false,
+        error: `environment run report expanded_test_files must not include generic entrypoint ${genericExpandedEntrypoint}`,
       };
     }
     if (!isRfc3339UtcTimestamp(payload.started_at) || !isRfc3339UtcTimestamp(payload.completed_at)) {
