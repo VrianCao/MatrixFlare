@@ -24,6 +24,7 @@ import {
   deployNonLocalEnvironment,
   installProductionTopology,
   promoteProductionEnvironment,
+  resolveClosedProdBillingWindow,
   rollbackProductionEnvironment,
   writeReleaseCandidateManifest,
   ensureNonLocalEnvironmentResources,
@@ -581,12 +582,15 @@ async function main() {
   }
   if (requestedEnvironment === 'prod-cost-snapshot') {
     const options = parseKeyValueOptions(process.argv);
+    if (typeof options.from === 'string' || typeof options.to === 'string') {
+      throw new Error('prod-cost-snapshot no longer accepts --from/--to; pass --billing-window');
+    }
     const result = await captureProdCostSnapshot({
       runTimestamp: requireOption(options, 'timestamp'),
       outputPath: path.resolve(process.cwd(), requireOption(options, 'output')),
       artifactRoot: path.resolve(process.cwd(), requireOption(options, 'artifact-root')),
-      fromDate: typeof options.from === 'string' ? options.from : null,
-      toDate: typeof options.to === 'string' ? options.to : null,
+      billingWindow: await readJsonFile(path.resolve(process.cwd(), requireOption(options, 'billing-window'))),
+      prodInstallRecord: await readJsonFile(path.resolve(process.cwd(), requireOption(options, 'install-record'))),
       capturedBy: typeof options['captured-by'] === 'string' ? options['captured-by'] : null,
       reviewedBy: typeof options['reviewed-by'] === 'string' ? options['reviewed-by'] : null,
       accountId: typeof options['account-id'] === 'string' ? options['account-id'] : null,
@@ -597,6 +601,23 @@ async function main() {
       deployment_identity_path: path.relative(process.cwd(), result.deployment_identity_path),
       billing_usage_path: path.relative(process.cwd(), result.billing_usage_path),
       resource_snapshot_path: path.relative(process.cwd(), result.resource_snapshot_path),
+    }, null, 2)}\n`);
+    return;
+  }
+  if (requestedEnvironment === 'prod-cost-billing-window') {
+    const options = parseKeyValueOptions(process.argv);
+    const result = await resolveClosedProdBillingWindow({
+      artifactRoot: typeof options['artifact-root'] === 'string' ? path.resolve(process.cwd(), options['artifact-root']) : null,
+      outputPath: path.resolve(process.cwd(), requireOption(options, 'output')),
+      profileOutputPath: path.resolve(process.cwd(), requireOption(options, 'profile-output')),
+      accountId: typeof options['account-id'] === 'string' ? options['account-id'] : null,
+      apiToken: typeof options['api-token'] === 'string' ? options['api-token'] : null,
+    });
+    process.stdout.write(`${JSON.stringify({
+      output_path: path.relative(process.cwd(), result.output_path),
+      profile_path: path.relative(process.cwd(), result.profile_path),
+      from_date: result.from_date,
+      to_date: result.to_date,
     }, null, 2)}\n`);
     return;
   }

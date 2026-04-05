@@ -38,6 +38,12 @@
 
 ### 3.1 Discovery, Capabilities, and Filter Baseline
 
+对浏览器可直接访问的 Matrix public/client routes，`gateway-worker` 是唯一允许的 CORS termination point：
+
+* `IF-PUB-001`,`IF-CS-001` 以及 `/_matrix/client/*` route family 在收到合法 browser `Origin` 时，实际响应必须返回一致的 CORS allow-origin 语义。
+* 上述 route family 所需的 `OPTIONS` preflight 必须在 `gateway-worker` 直接终结为成功 CORS 响应；不得落到 route-specific `M_UNRECOGNIZED` 或 generic plain-text `404`。
+* 该规则不授权 `/_ops`、内部 RPC 或其它非 Matrix public surface 自动获得 browser CORS 可读性。
+
 | IF-ID | Type | Caller | Callee | Route / Family | Auth | Input / Output | Idempotency | Ordering / Retry | Error Model | Owning Spec | Primary DATA | FLOW |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `IF-PUB-001` | HTTP | client | `gateway-worker` | `GET /.well-known/matrix/client` | none | `WellKnownClientResponse` | n/a | cacheable read | 404 or static JSON | `30` | `DATA-KV-001` | `FLOW-CS-DISCOVERY` |

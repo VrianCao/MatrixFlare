@@ -6,6 +6,7 @@ on:
     - cron: '17 3 1 * *'
 
 permissions:
+  actions: read
   contents: read
   id-token: write
 
@@ -43,30 +44,24 @@ jobs:
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-
-      - name: Require Cloudflare credentials
-        shell: bash
-        run: |
-          test -n "$CLOUDFLARE_ACCOUNT_ID"
-          test -n "$CLOUDFLARE_API_TOKEN"
-
       - name: Define prod-cost paths
         id: paths
         shell: bash
         run: |
           run_timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-          state_root=".tmp/github/prod-cost/state"
-          artifact_root=".tmp/github/prod-cost/artifacts"
+          workspace_root="${RUNNER_TEMP}/matrix-prod-cost-${{ github.run_id }}-${{ github.run_attempt }}"
+          state_root="${workspace_root}/state"
+          artifact_root="${workspace_root}/artifacts"
+          download_root="${workspace_root}/downloads"
           raw_artifact_name="prod-cost-raw-${run_timestamp}-${{ github.run_id }}-${{ github.run_attempt }}"
           attestation_artifact_name="prod-cost-attestation-${run_timestamp}-${{ github.run_id }}-${{ github.run_attempt }}"
           echo "run_timestamp=${run_timestamp}" >> "$GITHUB_OUTPUT"
+          echo "workspace_root=${workspace_root}" >> "$GITHUB_OUTPUT"
           echo "state_root=${state_root}" >> "$GITHUB_OUTPUT"
           echo "artifact_root=${artifact_root}" >> "$GITHUB_OUTPUT"
+          echo "download_root=${download_root}" >> "$GITHUB_OUTPUT"
+          echo "billing_profile=${artifact_root}/billing-profile.json" >> "$GITHUB_OUTPUT"
+          echo "billing_window=${artifact_root}/billing-window.json" >> "$GITHUB_OUTPUT"
           echo "snapshot=${artifact_root}/prod-cost-snapshot.json" >> "$GITHUB_OUTPUT"
           echo "deployment_identity=${artifact_root}/prod-deployment-identity.json" >> "$GITHUB_OUTPUT"
           echo "bundle=${artifact_root}/cost-bundle.tgz" >> "$GITHUB_OUTPUT"
@@ -75,28 +70,107 @@ jobs:
           echo "attestation=${state_root}/prod-cost-attestation.json" >> "$GITHUB_OUTPUT"
           echo "raw_artifact_name=${raw_artifact_name}" >> "$GITHUB_OUTPUT"
           echo "attestation_artifact_name=${attestation_artifact_name}" >> "$GITHUB_OUTPUT"
-          mkdir -p "$state_root" "$artifact_root"
+          mkdir -p "$state_root" "$artifact_root" "$download_root"
           printf '{"run_timestamp":"%s","workflow":"prod-cost-monthly"}\n' "$run_timestamp" > "${artifact_root}/raw-state-metadata.json"
 
-      - name: Define closed monthly billing window
-        id: billing_window
+      - uses: actions/checkout@v4
+        id: checkout_workflow_ref
+
+      - uses: actions/setup-node@v4
+        id: setup_node
+        if: steps.checkout_workflow_ref.outcome == 'success'
+        with:
+          node-version: '22'
+
+      - name: Require Cloudflare credentials
+        id: require_credentials
+        if: steps.setup_node.outcome == 'success'
+        continue-on-error: true
         shell: bash
         run: |
-          from_date="$(date -u -d "$(date -u +%Y-%m-01) -1 month" +%Y-%m-01)"
-          to_date="$(date -u -d "$(date -u +%Y-%m-01) -1 day" +%Y-%m-%d)"
-          echo "from_date=${from_date}" >> "$GITHUB_OUTPUT"
-          echo "to_date=${to_date}" >> "$GITHUB_OUTPUT"
+          missing=()
+          for secret_name in CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN; do
+            if [ -z "${!secret_name}" ]; then
+              missing+=("$secret_name")
+            fi
+          done
+
+          missing_json="$(printf '%s\n' "${missing[@]}" | node -e "const fs=require('fs');const values=fs.readFileSync(0,'utf8').split(/\n/).filter(Boolean);process.stdout.write(JSON.stringify(values));")"
+          cat > "${{ steps.paths.outputs.artifact_root }}/credentials-check.json" <<EOF
+          {
+            "required_secrets": [
+              "CLOUDFLARE_ACCOUNT_ID",
+              "CLOUDFLARE_API_TOKEN"
+            ],
+            "missing_secrets": ${missing_json}
+          }
+          EOF
+
+          if [ "${#missing[@]}" -ne 0 ]; then
+            echo "Missing required Cloudflare credentials: ${missing[*]}" >&2
+            exit 1
+          fi
+
+      - name: Resolve closed production billing window
+        id: billing_window
+        if: steps.require_credentials.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          result_json="${{ steps.paths.outputs.state_root }}/billing-window-result.json"
+          node packages/testing/src/cli.mjs prod-cost-billing-window \
+            --artifact-root "${{ steps.paths.outputs.artifact_root }}" \
+            --output "${{ steps.paths.outputs.billing_window }}" \
+            --profile-output "${{ steps.paths.outputs.billing_profile }}" \
+            > "$result_json"
+          node -e "const fs=require('fs');const payload=JSON.parse(fs.readFileSync(process.argv[1],'utf8'));process.stdout.write(\`from_date=\${payload.from_date}\\n\`);process.stdout.write(\`to_date=\${payload.to_date}\\n\`);" "$result_json" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve latest successful prod-install baseline run
+        id: install_run
+        if: steps.require_credentials.outcome == 'success'
+        continue-on-error: true
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const runs = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'prod-install.yml',
+              status: 'completed',
+              per_page: 20,
+            });
+            const successRun = runs.data.workflow_runs.find((run) => run.conclusion === 'success');
+            if (!successRun) {
+              core.setFailed('No successful prod-install workflow run found for the current repository baseline');
+              return;
+            }
+            core.setOutput('install_run_id', String(successRun.id));
+            core.setOutput('install_run_attempt', String(successRun.run_attempt));
+
+      - name: Download prod install baseline record
+        id: download_install_record
+        if: steps.install_run.outcome == 'success'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.install_run.outputs.install_run_id }}
+          pattern: prod-install-record-*-${{ steps.install_run.outputs.install_run_id }}-${{ steps.install_run.outputs.install_run_attempt }}
+          merge-multiple: true
+          path: ${{ steps.paths.outputs.download_root }}
 
       - name: Capture production cost snapshot
         id: capture_snapshot
+        if: steps.billing_window.outcome == 'success' && steps.download_install_record.outcome == 'success'
         continue-on-error: true
         run: |
           node packages/testing/src/cli.mjs prod-cost-snapshot \
             --timestamp "${{ steps.paths.outputs.run_timestamp }}" \
             --artifact-root "${{ steps.paths.outputs.artifact_root }}" \
             --output "${{ steps.paths.outputs.snapshot }}" \
-            --from "${{ steps.billing_window.outputs.from_date }}" \
-            --to "${{ steps.billing_window.outputs.to_date }}" \
+            --billing-window "${{ steps.paths.outputs.billing_window }}" \
+            --install-record "${{ steps.paths.outputs.download_root }}/prod-install-record.json" \
             --captured-by "github-actions:${{ github.actor }}" \
             --reviewed-by "github-actions-run:${{ github.run_id }}"
 
@@ -118,7 +192,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.paths.outputs.raw_artifact_name }}
-          path: ${{ steps.paths.outputs.artifact_root }}
+          path: |
+            ${{ steps.paths.outputs.artifact_root }}
+            ${{ steps.paths.outputs.download_root }}
           if-no-files-found: error
 
       - name: Upload raw prod-cost bundle to R2
@@ -162,6 +238,30 @@ jobs:
         if: always()
         shell: bash
         run: |
+          if [ "${{ steps.checkout_workflow_ref.outcome }}" != "success" ]; then
+            echo "Checking out the workflow ref for prod-cost-monthly failed after raw artifacts were preserved." >&2
+            exit 1
+          fi
+          if [ "${{ steps.setup_node.outcome }}" != "success" ]; then
+            echo "Setting up Node.js for prod-cost-monthly failed after raw artifacts were preserved." >&2
+            exit 1
+          fi
+          if [ "${{ steps.require_credentials.outcome }}" != "success" ]; then
+            echo "Required Cloudflare credentials were missing after raw artifacts were preserved." >&2
+            exit 1
+          fi
+          if [ "${{ steps.billing_window.outcome }}" != "success" ]; then
+            echo "Resolving the closed production billing window failed after raw artifacts were preserved." >&2
+            exit 1
+          fi
+          if [ "${{ steps.install_run.outcome }}" != "success" ]; then
+            echo "Resolving the latest successful prod-install baseline run failed after raw artifacts were preserved." >&2
+            exit 1
+          fi
+          if [ "${{ steps.download_install_record.outcome }}" != "success" ]; then
+            echo "Downloading the prod install baseline record failed after raw artifacts were preserved." >&2
+            exit 1
+          fi
           if [ "${{ steps.capture_snapshot.outcome }}" != "success" ]; then
             echo "Capture production cost snapshot failed after raw artifacts were preserved." >&2
             exit 1

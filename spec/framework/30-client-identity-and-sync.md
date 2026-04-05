@@ -45,8 +45,15 @@
 * `/sync` 长轮询持有
 * 响应聚合与流式输出
 * 将房间写路径转交 `RoomDO`
+* 浏览器 Matrix Client-Server 流量的 CORS / preflight 终结
 
 `gateway-worker` 不得拥有任何客户端真相。
+
+对浏览器可达的 Matrix 公开入口，`gateway-worker` 还必须满足：
+
+* `/.well-known/matrix/client`、`/_matrix/client/versions` 与 `/_matrix/client/*` 在收到合法 browser `Origin` 时，实际响应必须返回一致的 CORS allow-origin 语义，避免 Web client 因跨域读取被阻断。
+* 对这些同一路由族所需的 `OPTIONS` preflight，`gateway-worker` 必须直接返回 `2xx/204` CORS 响应；不得把预检请求落到 route-specific `M_UNRECOGNIZED` 或 plain-text `404`。
+* 该要求只适用于公开 Matrix client ingress；不得借此把受保护的 `/_ops` 或其它非 Matrix 管理面扩大成 browser-readable public surface。
 
 ## 3. 用户、设备与会话模型
 

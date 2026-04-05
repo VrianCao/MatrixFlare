@@ -128,6 +128,69 @@ function matrixErrorResponse(status, errcode, error, extra = null, headers = {})
   );
 }
 
+const PUBLIC_MATRIX_CORS_METHODS = Object.freeze(['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS']);
+const PUBLIC_MATRIX_CORS_HEADER_FALLBACK = 'authorization, content-type';
+
+function isBrowserOrigin(origin) {
+  if (typeof origin !== 'string') {
+    return false;
+  }
+  try {
+    const parsed = new URL(origin);
+    return parsed.protocol === 'https:' || parsed.protocol === 'http:';
+  } catch {
+    return false;
+  }
+}
+
+function isPublicMatrixCorsPath(pathname) {
+  return pathname === '/.well-known/matrix/client'
+    || pathname === '/_matrix/client/versions'
+    || pathname.startsWith('/_matrix/client/');
+}
+
+function appendVary(headers, value) {
+  const existing = headers.get('vary');
+  if (!existing) {
+    headers.set('vary', value);
+    return;
+  }
+  const parts = existing.split(',').map((part) => part.trim().toLowerCase());
+  if (!parts.includes(value.toLowerCase())) {
+    headers.set('vary', `${existing}, ${value}`);
+  }
+}
+
+function buildPublicMatrixCorsHeaders(request) {
+  const origin = request.headers.get('origin');
+  if (!isBrowserOrigin(origin)) {
+    return null;
+  }
+  const requestedHeaders = request.headers.get('access-control-request-headers');
+  return {
+    'access-control-allow-origin': origin,
+    'access-control-allow-methods': PUBLIC_MATRIX_CORS_METHODS.join(', '),
+    'access-control-allow-headers': requestedHeaders?.trim() || PUBLIC_MATRIX_CORS_HEADER_FALLBACK,
+    'access-control-max-age': '86400',
+  };
+}
+
+function buildPublicMatrixCorsPreflightResponse(request) {
+  const corsHeaders = buildPublicMatrixCorsHeaders(request);
+  if (corsHeaders == null) {
+    return new Response(null, {
+      status: 204,
+    });
+  }
+  const headers = new Headers(corsHeaders);
+  appendVary(headers, 'Origin');
+  appendVary(headers, 'Access-Control-Request-Headers');
+  return new Response(null, {
+    status: 204,
+    headers,
+  });
+}
+
 const ROLLOUT_PROBE_SECRET_HEADER = 'x-matrix-rollout-probe-secret';
 const ROLLOUT_PROBE_GATEWAY_VERSION_ID_HEADER = 'x-matrix-rollout-probe-gateway-version-id';
 const ROLLOUT_PROBE_GATEWAY_VERSION_TAG_HEADER = 'x-matrix-rollout-probe-gateway-version-tag';
@@ -140,22 +203,35 @@ function shouldExposeRolloutProbeHeaders(request, env) {
   return configuredSecret.length > 0 && providedSecret.length > 0 && configuredSecret === providedSecret;
 }
 
-function attachRolloutProbeHeaders(request, env, response) {
-  if (!shouldExposeRolloutProbeHeaders(request, env)) {
+function decorateGatewayResponse(request, env, pathname, response) {
+  const corsHeaders = isPublicMatrixCorsPath(pathname)
+    ? buildPublicMatrixCorsHeaders(request)
+    : null;
+  const exposeRolloutHeaders = shouldExposeRolloutProbeHeaders(request, env);
+  if (corsHeaders == null && !exposeRolloutHeaders) {
     return response;
   }
   const headers = new Headers(response.headers);
-  const versionId = typeof env.CF_VERSION_METADATA?.id === 'string'
-    ? env.CF_VERSION_METADATA.id.trim()
-    : '';
-  if (versionId.length > 0) {
-    headers.set(ROLLOUT_PROBE_GATEWAY_VERSION_ID_HEADER, versionId);
+  if (corsHeaders != null) {
+    for (const [name, value] of Object.entries(corsHeaders)) {
+      headers.set(name, value);
+    }
+    appendVary(headers, 'Origin');
+    appendVary(headers, 'Access-Control-Request-Headers');
   }
-  const versionTag = typeof env.CF_VERSION_METADATA?.tag === 'string'
-    ? env.CF_VERSION_METADATA.tag.trim()
-    : '';
-  if (versionTag.length > 0) {
-    headers.set(ROLLOUT_PROBE_GATEWAY_VERSION_TAG_HEADER, versionTag);
+  if (exposeRolloutHeaders) {
+    const versionId = typeof env.CF_VERSION_METADATA?.id === 'string'
+      ? env.CF_VERSION_METADATA.id.trim()
+      : '';
+    if (versionId.length > 0) {
+      headers.set(ROLLOUT_PROBE_GATEWAY_VERSION_ID_HEADER, versionId);
+    }
+    const versionTag = typeof env.CF_VERSION_METADATA?.tag === 'string'
+      ? env.CF_VERSION_METADATA.tag.trim()
+      : '';
+    if (versionTag.length > 0) {
+      headers.set(ROLLOUT_PROBE_GATEWAY_VERSION_TAG_HEADER, versionTag);
+    }
   }
   return new Response(response.body, {
     status: response.status,
@@ -4736,7 +4812,7 @@ async function handleRequest(request, env) {
         : { cpu_ms: Math.round(completed.cpu_ms) }),
       ...(errorClass == null ? {} : { error_class: errorClass }),
     });
-    return attachRolloutProbeHeaders(request, env, response);
+    return decorateGatewayResponse(request, env, pathname, response);
   };
 
   requestContext.logger.info('gateway.request.start', {
@@ -4744,6 +4820,9 @@ async function handleRequest(request, env) {
     path: pathname,
   });
   try {
+    if (method === 'OPTIONS' && isPublicMatrixCorsPath(pathname)) {
+      return finalizeResponse(buildPublicMatrixCorsPreflightResponse(request));
+    }
     const abuseResponse = await enforceGatewayAbuseGuard(request, env, classification);
     const response = await (async () => {
       if (abuseResponse) {
