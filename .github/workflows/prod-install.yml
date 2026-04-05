@@ -38,13 +38,6 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Require production secrets
-        shell: bash
-        run: |
-          test -n "$CLOUDFLARE_ACCOUNT_ID"
-          test -n "$CLOUDFLARE_API_TOKEN"
-          test -n "$MATRIX_PROD_SECRET_SEED"
-
       - name: Define install paths
         id: paths
         shell: bash
@@ -69,8 +62,38 @@ jobs:
           mkdir -p "$workspace_root" "$state_root" "$artifact_root"
           printf '{"run_timestamp":"%s","workflow":"prod-install"}\n' "$run_timestamp" > "${state_root}/raw-state-metadata.json"
 
+      - name: Require production secrets
+        id: require_secrets
+        continue-on-error: true
+        shell: bash
+        run: |
+          missing=()
+          for secret_name in CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN MATRIX_PROD_SECRET_SEED; do
+            if [ -z "${!secret_name}" ]; then
+              missing+=("$secret_name")
+            fi
+          done
+
+          missing_json="$(printf '%s\n' "${missing[@]}" | node -e "const fs=require('fs');const values=fs.readFileSync(0,'utf8').split(/\n/).filter(Boolean);process.stdout.write(JSON.stringify(values));")"
+          cat > "${{ steps.paths.outputs.state_root }}/secret-check.json" <<EOF
+          {
+            "required_secrets": [
+              "CLOUDFLARE_ACCOUNT_ID",
+              "CLOUDFLARE_API_TOKEN",
+              "MATRIX_PROD_SECRET_SEED"
+            ],
+            "missing_secrets": ${missing_json}
+          }
+          EOF
+
+          if [ "${#missing[@]}" -ne 0 ]; then
+            echo "Missing required production secrets: ${missing[*]}" >&2
+            exit 1
+          fi
+
       - name: Install production topology
         id: install_topology
+        if: steps.require_secrets.outcome == 'success'
         continue-on-error: true
         run: |
           args=(
@@ -119,6 +142,10 @@ jobs:
         if: always()
         shell: bash
         run: |
+          if [ "${{ steps.require_secrets.outcome }}" != "success" ]; then
+            echo "Required production secrets were missing after raw state preservation." >&2
+            exit 1
+          fi
           if [ "${{ steps.install_topology.outcome }}" != "success" ]; then
             echo "Install production topology failed after raw state preservation." >&2
             exit 1

@@ -3515,6 +3515,9 @@ test('production workflow YAMLs stay aligned with the prod automation CLI contra
   assert.match(prodInstallWorkflow, /environment:\s+prod/u, 'prod-install must run in the protected GitHub prod environment');
   assert.match(prodInstallWorkflow, /node packages\/testing\/src\/cli\.mjs prod-install/u, 'prod-install workflow must invoke the prod-install CLI entry');
   assert.match(prodInstallWorkflow, /--install-id/u, 'prod-install workflow must pass an explicit install id');
+  assert.match(prodInstallWorkflow, /id:\s+paths[\s\S]*?name:\s+Require production secrets/iu, 'prod-install must define raw-artifact paths before secret preflight');
+  assert.match(prodInstallWorkflow, /id:\s+require_secrets[\s\S]*?continue-on-error:\s+true/u, 'prod-install secret preflight must fail closed only after raw state can be preserved');
+  assert.match(prodInstallWorkflow, /secret-check\.json/u, 'prod-install must persist a machine-readable secret blocker artifact');
   assert.match(prodInstallWorkflow, /id:\s+install_topology[\s\S]*?continue-on-error:\s+true/u, 'prod-install must preserve raw state before failing closed');
   assert.match(prodInstallWorkflow, /prod-install-raw-state-/u, 'prod-install must upload a dedicated raw-state artifact');
 
@@ -3537,6 +3540,9 @@ test('production workflow YAMLs stay aligned with the prod automation CLI contra
   assert.match(promoteProdWorkflow, /--promotion-id/u, 'promote-prod workflow must persist an explicit promotion id');
   assert.doesNotMatch(promoteProdWorkflow, /--install-record/u, 'promote-prod workflow must not use the superseded install-record flag');
   assert.doesNotMatch(promoteProdWorkflow, /workers_subdomain:/u, 'promote-prod must not reintroduce manual workers_subdomain input friction');
+  assert.match(promoteProdWorkflow, /id:\s+paths[\s\S]*?name:\s+Require production secrets/iu, 'promote-prod must define raw-artifact paths before secret preflight');
+  assert.match(promoteProdWorkflow, /id:\s+require_secrets[\s\S]*?continue-on-error:\s+true/u, 'promote-prod secret preflight must fail closed only after raw state can be preserved');
+  assert.match(promoteProdWorkflow, /secret-check\.json/u, 'promote-prod must persist a machine-readable secret blocker artifact');
   assert.match(promoteProdWorkflow, /id:\s+runs[\s\S]*?continue-on-error:\s+true/u, 'promote-prod must preserve raw state when upstream run resolution fails');
   assert.match(promoteProdWorkflow, /id:\s+download_candidate[\s\S]*?continue-on-error:\s+true/u, 'promote-prod must preserve raw state when candidate download fails');
   assert.match(promoteProdWorkflow, /id:\s+download_baseline[\s\S]*?continue-on-error:\s+true/u, 'promote-prod must preserve raw state when baseline download fails');
