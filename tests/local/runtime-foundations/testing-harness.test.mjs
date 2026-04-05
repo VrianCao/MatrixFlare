@@ -393,15 +393,22 @@ function buildValidProdCostSnapshot(runTimestamp, overrides = {}) {
   return {
     artifact_id: 'prod_cost_snapshot',
     source_environment: 'prod',
-    captured_at: '2026-03-31T14:00:00.000Z',
+    captured_at: '2026-05-16T14:00:00.000Z',
     captured_by: 'finance-bot',
     reviewed_by: 'platform-reviewer',
-    source_dashboard_uri: 'https://example.invalid/cost/2026-03',
+    source_dashboard_uri: 'https://api.cloudflare.com/client/v4/accounts/cf-account/billing/usage/paygo?from=2026-04-16&to=2026-05-15',
+    billing_window_resolution_method: 'cloudflare-account-billing-profile-next-bill-date',
+    billing_cycle_next_bill_date: '2026-06-15T12:21:59.345Z',
     topology_kind: 'cloudflare-prod',
+    topology_baseline_install: {
+      install_id: 'install-prod-topology-v1',
+      installed_at: '2026-04-05T11:43:28.000Z',
+      origin_run_uri: 'https://github.com/VrianCao/MatrixFlare/actions/runs/24000789563',
+    },
     cloudflare_resources: buildExpectedCloudflareResources('prod'),
     billing_period: {
-      start: '2026-03-01T00:00:00.000Z',
-      end: '2026-03-31T00:00:00.000Z',
+      start: '2026-04-16T00:00:00.000Z',
+      end: '2026-05-15T00:00:00.000Z',
     },
     cost_surfaces: {
       workers: { request_count: 1000, cpu_ms: 250000, log_event_count: 500 },
@@ -2089,7 +2096,7 @@ test('manual artifact payload validation requires structured non-local reports a
     }),
     {
       valid: false,
-      error: 'prod_cost_snapshot must include an absolute external source_dashboard_uri',
+      error: 'prod_cost_snapshot source_dashboard_uri must be an official Cloudflare HTTPS locator',
     },
   );
 
@@ -2102,7 +2109,91 @@ test('manual artifact payload validation requires structured non-local reports a
     }),
     {
       valid: false,
-      error: 'prod_cost_snapshot must include an absolute external source_dashboard_uri',
+      error: 'prod_cost_snapshot source_dashboard_uri must be an official Cloudflare HTTPS locator',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('prod_cost_snapshot', {
+      ...validProdCostSnapshot,
+      billing_window_resolution_method: 'manual-calendar-month',
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'prod_cost_snapshot billing_window_resolution_method must be cloudflare-account-billing-profile-next-bill-date',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('prod_cost_snapshot', {
+      ...validProdCostSnapshot,
+      billing_cycle_next_bill_date: '2026-06-15T12:21:59+02:00',
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'prod_cost_snapshot billing_cycle_next_bill_date must be an RFC 3339 UTC timestamp',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('prod_cost_snapshot', {
+      ...validProdCostSnapshot,
+      billing_cycle_next_bill_date: '2026-04-15T12:21:59.345Z',
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'prod_cost_snapshot billing_cycle_next_bill_date must not be earlier than the captured_at date',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('prod_cost_snapshot', {
+      ...validProdCostSnapshot,
+      topology_baseline_install: null,
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'prod_cost_snapshot must include topology_baseline_install',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('prod_cost_snapshot', {
+      ...validProdCostSnapshot,
+      billing_period: {
+        start: '2026-04-01T00:00:00.000Z',
+        end: '2026-05-15T00:00:00.000Z',
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'prod_cost_snapshot billing_period.start must match the latest closed billing period derived from billing_cycle_next_bill_date',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('prod_cost_snapshot', {
+      ...validProdCostSnapshot,
+      topology_baseline_install: {
+        ...validProdCostSnapshot.topology_baseline_install,
+        installed_at: '2026-04-16T09:00:00.000Z',
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'prod_cost_snapshot billing_period.start must be after topology_baseline_install.installed_at date',
     },
   );
 

@@ -2040,6 +2040,20 @@ function buildBillingUsageApiPath({
   return `/billing/usage/paygo${query.length > 0 ? `?${query}` : ''}`;
 }
 
+function formatBillingPeriodDateFromUtcMillis(utcMillis, label) {
+  if (!Number.isFinite(utcMillis)) {
+    throw new RangeError(`${label} must be a valid UTC timestamp`);
+  }
+  return new Date(utcMillis).toISOString().slice(0, 10);
+}
+
+function currentUtcBillingDate(now = new Date(), label = 'current UTC date') {
+  return formatBillingPeriodDateFromUtcMillis(
+    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()),
+    label,
+  );
+}
+
 function parseBillingPeriodDateToUtcMillis(value, label) {
   const normalized = assertBillingPeriodDate(value, label);
   const parsed = Date.parse(`${normalized}T00:00:00.000Z`);
@@ -2060,41 +2074,152 @@ function normalizeObservedBillingDate(value, label) {
   return new Date(parsed).toISOString().slice(0, 10);
 }
 
-function normalizeClosedMonthlyBillingWindow({
+function shiftBillingPeriodDateByMonths(value, months, label) {
+  const normalized = assertBillingPeriodDate(value, label);
+  const [yearString, monthString, dayString] = normalized.split('-');
+  const year = Number(yearString);
+  const monthIndex = Number(monthString) - 1;
+  const day = Number(dayString);
+  const shiftedMonthIndex = monthIndex + Number(months);
+  const normalizedYear = year + Math.floor(shiftedMonthIndex / 12);
+  const normalizedMonthIndex = ((shiftedMonthIndex % 12) + 12) % 12;
+  const lastDayOfTargetMonth = new Date(Date.UTC(normalizedYear, normalizedMonthIndex + 1, 0)).getUTCDate();
+  const normalizedDay = Math.min(day, lastDayOfTargetMonth);
+  return formatBillingPeriodDateFromUtcMillis(
+    Date.UTC(normalizedYear, normalizedMonthIndex, normalizedDay),
+    label,
+  );
+}
+
+function addBillingPeriodDays(value, days, label) {
+  const utcMillis = parseBillingPeriodDateToUtcMillis(value, label);
+  return formatBillingPeriodDateFromUtcMillis(utcMillis + (Number(days) * 24 * 60 * 60 * 1000), label);
+}
+
+function normalizeUpcomingBillingProfileNextBillDate(nextBillDate, {
+  now = new Date(),
+  label = 'Cloudflare billing profile next_bill_date',
+} = {}) {
+  const normalizedNextBillDate = normalizeObservedBillingDate(nextBillDate, label);
+  const todayDate = currentUtcBillingDate(now, 'current UTC date');
+  const nextBillDateMillis = parseBillingPeriodDateToUtcMillis(normalizedNextBillDate, label);
+  const todayMillis = parseBillingPeriodDateToUtcMillis(todayDate, 'current UTC date');
+  if (nextBillDateMillis < todayMillis) {
+    throw new Error(`${label} must not be earlier than the current UTC date when resolving the latest closed billing period`);
+  }
+  const latestExpectedNextBillDate = addBillingPeriodDays(
+    todayDate,
+    31,
+    `${label} upper bound`,
+  );
+  if (nextBillDateMillis > parseBillingPeriodDateToUtcMillis(latestExpectedNextBillDate, `${label} upper bound`)) {
+    throw new Error(`${label} must be within 31 days of the current UTC date when resolving the latest closed billing period`);
+  }
+  return normalizedNextBillDate;
+}
+
+function normalizeCloudflareBillingProfile(value) {
+  if (!isPlainObject(value)) {
+    throw new TypeError('Cloudflare billing profile result must be an object');
+  }
+  const nextBillDate = stableString(value.next_bill_date);
+  if (!isNonEmptyString(nextBillDate) || !Number.isFinite(Date.parse(nextBillDate))) {
+    throw new Error('Cloudflare billing profile must include a valid next_bill_date');
+  }
+  return Object.freeze({
+    next_bill_date: nextBillDate,
+  });
+}
+
+function normalizeClosedBillingWindow({
   fromDate = null,
   toDate = null,
+  now = new Date(),
 } = {}) {
   if (fromDate == null || toDate == null) {
-    throw new Error('production cost snapshot requires explicit --from and --to dates for a closed monthly billing window');
+    throw new Error('production cost snapshot requires explicit --from and --to dates for a closed billing window');
   }
   const normalizedFromDate = assertBillingPeriodDate(fromDate, 'billing from date');
   const normalizedToDate = assertBillingPeriodDate(toDate, 'billing to date');
   const fromMillis = parseBillingPeriodDateToUtcMillis(normalizedFromDate, 'billing from date');
   const toMillis = parseBillingPeriodDateToUtcMillis(normalizedToDate, 'billing to date');
-  const fromDateValue = new Date(fromMillis);
-  if (fromDateValue.getUTCDate() !== 1) {
-    throw new Error('production cost snapshot from date must be the first day of a calendar month');
+  if (fromMillis > toMillis) {
+    throw new Error('production cost snapshot billing window start must be on or before the billing window end');
   }
-  const expectedToMillis = Date.UTC(
-    fromDateValue.getUTCFullYear(),
-    fromDateValue.getUTCMonth() + 1,
-    0,
-  );
-  if (toMillis !== expectedToMillis) {
-    throw new Error('production cost snapshot to date must be the last day of the same calendar month');
-  }
-  const now = new Date();
   const todayStartMillis = Date.UTC(
     now.getUTCFullYear(),
     now.getUTCMonth(),
     now.getUTCDate(),
   );
   if (toMillis >= todayStartMillis) {
-    throw new Error('production cost snapshot requires a closed monthly billing window that ends before today');
+    throw new Error('production cost snapshot requires a closed billing window that ends before today');
   }
   return Object.freeze({
     fromDate: normalizedFromDate,
     toDate: normalizedToDate,
+  });
+}
+
+function deriveClosedBillingWindowFromNextBillDate({
+  nextBillDate,
+  now = new Date(),
+} = {}) {
+  const normalizedNextBillDate = normalizeUpcomingBillingProfileNextBillDate(nextBillDate, {
+    now,
+    label: 'Cloudflare billing profile next_bill_date',
+  });
+  const closedPeriodEndDate = shiftBillingPeriodDateByMonths(
+    normalizedNextBillDate,
+    -1,
+    'Cloudflare billing profile next_bill_date',
+  );
+  const previousBillingAnchorDate = shiftBillingPeriodDateByMonths(
+    normalizedNextBillDate,
+    -2,
+    'Cloudflare billing profile next_bill_date',
+  );
+  const closedPeriodStartDate = addBillingPeriodDays(
+    previousBillingAnchorDate,
+    1,
+    'resolved production billing window start',
+  );
+  return Object.freeze({
+    nextBillDate: normalizedNextBillDate,
+    ...normalizeClosedBillingWindow({
+      fromDate: closedPeriodStartDate,
+      toDate: closedPeriodEndDate,
+      now,
+    }),
+  });
+}
+
+function normalizeResolvedClosedProdBillingWindow(value, {
+  now = new Date(),
+} = {}) {
+  if (!isPlainObject(value)) {
+    throw new TypeError('resolved production billing window must be an object');
+  }
+  if (stableString(value.resolution_method) !== 'cloudflare-account-billing-profile-next-bill-date') {
+    throw new Error('resolved production billing window resolution_method must be cloudflare-account-billing-profile-next-bill-date');
+  }
+  const billingProfile = normalizeCloudflareBillingProfile({
+    next_bill_date: value.next_bill_date,
+  });
+  const derivedBillingWindow = deriveClosedBillingWindowFromNextBillDate({
+    nextBillDate: billingProfile.next_bill_date,
+    now,
+  });
+  if (stableString(value.from_date) !== derivedBillingWindow.fromDate) {
+    throw new Error('resolved production billing window from_date must match the latest closed billing period derived from next_bill_date');
+  }
+  if (stableString(value.to_date) !== derivedBillingWindow.toDate) {
+    throw new Error('resolved production billing window to_date must match the latest closed billing period derived from next_bill_date');
+  }
+  return Object.freeze({
+    resolutionMethod: 'cloudflare-account-billing-profile-next-bill-date',
+    nextBillDate: billingProfile.next_bill_date,
+    fromDate: derivedBillingWindow.fromDate,
+    toDate: derivedBillingWindow.toDate,
   });
 }
 
@@ -2452,17 +2577,17 @@ function assertBillingUsageMatchesClosedMonthlyWindow(billingUsageRecords, billi
     const observedChargePeriodEnd = normalizeObservedBillingDate(record.charge_period_end, `billing usage record ${index} ChargePeriodEnd`);
     if (observedBillingPeriodStart !== billingWindow.fromDate) {
       throw new Error(
-        `Cloudflare billing usage record ${index} BillingPeriodStart ${observedBillingPeriodStart} does not match requested production monthly window start ${billingWindow.fromDate}`,
+        `Cloudflare billing usage record ${index} BillingPeriodStart ${observedBillingPeriodStart} does not match requested production billing window start ${billingWindow.fromDate}`,
       );
     }
     if (observedChargePeriodStart !== billingWindow.fromDate) {
       throw new Error(
-        `Cloudflare billing usage record ${index} ChargePeriodStart ${observedChargePeriodStart} does not match requested production monthly window start ${billingWindow.fromDate}`,
+        `Cloudflare billing usage record ${index} ChargePeriodStart ${observedChargePeriodStart} does not match requested production billing window start ${billingWindow.fromDate}`,
       );
     }
     if (observedChargePeriodEnd !== billingWindow.toDate) {
       throw new Error(
-        `Cloudflare billing usage record ${index} ChargePeriodEnd ${observedChargePeriodEnd} does not match requested production monthly window end ${billingWindow.toDate}`,
+        `Cloudflare billing usage record ${index} ChargePeriodEnd ${observedChargePeriodEnd} does not match requested production billing window end ${billingWindow.toDate}`,
       );
     }
   }
@@ -2651,12 +2776,88 @@ export async function writeProdCostSnapshotProvenance(outputPath, options, {
   };
 }
 
+export async function resolveClosedProdBillingWindow({
+  artifactRoot = null,
+  outputPath,
+  profileOutputPath,
+  accountId: explicitAccountId = null,
+  apiToken: explicitApiToken = null,
+} = {}, {
+  requireGitHubActionsExecutionImpl = requireGitHubActionsExecution,
+  requireCloudflareCredentialsImpl = requireCloudflareCredentials,
+  callCloudflareApiImpl = callCloudflareApi,
+  now = new Date(),
+} = {}) {
+  await requireGitHubActionsExecutionImpl('resolveClosedProdBillingWindow', {
+    expectedEnvironmentName: PRODUCTION_ENVIRONMENT_NAME,
+  });
+  const { accountId, apiToken } = requireCloudflareCredentialsImpl({
+    accountId: explicitAccountId,
+    apiToken: explicitApiToken,
+  });
+  const resolvedArtifactRoot = path.resolve(artifactRoot ?? path.join(process.cwd(), '.tmp', 'prod-cost'));
+  const resolvedOutputPath = path.resolve(outputPath ?? path.join(resolvedArtifactRoot, 'billing-window.json'));
+  const resolvedProfileOutputPath = path.resolve(profileOutputPath ?? path.join(resolvedArtifactRoot, 'billing-profile.json'));
+  await Promise.all([
+    fs.mkdir(path.dirname(resolvedOutputPath), { recursive: true }),
+    fs.mkdir(path.dirname(resolvedProfileOutputPath), { recursive: true }),
+  ]);
+
+  let profilePayload = null;
+  try {
+    profilePayload = await callCloudflareApiImpl({
+      accountId,
+      apiToken,
+      pathname: '/billing/profile',
+    });
+    await fs.writeFile(resolvedProfileOutputPath, stableJson(profilePayload));
+    const billingProfile = normalizeCloudflareBillingProfile(profilePayload.result);
+    const billingWindow = deriveClosedBillingWindowFromNextBillDate({
+      nextBillDate: billingProfile.next_bill_date,
+      now,
+    });
+    const outputPayload = {
+      resolution_method: 'cloudflare-account-billing-profile-next-bill-date',
+      next_bill_date: billingProfile.next_bill_date,
+      from_date: billingWindow.fromDate,
+      to_date: billingWindow.toDate,
+    };
+    await fs.writeFile(resolvedOutputPath, stableJson(outputPayload));
+    return {
+      output_path: resolvedOutputPath,
+      profile_path: resolvedProfileOutputPath,
+      from_date: billingWindow.fromDate,
+      to_date: billingWindow.toDate,
+      billing_window: billingWindow,
+      billing_profile: billingProfile,
+    };
+  } catch (error) {
+    const diagnosticPayload = profilePayload == null
+      ? {
+          pathname: '/billing/profile',
+          error: String(error?.message ?? error),
+        }
+      : {
+          profile_payload: profilePayload,
+          error: String(error?.message ?? error),
+        };
+    await Promise.allSettled([
+      fs.writeFile(resolvedProfileOutputPath, stableJson(diagnosticPayload)),
+      fs.writeFile(resolvedOutputPath, stableJson({
+        resolution_method: 'cloudflare-account-billing-profile-next-bill-date',
+        error: String(error?.message ?? error),
+      })),
+    ]);
+    throw error;
+  }
+}
+
 export async function captureProdCostSnapshot({
   runTimestamp,
   outputPath,
   artifactRoot,
-  fromDate = null,
-  toDate = null,
+  billingWindow = null,
+  prodInstallRecord = null,
   capturedBy = null,
   reviewedBy = null,
   accountId: explicitAccountId = null,
@@ -2667,6 +2868,7 @@ export async function captureProdCostSnapshot({
   callCloudflareApiImpl = callCloudflareApi,
   fetchWorkerDeploymentStateImpl = fetchWorkerDeploymentState,
   fetchWorkerBindingStateImpl = fetchWorkerBindingState,
+  now = new Date(),
 } = {}) {
   const claims = await requireGitHubActionsExecutionImpl('captureProdCostSnapshot', {
     expectedEnvironmentName: PRODUCTION_ENVIRONMENT_NAME,
@@ -2674,10 +2876,25 @@ export async function captureProdCostSnapshot({
   if (!isNonEmptyString(runTimestamp)) {
     throw new RangeError('runTimestamp is required');
   }
-  const billingWindow = normalizeClosedMonthlyBillingWindow({
-    fromDate,
-    toDate,
+  const normalizedBillingWindow = normalizeResolvedClosedProdBillingWindow(billingWindow, {
+    now,
   });
+  const prodInstallRecordValidation = validateProdInstallRecord(prodInstallRecord, {
+    expectedGitHubRepository: String(claims.repository ?? ''),
+  });
+  if (!prodInstallRecordValidation.valid) {
+    throw new Error(`production cost snapshot requires a valid prod install record: ${prodInstallRecordValidation.error}`);
+  }
+  const prodInstallDate = normalizeObservedBillingDate(
+    prodInstallRecord.installed_at,
+    'prod install record installed_at',
+  );
+  if (
+    parseBillingPeriodDateToUtcMillis(normalizedBillingWindow.fromDate, 'resolved production billing window from_date')
+    <= parseBillingPeriodDateToUtcMillis(prodInstallDate, 'prod install record installed_at')
+  ) {
+    throw new Error(`production cost snapshot requires a closed billing window that starts after prod install date ${prodInstallDate}`);
+  }
   const { accountId, apiToken } = requireCloudflareCredentialsImpl({
     accountId: explicitAccountId,
     apiToken: explicitApiToken,
@@ -2712,8 +2929,8 @@ export async function captureProdCostSnapshot({
   const deploymentIdentityPath = path.join(resolvedArtifactRoot, 'prod-deployment-identity.json');
 
   const billingUsagePathname = buildBillingUsageApiPath({
-    fromDate: billingWindow.fromDate,
-    toDate: billingWindow.toDate,
+    fromDate: normalizedBillingWindow.fromDate,
+    toDate: normalizedBillingWindow.toDate,
   });
   const billingUsagePayload = await callCloudflareApiImpl({
     accountId,
@@ -2734,7 +2951,7 @@ export async function captureProdCostSnapshot({
   if (billingUsageRecords.length === 0) {
     throw new Error('Cloudflare billing usage API returned zero records for the requested production billing window');
   }
-  assertBillingUsageMatchesClosedMonthlyWindow(billingUsageRecords, billingWindow);
+  assertBillingUsageMatchesClosedMonthlyWindow(billingUsageRecords, normalizedBillingWindow);
   const billingCurrencies = sortUniqueStringArray(billingUsageRecords.map((record) => record.billing_currency));
   if (billingCurrencies.length !== 1) {
     throw new Error(`Cloudflare billing usage API returned multiple billing currencies: ${billingCurrencies.join(', ')}`);
@@ -2771,11 +2988,18 @@ export async function captureProdCostSnapshot({
     artifact_id: 'prod_cost_snapshot',
     source_environment: PRODUCTION_ENVIRONMENT_NAME,
     run_timestamp: runTimestamp,
-    captured_at: new Date().toISOString(),
+    captured_at: now.toISOString(),
     captured_by: capturedBy ?? `github-actions:${process.env.GITHUB_ACTOR ?? 'unknown'}`,
     reviewed_by: reviewedBy ?? `github-actions-run:${claims.run_id}`,
     source_dashboard_uri: `https://api.cloudflare.com/client/v4/accounts/${accountId}${billingUsagePathname}`,
+    billing_window_resolution_method: normalizedBillingWindow.resolutionMethod,
+    billing_cycle_next_bill_date: normalizedBillingWindow.nextBillDate,
     topology_kind: 'cloudflare-prod',
+    topology_baseline_install: {
+      install_id: prodInstallRecord.install_id,
+      installed_at: prodInstallRecord.installed_at,
+      origin_run_uri: prodInstallRecord.origin_run_uri,
+    },
     cloudflare_resources: expectedResources,
     billing_period: deriveBillingPeriodFromUsageRecords(billingUsageRecords),
     cost_surfaces: aggregated.cost_surfaces,

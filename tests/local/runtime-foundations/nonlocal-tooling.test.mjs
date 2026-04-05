@@ -26,6 +26,7 @@ import {
   captureProdCostSnapshot,
   createEnvironmentWranglerConfig,
   fetchWorkerDeploymentState,
+  resolveClosedProdBillingWindow,
   resolveFreshCloudflareIdentity,
   resolvePreDeployWorkerDeploymentState,
   runEnvironmentBackedSuite,
@@ -571,8 +572,8 @@ function buildPreReleaseCostObservationFixture(overrides = {}) {
 }
 
 function buildMinimalProdBillingUsageRecords({
-  billingPeriodStart = '2026-03-01T00:00:00Z',
-  chargePeriodEnd = '2026-03-31T00:00:00Z',
+  billingPeriodStart = '2026-02-16T00:00:00Z',
+  chargePeriodEnd = '2026-03-15T00:00:00Z',
 } = {}) {
   return [
     {
@@ -587,6 +588,36 @@ function buildMinimalProdBillingUsageRecords({
       ServiceName: 'Workers Paid Plan',
     },
   ];
+}
+
+function buildResolvedProdBillingWindowFixture({
+  nextBillDate = '2026-04-15T12:21:59.345Z',
+  fromDate = '2026-02-16',
+  toDate = '2026-03-15',
+} = {}) {
+  return {
+    resolution_method: 'cloudflare-account-billing-profile-next-bill-date',
+    next_bill_date: nextBillDate,
+    from_date: fromDate,
+    to_date: toDate,
+  };
+}
+
+function buildProdInstallRecordFixture({
+  installedAt = '2026-02-01T00:00:00.000Z',
+  repository = 'VrianCao/MatrixFlare',
+} = {}) {
+  return buildProdInstallRecord({
+    releaseCommitSha: '0123456789abcdef0123456789abcdef01234567',
+    provisionedEnvironment: buildProductionProvisioningFixture(),
+    deploymentSummary: buildProductionDeploymentSummaryFixture(),
+    originRunIdentity: buildProducerRunIdentityFixture({
+      repository,
+      runId: '24000789563',
+    }),
+    installId: 'install-prod-topology-v1',
+    installedAt,
+  });
 }
 
 test('non-local environment plan derives deterministic workers.dev scripts and resource names', () => {
@@ -3586,8 +3617,13 @@ test('production workflow YAMLs stay aligned with the prod automation CLI contra
   assert.match(prodCostWorkflow, /node packages\/testing\/src\/cli\.mjs prod-cost-snapshot/u, 'prod-cost-monthly must capture the monthly production cost snapshot');
   assert.match(prodCostWorkflow, /cron:\s*'17 3 1 \* \*'/u, 'prod-cost-monthly must run on a monthly UTC schedule in addition to manual dispatch');
   assert.match(prodCostWorkflow, /RUNNER_TEMP/u, 'prod-cost-monthly raw blocker artifacts must live outside the checkout-cleaned workspace');
-  assert.match(prodCostWorkflow, /--from/u, 'prod-cost-monthly must pass the closed billing window start');
-  assert.match(prodCostWorkflow, /--to/u, 'prod-cost-monthly must pass the closed billing window end');
+  assert.match(prodCostWorkflow, /actions:\s+read/u, 'prod-cost-monthly must request actions:read so it can download the prod install baseline artifact');
+  assert.match(prodCostWorkflow, /node packages\/testing\/src\/cli\.mjs prod-cost-billing-window/u, 'prod-cost-monthly must resolve the closed billing window through the billing-profile CLI entry');
+  assert.match(prodCostWorkflow, /billing-profile\.json/u, 'prod-cost-monthly raw artifacts must retain the billing-profile lookup payload');
+  assert.match(prodCostWorkflow, /workflow_id:\s+'prod-install\.yml'/u, 'prod-cost-monthly must resolve the latest successful prod-install baseline run');
+  assert.match(prodCostWorkflow, /pattern:\s+prod-install-record-\*-\$\{\{\s*steps\.install_run\.outputs\.install_run_id\s*\}\}-\$\{\{\s*steps\.install_run\.outputs\.install_run_attempt\s*\}\}/u, 'prod-cost-monthly must download the prod install record artifact for the current baseline');
+  assert.match(prodCostWorkflow, /--billing-window/u, 'prod-cost-monthly must pass the resolved billing-window payload into prod-cost snapshot capture');
+  assert.match(prodCostWorkflow, /--install-record/u, 'prod-cost-monthly must pass the prod install record baseline into prod-cost snapshot capture');
   assert.match(prodCostWorkflow, /credentials-check\.json/u, 'prod-cost-monthly must persist a machine-readable credentials blocker artifact');
   assert.match(prodCostWorkflow, /node packages\/testing\/src\/cli\.mjs prod-cost-provenance/u, 'prod-cost-monthly must emit provenance before attestation');
   assert.match(prodCostWorkflow, /prod-cost-attestation-/u, 'prod-cost-monthly must upload a dedicated prod-cost attestation artifact');
@@ -3614,6 +3650,137 @@ test('prod cost snapshot capture requires the GitHub Actions prod environment cl
   );
 });
 
+test('prod cost billing window resolution derives the latest closed billing period from Cloudflare next_bill_date', async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-prod-cost-billing-window-'));
+  const outputPath = path.join(tempRoot, 'billing-window.json');
+  const profileOutputPath = path.join(tempRoot, 'billing-profile.json');
+
+  try {
+    const result = await resolveClosedProdBillingWindow({
+      artifactRoot: tempRoot,
+      outputPath,
+      profileOutputPath,
+    }, {
+      requireGitHubActionsExecutionImpl: async (operationName, {
+        expectedEnvironmentName = null,
+      } = {}) => {
+        assert.equal(operationName, 'resolveClosedProdBillingWindow');
+        assert.equal(expectedEnvironmentName, 'prod');
+        return {
+          repository: 'VrianCao/MatrixFlare',
+          run_id: '81234',
+        };
+      },
+      requireCloudflareCredentialsImpl: () => ({
+        accountId: 'cf-account',
+        apiToken: 'cf-token',
+      }),
+      callCloudflareApiImpl: async ({ pathname }) => {
+        assert.equal(pathname, '/billing/profile');
+        return {
+          success: true,
+          result: {
+            next_bill_date: '2026-05-15T12:21:59.3456Z',
+          },
+        };
+      },
+      now: new Date('2026-05-05T00:00:00.000Z'),
+    });
+
+    assert.equal(result.from_date, '2026-03-16');
+    assert.equal(result.to_date, '2026-04-15');
+    assert.deepEqual(
+      JSON.parse(await fs.readFile(outputPath, 'utf8')),
+      {
+        resolution_method: 'cloudflare-account-billing-profile-next-bill-date',
+        next_bill_date: '2026-05-15T12:21:59.3456Z',
+        from_date: '2026-03-16',
+        to_date: '2026-04-15',
+      },
+    );
+    assert.equal(
+      JSON.parse(await fs.readFile(profileOutputPath, 'utf8')).result.next_bill_date,
+      '2026-05-15T12:21:59.3456Z',
+    );
+  } finally {
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('prod cost billing window resolution preserves blocker artifacts when the billing profile is invalid', async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-prod-cost-billing-window-invalid-'));
+  const outputPath = path.join(tempRoot, 'billing-window.json');
+  const profileOutputPath = path.join(tempRoot, 'billing-profile.json');
+
+  try {
+    await assert.rejects(
+      () => resolveClosedProdBillingWindow({
+        artifactRoot: tempRoot,
+        outputPath,
+        profileOutputPath,
+      }, {
+        requireGitHubActionsExecutionImpl: async () => ({
+          repository: 'VrianCao/MatrixFlare',
+          run_id: '81234',
+        }),
+        requireCloudflareCredentialsImpl: () => ({
+          accountId: 'cf-account',
+          apiToken: 'cf-token',
+        }),
+        callCloudflareApiImpl: async () => ({
+          success: true,
+          result: {},
+        }),
+        now: new Date('2026-05-05T00:00:00.000Z'),
+      }),
+      /next_bill_date/,
+    );
+
+    assert.match(JSON.parse(await fs.readFile(outputPath, 'utf8')).error, /next_bill_date/u);
+    assert.match(JSON.parse(await fs.readFile(profileOutputPath, 'utf8')).error, /next_bill_date/u);
+  } finally {
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('prod cost billing window resolution rejects stale next_bill_date values', async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-prod-cost-billing-window-stale-'));
+  const outputPath = path.join(tempRoot, 'billing-window.json');
+  const profileOutputPath = path.join(tempRoot, 'billing-profile.json');
+
+  try {
+    await assert.rejects(
+      () => resolveClosedProdBillingWindow({
+        artifactRoot: tempRoot,
+        outputPath,
+        profileOutputPath,
+      }, {
+        requireGitHubActionsExecutionImpl: async () => ({
+          repository: 'VrianCao/MatrixFlare',
+          run_id: '81234',
+        }),
+        requireCloudflareCredentialsImpl: () => ({
+          accountId: 'cf-account',
+          apiToken: 'cf-token',
+        }),
+        callCloudflareApiImpl: async () => ({
+          success: true,
+          result: {
+            next_bill_date: '2026-01-15T12:21:59.3456Z',
+          },
+        }),
+        now: new Date('2026-05-05T00:00:00.000Z'),
+      }),
+      /must not be earlier than the current UTC date/,
+    );
+
+    assert.match(JSON.parse(await fs.readFile(outputPath, 'utf8')).error, /must not be earlier than the current UTC date/u);
+    assert.match(JSON.parse(await fs.readFile(profileOutputPath, 'utf8')).error, /must not be earlier than the current UTC date/u);
+  } finally {
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
 test('prod cost snapshot capture normalizes official billing usage into a valid prod_cost_snapshot payload', async () => {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-prod-cost-snapshot-'));
   const outputPath = path.join(tempRoot, 'snapshot.json');
@@ -3622,9 +3789,9 @@ test('prod cost snapshot capture normalizes official billing usage into a valid 
   const billingRecords = [
     {
       BillingCurrency: 'USD',
-      BillingPeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodEnd: '2026-03-31T00:00:00Z',
+      BillingPeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodEnd: '2026-03-15T00:00:00Z',
       ConsumedQuantity: 1,
       ConsumedUnit: 'Month',
       ContractedCost: 5,
@@ -3633,9 +3800,9 @@ test('prod cost snapshot capture normalizes official billing usage into a valid 
     },
     {
       BillingCurrency: 'USD',
-      BillingPeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodEnd: '2026-03-31T00:00:00Z',
+      BillingPeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodEnd: '2026-03-15T00:00:00Z',
       ConsumedQuantity: 12_000_000,
       ConsumedUnit: 'Requests',
       ContractedCost: 0.6,
@@ -3644,9 +3811,9 @@ test('prod cost snapshot capture normalizes official billing usage into a valid 
     },
     {
       BillingCurrency: 'USD',
-      BillingPeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodEnd: '2026-03-31T00:00:00Z',
+      BillingPeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodEnd: '2026-03-15T00:00:00Z',
       ConsumedQuantity: 35_000_000,
       ConsumedUnit: 'CPU Milliseconds',
       ContractedCost: 0.1,
@@ -3655,9 +3822,9 @@ test('prod cost snapshot capture normalizes official billing usage into a valid 
     },
     {
       BillingCurrency: 'USD',
-      BillingPeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodEnd: '2026-03-31T00:00:00Z',
+      BillingPeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodEnd: '2026-03-15T00:00:00Z',
       ConsumedQuantity: 25_000_000,
       ConsumedUnit: 'Log Events Written',
       ContractedCost: 3,
@@ -3666,9 +3833,9 @@ test('prod cost snapshot capture normalizes official billing usage into a valid 
     },
     {
       BillingCurrency: 'USD',
-      BillingPeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodEnd: '2026-03-31T00:00:00Z',
+      BillingPeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodEnd: '2026-03-15T00:00:00Z',
       ConsumedQuantity: 1_500_000,
       ConsumedUnit: 'Requests',
       ContractedCost: 0.075,
@@ -3677,9 +3844,9 @@ test('prod cost snapshot capture normalizes official billing usage into a valid 
     },
     {
       BillingCurrency: 'USD',
-      BillingPeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodEnd: '2026-03-31T00:00:00Z',
+      BillingPeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodEnd: '2026-03-15T00:00:00Z',
       ConsumedQuantity: 500_000,
       ConsumedUnit: 'Duration GB-s',
       ContractedCost: 1.25,
@@ -3688,9 +3855,9 @@ test('prod cost snapshot capture normalizes official billing usage into a valid 
     },
     {
       BillingCurrency: 'USD',
-      BillingPeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodEnd: '2026-03-31T00:00:00Z',
+      BillingPeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodEnd: '2026-03-15T00:00:00Z',
       ConsumedQuantity: 26_000_000_000,
       ConsumedUnit: 'Rows Read',
       ContractedCost: 1,
@@ -3699,9 +3866,9 @@ test('prod cost snapshot capture normalizes official billing usage into a valid 
     },
     {
       BillingCurrency: 'USD',
-      BillingPeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodEnd: '2026-03-31T00:00:00Z',
+      BillingPeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodEnd: '2026-03-15T00:00:00Z',
       ConsumedQuantity: 52_000_000,
       ConsumedUnit: 'Rows Written',
       ContractedCost: 2,
@@ -3710,9 +3877,9 @@ test('prod cost snapshot capture normalizes official billing usage into a valid 
     },
     {
       BillingCurrency: 'USD',
-      BillingPeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodEnd: '2026-03-31T00:00:00Z',
+      BillingPeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodEnd: '2026-03-15T00:00:00Z',
       ConsumedQuantity: 7,
       ConsumedUnit: 'SQL Storage GB-Month',
       ContractedCost: 0.4,
@@ -3721,9 +3888,9 @@ test('prod cost snapshot capture normalizes official billing usage into a valid 
     },
     {
       BillingCurrency: 'USD',
-      BillingPeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodEnd: '2026-03-31T00:00:00Z',
+      BillingPeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodEnd: '2026-03-15T00:00:00Z',
       ConsumedQuantity: 26_000_000_000,
       ConsumedUnit: 'Rows Read',
       ContractedCost: 1,
@@ -3732,9 +3899,9 @@ test('prod cost snapshot capture normalizes official billing usage into a valid 
     },
     {
       BillingCurrency: 'USD',
-      BillingPeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodEnd: '2026-03-31T00:00:00Z',
+      BillingPeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodEnd: '2026-03-15T00:00:00Z',
       ConsumedQuantity: 51_000_000,
       ConsumedUnit: 'Rows Written',
       ContractedCost: 1,
@@ -3743,9 +3910,9 @@ test('prod cost snapshot capture normalizes official billing usage into a valid 
     },
     {
       BillingCurrency: 'USD',
-      BillingPeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodEnd: '2026-03-31T00:00:00Z',
+      BillingPeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodEnd: '2026-03-15T00:00:00Z',
       ConsumedQuantity: 6,
       ConsumedUnit: 'Storage GB-Month',
       ContractedCost: 0.75,
@@ -3754,9 +3921,9 @@ test('prod cost snapshot capture normalizes official billing usage into a valid 
     },
     {
       BillingCurrency: 'USD',
-      BillingPeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodEnd: '2026-03-31T00:00:00Z',
+      BillingPeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodEnd: '2026-03-15T00:00:00Z',
       ConsumedQuantity: 12,
       ConsumedUnit: 'Storage GB-Month',
       ContractedCost: 0.03,
@@ -3765,9 +3932,9 @@ test('prod cost snapshot capture normalizes official billing usage into a valid 
     },
     {
       BillingCurrency: 'USD',
-      BillingPeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodEnd: '2026-03-31T00:00:00Z',
+      BillingPeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodEnd: '2026-03-15T00:00:00Z',
       ConsumedQuantity: 2_000_000,
       ConsumedUnit: 'Class A Operations',
       ContractedCost: 4.5,
@@ -3776,9 +3943,9 @@ test('prod cost snapshot capture normalizes official billing usage into a valid 
     },
     {
       BillingCurrency: 'USD',
-      BillingPeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodEnd: '2026-03-31T00:00:00Z',
+      BillingPeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodEnd: '2026-03-15T00:00:00Z',
       ConsumedQuantity: 12_000_000,
       ConsumedUnit: 'Class B Operations',
       ContractedCost: 0.72,
@@ -3787,9 +3954,9 @@ test('prod cost snapshot capture normalizes official billing usage into a valid 
     },
     {
       BillingCurrency: 'USD',
-      BillingPeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodEnd: '2026-03-31T00:00:00Z',
+      BillingPeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodEnd: '2026-03-15T00:00:00Z',
       ConsumedQuantity: 12_000_000,
       ConsumedUnit: 'Keys Read',
       ContractedCost: 1,
@@ -3798,9 +3965,9 @@ test('prod cost snapshot capture normalizes official billing usage into a valid 
     },
     {
       BillingCurrency: 'USD',
-      BillingPeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodEnd: '2026-03-31T00:00:00Z',
+      BillingPeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodEnd: '2026-03-15T00:00:00Z',
       ConsumedQuantity: 2_000_000,
       ConsumedUnit: 'Keys Written',
       ContractedCost: 5,
@@ -3809,9 +3976,9 @@ test('prod cost snapshot capture normalizes official billing usage into a valid 
     },
     {
       BillingCurrency: 'USD',
-      BillingPeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodEnd: '2026-03-31T00:00:00Z',
+      BillingPeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodEnd: '2026-03-15T00:00:00Z',
       ConsumedQuantity: 1_500_000,
       ConsumedUnit: 'Keys Deleted',
       ContractedCost: 2.5,
@@ -3820,9 +3987,9 @@ test('prod cost snapshot capture normalizes official billing usage into a valid 
     },
     {
       BillingCurrency: 'USD',
-      BillingPeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodEnd: '2026-03-31T00:00:00Z',
+      BillingPeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodEnd: '2026-03-15T00:00:00Z',
       ConsumedQuantity: 1_400_000,
       ConsumedUnit: 'List Requests',
       ContractedCost: 2,
@@ -3831,9 +3998,9 @@ test('prod cost snapshot capture normalizes official billing usage into a valid 
     },
     {
       BillingCurrency: 'USD',
-      BillingPeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodEnd: '2026-03-31T00:00:00Z',
+      BillingPeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodEnd: '2026-03-15T00:00:00Z',
       ConsumedQuantity: 2,
       ConsumedUnit: 'Storage GB-Month',
       ContractedCost: 0.5,
@@ -3842,9 +4009,9 @@ test('prod cost snapshot capture normalizes official billing usage into a valid 
     },
     {
       BillingCurrency: 'USD',
-      BillingPeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodEnd: '2026-03-31T00:00:00Z',
+      BillingPeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodEnd: '2026-03-15T00:00:00Z',
       ConsumedQuantity: 300_000,
       ConsumedUnit: 'Write Operations',
       ContractedCost: 0,
@@ -3853,9 +4020,9 @@ test('prod cost snapshot capture normalizes official billing usage into a valid 
     },
     {
       BillingCurrency: 'USD',
-      BillingPeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodEnd: '2026-03-31T00:00:00Z',
+      BillingPeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodEnd: '2026-03-15T00:00:00Z',
       ConsumedQuantity: 300_000,
       ConsumedUnit: 'Read Operations',
       ContractedCost: 0,
@@ -3864,9 +4031,9 @@ test('prod cost snapshot capture normalizes official billing usage into a valid 
     },
     {
       BillingCurrency: 'USD',
-      BillingPeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodStart: '2026-03-01T00:00:00Z',
-      ChargePeriodEnd: '2026-03-31T00:00:00Z',
+      BillingPeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodStart: '2026-02-16T00:00:00Z',
+      ChargePeriodEnd: '2026-03-15T00:00:00Z',
       ConsumedQuantity: 300_000,
       ConsumedUnit: 'Delete Operations',
       ContractedCost: 0,
@@ -3880,8 +4047,8 @@ test('prod cost snapshot capture normalizes official billing usage into a valid 
       runTimestamp,
       artifactRoot,
       outputPath,
-      fromDate: '2026-03-01',
-      toDate: '2026-03-31',
+      billingWindow: buildResolvedProdBillingWindowFixture(),
+      prodInstallRecord: buildProdInstallRecordFixture(),
     }, {
       requireGitHubActionsExecutionImpl: async (operationName, {
         expectedEnvironmentName = null,
@@ -3912,7 +4079,7 @@ test('prod cost snapshot capture normalizes official billing usage into a valid 
         };
       },
       callCloudflareApiImpl: async ({ pathname }) => {
-        if (pathname === '/billing/usage/paygo?from=2026-03-01&to=2026-03-31') {
+        if (pathname === '/billing/usage/paygo?from=2026-02-16&to=2026-03-15') {
           return {
             success: true,
             result: billingRecords,
@@ -3968,6 +4135,7 @@ test('prod cost snapshot capture normalizes official billing usage into a valid 
         }
         throw new Error(`Unexpected Cloudflare API pathname: ${pathname}`);
       },
+      now: new Date('2026-04-05T00:00:00.000Z'),
     });
 
     const snapshot = JSON.parse(await fs.readFile(outputPath, 'utf8'));
@@ -3980,7 +4148,10 @@ test('prod cost snapshot capture normalizes official billing usage into a valid 
     assert.equal(result.snapshot.cost_surfaces.d1.storage_gb_month, 6);
     assert.equal(result.snapshot.cost_surfaces.kv.storage_gb_month, 2);
     assert.equal(result.snapshot.cost_surfaces.queues.write_ops, 300_000);
-    assert.equal(result.snapshot.source_dashboard_uri, 'https://api.cloudflare.com/client/v4/accounts/cf-account/billing/usage/paygo?from=2026-03-01&to=2026-03-31');
+    assert.equal(result.snapshot.source_dashboard_uri, 'https://api.cloudflare.com/client/v4/accounts/cf-account/billing/usage/paygo?from=2026-02-16&to=2026-03-15');
+    assert.equal(result.snapshot.billing_window_resolution_method, 'cloudflare-account-billing-profile-next-bill-date');
+    assert.equal(result.snapshot.billing_cycle_next_bill_date, '2026-04-15T12:21:59.345Z');
+    assert.equal(result.snapshot.topology_baseline_install.install_id, 'install-prod-topology-v1');
     assert.ok(await fs.stat(path.join(artifactRoot, 'billing-usage-paygo.json')));
     assert.ok(await fs.stat(path.join(artifactRoot, 'prod-resource-snapshot.json')));
   } finally {
@@ -3988,13 +4159,13 @@ test('prod cost snapshot capture normalizes official billing usage into a valid 
   }
 });
 
-test('prod cost snapshot capture requires an explicit closed monthly billing window', async () => {
+test('prod cost snapshot capture requires a resolved closed billing window and a post-install baseline', async () => {
   await assert.rejects(
     () => captureProdCostSnapshot({
       runTimestamp: '20260405T010203Z',
       artifactRoot: '/tmp/unused-prod-cost-artifacts',
       outputPath: '/tmp/unused-prod-cost-snapshot.json',
-      fromDate: '2026-03-01',
+      prodInstallRecord: buildProdInstallRecordFixture(),
     }, {
       requireGitHubActionsExecutionImpl: async () => ({
         repository: 'VrianCao/MatrixFlare',
@@ -4004,8 +4175,9 @@ test('prod cost snapshot capture requires an explicit closed monthly billing win
         accountId: 'cf-account',
         apiToken: 'cf-token',
       }),
+      now: new Date('2026-04-05T00:00:00.000Z'),
     }),
-    /requires explicit --from and --to dates/,
+    /resolved production billing window must be an object/,
   );
 
   await assert.rejects(
@@ -4013,8 +4185,10 @@ test('prod cost snapshot capture requires an explicit closed monthly billing win
       runTimestamp: '20260405T010203Z',
       artifactRoot: '/tmp/unused-prod-cost-artifacts',
       outputPath: '/tmp/unused-prod-cost-snapshot.json',
-      fromDate: '2026-03-02',
-      toDate: '2026-03-31',
+      billingWindow: buildResolvedProdBillingWindowFixture(),
+      prodInstallRecord: buildProdInstallRecordFixture({
+        installedAt: '2026-02-16T08:00:00.000Z',
+      }),
     }, {
       requireGitHubActionsExecutionImpl: async () => ({
         repository: 'VrianCao/MatrixFlare',
@@ -4024,12 +4198,13 @@ test('prod cost snapshot capture requires an explicit closed monthly billing win
         accountId: 'cf-account',
         apiToken: 'cf-token',
       }),
+      now: new Date('2026-04-05T00:00:00.000Z'),
     }),
-    /must be the first day of a calendar month/,
+    /starts after prod install date 2026-02-16/,
   );
 });
 
-test('prod cost snapshot capture rejects billing usage rows that do not match the requested closed month', async () => {
+test('prod cost snapshot capture rejects billing usage rows that do not match the requested closed billing window', async () => {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-prod-cost-snapshot-wrong-window-'));
 
   try {
@@ -4038,8 +4213,8 @@ test('prod cost snapshot capture rejects billing usage rows that do not match th
         runTimestamp: '20260405T010203Z',
         artifactRoot: path.join(tempRoot, 'artifacts'),
         outputPath: path.join(tempRoot, 'snapshot.json'),
-        fromDate: '2026-03-01',
-        toDate: '2026-03-31',
+        billingWindow: buildResolvedProdBillingWindowFixture(),
+        prodInstallRecord: buildProdInstallRecordFixture(),
       }, {
         requireGitHubActionsExecutionImpl: async () => ({
           repository: 'VrianCao/MatrixFlare',
@@ -4061,11 +4236,11 @@ test('prod cost snapshot capture rejects billing usage rows that do not match th
             .sort(),
         }),
         callCloudflareApiImpl: async ({ pathname }) => {
-          if (pathname === '/billing/usage/paygo?from=2026-03-01&to=2026-03-31') {
+          if (pathname === '/billing/usage/paygo?from=2026-02-16&to=2026-03-15') {
             return {
               success: true,
               result: buildMinimalProdBillingUsageRecords({
-                billingPeriodStart: '2026-02-01T00:00:00Z',
+                billingPeriodStart: '2026-01-16T00:00:00Z',
               }),
             };
           }
@@ -4119,8 +4294,9 @@ test('prod cost snapshot capture rejects billing usage rows that do not match th
           }
           throw new Error(`Unexpected Cloudflare API pathname: ${pathname}`);
         },
+        now: new Date('2026-04-05T00:00:00.000Z'),
       }),
-      /BillingPeriodStart .* does not match requested production monthly window start/,
+      /BillingPeriodStart .* does not match requested production billing window start/,
     );
   } finally {
     await fs.rm(tempRoot, { recursive: true, force: true });
@@ -4136,8 +4312,8 @@ test('prod cost snapshot capture fails closed when the billing account still con
         runTimestamp: '20260405T010203Z',
         artifactRoot: path.join(tempRoot, 'artifacts'),
         outputPath: path.join(tempRoot, 'snapshot.json'),
-        fromDate: '2026-03-01',
-        toDate: '2026-03-31',
+        billingWindow: buildResolvedProdBillingWindowFixture(),
+        prodInstallRecord: buildProdInstallRecordFixture(),
       }, {
         requireGitHubActionsExecutionImpl: async () => ({
           repository: 'VrianCao/MatrixFlare',
@@ -4159,7 +4335,7 @@ test('prod cost snapshot capture fails closed when the billing account still con
             .sort(),
         }),
         callCloudflareApiImpl: async ({ pathname }) => {
-          if (pathname === '/billing/usage/paygo?from=2026-03-01&to=2026-03-31') {
+          if (pathname === '/billing/usage/paygo?from=2026-02-16&to=2026-03-15') {
             return {
               success: true,
               result: buildMinimalProdBillingUsageRecords(),
@@ -4216,6 +4392,7 @@ test('prod cost snapshot capture fails closed when the billing account still con
           }
           throw new Error(`Unexpected Cloudflare API pathname: ${pathname}`);
         },
+        now: new Date('2026-04-05T00:00:00.000Z'),
       }),
       /account-scoped.*non-production Matrix resources/,
     );
@@ -4233,8 +4410,8 @@ test('prod cost snapshot capture fails closed when the billing account still con
         runTimestamp: '20260405T010203Z',
         artifactRoot: path.join(tempRoot, 'artifacts'),
         outputPath: path.join(tempRoot, 'snapshot.json'),
-        fromDate: '2026-03-01',
-        toDate: '2026-03-31',
+        billingWindow: buildResolvedProdBillingWindowFixture(),
+        prodInstallRecord: buildProdInstallRecordFixture(),
       }, {
         requireGitHubActionsExecutionImpl: async () => ({
           repository: 'VrianCao/MatrixFlare',
@@ -4256,7 +4433,7 @@ test('prod cost snapshot capture fails closed when the billing account still con
             .sort(),
         }),
         callCloudflareApiImpl: async ({ pathname }) => {
-          if (pathname === '/billing/usage/paygo?from=2026-03-01&to=2026-03-31') {
+          if (pathname === '/billing/usage/paygo?from=2026-02-16&to=2026-03-15') {
             return {
               success: true,
               result: buildMinimalProdBillingUsageRecords(),
@@ -4313,6 +4490,7 @@ test('prod cost snapshot capture fails closed when the billing account still con
           }
           throw new Error(`Unexpected Cloudflare API pathname: ${pathname}`);
         },
+        now: new Date('2026-04-05T00:00:00.000Z'),
       }),
       /unexpected non-Matrix Cloudflare resources/,
     );
@@ -4330,8 +4508,8 @@ test('prod cost snapshot capture rejects multiple active worker versions in the 
         runTimestamp: '20260405T010203Z',
         artifactRoot: path.join(tempRoot, 'artifacts'),
         outputPath: path.join(tempRoot, 'snapshot.json'),
-        fromDate: '2026-03-01',
-        toDate: '2026-03-31',
+        billingWindow: buildResolvedProdBillingWindowFixture(),
+        prodInstallRecord: buildProdInstallRecordFixture(),
       }, {
         requireGitHubActionsExecutionImpl: async () => ({
           repository: 'VrianCao/MatrixFlare',
@@ -4355,7 +4533,7 @@ test('prod cost snapshot capture rejects multiple active worker versions in the 
             .sort(),
         }),
         callCloudflareApiImpl: async ({ pathname }) => {
-          if (pathname === '/billing/usage/paygo?from=2026-03-01&to=2026-03-31') {
+          if (pathname === '/billing/usage/paygo?from=2026-02-16&to=2026-03-15') {
             return {
               success: true,
               result: buildMinimalProdBillingUsageRecords(),
@@ -4411,6 +4589,7 @@ test('prod cost snapshot capture rejects multiple active worker versions in the 
           }
           throw new Error(`Unexpected Cloudflare API pathname: ${pathname}`);
         },
+        now: new Date('2026-04-05T00:00:00.000Z'),
       }),
       /exactly one active worker version id/,
     );
@@ -4428,8 +4607,8 @@ test('prod cost snapshot capture rejects Pages Functions billing rows because th
         runTimestamp: '20260405T010203Z',
         artifactRoot: path.join(tempRoot, 'artifacts'),
         outputPath: path.join(tempRoot, 'snapshot.json'),
-        fromDate: '2026-03-01',
-        toDate: '2026-03-31',
+        billingWindow: buildResolvedProdBillingWindowFixture(),
+        prodInstallRecord: buildProdInstallRecordFixture(),
       }, {
         requireGitHubActionsExecutionImpl: async () => ({
           repository: 'VrianCao/MatrixFlare',
@@ -4451,16 +4630,16 @@ test('prod cost snapshot capture rejects Pages Functions billing rows because th
             .sort(),
         }),
         callCloudflareApiImpl: async ({ pathname }) => {
-          if (pathname === '/billing/usage/paygo?from=2026-03-01&to=2026-03-31') {
+          if (pathname === '/billing/usage/paygo?from=2026-02-16&to=2026-03-15') {
             return {
               success: true,
               result: [
                 ...buildMinimalProdBillingUsageRecords(),
                 {
                   BillingCurrency: 'USD',
-                  BillingPeriodStart: '2026-03-01T00:00:00Z',
-                  ChargePeriodStart: '2026-03-01T00:00:00Z',
-                  ChargePeriodEnd: '2026-03-31T00:00:00Z',
+                  BillingPeriodStart: '2026-02-16T00:00:00Z',
+                  ChargePeriodStart: '2026-02-16T00:00:00Z',
+                  ChargePeriodEnd: '2026-03-15T00:00:00Z',
                   ConsumedQuantity: 42,
                   ConsumedUnit: 'Requests',
                   ContractedCost: 1.5,
@@ -4520,6 +4699,7 @@ test('prod cost snapshot capture rejects Pages Functions billing rows because th
           }
           throw new Error(`Unexpected Cloudflare API pathname: ${pathname}`);
         },
+        now: new Date('2026-04-05T00:00:00.000Z'),
       }),
       /Pages Functions billing record .* is not attributable to the Matrix production worker topology/,
     );
@@ -4656,18 +4836,43 @@ test('nonlocal workflow routes prod-cost attestation into the L1 evidence gate',
   );
   assert.match(
     workflow,
+    /prod-cost:\n[\s\S]*?permissions:\n[\s\S]*?actions: read/s,
+    'prod-cost job must request actions:read so it can download the prod install baseline artifact',
+  );
+  assert.match(
+    workflow,
     /- name: Write prod-cost provenance[\s\S]*?node packages\/testing\/src\/cli\.mjs prod-cost-provenance/s,
     'workflow must generate dedicated prod-cost provenance before attestation',
   );
   assert.match(
     workflow,
-    /- name: Define closed monthly billing window[\s\S]*?echo "from_date=\$\{from_date\}" >> "\$GITHUB_OUTPUT"[\s\S]*?echo "to_date=\$\{to_date\}" >> "\$GITHUB_OUTPUT"/s,
-    'workflow must derive an explicit previous closed monthly billing window for prod-cost capture',
+    /- name: Resolve closed production billing window[\s\S]*?node packages\/testing\/src\/cli\.mjs prod-cost-billing-window/s,
+    'workflow must derive an explicit closed production billing window from the official billing profile contract',
   );
   assert.match(
     workflow,
-    /- name: Capture production cost snapshot[\s\S]*?--from "\$\{\{ steps\.billing_window\.outputs\.from_date \}\}"[\s\S]*?--to "\$\{\{ steps\.billing_window\.outputs\.to_date \}\}"/s,
-    'workflow must pass the closed monthly billing window into prod-cost snapshot capture',
+    /billing_profile=\$\{artifact_root\}\/billing-profile\.json/u,
+    'workflow must retain the raw billing-profile payload in the prod-cost artifact set',
+  );
+  assert.match(
+    workflow,
+    /- name: Capture production cost snapshot[\s\S]*?if: steps\.billing_window\.outcome == 'success'/s,
+    'workflow must not attempt prod-cost snapshot capture before billing-window resolution succeeds',
+  );
+  assert.match(
+    workflow,
+    /workflow_id:\s+'prod-install\.yml'/u,
+    'workflow must resolve the latest successful prod-install baseline run before prod-cost capture',
+  );
+  assert.match(
+    workflow,
+    /pattern:\s+prod-install-record-\*-\$\{\{\s*steps\.install_run\.outputs\.install_run_id\s*\}\}-\$\{\{\s*steps\.install_run\.outputs\.install_run_attempt\s*\}\}/u,
+    'workflow must download the prod install record artifact for the current baseline',
+  );
+  assert.match(
+    workflow,
+    /- name: Capture production cost snapshot[\s\S]*?--billing-window "\$\{\{ steps\.paths\.outputs\.billing_window \}\}"[\s\S]*?--install-record "\$\{\{ steps\.paths\.outputs\.download_root \}\}\/prod-install-record\.json"/s,
+    'workflow must pass the resolved billing window and prod install baseline into prod-cost snapshot capture',
   );
   assert.match(
     workflow,
@@ -4676,7 +4881,7 @@ test('nonlocal workflow routes prod-cost attestation into the L1 evidence gate',
   );
   assert.match(
     workflow,
-    /- name: Enforce pre-attestation prod-cost gate[\s\S]*?steps\.upload_bundle_r2\.outcome[\s\S]*?prod-cost R2 upload did not pass/s,
+    /- name: Enforce pre-attestation prod-cost gate[\s\S]*?steps\.billing_window\.outcome[\s\S]*?prod-cost billing-window resolution did not pass[\s\S]*?steps\.upload_bundle_r2\.outcome[\s\S]*?prod-cost R2 upload did not pass/s,
     'workflow must fail closed when prod-cost bundle upload to R2 does not succeed',
   );
   assert.match(

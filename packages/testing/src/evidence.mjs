@@ -2044,6 +2044,120 @@ function isOfficialCloudflareLocator(value) {
   }
 }
 
+function formatBillingPeriodDateFromUtcMillis(utcMillis, label) {
+  if (!Number.isFinite(utcMillis)) {
+    throw new RangeError(`${label} must be a valid UTC timestamp`);
+  }
+  return new Date(utcMillis).toISOString().slice(0, 10);
+}
+
+function parseBillingPeriodDateToUtcMillis(value, label) {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/u.test(value)) {
+    throw new RangeError(`${label} must be a YYYY-MM-DD UTC date`);
+  }
+  const parsed = Date.parse(`${value}T00:00:00.000Z`);
+  if (!Number.isFinite(parsed)) {
+    throw new RangeError(`${label} must be a valid UTC date`);
+  }
+  return parsed;
+}
+
+function extractObservedBillingDateFromTimestamp(value, label) {
+  if (!isRfc3339UtcTimestamp(value)) {
+    throw new RangeError(`${label} must be an RFC 3339 UTC timestamp`);
+  }
+  return new Date(Date.parse(value)).toISOString().slice(0, 10);
+}
+
+function currentUtcBillingDateFromTimestamp(value, label) {
+  if (!isRfc3339UtcTimestamp(value)) {
+    throw new RangeError(`${label} must be an RFC 3339 UTC timestamp`);
+  }
+  const parsed = Date.parse(value);
+  const observed = new Date(parsed);
+  return formatBillingPeriodDateFromUtcMillis(
+    Date.UTC(observed.getUTCFullYear(), observed.getUTCMonth(), observed.getUTCDate()),
+    label,
+  );
+}
+
+function shiftBillingPeriodDateByMonths(value, months, label) {
+  const currentMillis = parseBillingPeriodDateToUtcMillis(value, label);
+  const current = new Date(currentMillis);
+  const shiftedMonthIndex = current.getUTCMonth() + Number(months);
+  const normalizedYear = current.getUTCFullYear() + Math.floor(shiftedMonthIndex / 12);
+  const normalizedMonthIndex = ((shiftedMonthIndex % 12) + 12) % 12;
+  const lastDayOfTargetMonth = new Date(Date.UTC(normalizedYear, normalizedMonthIndex + 1, 0)).getUTCDate();
+  const normalizedDay = Math.min(current.getUTCDate(), lastDayOfTargetMonth);
+  return formatBillingPeriodDateFromUtcMillis(
+    Date.UTC(normalizedYear, normalizedMonthIndex, normalizedDay),
+    label,
+  );
+}
+
+function addBillingPeriodDays(value, days, label) {
+  return formatBillingPeriodDateFromUtcMillis(
+    parseBillingPeriodDateToUtcMillis(value, label) + (Number(days) * 24 * 60 * 60 * 1000),
+    label,
+  );
+}
+
+function deriveExpectedProdBillingWindowFromNextBillDate(nextBillDate, {
+  capturedAt,
+} = {}) {
+  const normalizedNextBillDate = extractObservedBillingDateFromTimestamp(
+    nextBillDate,
+    'prod_cost_snapshot billing_cycle_next_bill_date',
+  );
+  const capturedAtDate = currentUtcBillingDateFromTimestamp(
+    capturedAt,
+    'prod_cost_snapshot captured_at',
+  );
+  const nextBillDateMillis = parseBillingPeriodDateToUtcMillis(
+    normalizedNextBillDate,
+    'prod_cost_snapshot billing_cycle_next_bill_date',
+  );
+  const capturedAtMillis = parseBillingPeriodDateToUtcMillis(
+    capturedAtDate,
+    'prod_cost_snapshot captured_at',
+  );
+  if (nextBillDateMillis < capturedAtMillis) {
+    throw new Error('prod_cost_snapshot billing_cycle_next_bill_date must not be earlier than the captured_at date');
+  }
+  const latestExpectedNextBillDate = addBillingPeriodDays(
+    capturedAtDate,
+    31,
+    'prod_cost_snapshot billing_cycle_next_bill_date upper bound',
+  );
+  if (
+    nextBillDateMillis
+    > parseBillingPeriodDateToUtcMillis(
+      latestExpectedNextBillDate,
+      'prod_cost_snapshot billing_cycle_next_bill_date upper bound',
+    )
+  ) {
+    throw new Error('prod_cost_snapshot billing_cycle_next_bill_date must be within 31 days of captured_at');
+  }
+  const endDate = shiftBillingPeriodDateByMonths(
+    normalizedNextBillDate,
+    -1,
+    'prod_cost_snapshot billing_cycle_next_bill_date',
+  );
+  const previousAnchorDate = shiftBillingPeriodDateByMonths(
+    normalizedNextBillDate,
+    -2,
+    'prod_cost_snapshot billing_cycle_next_bill_date',
+  );
+  return {
+    startDate: addBillingPeriodDays(
+      previousAnchorDate,
+      1,
+      'prod_cost_snapshot billing period start',
+    ),
+    endDate,
+  };
+}
+
 function isGitHubActionsRunUri(value) {
   if (!isAbsoluteExternalUri(value)) {
     return false;
@@ -5279,16 +5393,52 @@ export function validateManualArtifactPayload(artifactId, payload, {
         error: 'prod_cost_snapshot must include reviewed_by',
       };
     }
-    if (!isAbsoluteExternalUri(payload.source_dashboard_uri)) {
+    if (!isOfficialCloudflareLocator(payload.source_dashboard_uri)) {
       return {
         valid: false,
-        error: 'prod_cost_snapshot must include an absolute external source_dashboard_uri',
+        error: 'prod_cost_snapshot source_dashboard_uri must be an official Cloudflare HTTPS locator',
+      };
+    }
+    if (payload.billing_window_resolution_method !== 'cloudflare-account-billing-profile-next-bill-date') {
+      return {
+        valid: false,
+        error: 'prod_cost_snapshot billing_window_resolution_method must be cloudflare-account-billing-profile-next-bill-date',
+      };
+    }
+    if (!isRfc3339UtcTimestamp(payload.billing_cycle_next_bill_date)) {
+      return {
+        valid: false,
+        error: 'prod_cost_snapshot billing_cycle_next_bill_date must be an RFC 3339 UTC timestamp',
       };
     }
     if (!isNonEmptyString(payload.topology_kind) || payload.topology_kind === 'local') {
       return {
         valid: false,
         error: 'prod_cost_snapshot must include a non-local topology_kind',
+      };
+    }
+    if (!isPlainObject(payload.topology_baseline_install)) {
+      return {
+        valid: false,
+        error: 'prod_cost_snapshot must include topology_baseline_install',
+      };
+    }
+    if (!isNonEmptyString(payload.topology_baseline_install.install_id)) {
+      return {
+        valid: false,
+        error: 'prod_cost_snapshot topology_baseline_install.install_id must be non-empty',
+      };
+    }
+    if (!isRfc3339UtcTimestamp(payload.topology_baseline_install.installed_at)) {
+      return {
+        valid: false,
+        error: 'prod_cost_snapshot topology_baseline_install.installed_at must be an RFC 3339 UTC timestamp',
+      };
+    }
+    if (!isGitHubActionsRunUri(payload.topology_baseline_install.origin_run_uri)) {
+      return {
+        valid: false,
+        error: 'prod_cost_snapshot topology_baseline_install.origin_run_uri must be a GitHub Actions run URL',
       };
     }
     const resourceValidation = validateExpectedCloudflareResources(
@@ -5315,6 +5465,59 @@ export function validateManualArtifactPayload(artifactId, payload, {
       return {
         valid: false,
         error: 'prod_cost_snapshot billing_period start must be earlier than end',
+      };
+    }
+    let expectedBillingWindow;
+    try {
+      expectedBillingWindow = deriveExpectedProdBillingWindowFromNextBillDate(
+        payload.billing_cycle_next_bill_date,
+        {
+          capturedAt: payload.captured_at,
+        },
+      );
+    } catch (error) {
+      return {
+        valid: false,
+        error: String(error?.message ?? error),
+      };
+    }
+    const observedBillingStartDate = extractObservedBillingDateFromTimestamp(
+      payload.billing_period.start,
+      'prod_cost_snapshot billing_period.start',
+    );
+    const observedBillingEndDate = extractObservedBillingDateFromTimestamp(
+      payload.billing_period.end,
+      'prod_cost_snapshot billing_period.end',
+    );
+    if (observedBillingStartDate !== expectedBillingWindow.startDate) {
+      return {
+        valid: false,
+        error: 'prod_cost_snapshot billing_period.start must match the latest closed billing period derived from billing_cycle_next_bill_date',
+      };
+    }
+    if (observedBillingEndDate !== expectedBillingWindow.endDate) {
+      return {
+        valid: false,
+        error: 'prod_cost_snapshot billing_period.end must match the latest closed billing period derived from billing_cycle_next_bill_date',
+      };
+    }
+    const installDate = extractObservedBillingDateFromTimestamp(
+      payload.topology_baseline_install.installed_at,
+      'prod_cost_snapshot topology_baseline_install.installed_at',
+    );
+    if (
+      parseBillingPeriodDateToUtcMillis(
+        observedBillingStartDate,
+        'prod_cost_snapshot billing_period.start',
+      )
+      <= parseBillingPeriodDateToUtcMillis(
+        installDate,
+        'prod_cost_snapshot topology_baseline_install.installed_at',
+      )
+    ) {
+      return {
+        valid: false,
+        error: 'prod_cost_snapshot billing_period.start must be after topology_baseline_install.installed_at date',
       };
     }
     if (!isPlainObject(payload.cost_surfaces)) {
