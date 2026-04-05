@@ -1395,17 +1395,54 @@ function validateProdPromotionRecordPayload(payload) {
       error: `${payloadLabel} promotion_mode must be "gradual" or "deploy_with_migration"`,
     };
   }
-  if (!isPlainObject(payload.source_candidate) || !isNonEmptyString(payload.source_candidate.candidate_id)) {
+  if (payload.promotion_authority !== 'reviewed_candidate' && payload.promotion_authority !== 'operational_unblock') {
     return {
       valid: false,
-      error: `${payloadLabel} source_candidate.candidate_id must be non-empty`,
+      error: `${payloadLabel} promotion_authority must be "reviewed_candidate" or "operational_unblock"`,
     };
   }
-  if (!isGitHubActionsRunUri(payload.source_candidate.source_run_uri)) {
-    return {
-      valid: false,
-      error: `${payloadLabel} source_candidate.source_run_uri must be a GitHub Actions run URL`,
-    };
+  if (payload.promotion_authority === 'reviewed_candidate') {
+    if (!isPlainObject(payload.source_candidate) || !isNonEmptyString(payload.source_candidate.candidate_id)) {
+      return {
+        valid: false,
+        error: `${payloadLabel} source_candidate.candidate_id must be non-empty`,
+      };
+    }
+    if (!isGitHubActionsRunUri(payload.source_candidate.source_run_uri)) {
+      return {
+        valid: false,
+        error: `${payloadLabel} source_candidate.source_run_uri must be a GitHub Actions run URL`,
+      };
+    }
+    if (payload.operational_unblock != null) {
+      return {
+        valid: false,
+        error: `${payloadLabel} operational_unblock must be null for reviewed_candidate promotions`,
+      };
+    }
+  } else {
+    if (payload.source_candidate != null) {
+      return {
+        valid: false,
+        error: `${payloadLabel} source_candidate must be null for operational_unblock promotions`,
+      };
+    }
+    if (!isPlainObject(payload.operational_unblock) || !isNonEmptyString(payload.operational_unblock.reason)) {
+      return {
+        valid: false,
+        error: `${payloadLabel} operational_unblock.reason must be non-empty`,
+      };
+    }
+    if (
+      !Array.isArray(payload.operational_unblock.blocked_by_open_questions)
+      || payload.operational_unblock.blocked_by_open_questions.length === 0
+      || payload.operational_unblock.blocked_by_open_questions.some((entry) => !isNonEmptyString(entry))
+    ) {
+      return {
+        valid: false,
+        error: `${payloadLabel} operational_unblock.blocked_by_open_questions must be a non-empty string array`,
+      };
+    }
   }
   const previousValidation = validateEvidenceDeploymentIdentity(payloadLabel, payload.previous_deployment_identity, {
     deploymentFieldName: 'previous_deployment_identity',

@@ -23,6 +23,7 @@ import {
   downloadImmutableArtifactFromR2,
   deployNonLocalEnvironment,
   installProductionTopology,
+  operationalRefreshProductionEnvironment,
   promoteProductionEnvironment,
   resolveClosedProdBillingWindow,
   rollbackProductionEnvironment,
@@ -532,6 +533,37 @@ async function main() {
       output_path: typeof options.output === 'string' ? options.output : null,
       promotion_id: result.record.promotion_id,
       promotion_mode: result.record.promotion_mode,
+      current_deployment_identity: result.record.current_deployment_identity,
+      gateway_rollout_steps: result.record.gateway_rollout_steps.length,
+    }, null, 2)}\n`);
+    return;
+  }
+  if (requestedEnvironment === 'prod-operational-refresh') {
+    const options = parseKeyValueOptions(process.argv);
+    const result = await operationalRefreshProductionEnvironment({
+      repoRoot: process.cwd(),
+      baselineRecord: await readJsonFile(path.resolve(process.cwd(), requireOption(options, 'baseline-record'))),
+      workingRoot: typeof options['working-root'] === 'string'
+        ? path.resolve(process.cwd(), options['working-root'])
+        : path.resolve(process.cwd(), '.tmp', 'prod', 'operational-refresh'),
+      outputPath: typeof options.output === 'string' ? path.resolve(process.cwd(), options.output) : null,
+      promotionId: typeof options['promotion-id'] === 'string' ? options['promotion-id'] : null,
+      deploymentId: typeof options['deployment-id'] === 'string' ? options['deployment-id'] : null,
+      blockedByOpenQuestions: typeof options['blocked-by-open-questions'] === 'string'
+        ? options['blocked-by-open-questions'].split(',').map((entry) => entry.trim()).filter(Boolean)
+        : ['OQ-0002', 'OQ-0006'],
+      reason: typeof options.reason === 'string'
+        ? options.reason
+        : 'Operational prod refresh to unblock Phase 08 cost closure',
+      accountId: typeof options['account-id'] === 'string' ? options['account-id'] : null,
+      apiToken: typeof options['api-token'] === 'string' ? options['api-token'] : null,
+      productionSecretSeed: typeof options['secret-seed'] === 'string' ? options['secret-seed'] : null,
+    });
+    process.stdout.write(`${JSON.stringify({
+      output_path: typeof options.output === 'string' ? options.output : null,
+      promotion_id: result.record.promotion_id,
+      promotion_mode: result.record.promotion_mode,
+      promotion_authority: result.record.promotion_authority,
       current_deployment_identity: result.record.current_deployment_identity,
       gateway_rollout_steps: result.record.gateway_rollout_steps.length,
     }, null, 2)}\n`);

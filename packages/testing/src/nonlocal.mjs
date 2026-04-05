@@ -6518,7 +6518,9 @@ export function validateProdPromotionRecord(payload, {
 
 export function buildProdPromotionRecord({
   releaseCommitSha,
+  promotionAuthority = 'reviewed_candidate',
   sourceCandidate,
+  operationalUnblock = null,
   promotionMode,
   previousDeploymentIdentity,
   currentDeploymentIdentity,
@@ -6544,8 +6546,10 @@ export function buildProdPromotionRecord({
     origin_run_attempt: originRunIdentity.origin_run_attempt,
     origin_run_uri: originRunIdentity.origin_run_uri,
     release_commit_sha: String(releaseCommitSha ?? ''),
+    promotion_authority: String(promotionAuthority ?? ''),
     promotion_mode: String(promotionMode ?? ''),
-    source_candidate: structuredCloneJson(sourceCandidate ?? {}),
+    source_candidate: sourceCandidate == null ? null : structuredCloneJson(sourceCandidate),
+    operational_unblock: operationalUnblock == null ? null : structuredCloneJson(operationalUnblock),
     previous_deployment_identity: structuredCloneJson(previousDeploymentIdentity ?? {}),
     current_deployment_identity: structuredCloneJson(currentDeploymentIdentity ?? {}),
     gateway_rollout_steps: structuredCloneJson(gatewayRolloutSteps),
@@ -6568,6 +6572,257 @@ export async function writeProdPromotionRecord(outputPath, options) {
   return {
     output_path: outputPath,
     record,
+  };
+}
+
+export async function operationalRefreshProductionEnvironment({
+  repoRoot = process.cwd(),
+  baselineRecord,
+  promotionId = null,
+  workingRoot = null,
+  outputPath = null,
+  deploymentId = null,
+  blockedByOpenQuestions = ['OQ-0002', 'OQ-0006'],
+  reason = 'Operational prod refresh to unblock Phase 08 cost closure',
+  accountId: explicitAccountId = null,
+  apiToken: explicitApiToken = null,
+  productionSecretSeed = null,
+} = {}) {
+  const claims = await requireGitHubActionsExecution('operationalRefreshProductionEnvironment', {
+    expectedEnvironmentName: PRODUCTION_ENVIRONMENT_NAME,
+  });
+  const currentRepository = await resolveCurrentGitHubRepository(repoRoot, claims);
+  const currentHeadSha = await resolveCurrentGitCommitSha(repoRoot);
+  const resolvedBaselineRecord = validateProductionBaselineRecord(baselineRecord);
+  assertArtifactRepositoryMatchesCurrent('baselineRecord', resolvedBaselineRecord, currentRepository);
+  const { accountId, apiToken } = requireCloudflareCredentials({
+    accountId: explicitAccountId,
+    apiToken: explicitApiToken,
+  });
+  const resolvedWorkingRoot = path.resolve(workingRoot ?? path.join(repoRoot, '.tmp', 'prod-operational-refresh'));
+  await fs.mkdir(resolvedWorkingRoot, { recursive: true });
+  const provisionedEnvironment = await ensureProductionEnvironmentResources({
+    repoRoot,
+    preferredWorkersSubdomain: extractBaselineWorkersSubdomain(resolvedBaselineRecord),
+    accountId,
+    apiToken,
+  });
+  const accessSession = await prepareProductionOpsAccessSession({
+    repoRoot,
+    provisionedEnvironment,
+    deploymentSummary: cloneProductionDeploymentSummary(resolvedBaselineRecord, provisionedEnvironment),
+    workingRoot: path.join(resolvedWorkingRoot, 'ops-access'),
+    accountId,
+    apiToken,
+  });
+  const currentIdentity = await buildProductionDeploymentIdentityFromCurrentCloudflareState(resolvedBaselineRecord, {
+    accountId,
+    apiToken,
+  });
+  assertProductionBaselineMatchesCurrentIdentity(resolvedBaselineRecord, currentIdentity);
+  const currentDeploymentSummary = cloneProductionDeploymentSummary(resolvedBaselineRecord, provisionedEnvironment);
+  for (const workerName of WORKER_DEPLOYMENT_ORDER) {
+    updateProductionDeploymentSummaryWorker(currentDeploymentSummary, provisionedEnvironment.plan, workerName, {
+      deploymentId: currentIdentity.deployment_ids[WORKER_DEPLOYMENT_ORDER.indexOf(workerName)],
+      workerVersionId: currentIdentity.worker_version_ids[WORKER_DEPLOYMENT_ORDER.indexOf(workerName)],
+      workerVersionTag: resolvedBaselineRecord.workers?.[workerName]?.worker_version_tag ?? null,
+    });
+  }
+
+  const resolvedPromotionId = promotionId ?? deploymentId ?? `gha-prod-operational-refresh-${Date.now().toString(36)}`;
+  const jobsUpload = await uploadWorkerVersion('jobs-worker', provisionedEnvironment, {
+    repoRoot,
+    deploymentSummary: currentDeploymentSummary,
+    workingRoot: path.join(resolvedWorkingRoot, 'jobs-worker'),
+    deploymentId: `${resolvedPromotionId}-jobs`,
+    accountId,
+    apiToken,
+    productionSecretSeed,
+  });
+  const jobsDeploy = await deployProductionWorkerVersion(
+    'jobs-worker',
+    jobsUpload.config_path,
+    buildSingleVersionSpecs(jobsUpload.worker_version_id),
+    {
+      repoRoot,
+      accountId,
+      apiToken,
+      deploymentMessage: `${resolvedPromotionId}:jobs-operational`,
+      scriptName: jobsUpload.script_name,
+    },
+  );
+  updateProductionDeploymentSummaryWorker(currentDeploymentSummary, provisionedEnvironment.plan, 'jobs-worker', {
+    deploymentId: jobsDeploy.deployment_id,
+    workerVersionId: jobsUpload.worker_version_id,
+    workerVersionTag: jobsUpload.worker_version_tag,
+  });
+  const jobsReadiness = await waitForProductionDeploymentReadiness(
+    buildRemoteHarnessEnvironmentVariablesWithAccessSession(
+      buildRemoteHarnessEnvironmentVariables(provisionedEnvironment.plan),
+      accessSession,
+    ),
+  );
+  if (!jobsReadiness.ready) {
+    throw new Error(`Operational prod refresh jobs-worker readiness probe failed: ${jobsReadiness.last_error}`);
+  }
+
+  const opsUpload = await uploadWorkerVersion('ops-worker', provisionedEnvironment, {
+    repoRoot,
+    deploymentSummary: currentDeploymentSummary,
+    workingRoot: path.join(resolvedWorkingRoot, 'ops-worker'),
+    deploymentId: `${resolvedPromotionId}-ops`,
+    accountId,
+    apiToken,
+    productionSecretSeed,
+  });
+  const opsDeploy = await deployProductionWorkerVersion(
+    'ops-worker',
+    opsUpload.config_path,
+    buildSingleVersionSpecs(opsUpload.worker_version_id),
+    {
+      repoRoot,
+      accountId,
+      apiToken,
+      deploymentMessage: `${resolvedPromotionId}:ops-operational`,
+      scriptName: opsUpload.script_name,
+    },
+  );
+  updateProductionDeploymentSummaryWorker(currentDeploymentSummary, provisionedEnvironment.plan, 'ops-worker', {
+    deploymentId: opsDeploy.deployment_id,
+    workerVersionId: opsUpload.worker_version_id,
+    workerVersionTag: opsUpload.worker_version_tag,
+  });
+  const opsReadiness = await waitForProductionDeploymentReadiness(
+    buildRemoteHarnessEnvironmentVariablesWithAccessSession(
+      buildRemoteHarnessEnvironmentVariables(provisionedEnvironment.plan),
+      accessSession,
+    ),
+  );
+  if (!opsReadiness.ready) {
+    throw new Error(`Operational prod refresh ops-worker readiness probe failed: ${opsReadiness.last_error}`);
+  }
+
+  const gatewayBaselineVersionId = currentIdentity.worker_version_ids[WORKER_DEPLOYMENT_ORDER.indexOf('gateway-worker')];
+  const gatewayUpload = await uploadWorkerVersion('gateway-worker', provisionedEnvironment, {
+    repoRoot,
+    deploymentSummary: currentDeploymentSummary,
+    workingRoot: path.join(resolvedWorkingRoot, 'gateway-worker'),
+    deploymentId: `${resolvedPromotionId}-gateway`,
+    accountId,
+    apiToken,
+    productionSecretSeed,
+  });
+  const gatewayRolloutSteps = [];
+  let latestGatewayDeploymentId = currentIdentity.deployment_ids[WORKER_DEPLOYMENT_ORDER.indexOf('gateway-worker')];
+  for (const percentage of PROD_GATEWAY_GRADUAL_PERCENTAGES) {
+    const gatewayDeploy = await deployProductionWorkerVersion(
+      'gateway-worker',
+      gatewayUpload.config_path,
+      buildProdGatewayGradualVersionSpecs(
+        gatewayBaselineVersionId,
+        gatewayUpload.worker_version_id,
+        percentage,
+      ),
+      {
+        repoRoot,
+        accountId,
+        apiToken,
+        deploymentMessage: `${resolvedPromotionId}:gateway-operational-${percentage}`,
+        scriptName: gatewayUpload.script_name,
+      },
+    );
+    latestGatewayDeploymentId = gatewayDeploy.deployment_id;
+    updateProductionDeploymentSummaryWorker(currentDeploymentSummary, provisionedEnvironment.plan, 'gateway-worker', {
+      deploymentId: gatewayDeploy.deployment_id,
+      workerVersionId: percentage === 100 ? gatewayUpload.worker_version_id : gatewayBaselineVersionId,
+      workerVersionTag: percentage === 100
+        ? gatewayUpload.worker_version_tag
+        : resolvedBaselineRecord.workers?.['gateway-worker']?.worker_version_tag ?? null,
+    });
+    const readinessProbe = await waitForProductionDeploymentReadiness(
+      buildRemoteHarnessEnvironmentVariablesWithAccessSession(
+        buildRemoteHarnessEnvironmentVariables(provisionedEnvironment.plan),
+        accessSession,
+      ),
+    );
+    gatewayRolloutSteps.push({
+      percentage,
+      deployment_id: gatewayDeploy.deployment_id,
+      ready: readinessProbe.ready,
+      attempt_count: readinessProbe.attempt_count,
+      last_error: readinessProbe.last_error,
+    });
+    if (!readinessProbe.ready) {
+      throw new Error(`Operational prod refresh gateway rollout readiness probe failed at ${percentage}%: ${readinessProbe.last_error}`);
+    }
+  }
+
+  const record = buildProdPromotionRecord({
+    releaseCommitSha: currentHeadSha,
+    promotionAuthority: 'operational_unblock',
+    sourceCandidate: null,
+    operationalUnblock: {
+      reason,
+      blocked_by_open_questions: blockedByOpenQuestions,
+    },
+    promotionMode: 'gradual',
+    previousDeploymentIdentity: extractBaselineDeploymentIdentity(resolvedBaselineRecord),
+    currentDeploymentIdentity: {
+      environment_id: PRODUCTION_ENVIRONMENT_NAME,
+      deployment_ids: [
+        jobsDeploy.deployment_id,
+        opsDeploy.deployment_id,
+        latestGatewayDeploymentId,
+      ],
+      worker_version_ids: [
+        jobsUpload.worker_version_id,
+        opsUpload.worker_version_id,
+        gatewayUpload.worker_version_id,
+      ],
+    },
+    gatewayRolloutSteps,
+    readinessChecks: {
+      jobs_promoted: jobsReadiness,
+      ops_promoted: opsReadiness,
+    },
+    rollbackHandle: buildProductionRollbackHandle({
+      workers_subdomain: extractBaselineWorkersSubdomain(resolvedBaselineRecord) ?? provisionedEnvironment.workers_subdomain,
+      workers: {
+        ...resolvedBaselineRecord.workers,
+        'jobs-worker': {
+          ...resolvedBaselineRecord.workers?.['jobs-worker'],
+          script_name: resolvedBaselineRecord.workers?.['jobs-worker']?.script_name ?? provisionedEnvironment.plan.worker_scripts['jobs-worker'],
+          deployment_id: currentIdentity.deployment_ids[WORKER_DEPLOYMENT_ORDER.indexOf('jobs-worker')],
+          worker_version_id: currentIdentity.worker_version_ids[WORKER_DEPLOYMENT_ORDER.indexOf('jobs-worker')],
+        },
+        'ops-worker': {
+          ...resolvedBaselineRecord.workers?.['ops-worker'],
+          script_name: resolvedBaselineRecord.workers?.['ops-worker']?.script_name ?? provisionedEnvironment.plan.worker_scripts['ops-worker'],
+          deployment_id: currentIdentity.deployment_ids[WORKER_DEPLOYMENT_ORDER.indexOf('ops-worker')],
+          worker_version_id: currentIdentity.worker_version_ids[WORKER_DEPLOYMENT_ORDER.indexOf('ops-worker')],
+        },
+        'gateway-worker': {
+          ...resolvedBaselineRecord.workers?.['gateway-worker'],
+          script_name: resolvedBaselineRecord.workers?.['gateway-worker']?.script_name ?? provisionedEnvironment.plan.worker_scripts['gateway-worker'],
+          deployment_id: currentIdentity.deployment_ids[WORKER_DEPLOYMENT_ORDER.indexOf('gateway-worker')],
+          worker_version_id: currentIdentity.worker_version_ids[WORKER_DEPLOYMENT_ORDER.indexOf('gateway-worker')],
+        },
+      },
+    }),
+    promotionId: resolvedPromotionId,
+    originRunIdentity: buildGitHubActionsProducerRunIdentity(claims),
+  });
+  assertArtifactRepositoryMatchesCurrent('prodPromotionRecord', record, currentRepository);
+  if (outputPath != null) {
+    await fs.mkdir(path.dirname(outputPath), { recursive: true });
+    await fs.writeFile(outputPath, stableJson(record));
+  }
+  return {
+    provisioned_environment: provisionedEnvironment,
+    access_session: accessSession,
+    promotion_mode: 'gradual',
+    record,
+    output_path: outputPath,
   };
 }
 

@@ -1,0 +1,256 @@
+name: Operational Prod Refresh
+
+on:
+  workflow_dispatch:
+    inputs:
+      baseline_run_id:
+        description: Current prod baseline run id (prod-install or prior promote-prod or prior operational-prod-refresh)
+        required: true
+        type: string
+      reason:
+        description: Short reason for this operational unblock deployment
+        required: false
+        default: Operational prod refresh to unblock Phase 08 cost closure
+        type: string
+      blocked_by_open_questions:
+        description: Comma-separated open-question ids justifying this exception path
+        required: false
+        default: OQ-0002,OQ-0006
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+  id-token: write
+
+concurrency:
+  group: operational-prod-refresh
+  cancel-in-progress: false
+
+jobs:
+  operational-prod-refresh:
+    runs-on: ubuntu-latest
+    environment: prod
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_OBSERVABILITY_API_TOKEN: ${{ secrets.CLOUDFLARE_OBSERVABILITY_API_TOKEN }}
+      MATRIX_PROD_SECRET_SEED: ${{ secrets.MATRIX_PROD_SECRET_SEED }}
+    steps:
+      - name: Define operational refresh paths
+        id: paths
+        shell: bash
+        run: |
+          run_timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+          workspace_root="${RUNNER_TEMP}/matrix-operational-prod-refresh-${{ github.run_id }}-${{ github.run_attempt }}"
+          state_root="${workspace_root}/state"
+          download_root="${workspace_root}/downloaded"
+          artifact_root="${workspace_root}/artifacts"
+          record_key="gha/${{ github.run_id }}/${{ github.run_attempt }}/prod/${run_timestamp}/prod-promotion-record.json"
+          artifact_name="prod-operational-refresh-record-${run_timestamp}-${{ github.run_id }}-${{ github.run_attempt }}"
+          raw_state_artifact_name="prod-operational-refresh-raw-state-${run_timestamp}-${{ github.run_id }}-${{ github.run_attempt }}"
+          echo "run_timestamp=${run_timestamp}" >> "$GITHUB_OUTPUT"
+          echo "workspace_root=${workspace_root}" >> "$GITHUB_OUTPUT"
+          echo "state_root=${state_root}" >> "$GITHUB_OUTPUT"
+          echo "download_root=${download_root}" >> "$GITHUB_OUTPUT"
+          echo "artifact_root=${artifact_root}" >> "$GITHUB_OUTPUT"
+          echo "record=${artifact_root}/prod-promotion-record.json" >> "$GITHUB_OUTPUT"
+          echo "record_key=${record_key}" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=${artifact_name}" >> "$GITHUB_OUTPUT"
+          echo "raw_state_artifact_name=${raw_state_artifact_name}" >> "$GITHUB_OUTPUT"
+          mkdir -p "$workspace_root" "$state_root" "$download_root" "$artifact_root"
+          printf '{"run_timestamp":"%s","workflow":"operational-prod-refresh"}\n' "$run_timestamp" > "${state_root}/raw-state-metadata.json"
+          cat > "${state_root}/dispatch-request.json" <<EOF
+          {
+            "baseline_run_id": "${{ inputs.baseline_run_id }}",
+            "reason": "${{ inputs.reason }}",
+            "blocked_by_open_questions": "${{ inputs.blocked_by_open_questions }}"
+          }
+          EOF
+
+      - uses: actions/checkout@v4
+        id: checkout_workflow_ref
+
+      - uses: actions/setup-node@v4
+        id: setup_node
+        if: steps.checkout_workflow_ref.outcome == 'success'
+        with:
+          node-version: '22'
+
+      - name: Require master dispatch ref
+        id: require_master_ref
+        if: steps.setup_node.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          cat > "${{ steps.paths.outputs.state_root }}/ref-check.json" <<EOF
+          {
+            "github_ref": "${{ github.ref }}",
+            "github_ref_name": "${{ github.ref_name }}",
+            "required_ref": "refs/heads/master"
+          }
+          EOF
+
+          if [ "${{ github.ref }}" != "refs/heads/master" ]; then
+            echo "operational-prod-refresh may only run from refs/heads/master; got ${{ github.ref }}" >&2
+            exit 1
+          fi
+
+      - name: Require production secrets
+        id: require_secrets
+        if: steps.require_master_ref.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          missing=()
+          for secret_name in CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN MATRIX_PROD_SECRET_SEED; do
+            if [ -z "${!secret_name}" ]; then
+              missing+=("$secret_name")
+            fi
+          done
+
+          missing_json="$(printf '%s\n' "${missing[@]}" | node -e "const fs=require('fs');const values=fs.readFileSync(0,'utf8').split(/\n/).filter(Boolean);process.stdout.write(JSON.stringify(values));")"
+          cat > "${{ steps.paths.outputs.state_root }}/secret-check.json" <<EOF
+          {
+            "required_secrets": [
+              "CLOUDFLARE_ACCOUNT_ID",
+              "CLOUDFLARE_API_TOKEN",
+              "MATRIX_PROD_SECRET_SEED"
+            ],
+            "missing_secrets": ${missing_json}
+          }
+          EOF
+
+          if [ "${#missing[@]}" -ne 0 ]; then
+            echo "Missing required production secrets: ${missing[*]}" >&2
+            exit 1
+          fi
+
+      - name: Resolve baseline run metadata
+        id: baseline_run
+        if: steps.require_secrets.outcome == 'success'
+        continue-on-error: true
+        uses: actions/github-script@v7
+        env:
+          BASELINE_RUN_ID: ${{ inputs.baseline_run_id }}
+        with:
+          script: |
+            const baseline = await github.rest.actions.getWorkflowRun({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: Number(process.env.BASELINE_RUN_ID),
+            });
+            const allowedPaths = [
+              '.github/workflows/prod-install.yml',
+              '.github/workflows/promote-prod.yml',
+              '.github/workflows/operational-prod-refresh.yml',
+            ];
+            if (!allowedPaths.includes(baseline.data.path)) {
+              core.setFailed(`baseline_run_id must come from ${allowedPaths.join(', ')}, got ${baseline.data.path}`);
+              return;
+            }
+            core.setOutput('baseline_run_attempt', String(baseline.data.run_attempt));
+            core.setOutput(
+              'baseline_artifact_prefix',
+              baseline.data.path === '.github/workflows/prod-install.yml'
+                ? 'prod-install-record'
+                : baseline.data.path === '.github/workflows/promote-prod.yml'
+                  ? 'prod-promotion-record'
+                  : 'prod-operational-refresh-record',
+            );
+            core.setOutput(
+              'baseline_record_name',
+              baseline.data.path === '.github/workflows/prod-install.yml'
+                ? 'prod-install-record.json'
+                : 'prod-promotion-record.json',
+            );
+
+      - name: Download production baseline record
+        id: download_baseline
+        if: steps.baseline_run.outcome == 'success'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.baseline_run_id }}
+          pattern: ${{ steps.baseline_run.outputs.baseline_artifact_prefix }}-*-${{ inputs.baseline_run_id }}-${{ steps.baseline_run.outputs.baseline_run_attempt }}
+          merge-multiple: true
+          path: ${{ steps.paths.outputs.download_root }}/baseline
+
+      - name: Refresh production topology operationally
+        id: operational_refresh
+        if: steps.download_baseline.outcome == 'success'
+        continue-on-error: true
+        run: |
+          node packages/testing/src/cli.mjs prod-operational-refresh \
+            --baseline-record "${{ steps.paths.outputs.download_root }}/baseline/${{ steps.baseline_run.outputs.baseline_record_name }}" \
+            --working-root "${{ steps.paths.outputs.state_root }}/operational-refresh" \
+            --output "${{ steps.paths.outputs.record }}" \
+            --promotion-id "gha-prod-operational-refresh-${{ steps.paths.outputs.run_timestamp }}-${{ github.run_id }}-${{ github.run_attempt }}" \
+            --reason "${{ inputs.reason }}" \
+            --blocked-by-open-questions "${{ inputs.blocked_by_open_questions }}"
+
+      - name: Upload prod-operational-refresh raw state artifact
+        if: always() && steps.paths.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.paths.outputs.raw_state_artifact_name }}
+          path: |
+            ${{ steps.paths.outputs.state_root }}
+            ${{ steps.paths.outputs.download_root }}
+            ${{ steps.paths.outputs.artifact_root }}
+          if-no-files-found: error
+
+      - name: Upload operational refresh record artifact
+        if: steps.operational_refresh.outcome == 'success'
+        id: upload_record
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.paths.outputs.artifact_name }}
+          path: ${{ steps.paths.outputs.record }}
+          if-no-files-found: error
+
+      - name: Upload operational refresh record to R2
+        if: steps.operational_refresh.outcome == 'success'
+        id: upload_r2
+        run: |
+          node packages/testing/src/cli.mjs nonlocal-upload-r2 \
+            --bucket "matrix-evidence-prod" \
+            --key "${{ steps.paths.outputs.record_key }}" \
+            --file "${{ steps.paths.outputs.record }}" \
+            --content-type "application/json; charset=utf-8" \
+            --output "${{ steps.paths.outputs.state_root }}/record-upload.json"
+
+      - name: Enforce operational-prod-refresh fail-closed outcome after raw artifact preservation
+        if: always()
+        shell: bash
+        run: |
+          if [ "${{ steps.checkout_workflow_ref.outcome }}" != "success" ]; then
+            echo "Checking out the workflow ref for operational-prod-refresh failed after raw state preservation." >&2
+            exit 1
+          fi
+          if [ "${{ steps.setup_node.outcome }}" != "success" ]; then
+            echo "Setting up Node.js for operational-prod-refresh failed after raw state preservation." >&2
+            exit 1
+          fi
+          if [ "${{ steps.require_master_ref.outcome }}" != "success" ]; then
+            echo "operational-prod-refresh was not dispatched from refs/heads/master after raw state preservation." >&2
+            exit 1
+          fi
+          if [ "${{ steps.require_secrets.outcome }}" != "success" ]; then
+            echo "Required production secrets were missing after raw state preservation." >&2
+            exit 1
+          fi
+          if [ "${{ steps.baseline_run.outcome }}" != "success" ]; then
+            echo "Resolving baseline run metadata failed after raw state preservation." >&2
+            exit 1
+          fi
+          if [ "${{ steps.download_baseline.outcome }}" != "success" ]; then
+            echo "Downloading production baseline artifact failed after raw state preservation." >&2
+            exit 1
+          fi
+          if [ "${{ steps.operational_refresh.outcome }}" != "success" ]; then
+            echo "Operational prod refresh failed after raw state preservation." >&2
+            exit 1
+          fi

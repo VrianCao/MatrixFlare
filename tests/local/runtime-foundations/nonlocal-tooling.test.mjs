@@ -3375,11 +3375,13 @@ test('production automation validators fail closed on missing rollback data and 
     promoted_at: '2026-03-31T14:09:00.000Z',
     ...buildProducerRunIdentityFixture({ runId: '912349' }),
     release_commit_sha: '89abcdef0123456789abcdef0123456789abcdef',
+    promotion_authority: 'reviewed_candidate',
     promotion_mode: 'gradual',
     source_candidate: {
       candidate_id: 'candidate-20260331t140000z',
       source_run_uri: buildGitHubRunUrl('VrianCao/MatrixFlare', '81234'),
     },
+    operational_unblock: null,
     previous_deployment_identity: {
       environment_id: 'prod',
       deployment_ids: ['jobs-prod-deployment-v1', 'ops-prod-deployment-v1', 'gateway-prod-deployment-v1'],
@@ -3405,11 +3407,13 @@ test('production automation validators fail closed on missing rollback data and 
     promoted_at: '2026-03-31T14:09:00.000Z',
     ...buildProducerRunIdentityFixture({ runId: '912350' }),
     release_commit_sha: '89abcdef0123456789abcdef0123456789abcdef',
+    promotion_authority: 'reviewed_candidate',
     promotion_mode: 'deploy_with_migration',
     source_candidate: {
       candidate_id: 'candidate-20260331t140000z',
       source_run_uri: buildGitHubRunUrl('VrianCao/MatrixFlare', '81234'),
     },
+    operational_unblock: null,
     previous_deployment_identity: {
       environment_id: 'prod',
       deployment_ids: ['jobs-prod-deployment-v1', 'ops-prod-deployment-v1', 'gateway-prod-deployment-v1'],
@@ -3486,11 +3490,13 @@ test('production automation builders fail closed on missing reviewed candidate o
     promoted_at: '2026-03-31T14:09:00.000Z',
     ...buildProducerRunIdentityFixture({ runId: '912351' }),
     release_commit_sha: '89abcdef0123456789abcdef0123456789abcdef',
+    promotion_authority: 'reviewed_candidate',
     promotion_mode: 'gradual',
     source_candidate: {
       candidate_id: 'candidate-20260331t140000z',
       source_run_uri: buildGitHubRunUrl('VrianCao/MatrixFlare', '81234'),
     },
+    operational_unblock: null,
     previous_deployment_identity: {
       environment_id: 'prod',
       deployment_ids: [],
@@ -3535,12 +3541,73 @@ test('production automation builders fail closed on missing reviewed candidate o
     valid: false,
     error: 'prod_promotion_record previous_deployment_identity.deployment_ids must be a non-empty string array',
   });
+
+  assert.deepEqual(validateProdPromotionRecord({
+    schema_version: 1,
+    artifact_id: 'prod_promotion_record',
+    source_environment: 'prod',
+    promotion_id: 'promotion-prod-operational-unblock',
+    promoted_at: '2026-04-05T12:09:00.000Z',
+    ...buildProducerRunIdentityFixture({ runId: '912352' }),
+    release_commit_sha: '89abcdef0123456789abcdef0123456789abcdef',
+    promotion_authority: 'operational_unblock',
+    promotion_mode: 'gradual',
+    source_candidate: null,
+    operational_unblock: {
+      reason: 'Operational prod refresh to unblock Phase 08 cost closure',
+      blocked_by_open_questions: ['OQ-0002', 'OQ-0006'],
+    },
+    previous_deployment_identity: {
+      environment_id: 'prod',
+      deployment_ids: ['jobs-prod-deployment-v1', 'ops-prod-deployment-v1', 'gateway-prod-deployment-v1'],
+      worker_version_ids: ['jobs@prod-v1', 'ops@prod-v1', 'gateway@prod-v1'],
+    },
+    current_deployment_identity: {
+      environment_id: 'prod',
+      deployment_ids: ['jobs-prod-deployment-v2', 'ops-prod-deployment-v2', 'gateway-prod-deployment-v2'],
+      worker_version_ids: ['jobs@prod-v2', 'ops@prod-v2', 'gateway@prod-v2'],
+    },
+    gateway_rollout_steps: [
+      { percentage: 100, deployment_id: 'gateway-prod-rollout-100', ready: true, attempt_count: 1, last_error: null },
+    ],
+    readiness_checks: {
+      jobs_promoted: buildProductionReadinessProbeFixture(),
+      ops_promoted: buildProductionReadinessProbeFixture(),
+    },
+    rollback_handle: {
+      workers_subdomain: 'matrixflare',
+      worker_versions: {
+        'gateway-worker': {
+          script_name: 'matrix-gateway-worker-prod',
+          previous_deployment_id: 'gateway-prod-deployment-v1',
+          previous_worker_version_id: 'gateway@prod-v1',
+          restore_version_specs: ['gateway@prod-v1@100'],
+        },
+        'jobs-worker': {
+          script_name: 'matrix-jobs-worker-prod',
+          previous_deployment_id: 'jobs-prod-deployment-v1',
+          previous_worker_version_id: 'jobs@prod-v1',
+          restore_version_specs: ['jobs@prod-v1@100'],
+        },
+        'ops-worker': {
+          script_name: 'matrix-ops-worker-prod',
+          previous_deployment_id: 'ops-prod-deployment-v1',
+          previous_worker_version_id: 'ops@prod-v1',
+          restore_version_specs: ['ops@prod-v1@100'],
+        },
+      },
+    },
+  }), {
+    valid: true,
+    error: null,
+  });
 });
 
 test('production workflow YAMLs stay aligned with the prod automation CLI contract', async () => {
   const prodInstallWorkflow = await fs.readFile(new URL('../../../.github/workflows/prod-install.yml', import.meta.url), 'utf8');
   const releaseCandidateWorkflow = await fs.readFile(new URL('../../../.github/workflows/release-candidate.yml', import.meta.url), 'utf8');
   const promoteProdWorkflow = await fs.readFile(new URL('../../../.github/workflows/promote-prod.yml', import.meta.url), 'utf8');
+  const operationalRefreshWorkflow = await fs.readFile(new URL('../../../.github/workflows/operational-prod-refresh.yml', import.meta.url), 'utf8');
   const rollbackProdWorkflow = await fs.readFile(new URL('../../../.github/workflows/rollback-prod.yml', import.meta.url), 'utf8');
   const prodCostWorkflow = await fs.readFile(new URL('../../../.github/workflows/prod-cost-monthly.yml', import.meta.url), 'utf8');
   const assertStepOrder = (workflowSource, earlierStepId, laterSnippet, message) => {
@@ -3598,6 +3665,28 @@ test('production workflow YAMLs stay aligned with the prod automation CLI contra
   assert.match(promoteProdWorkflow, /id:\s+require_candidate_checkout_match[\s\S]*?continue-on-error:\s+true/u, 'promote-prod must preserve raw state when candidate checkout validation fails');
   assert.match(promoteProdWorkflow, /id:\s+promote_candidate[\s\S]*?continue-on-error:\s+true/u, 'promote-prod must preserve raw state before failing closed');
   assert.match(promoteProdWorkflow, /prod-promote-raw-state-/u, 'promote-prod must upload a dedicated raw-state artifact');
+
+  assert.match(operationalRefreshWorkflow, /environment:\s+prod/u, 'operational-prod-refresh must run in the protected GitHub prod environment');
+  assert.match(operationalRefreshWorkflow, /node packages\/testing\/src\/cli\.mjs prod-operational-refresh/u, 'operational-prod-refresh workflow must invoke the prod-operational-refresh CLI entry');
+  assert.match(operationalRefreshWorkflow, /\.github\/workflows\/operational-prod-refresh\.yml/u, 'operational-prod-refresh must permit its own prior runs as future baseline sources');
+  assert.match(operationalRefreshWorkflow, /\.github\/workflows\/promote-prod\.yml/u, 'operational-prod-refresh must accept promote-prod as a baseline source');
+  assert.match(operationalRefreshWorkflow, /\.github\/workflows\/prod-install\.yml/u, 'operational-prod-refresh must accept prod-install as a baseline source');
+  assert.match(operationalRefreshWorkflow, /--baseline-record/u, 'operational-prod-refresh workflow must consume a baseline record');
+  assert.match(operationalRefreshWorkflow, /--promotion-id/u, 'operational-prod-refresh workflow must persist an explicit promotion id');
+  assert.match(operationalRefreshWorkflow, /--reason/u, 'operational-prod-refresh workflow must persist the operational reason');
+  assert.match(operationalRefreshWorkflow, /--blocked-by-open-questions/u, 'operational-prod-refresh workflow must persist the blocker list');
+  assertStepOrder(operationalRefreshWorkflow, 'paths', 'id: checkout_workflow_ref', 'operational-prod-refresh must define raw-artifact paths before checkout');
+  assert.match(operationalRefreshWorkflow, /id:\s+require_master_ref[\s\S]*?continue-on-error:\s+true/u, 'operational-prod-refresh must preserve raw state when the dispatch ref is not master');
+  assert.match(operationalRefreshWorkflow, /required_ref/u, 'operational-prod-refresh must persist a machine-readable ref gate artifact');
+  assert.match(operationalRefreshWorkflow, /refs\/heads\/master/u, 'operational-prod-refresh must fail closed unless dispatched from master');
+  assert.match(operationalRefreshWorkflow, /id:\s+require_secrets[\s\S]*?continue-on-error:\s+true/u, 'operational-prod-refresh secret preflight must fail closed only after raw state can be preserved');
+  assert.match(operationalRefreshWorkflow, /RUNNER_TEMP/u, 'operational-prod-refresh raw blocker artifacts must live outside the checkout-cleaned workspace');
+  assert.match(operationalRefreshWorkflow, /secret-check\.json/u, 'operational-prod-refresh must persist a machine-readable secret blocker artifact');
+  assert.match(operationalRefreshWorkflow, /dispatch-request\.json/u, 'operational-prod-refresh raw state must retain the requested baseline and unblock inputs');
+  assert.match(operationalRefreshWorkflow, /id:\s+baseline_run[\s\S]*?continue-on-error:\s+true/u, 'operational-prod-refresh must preserve raw state when baseline run resolution fails');
+  assert.match(operationalRefreshWorkflow, /id:\s+download_baseline[\s\S]*?continue-on-error:\s+true/u, 'operational-prod-refresh must preserve raw state when baseline download fails');
+  assert.match(operationalRefreshWorkflow, /id:\s+operational_refresh[\s\S]*?continue-on-error:\s+true/u, 'operational-prod-refresh must preserve raw state before failing closed');
+  assert.match(operationalRefreshWorkflow, /prod-operational-refresh-raw-state-/u, 'operational-prod-refresh must upload a dedicated raw-state artifact');
 
   assert.match(rollbackProdWorkflow, /node packages\/testing\/src\/cli\.mjs prod-rollback/u, 'rollback-prod workflow must invoke the prod-rollback CLI entry');
   assert.match(rollbackProdWorkflow, /\.github\/workflows\/promote-prod\.yml/u, 'rollback-prod workflow must require source runs from promote-prod.yml');
