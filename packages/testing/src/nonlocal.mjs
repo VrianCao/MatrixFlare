@@ -43,6 +43,10 @@ const NON_LOCAL_ENVIRONMENT_NAMES = Object.freeze([
   'pre-release',
 ]);
 const PRODUCTION_ENVIRONMENT_NAME = 'prod';
+const DEPLOYABLE_ENVIRONMENT_NAMES = Object.freeze([
+  ...NON_LOCAL_ENVIRONMENT_NAMES,
+  PRODUCTION_ENVIRONMENT_NAME,
+]);
 
 const WORKER_DEPLOYMENT_ORDER = Object.freeze([
   'jobs-worker',
@@ -104,7 +108,10 @@ const NON_LOCAL_READINESS_MAX_DELAY_MS = 15_000;
 const NON_LOCAL_READINESS_REQUEST_TIMEOUT_MS = 10_000;
 const PRE_RELEASE_ROLLOUT_BASELINE_PERCENTAGE = 50;
 const PRE_RELEASE_ROLLOUT_CANDIDATE_PERCENTAGE = 50;
+const PROD_GATEWAY_GRADUAL_PERCENTAGES = Object.freeze([10, 50, 100]);
 const BILLING_PERIOD_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const RFC3339_UTC_TIMESTAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
+const GIT_SHA1_RE = /^[a-f0-9]{40}$/;
 let githubActionsOidcIdentityPromise = null;
 let githubActionsJwksPromise = null;
 
@@ -115,12 +122,21 @@ function assertNonLocalEnvironmentName(environmentName) {
   return environmentName;
 }
 
-function nonLocalEnvironmentRequiresOpsAccess(environmentName) {
-  return environmentName === 'staging' || environmentName === 'pre-release';
+function assertDeployableEnvironmentName(environmentName) {
+  if (!DEPLOYABLE_ENVIRONMENT_NAMES.includes(environmentName)) {
+    throw new RangeError(`Unsupported deployable environment "${environmentName}"`);
+  }
+  return environmentName;
+}
+
+function environmentRequiresOpsAccess(environmentName) {
+  return environmentName === 'staging'
+    || environmentName === 'pre-release'
+    || environmentName === PRODUCTION_ENVIRONMENT_NAME;
 }
 
 function assertRequiredOpsAccessRemoteHarnessEnv(environmentName, remoteHarnessEnv) {
-  if (!nonLocalEnvironmentRequiresOpsAccess(environmentName)) {
+  if (!environmentRequiresOpsAccess(environmentName)) {
     return;
   }
   if (!isNonEmptyString(remoteHarnessEnv.MATRIX_REMOTE_OPS_BASE_URL)) {
@@ -439,28 +455,28 @@ export function buildWorkerScriptName(workerName, environmentName) {
   return `${buildWorkerScriptBaseName(workerName)}-${assertNonLocalEnvironmentName(environmentName)}`;
 }
 
-function buildProductionWorkerScriptName(workerName) {
+export function buildProductionWorkerScriptName(workerName) {
   return `${buildWorkerScriptBaseName(workerName)}-${PRODUCTION_ENVIRONMENT_NAME}`;
 }
 
 function buildResourceSuffix(environmentName) {
-  return assertNonLocalEnvironmentName(environmentName);
+  return assertDeployableEnvironmentName(environmentName);
 }
 
 function buildAccessApplicationName(environmentName) {
-  return `matrix-phase08-${assertNonLocalEnvironmentName(environmentName)}-ops`;
+  return `matrix-phase08-${assertDeployableEnvironmentName(environmentName)}-ops`;
 }
 
 function buildAccessPolicyName(environmentName) {
-  return `matrix-phase08-${assertNonLocalEnvironmentName(environmentName)}-gha-service-auth`;
+  return `matrix-phase08-${assertDeployableEnvironmentName(environmentName)}-gha-service-auth`;
 }
 
 function buildAccessServiceTokenName(environmentName) {
-  return `matrix-phase08-${assertNonLocalEnvironmentName(environmentName)}-gha-service-token`;
+  return `matrix-phase08-${assertDeployableEnvironmentName(environmentName)}-gha-service-token`;
 }
 
 function buildOperatorPolicyPrincipalId(environmentName) {
-  return `matrix-phase08-${assertNonLocalEnvironmentName(environmentName)}-gha-ops`;
+  return `matrix-phase08-${assertDeployableEnvironmentName(environmentName)}-gha-ops`;
 }
 
 function buildResourceBindingNames(environmentName) {
@@ -482,16 +498,21 @@ function buildResourceBindingNames(environmentName) {
   });
 }
 
-export function buildNonLocalEnvironmentPlan(environmentName, {
+function buildEnvironmentPlan(environmentName, {
   workersSubdomain = null,
   releaseProfile = DEFAULT_RELEASE_PROFILE,
 } = {}) {
-  const normalizedEnvironmentName = assertNonLocalEnvironmentName(environmentName);
+  const normalizedEnvironmentName = assertDeployableEnvironmentName(environmentName);
   const normalizedWorkersSubdomain = workersSubdomain == null
     ? null
     : normalizeWorkersSubdomain(workersSubdomain, 'workersSubdomain');
   const workerScripts = Object.freeze(Object.fromEntries(
-    listWorkerNames().map((workerName) => [workerName, buildWorkerScriptName(workerName, normalizedEnvironmentName)]),
+    listWorkerNames().map((workerName) => [
+      workerName,
+      normalizedEnvironmentName === PRODUCTION_ENVIRONMENT_NAME
+        ? buildProductionWorkerScriptName(workerName)
+        : buildWorkerScriptName(workerName, normalizedEnvironmentName),
+    ]),
   ));
   const resourceBindingNames = buildResourceBindingNames(normalizedEnvironmentName);
   const workerUrls = normalizedWorkersSubdomain == null
@@ -521,11 +542,28 @@ export function buildNonLocalEnvironmentPlan(environmentName, {
         resourceBindingNames.r2_buckets.MATRIX_ARCHIVE_BUCKET,
       ]),
       kv_namespaces: Object.freeze([resourceBindingNames.kv_namespaces.MATRIX_EDGE_CACHE]),
-      ratelimit_namespaces: listEnvironmentRateLimitNamespaces(normalizedEnvironmentName),
+      ratelimit_namespaces: normalizedEnvironmentName === PRODUCTION_ENVIRONMENT_NAME
+        ? listProductionRateLimitNamespaces()
+        : listEnvironmentRateLimitNamespaces(normalizedEnvironmentName),
       queues: Object.freeze(Object.values(resourceBindingNames.queues)),
     }),
     deployment_order: WORKER_DEPLOYMENT_ORDER,
     bootstrap_order: WORKER_BOOTSTRAP_ORDER,
+  });
+}
+
+export function buildNonLocalEnvironmentPlan(environmentName, options = {}) {
+  assertNonLocalEnvironmentName(environmentName);
+  return buildEnvironmentPlan(environmentName, options);
+}
+
+export function buildProductionEnvironmentPlan({
+  workersSubdomain = null,
+  releaseProfile = DEFAULT_RELEASE_PROFILE,
+} = {}) {
+  return buildEnvironmentPlan(PRODUCTION_ENVIRONMENT_NAME, {
+    workersSubdomain,
+    releaseProfile,
   });
 }
 
@@ -585,12 +623,12 @@ function buildAccessApplicationRequestBody(plan) {
 }
 
 function deriveStableSecretBytes({
-  apiToken,
+  secretMaterial,
   accountId,
   environmentName,
   label,
 }) {
-  return createHmac('sha256', String(apiToken))
+  return createHmac('sha256', String(secretMaterial))
     .update(`matrixflare:${accountId}:${environmentName}:${label}`)
     .digest();
 }
@@ -619,24 +657,30 @@ function buildDeterministicEd25519PemPair(secretBytes) {
   };
 }
 
-export function buildNonProductionSecretBundle({
+function buildEnvironmentSecretBundle({
   environmentName,
   accountId,
-  apiToken,
-  observabilityApiToken = apiToken,
+  secretMaterial,
+  observabilityApiToken,
 }) {
+  const normalizedEnvironmentName = assertDeployableEnvironmentName(environmentName);
+  if (!isNonEmptyString(accountId)) {
+    throw new TypeError('accountId must be non-empty');
+  }
+  if (!isNonEmptyString(secretMaterial)) {
+    throw new TypeError('secretMaterial must be non-empty');
+  }
   const resolvedObservabilityApiToken = typeof observabilityApiToken === 'string' && observabilityApiToken.trim().length > 0
     ? observabilityApiToken
-    : apiToken;
-  const normalizedEnvironmentName = assertNonLocalEnvironmentName(environmentName);
+    : secretMaterial;
   const signingKeyBytes = deriveStableSecretBytes({
-    apiToken,
+    secretMaterial,
     accountId,
     environmentName: normalizedEnvironmentName,
     label: 'export-signing-key',
   });
   const encryptionKeyBytes = deriveStableSecretBytes({
-    apiToken,
+    secretMaterial,
     accountId,
     environmentName: normalizedEnvironmentName,
     label: 'export-encryption-key',
@@ -644,7 +688,7 @@ export function buildNonProductionSecretBundle({
   const exportPemPair = buildDeterministicEd25519PemPair(signingKeyBytes);
   const rolloutProbeSharedSecret = createHash('sha256')
     .update(deriveStableSecretBytes({
-      apiToken,
+      secretMaterial,
       accountId,
       environmentName: normalizedEnvironmentName,
       label: 'rollout-probe-shared-secret',
@@ -653,26 +697,26 @@ export function buildNonProductionSecretBundle({
   return Object.freeze({
     gateway: Object.freeze({
       HOMESERVER_SIGNING_KEY_RING: buildOpaqueKeyRing(deriveStableSecretBytes({
-        apiToken,
+        secretMaterial,
         accountId,
         environmentName: normalizedEnvironmentName,
         label: 'homeserver-signing-key-ring',
       })),
       SESSION_ROOT_KEY_RING: buildOpaqueKeyRing(deriveStableSecretBytes({
-        apiToken,
+        secretMaterial,
         accountId,
         environmentName: normalizedEnvironmentName,
         label: 'session-root-key-ring',
       })),
       UIA_ROOT_KEY_RING: buildOpaqueKeyRing(deriveStableSecretBytes({
-        apiToken,
+        secretMaterial,
         accountId,
         environmentName: normalizedEnvironmentName,
         label: 'uia-root-key-ring',
       })),
       APPSERVICE_TOKEN_SET: createHash('sha256')
         .update(deriveStableSecretBytes({
-          apiToken,
+          secretMaterial,
           accountId,
           environmentName: normalizedEnvironmentName,
           label: 'appservice-token-set',
@@ -721,8 +765,72 @@ export function buildNonProductionSecretBundle({
   });
 }
 
+export function buildNonProductionSecretBundle({
+  environmentName,
+  accountId,
+  apiToken,
+  observabilityApiToken = apiToken,
+}) {
+  const normalizedEnvironmentName = assertNonLocalEnvironmentName(environmentName);
+  return buildEnvironmentSecretBundle({
+    environmentName: normalizedEnvironmentName,
+    accountId,
+    secretMaterial: apiToken,
+    observabilityApiToken,
+  });
+}
+
+export function buildProductionSecretBundle({
+  accountId,
+  secretSeed,
+  observabilityApiToken = process.env.CLOUDFLARE_OBSERVABILITY_API_TOKEN ?? secretSeed,
+}) {
+  return buildEnvironmentSecretBundle({
+    environmentName: PRODUCTION_ENVIRONMENT_NAME,
+    accountId,
+    secretMaterial: secretSeed,
+    observabilityApiToken,
+  });
+}
+
 function structuredCloneJson(value) {
   return JSON.parse(JSON.stringify(value));
+}
+
+function resolvePlanRateLimitNamespaceId(environmentName, namespaceId) {
+  if (environmentName === PRODUCTION_ENVIRONMENT_NAME) {
+    return String(namespaceId);
+  }
+  return buildEnvironmentRateLimitNamespaceId(environmentName, namespaceId);
+}
+
+function requireProductionSecretSeed(explicitSecretSeed = null) {
+  const secretSeed = explicitSecretSeed ?? process.env.MATRIX_PROD_SECRET_SEED ?? null;
+  if (!isNonEmptyString(secretSeed)) {
+    throw new RangeError('MATRIX_PROD_SECRET_SEED is required for production deploy/promote tooling');
+  }
+  return secretSeed;
+}
+
+function buildDeploymentSecretBundle(environmentName, {
+  accountId,
+  apiToken,
+  productionSecretSeed = null,
+  observabilityApiToken = process.env.CLOUDFLARE_OBSERVABILITY_API_TOKEN,
+}) {
+  if (environmentName === PRODUCTION_ENVIRONMENT_NAME) {
+    return buildProductionSecretBundle({
+      accountId,
+      secretSeed: requireProductionSecretSeed(productionSecretSeed),
+      observabilityApiToken,
+    });
+  }
+  return buildNonProductionSecretBundle({
+    environmentName,
+    accountId,
+    apiToken,
+    observabilityApiToken,
+  });
 }
 
 function buildWorkerVars(workerName, plan, {
@@ -872,7 +980,7 @@ export function createEnvironmentWranglerConfig(workerName, plan, {
   if (Array.isArray(baseConfig.ratelimits) && baseConfig.ratelimits.length > 0) {
     envConfig.ratelimits = baseConfig.ratelimits.map((binding) => ({
       ...binding,
-      namespace_id: buildEnvironmentRateLimitNamespaceId(envName, binding.namespace_id),
+      namespace_id: resolvePlanRateLimitNamespaceId(envName, binding.namespace_id),
     }));
   }
 
@@ -2907,7 +3015,7 @@ export function buildWranglerDeployArguments({
     '--config',
     configPath,
     '--env',
-    assertNonLocalEnvironmentName(environmentName),
+    assertDeployableEnvironmentName(environmentName),
     '--message',
     `${deploymentId}:${workerName}${gatewayBootstrapMode ? ':bootstrap' : ':deploy'}`,
     '--tag',
@@ -2984,6 +3092,104 @@ export async function ensureNonLocalEnvironmentResources(environmentName, {
   ]);
   const result = {
     environment_name: plan.environment_name,
+    repo_root: repoRoot,
+    account_id: accountId,
+    workers_subdomain: workersSubdomain.subdomain,
+    plan,
+    access: {
+      auth_domain: organization.auth_domain,
+      application_id: accessApp.application.id,
+      application_audience: accessApp.application.aud,
+      application_domain: accessApp.application.domain,
+      application_type: accessApp.application.type,
+      application_name: accessApp.application.name,
+      protected_ops_url: `https://${accessApp.application.domain}`,
+      created: accessApp.created,
+      updated: accessApp.updated,
+    },
+    resources: {
+      d1_database: d1Database,
+      kv_namespace: kvNamespace,
+      r2_buckets: {
+        media: mediaBucket,
+        archive: archiveBucket,
+        evidence: artifactBucket,
+      },
+      queues,
+    },
+  };
+  if (outputPath != null) {
+    await fs.mkdir(path.dirname(outputPath), { recursive: true });
+    await fs.writeFile(outputPath, stableJson(result));
+  }
+  return result;
+}
+
+export async function ensureProductionEnvironmentResources({
+  repoRoot = process.cwd(),
+  outputPath = null,
+  preferredWorkersSubdomain = null,
+  accountId: explicitAccountId = null,
+  apiToken: explicitApiToken = null,
+} = {}) {
+  await requireGitHubActionsExecution('ensureProductionEnvironmentResources', {
+    expectedEnvironmentName: PRODUCTION_ENVIRONMENT_NAME,
+  });
+  const { accountId, apiToken } = requireCloudflareCredentials({
+    accountId: explicitAccountId,
+    apiToken: explicitApiToken,
+  });
+  const workersSubdomain = await ensureWorkersSubdomain({
+    accountId,
+    apiToken,
+    preferredSubdomain: preferredWorkersSubdomain,
+  });
+  const plan = buildProductionEnvironmentPlan({
+    workersSubdomain: workersSubdomain.subdomain,
+  });
+  const [organization, accessApp, d1Database, kvNamespace, mediaBucket, archiveBucket, artifactBucket, ...queues] = await Promise.all([
+    getZeroTrustOrganization({
+      accountId,
+      apiToken,
+    }),
+    ensureAccessApplication({
+      accountId,
+      apiToken,
+      plan,
+    }),
+    ensureD1Database({
+      accountId,
+      apiToken,
+      databaseName: plan.d1_database_name,
+    }),
+    ensureKvNamespace({
+      accountId,
+      apiToken,
+      title: plan.kv_namespace_title,
+    }),
+    ensureR2Bucket({
+      accountId,
+      apiToken,
+      bucketName: plan.runtime_resource_binding_names.r2_buckets.MATRIX_MEDIA_BUCKET,
+    }),
+    ensureR2Bucket({
+      accountId,
+      apiToken,
+      bucketName: plan.runtime_resource_binding_names.r2_buckets.MATRIX_ARCHIVE_BUCKET,
+    }),
+    ensureR2Bucket({
+      accountId,
+      apiToken,
+      bucketName: plan.artifact_bucket_name,
+    }),
+    ...Object.values(plan.runtime_resource_binding_names.queues).map((queueName) => ensureQueue({
+      accountId,
+      apiToken,
+      queueName,
+    })),
+  ]);
+  const result = {
+    environment_name: PRODUCTION_ENVIRONMENT_NAME,
     repo_root: repoRoot,
     account_id: accountId,
     workers_subdomain: workersSubdomain.subdomain,
@@ -3128,6 +3334,116 @@ export async function prepareNonLocalOpsAccessSession(environmentName, {
   return result;
 }
 
+export async function prepareProductionOpsAccessSession({
+  repoRoot = process.cwd(),
+  provisionedEnvironment,
+  deploymentSummary,
+  workingRoot = null,
+  outputPath = null,
+  accountId: explicitAccountId = null,
+  apiToken: explicitApiToken = null,
+} = {}) {
+  await requireGitHubActionsExecution('prepareProductionOpsAccessSession', {
+    expectedEnvironmentName: PRODUCTION_ENVIRONMENT_NAME,
+  });
+  if (!isPlainObject(provisionedEnvironment) || provisionedEnvironment.environment_name !== PRODUCTION_ENVIRONMENT_NAME) {
+    throw new TypeError('provisionedEnvironment must be the prod provisioning payload');
+  }
+  if (!isPlainObject(deploymentSummary) || deploymentSummary.environment_name !== PRODUCTION_ENVIRONMENT_NAME) {
+    throw new TypeError('deploymentSummary must be the prod deployment/install payload');
+  }
+  if (!isPlainObject(provisionedEnvironment.access)) {
+    throw new TypeError('provisionedEnvironment.access must be present');
+  }
+  const accessMetadata = provisionedEnvironment.access;
+  if (!isNonEmptyString(accessMetadata.auth_domain)) {
+    throw new TypeError('provisionedEnvironment.access.auth_domain must be non-empty');
+  }
+  if (!isNonEmptyString(accessMetadata.application_id)) {
+    throw new TypeError('provisionedEnvironment.access.application_id must be non-empty');
+  }
+  if (!isNonEmptyString(accessMetadata.application_audience)) {
+    throw new TypeError('provisionedEnvironment.access.application_audience must be non-empty');
+  }
+  if (!isNonEmptyString(provisionedEnvironment.resources?.d1_database?.name)) {
+    throw new TypeError('provisionedEnvironment.resources.d1_database.name must be non-empty');
+  }
+  const { accountId, apiToken } = requireCloudflareCredentials({
+    accountId: explicitAccountId,
+    apiToken: explicitApiToken,
+  });
+  const serviceTokenResult = await ensureServiceToken({
+    accountId,
+    apiToken,
+    environmentName: PRODUCTION_ENVIRONMENT_NAME,
+  });
+  if (!isNonEmptyString(serviceTokenResult.service_token.client_secret)) {
+    throw new Error('Cloudflare service token rotation for prod did not return client_secret');
+  }
+  const accessPolicyResult = await ensureAccessApplicationPolicy({
+    accountId,
+    apiToken,
+    appId: accessMetadata.application_id,
+    environmentName: PRODUCTION_ENVIRONMENT_NAME,
+    serviceTokenId: serviceTokenResult.service_token.id,
+  });
+  const operatorPolicyRecord = buildOperatorPolicyRecord({
+    environmentName: PRODUCTION_ENVIRONMENT_NAME,
+    authDomain: accessMetadata.auth_domain,
+    audience: accessMetadata.application_audience,
+    accessSubjectValue: serviceTokenResult.service_token.client_id,
+  });
+  const resolvedWorkingRoot = path.resolve(workingRoot ?? path.join(repoRoot, '.tmp', 'prod', 'ops-access'));
+  await executeRemoteD1Sql({
+    repoRoot,
+    accountId,
+    databaseName: provisionedEnvironment.resources.d1_database.name,
+    sql: CONTROL_PLANE_SCHEMA_SQL,
+    workingRoot: resolvedWorkingRoot,
+  });
+  await executeRemoteD1Sql({
+    repoRoot,
+    accountId,
+    databaseName: provisionedEnvironment.resources.d1_database.name,
+    sql: buildOperatorPolicyUpsertSql(operatorPolicyRecord),
+    workingRoot: resolvedWorkingRoot,
+  });
+  const result = {
+    environment_name: PRODUCTION_ENVIRONMENT_NAME,
+    account_id: accountId,
+    access: {
+      auth_domain: accessMetadata.auth_domain,
+      application_id: accessMetadata.application_id,
+      application_audience: accessMetadata.application_audience,
+      application_domain: accessMetadata.application_domain,
+      protected_ops_url: accessMetadata.protected_ops_url ?? deploymentSummary.workers?.['ops-worker']?.url ?? '',
+      policy_id: accessPolicyResult.policy.id,
+      policy_name: accessPolicyResult.policy.name,
+      service_token_id: serviceTokenResult.service_token.id,
+      service_token_name: serviceTokenResult.service_token.name,
+      service_token_client_id: serviceTokenResult.service_token.client_id,
+      service_token_client_secret: serviceTokenResult.service_token.client_secret,
+    },
+    operator_policy: {
+      principal_id: operatorPolicyRecord.principal_id,
+      access_subject_value: operatorPolicyRecord.access_subject_value,
+      allowed_scopes: operatorPolicyRecord.allowed_scopes,
+      target_scope_constraints: operatorPolicyRecord.target_scope_constraints,
+    },
+    audit: {
+      service_token_created: serviceTokenResult.created,
+      service_token_rotated: serviceTokenResult.rotated,
+      policy_created: accessPolicyResult.created,
+      policy_updated: accessPolicyResult.updated,
+    },
+  };
+  if (outputPath != null) {
+    await fs.mkdir(path.dirname(outputPath), { recursive: true });
+    await fs.writeFile(outputPath, stableJson(result));
+  }
+  return result;
+}
+
 export function buildRemoteHarnessEnvironmentVariables(plan) {
   const gatewayBaseUrl = plan.worker_urls['gateway-worker'] ?? `https://${plan.worker_scripts['gateway-worker']}.workers.dev`;
   return Object.freeze({
@@ -3141,7 +3457,13 @@ function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-function validateNonLocalDeploymentWorker(workerName, environmentName, workerSummary, {
+function buildExpectedWorkerScriptNameForEnvironment(workerName, environmentName) {
+  return environmentName === PRODUCTION_ENVIRONMENT_NAME
+    ? buildProductionWorkerScriptName(workerName)
+    : buildWorkerScriptName(workerName, environmentName);
+}
+
+function validateDeploymentWorker(workerName, environmentName, workerSummary, {
   workersSubdomain = null,
   expectedDeploymentId = null,
   expectedWorkerVersionId = null,
@@ -3152,7 +3474,7 @@ function validateNonLocalDeploymentWorker(workerName, environmentName, workerSum
   if (workerSummary.worker_name !== workerName) {
     throw new TypeError(`deployment workers.${workerName}.worker_name must equal ${workerName}`);
   }
-  const expectedScriptName = buildWorkerScriptName(workerName, environmentName);
+  const expectedScriptName = buildExpectedWorkerScriptNameForEnvironment(workerName, environmentName);
   if (workerSummary.script_name !== expectedScriptName) {
     throw new TypeError(`deployment workers.${workerName}.script_name must equal ${expectedScriptName}`);
   }
@@ -3583,14 +3905,14 @@ function sleepForReadinessProbe(delayMs, {
   });
 }
 
-export async function waitForNonLocalDeploymentReadiness(environmentName, remoteHarnessEnv, {
+async function waitForDeploymentReadinessInternal(environmentName, remoteHarnessEnv, {
   fetchImpl = globalThis.fetch,
   maxAttempts = NON_LOCAL_READINESS_MAX_ATTEMPTS,
   initialDelayMs = NON_LOCAL_READINESS_INITIAL_DELAY_MS,
   maxDelayMs = NON_LOCAL_READINESS_MAX_DELAY_MS,
   sleepImpl = null,
 } = {}) {
-  const normalizedEnvironmentName = assertNonLocalEnvironmentName(environmentName);
+  const normalizedEnvironmentName = assertDeployableEnvironmentName(environmentName);
   const validatedRemoteHarnessEnv = validateRemoteHarnessEnvironmentVariables(remoteHarnessEnv);
   assertRequiredOpsAccessRemoteHarnessEnv(normalizedEnvironmentName, validatedRemoteHarnessEnv);
   if (!Number.isInteger(maxAttempts) || maxAttempts <= 0) {
@@ -3671,9 +3993,18 @@ export async function waitForNonLocalDeploymentReadiness(environmentName, remote
   };
 }
 
-function formatNonLocalReadinessProbeLog(readinessProbe) {
+export async function waitForNonLocalDeploymentReadiness(environmentName, remoteHarnessEnv, options = {}) {
+  assertNonLocalEnvironmentName(environmentName);
+  return waitForDeploymentReadinessInternal(environmentName, remoteHarnessEnv, options);
+}
+
+export async function waitForProductionDeploymentReadiness(remoteHarnessEnv, options = {}) {
+  return waitForDeploymentReadinessInternal(PRODUCTION_ENVIRONMENT_NAME, remoteHarnessEnv, options);
+}
+
+function formatDeploymentReadinessProbeLog(readinessProbe) {
   return [
-    '# Non-local deployment readiness probe',
+    '# Deployment readiness probe',
     stableJson(readinessProbe).trimEnd(),
   ].join('\n');
 }
@@ -3712,7 +4043,7 @@ export function buildRemoteHarnessEnvironmentVariablesFromDeployment(environment
   if (!isPlainObject(deploymentSummary.workers)) {
     throw new TypeError('deployment summary workers must be an object');
   }
-  const gatewayWorker = validateNonLocalDeploymentWorker(
+  const gatewayWorker = validateDeploymentWorker(
     'gateway-worker',
     normalizedEnvironmentName,
     deploymentSummary.workers['gateway-worker'],
@@ -3722,7 +4053,7 @@ export function buildRemoteHarnessEnvironmentVariablesFromDeployment(environment
       expectedWorkerVersionId: deploymentSummary.deployment_identity.worker_version_ids[WORKER_DEPLOYMENT_ORDER.indexOf('gateway-worker')],
     },
   );
-  validateNonLocalDeploymentWorker(
+  validateDeploymentWorker(
     'jobs-worker',
     normalizedEnvironmentName,
     deploymentSummary.workers['jobs-worker'],
@@ -3732,7 +4063,7 @@ export function buildRemoteHarnessEnvironmentVariablesFromDeployment(environment
       expectedWorkerVersionId: deploymentSummary.deployment_identity.worker_version_ids[WORKER_DEPLOYMENT_ORDER.indexOf('jobs-worker')],
     },
   );
-  const opsWorker = validateNonLocalDeploymentWorker(
+  const opsWorker = validateDeploymentWorker(
     'ops-worker',
     normalizedEnvironmentName,
     deploymentSummary.workers['ops-worker'],
@@ -3825,6 +4156,7 @@ async function deployWorker(workerName, provisionedEnvironment, {
   gatewayBootstrapMode = false,
   accountId,
   apiToken,
+  productionSecretSeed = null,
 }) {
   const scriptName = provisionedEnvironment.plan.worker_scripts[workerName];
   const workerVersionTag = buildRuntimeWorkerVersionTag(deploymentId, workerName, {
@@ -3851,11 +4183,10 @@ async function deployWorker(workerName, provisionedEnvironment, {
     cloudflareAccountId: accountId,
     cloudflareResourceIds: buildOpsWorkerCloudflareResourceIds(provisionedEnvironment),
   });
-  const secretBundle = buildNonProductionSecretBundle({
-    environmentName: provisionedEnvironment.environment_name,
+  const secretBundle = buildDeploymentSecretBundle(provisionedEnvironment.environment_name, {
     accountId,
     apiToken,
-    observabilityApiToken: process.env.CLOUDFLARE_OBSERVABILITY_API_TOKEN,
+    productionSecretSeed,
   });
   await writeWorkerSecretsFile(workerName, secretBundle, secretsPath);
   await runWrangler(buildWranglerDeployArguments({
@@ -3981,6 +4312,94 @@ export async function deployNonLocalEnvironment(environmentName, {
   return result;
 }
 
+export async function deployProductionEnvironment({
+  repoRoot = process.cwd(),
+  provisionedEnvironment,
+  workingRoot,
+  outputPath = null,
+  deploymentId = null,
+  accountId: explicitAccountId = null,
+  apiToken: explicitApiToken = null,
+  productionSecretSeed = null,
+} = {}) {
+  await requireGitHubActionsExecution('deployProductionEnvironment', {
+    expectedEnvironmentName: PRODUCTION_ENVIRONMENT_NAME,
+  });
+  if (!isPlainObject(provisionedEnvironment) || provisionedEnvironment.environment_name !== PRODUCTION_ENVIRONMENT_NAME) {
+    throw new TypeError('provisionedEnvironment must be the prod provisioning payload');
+  }
+  const { accountId, apiToken } = requireCloudflareCredentials({
+    accountId: explicitAccountId,
+    apiToken: explicitApiToken,
+  });
+  const resolvedWorkingRoot = path.resolve(workingRoot ?? path.join(repoRoot, '.tmp', 'prod', 'deploy'));
+  await fs.mkdir(resolvedWorkingRoot, { recursive: true });
+  const resolvedDeploymentId = deploymentId ?? `gha-prod-${Date.now().toString(36)}`;
+  const runtimeComposition = [];
+  const workers = {};
+
+  for (const workerName of provisionedEnvironment.plan.bootstrap_order) {
+    const workerRoot = path.join(resolvedWorkingRoot, workerName);
+    const deployedWorker = await deployWorker(workerName, provisionedEnvironment, {
+      repoRoot,
+      deploymentId: resolvedDeploymentId,
+      runtimeComposition,
+      workingRoot: workerRoot,
+      gatewayBootstrapMode: workerName === 'gateway-worker' && workers['gateway-worker'] == null,
+      accountId,
+      apiToken,
+      productionSecretSeed,
+    });
+    workers[workerName] = deployedWorker;
+    const runtimeEntry = {
+      worker_name: workerName,
+      deployment_id: deployedWorker.deployment_id,
+      worker_version_id: deployedWorker.worker_version_id,
+    };
+    const existingIndex = runtimeComposition.findIndex((entry) => entry.worker_name === workerName);
+    if (existingIndex === -1) {
+      runtimeComposition.push(runtimeEntry);
+    } else {
+      runtimeComposition[existingIndex] = runtimeEntry;
+    }
+  }
+
+  const deploymentIdentity = {
+    environment_id: PRODUCTION_ENVIRONMENT_NAME,
+    deployment_ids: WORKER_DEPLOYMENT_ORDER.map((workerName) => workers[workerName].deployment_id),
+    worker_version_ids: WORKER_DEPLOYMENT_ORDER.map((workerName) => workers[workerName].worker_version_id),
+  };
+  const result = {
+    environment_name: PRODUCTION_ENVIRONMENT_NAME,
+    account_id: accountId,
+    deployment_id: resolvedDeploymentId,
+    working_root: resolvedWorkingRoot,
+    workers_subdomain: provisionedEnvironment.workers_subdomain,
+    access: {
+      auth_domain: provisionedEnvironment.access.auth_domain,
+      application_id: provisionedEnvironment.access.application_id,
+      application_audience: provisionedEnvironment.access.application_audience,
+      application_domain: provisionedEnvironment.access.application_domain,
+      protected_ops_url: provisionedEnvironment.access.protected_ops_url,
+    },
+    remote_harness_env: buildRemoteHarnessEnvironmentVariables(provisionedEnvironment.plan),
+    cloudflare_resources: {
+      ...provisionedEnvironment.plan.cloudflare_resources,
+      r2_buckets: [
+        ...provisionedEnvironment.plan.cloudflare_resources.r2_buckets,
+        provisionedEnvironment.plan.artifact_bucket_name,
+      ],
+    },
+    deployment_identity: deploymentIdentity,
+    workers,
+  };
+  if (outputPath != null) {
+    await fs.mkdir(path.dirname(outputPath), { recursive: true });
+    await fs.writeFile(outputPath, stableJson(result));
+  }
+  return result;
+}
+
 function buildDeploymentCompositionFromSummary(deploymentSummary) {
   return WORKER_DEPLOYMENT_ORDER
     .map((workerName) => {
@@ -4004,6 +4423,7 @@ async function uploadWorkerVersion(workerName, provisionedEnvironment, {
   deploymentId,
   accountId,
   apiToken,
+  productionSecretSeed = null,
 }) {
   const scriptName = provisionedEnvironment.plan.worker_scripts[workerName];
   const workerVersionTag = buildRuntimeWorkerVersionTag(deploymentId, workerName);
@@ -4026,11 +4446,10 @@ async function uploadWorkerVersion(workerName, provisionedEnvironment, {
     cloudflareAccountId: accountId,
     cloudflareResourceIds: buildOpsWorkerCloudflareResourceIds(provisionedEnvironment),
   });
-  const secretBundle = buildNonProductionSecretBundle({
-    environmentName: provisionedEnvironment.environment_name,
+  const secretBundle = buildDeploymentSecretBundle(provisionedEnvironment.environment_name, {
     accountId,
     apiToken,
-    observabilityApiToken: process.env.CLOUDFLARE_OBSERVABILITY_API_TOKEN,
+    productionSecretSeed,
   });
   await writeWorkerSecretsFile(workerName, secretBundle, secretsPath);
   await runWrangler([
@@ -4076,7 +4495,7 @@ function buildWranglerVersionsDeployArguments({
     '--config',
     configPath,
     '--env',
-    assertNonLocalEnvironmentName(environmentName),
+    assertDeployableEnvironmentName(environmentName),
     '--yes',
     ...(isNonEmptyString(message) ? ['--message', message] : []),
     ...versionSpecs,
@@ -4103,6 +4522,181 @@ export function buildPreReleaseRolloutVersionSpecs(baselineGatewayVersionId, can
     `${baselineGatewayVersionId}@${PRE_RELEASE_ROLLOUT_BASELINE_PERCENTAGE}`,
     `${candidateGatewayVersionId}@${PRE_RELEASE_ROLLOUT_CANDIDATE_PERCENTAGE}`,
   ]);
+}
+
+function buildSingleVersionSpecs(workerVersionId) {
+  if (!isNonEmptyString(workerVersionId)) {
+    throw new TypeError('workerVersionId must be non-empty');
+  }
+  return Object.freeze([`${workerVersionId}@100`]);
+}
+
+function buildProdGatewayGradualVersionSpecs(baselineGatewayVersionId, candidateGatewayVersionId, percentage) {
+  if (!PROD_GATEWAY_GRADUAL_PERCENTAGES.includes(percentage)) {
+    throw new RangeError(`Unsupported production gradual rollout percentage ${percentage}`);
+  }
+  if (percentage === 100) {
+    return buildSingleVersionSpecs(candidateGatewayVersionId);
+  }
+  return Object.freeze([
+    `${baselineGatewayVersionId}@${100 - percentage}`,
+    `${candidateGatewayVersionId}@${percentage}`,
+  ]);
+}
+
+function validateProductionBaselineRecord(record) {
+  if (!isPlainObject(record)) {
+    throw new TypeError('baselineRecord must be an object');
+  }
+  const validation = record.artifact_id === 'prod_install_record'
+    ? validateProdInstallRecord(record)
+    : record.artifact_id === 'prod_promotion_record'
+      ? validateProdPromotionRecord(record)
+      : {
+        valid: false,
+        error: 'baselineRecord must be a prod_install_record or prod_promotion_record',
+      };
+  if (!validation.valid) {
+    throw new TypeError(`baselineRecord is invalid: ${validation.error}`);
+  }
+  return record;
+}
+
+function extractBaselineDeploymentIdentity(record) {
+  return record.artifact_id === 'prod_install_record'
+    ? record.deployment_identity
+    : record.current_deployment_identity;
+}
+
+function extractBaselineWorkersSubdomain(record) {
+  if (record.artifact_id === 'prod_install_record') {
+    return record.workers_subdomain;
+  }
+  return record.rollback_handle?.workers_subdomain ?? null;
+}
+
+function assertProductionBaselineMatchesCurrentIdentity(record, currentIdentity) {
+  const baselineIdentity = extractBaselineDeploymentIdentity(record);
+  if (JSON.stringify(baselineIdentity.deployment_ids) !== JSON.stringify(currentIdentity.deployment_ids)) {
+    throw new Error('baselineRecord deployment_ids do not match the current Cloudflare production deployment state');
+  }
+  if (JSON.stringify(baselineIdentity.worker_version_ids) !== JSON.stringify(currentIdentity.worker_version_ids)) {
+    throw new Error('baselineRecord worker_version_ids do not match the current Cloudflare production deployment state');
+  }
+}
+
+function cloneProductionDeploymentSummary(baselineRecord, provisionedEnvironment = null) {
+  return structuredCloneJson({
+    environment_name: PRODUCTION_ENVIRONMENT_NAME,
+    workers_subdomain: baselineRecord?.workers_subdomain
+      ?? provisionedEnvironment?.workers_subdomain
+      ?? '',
+    access: {
+      protected_ops_url: baselineRecord?.access?.protected_ops_url
+        ?? provisionedEnvironment?.access?.protected_ops_url
+        ?? '',
+    },
+    workers: baselineRecord?.workers ?? {},
+  });
+}
+
+function updateProductionDeploymentSummaryWorker(summary, plan, workerName, {
+  deploymentId,
+  workerVersionId,
+  workerVersionTag = null,
+} = {}) {
+  summary.workers[workerName] = {
+    worker_name: workerName,
+    script_name: plan.worker_scripts[workerName],
+    url: plan.worker_urls[workerName],
+    deployment_id: deploymentId,
+    worker_version_id: workerVersionId,
+    worker_version_tag: workerVersionTag ?? summary.workers?.[workerName]?.worker_version_tag ?? 'unknown',
+  };
+  return summary;
+}
+
+function buildProductionRollbackHandle(installRecord) {
+  const workerVersions = {};
+  for (const workerName of WORKER_DEPLOYMENT_ORDER) {
+    const worker = installRecord.workers[workerName];
+    workerVersions[workerName] = {
+      script_name: worker.script_name,
+      previous_deployment_id: worker.deployment_id,
+      previous_worker_version_id: worker.worker_version_id,
+      restore_version_specs: buildSingleVersionSpecs(worker.worker_version_id),
+    };
+  }
+  return Object.freeze({
+    workers_subdomain: installRecord.workers_subdomain,
+    worker_versions: Object.freeze(workerVersions),
+  });
+}
+
+async function deployProductionWorkerVersion(workerName, configPath, versionSpecs, {
+  repoRoot,
+  accountId,
+  apiToken,
+  deploymentMessage,
+  scriptName,
+}) {
+  const beforeState = await fetchWorkerDeploymentState({
+    accountId,
+    apiToken,
+    scriptName,
+  });
+  await runWrangler(buildWranglerVersionsDeployArguments({
+    environmentName: PRODUCTION_ENVIRONMENT_NAME,
+    configPath,
+    versionSpecs,
+    message: deploymentMessage,
+  }), {
+    repoRoot,
+    accountId,
+  });
+  const afterState = await fetchWorkerDeploymentState({
+    accountId,
+    apiToken,
+    scriptName,
+  });
+  return {
+    deployment_id: resolveFreshCloudflareIdentity(
+      beforeState.latest_active_deployment_id == null ? [] : [beforeState.latest_active_deployment_id],
+      [afterState.latest_active_deployment_id],
+      `${workerName} deployment id`,
+    ),
+    active_worker_version_ids: afterState.active_worker_version_ids,
+  };
+}
+
+async function buildProductionDeploymentIdentityFromCurrentCloudflareState(baselineRecord, {
+  accountId,
+  apiToken,
+} = {}) {
+  const deploymentIds = [];
+  const workerVersionIds = [];
+  for (const workerName of WORKER_DEPLOYMENT_ORDER) {
+    const scriptName = baselineRecord.workers?.[workerName]?.script_name ?? buildProductionWorkerScriptName(workerName);
+    const state = await fetchWorkerDeploymentState({
+      accountId,
+      apiToken,
+      scriptName,
+      allowMissingScript: false,
+    });
+    if (!isNonEmptyString(state.latest_active_deployment_id)) {
+      throw new Error(`Cloudflare did not expose an active deployment id for ${scriptName}`);
+    }
+    if (!Array.isArray(state.active_worker_version_ids) || state.active_worker_version_ids.length !== 1) {
+      throw new Error(`Cloudflare must expose exactly one active worker version id for ${scriptName} before gradual production rollout`);
+    }
+    deploymentIds.push(state.latest_active_deployment_id);
+    workerVersionIds.push(state.active_worker_version_ids[0]);
+  }
+  return {
+    environment_id: PRODUCTION_ENVIRONMENT_NAME,
+    deployment_ids: deploymentIds,
+    worker_version_ids: workerVersionIds,
+  };
 }
 
 export async function startPreReleaseGatewayRollout(environmentName, {
@@ -4284,6 +4878,620 @@ export async function restorePreReleaseGatewayRollout(environmentName, {
   return result;
 }
 
+export async function installProductionTopology({
+  repoRoot = process.cwd(),
+  releaseCommitSha,
+  installId = null,
+  workingRoot = null,
+  outputPath = null,
+  preferredWorkersSubdomain = null,
+  deploymentId = null,
+  accountId: explicitAccountId = null,
+  apiToken: explicitApiToken = null,
+  productionSecretSeed = null,
+} = {}) {
+  const claims = await requireGitHubActionsExecution('installProductionTopology', {
+    expectedEnvironmentName: PRODUCTION_ENVIRONMENT_NAME,
+  });
+  if (!isLowercaseGitSha(releaseCommitSha)) {
+    throw new TypeError('releaseCommitSha must be a 40-character lowercase git sha');
+  }
+  const currentRepository = await resolveCurrentGitHubRepository(repoRoot, claims);
+  const currentHeadSha = await resolveCurrentGitCommitSha(repoRoot);
+  assertReleaseCommitMatchesCurrentHead('releaseCommitSha', releaseCommitSha, currentHeadSha);
+  const { accountId, apiToken } = requireCloudflareCredentials({
+    accountId: explicitAccountId,
+    apiToken: explicitApiToken,
+  });
+  const resolvedWorkingRoot = path.resolve(workingRoot ?? path.join(repoRoot, '.tmp', 'prod-install'));
+  await fs.mkdir(resolvedWorkingRoot, { recursive: true });
+  const provisionedEnvironment = await ensureProductionEnvironmentResources({
+    repoRoot,
+    preferredWorkersSubdomain,
+    accountId,
+    apiToken,
+  });
+  await assertProductionTopologyInstallAllowed({
+    accountId,
+    apiToken,
+  });
+  const deploymentSummary = await deployProductionEnvironment({
+    repoRoot,
+    provisionedEnvironment,
+    workingRoot: path.join(resolvedWorkingRoot, 'deploy'),
+    deploymentId: deploymentId ?? `gha-prod-install-${Date.now().toString(36)}`,
+    accountId,
+    apiToken,
+    productionSecretSeed,
+  });
+  const accessSession = await prepareProductionOpsAccessSession({
+    repoRoot,
+    provisionedEnvironment,
+    deploymentSummary,
+    workingRoot: path.join(resolvedWorkingRoot, 'ops-access'),
+    accountId,
+    apiToken,
+  });
+  const readinessProbe = await waitForProductionDeploymentReadiness(
+    buildRemoteHarnessEnvironmentVariablesWithAccessSession(
+      deploymentSummary.remote_harness_env,
+      accessSession,
+    ),
+  );
+  if (!readinessProbe.ready) {
+    throw new Error(`Production install readiness probe failed: ${readinessProbe.last_error}`);
+  }
+  const record = buildProdInstallRecord({
+    releaseCommitSha,
+    provisionedEnvironment,
+    deploymentSummary,
+    installId: installId ?? deploymentSummary.deployment_id,
+    originRunIdentity: buildGitHubActionsProducerRunIdentity(claims),
+  });
+  assertArtifactRepositoryMatchesCurrent('prodInstallRecord', record, currentRepository);
+  if (outputPath != null) {
+    await fs.mkdir(path.dirname(outputPath), { recursive: true });
+    await fs.writeFile(outputPath, stableJson(record));
+  }
+  return {
+    provisioned_environment: provisionedEnvironment,
+    deployment_summary: deploymentSummary,
+    access_session: accessSession,
+    readiness_probe: readinessProbe,
+    record,
+    output_path: outputPath,
+  };
+}
+
+export async function promoteProductionEnvironment({
+  repoRoot = process.cwd(),
+  candidateManifest,
+  baselineRecord = null,
+  installRecord,
+  promotionId = null,
+  workingRoot = null,
+  outputPath = null,
+  deploymentId = null,
+  accountId: explicitAccountId = null,
+  apiToken: explicitApiToken = null,
+  productionSecretSeed = null,
+} = {}) {
+  const claims = await requireGitHubActionsExecution('promoteProductionEnvironment', {
+    expectedEnvironmentName: PRODUCTION_ENVIRONMENT_NAME,
+  });
+  const currentRepository = await resolveCurrentGitHubRepository(repoRoot, claims);
+  const currentHeadSha = await resolveCurrentGitCommitSha(repoRoot);
+  const manifestValidation = validateReleaseCandidateManifest(candidateManifest, {
+    expectedGitHubRepository: currentRepository,
+  });
+  if (!manifestValidation.valid) {
+    throw new TypeError(`candidateManifest is invalid: ${manifestValidation.error}`);
+  }
+  assertArtifactRepositoryMatchesCurrent('candidateManifest', candidateManifest, currentRepository);
+  assertReleaseCommitMatchesCurrentHead('candidateManifest.release_commit_sha', candidateManifest.release_commit_sha, currentHeadSha);
+  const resolvedBaselineRecord = validateProductionBaselineRecord(baselineRecord ?? installRecord);
+  assertArtifactRepositoryMatchesCurrent('baselineRecord', resolvedBaselineRecord, currentRepository);
+  const { accountId, apiToken } = requireCloudflareCredentials({
+    accountId: explicitAccountId,
+    apiToken: explicitApiToken,
+  });
+  const resolvedWorkingRoot = path.resolve(workingRoot ?? path.join(repoRoot, '.tmp', 'prod-promote'));
+  await fs.mkdir(resolvedWorkingRoot, { recursive: true });
+  const provisionedEnvironment = await ensureProductionEnvironmentResources({
+    repoRoot,
+    preferredWorkersSubdomain: extractBaselineWorkersSubdomain(resolvedBaselineRecord),
+    accountId,
+    apiToken,
+  });
+  const accessSession = await prepareProductionOpsAccessSession({
+    repoRoot,
+    provisionedEnvironment,
+    deploymentSummary: cloneProductionDeploymentSummary(resolvedBaselineRecord, provisionedEnvironment),
+    workingRoot: path.join(resolvedWorkingRoot, 'ops-access'),
+    accountId,
+    apiToken,
+  });
+  const currentIdentity = await buildProductionDeploymentIdentityFromCurrentCloudflareState(resolvedBaselineRecord, {
+    accountId,
+    apiToken,
+  });
+  assertProductionBaselineMatchesCurrentIdentity(resolvedBaselineRecord, currentIdentity);
+  const currentDeploymentSummary = cloneProductionDeploymentSummary(resolvedBaselineRecord, provisionedEnvironment);
+  for (const workerName of WORKER_DEPLOYMENT_ORDER) {
+    updateProductionDeploymentSummaryWorker(currentDeploymentSummary, provisionedEnvironment.plan, workerName, {
+      deploymentId: currentIdentity.deployment_ids[WORKER_DEPLOYMENT_ORDER.indexOf(workerName)],
+      workerVersionId: currentIdentity.worker_version_ids[WORKER_DEPLOYMENT_ORDER.indexOf(workerName)],
+      workerVersionTag: resolvedBaselineRecord.workers?.[workerName]?.worker_version_tag ?? null,
+    });
+  }
+
+  const resolvedPromotionId = promotionId ?? deploymentId ?? `gha-prod-promote-${Date.now().toString(36)}`;
+  const sourceCandidate = {
+    candidate_id: candidateManifest.candidate_id,
+    source_run_uri: candidateManifest.source_run_uri,
+  };
+  if (candidateManifest.requires_do_migration) {
+    const migrationWorkingRoot = path.join(resolvedWorkingRoot, 'deploy');
+    await fs.mkdir(migrationWorkingRoot, { recursive: true });
+    const migrationRuntimeComposition = buildDeploymentCompositionFromSummary(currentDeploymentSummary);
+    const migrationWorkers = {};
+    const migrationReadinessChecks = {};
+    const migrationReadinessFieldNames = Object.freeze({
+      'jobs-worker': 'jobs_promoted',
+      'ops-worker': 'ops_promoted',
+      'gateway-worker': 'gateway_promoted',
+    });
+    for (const workerName of WORKER_DEPLOYMENT_ORDER) {
+      const deployedWorker = await deployWorker(workerName, provisionedEnvironment, {
+        repoRoot,
+        deploymentId: resolvedPromotionId,
+        runtimeComposition: migrationRuntimeComposition,
+        workingRoot: path.join(migrationWorkingRoot, workerName),
+        gatewayBootstrapMode: false,
+        accountId,
+        apiToken,
+        productionSecretSeed,
+      });
+      migrationWorkers[workerName] = deployedWorker;
+      const runtimeEntry = {
+        worker_name: workerName,
+        deployment_id: deployedWorker.deployment_id,
+        worker_version_id: deployedWorker.worker_version_id,
+      };
+      const existingIndex = migrationRuntimeComposition.findIndex((entry) => entry.worker_name === workerName);
+      if (existingIndex === -1) {
+        migrationRuntimeComposition.push(runtimeEntry);
+      } else {
+        migrationRuntimeComposition[existingIndex] = runtimeEntry;
+      }
+      updateProductionDeploymentSummaryWorker(currentDeploymentSummary, provisionedEnvironment.plan, workerName, {
+        deploymentId: deployedWorker.deployment_id,
+        workerVersionId: deployedWorker.worker_version_id,
+        workerVersionTag: deployedWorker.worker_version_tag,
+      });
+      const readinessProbe = await waitForProductionDeploymentReadiness(
+        buildRemoteHarnessEnvironmentVariablesWithAccessSession(
+          buildRemoteHarnessEnvironmentVariables(provisionedEnvironment.plan),
+          accessSession,
+        ),
+      );
+      migrationReadinessChecks[migrationReadinessFieldNames[workerName]] = readinessProbe;
+      if (!readinessProbe.ready) {
+        throw new Error(`Production migration-safe promote readiness probe failed after ${workerName}: ${readinessProbe.last_error}`);
+      }
+    }
+    const migrationDeploymentIdentity = {
+      environment_id: PRODUCTION_ENVIRONMENT_NAME,
+      deployment_ids: WORKER_DEPLOYMENT_ORDER.map((workerName) => migrationWorkers[workerName].deployment_id),
+      worker_version_ids: WORKER_DEPLOYMENT_ORDER.map((workerName) => migrationWorkers[workerName].worker_version_id),
+    };
+    const migrationDeployment = {
+      environment_name: PRODUCTION_ENVIRONMENT_NAME,
+      account_id: accountId,
+      deployment_id: resolvedPromotionId,
+      working_root: migrationWorkingRoot,
+      workers_subdomain: provisionedEnvironment.workers_subdomain,
+      access: {
+        auth_domain: provisionedEnvironment.access.auth_domain,
+        application_id: provisionedEnvironment.access.application_id,
+        application_audience: provisionedEnvironment.access.application_audience,
+        application_domain: provisionedEnvironment.access.application_domain,
+        protected_ops_url: provisionedEnvironment.access.protected_ops_url,
+      },
+      remote_harness_env: buildRemoteHarnessEnvironmentVariables(provisionedEnvironment.plan),
+      cloudflare_resources: {
+        ...provisionedEnvironment.plan.cloudflare_resources,
+        r2_buckets: [
+          ...provisionedEnvironment.plan.cloudflare_resources.r2_buckets,
+          provisionedEnvironment.plan.artifact_bucket_name,
+        ],
+      },
+      deployment_identity: migrationDeploymentIdentity,
+      workers: migrationWorkers,
+    };
+    const record = buildProdPromotionRecord({
+      releaseCommitSha: candidateManifest.release_commit_sha,
+      sourceCandidate,
+      promotionMode: 'deploy_with_migration',
+      previousDeploymentIdentity: extractBaselineDeploymentIdentity(resolvedBaselineRecord),
+      currentDeploymentIdentity: migrationDeploymentIdentity,
+      gatewayRolloutSteps: [],
+      readinessChecks: migrationReadinessChecks,
+      rollbackHandle: null,
+      promotionId: resolvedPromotionId,
+      originRunIdentity: buildGitHubActionsProducerRunIdentity(claims),
+    });
+    assertArtifactRepositoryMatchesCurrent('prodPromotionRecord', record, currentRepository);
+    if (outputPath != null) {
+      await fs.mkdir(path.dirname(outputPath), { recursive: true });
+      await fs.writeFile(outputPath, stableJson(record));
+    }
+    return {
+      provisioned_environment: provisionedEnvironment,
+      access_session: accessSession,
+      readiness_probe: migrationReadinessChecks.gateway_promoted,
+      promotion_mode: 'deploy_with_migration',
+      record,
+      deployment_summary: migrationDeployment,
+      output_path: outputPath,
+    };
+  }
+
+  const jobsUpload = await uploadWorkerVersion('jobs-worker', provisionedEnvironment, {
+    repoRoot,
+    deploymentSummary: currentDeploymentSummary,
+    workingRoot: path.join(resolvedWorkingRoot, 'jobs-worker'),
+    deploymentId: `${resolvedPromotionId}-jobs`,
+    accountId,
+    apiToken,
+    productionSecretSeed,
+  });
+  const jobsDeploy = await deployProductionWorkerVersion(
+    'jobs-worker',
+    jobsUpload.config_path,
+    buildSingleVersionSpecs(jobsUpload.worker_version_id),
+    {
+      repoRoot,
+      accountId,
+      apiToken,
+      deploymentMessage: `${resolvedPromotionId}:jobs-promote`,
+      scriptName: jobsUpload.script_name,
+    },
+  );
+  updateProductionDeploymentSummaryWorker(currentDeploymentSummary, provisionedEnvironment.plan, 'jobs-worker', {
+    deploymentId: jobsDeploy.deployment_id,
+    workerVersionId: jobsUpload.worker_version_id,
+    workerVersionTag: jobsUpload.worker_version_tag,
+  });
+  const jobsReadiness = await waitForProductionDeploymentReadiness(
+    buildRemoteHarnessEnvironmentVariablesWithAccessSession(
+      buildRemoteHarnessEnvironmentVariables(provisionedEnvironment.plan),
+      accessSession,
+    ),
+  );
+  if (!jobsReadiness.ready) {
+    throw new Error(`Production jobs-worker readiness probe failed: ${jobsReadiness.last_error}`);
+  }
+
+  const opsUpload = await uploadWorkerVersion('ops-worker', provisionedEnvironment, {
+    repoRoot,
+    deploymentSummary: currentDeploymentSummary,
+    workingRoot: path.join(resolvedWorkingRoot, 'ops-worker'),
+    deploymentId: `${resolvedPromotionId}-ops`,
+    accountId,
+    apiToken,
+    productionSecretSeed,
+  });
+  const opsDeploy = await deployProductionWorkerVersion(
+    'ops-worker',
+    opsUpload.config_path,
+    buildSingleVersionSpecs(opsUpload.worker_version_id),
+    {
+      repoRoot,
+      accountId,
+      apiToken,
+      deploymentMessage: `${resolvedPromotionId}:ops-promote`,
+      scriptName: opsUpload.script_name,
+    },
+  );
+  updateProductionDeploymentSummaryWorker(currentDeploymentSummary, provisionedEnvironment.plan, 'ops-worker', {
+    deploymentId: opsDeploy.deployment_id,
+    workerVersionId: opsUpload.worker_version_id,
+    workerVersionTag: opsUpload.worker_version_tag,
+  });
+  const opsReadiness = await waitForProductionDeploymentReadiness(
+    buildRemoteHarnessEnvironmentVariablesWithAccessSession(
+      buildRemoteHarnessEnvironmentVariables(provisionedEnvironment.plan),
+      accessSession,
+    ),
+  );
+  if (!opsReadiness.ready) {
+    throw new Error(`Production ops-worker readiness probe failed: ${opsReadiness.last_error}`);
+  }
+
+  const gatewayBaselineVersionId = currentIdentity.worker_version_ids[WORKER_DEPLOYMENT_ORDER.indexOf('gateway-worker')];
+  const gatewayUpload = await uploadWorkerVersion('gateway-worker', provisionedEnvironment, {
+    repoRoot,
+    deploymentSummary: currentDeploymentSummary,
+    workingRoot: path.join(resolvedWorkingRoot, 'gateway-worker'),
+    deploymentId: `${resolvedPromotionId}-gateway`,
+    accountId,
+    apiToken,
+    productionSecretSeed,
+  });
+  const gatewayRolloutSteps = [];
+  let latestGatewayDeploymentId = currentIdentity.deployment_ids[WORKER_DEPLOYMENT_ORDER.indexOf('gateway-worker')];
+  for (const percentage of PROD_GATEWAY_GRADUAL_PERCENTAGES) {
+    const gatewayDeploy = await deployProductionWorkerVersion(
+      'gateway-worker',
+      gatewayUpload.config_path,
+      buildProdGatewayGradualVersionSpecs(
+        gatewayBaselineVersionId,
+        gatewayUpload.worker_version_id,
+        percentage,
+      ),
+      {
+        repoRoot,
+        accountId,
+        apiToken,
+        deploymentMessage: `${resolvedPromotionId}:gateway-${percentage}`,
+        scriptName: gatewayUpload.script_name,
+      },
+    );
+    latestGatewayDeploymentId = gatewayDeploy.deployment_id;
+    updateProductionDeploymentSummaryWorker(currentDeploymentSummary, provisionedEnvironment.plan, 'gateway-worker', {
+      deploymentId: gatewayDeploy.deployment_id,
+      workerVersionId: percentage === 100 ? gatewayUpload.worker_version_id : gatewayBaselineVersionId,
+      workerVersionTag: percentage === 100
+        ? gatewayUpload.worker_version_tag
+        : resolvedBaselineRecord.workers?.['gateway-worker']?.worker_version_tag ?? null,
+    });
+    const readinessProbe = await waitForProductionDeploymentReadiness(
+      buildRemoteHarnessEnvironmentVariablesWithAccessSession(
+        buildRemoteHarnessEnvironmentVariables(provisionedEnvironment.plan),
+        accessSession,
+      ),
+    );
+    gatewayRolloutSteps.push({
+      percentage,
+      deployment_id: gatewayDeploy.deployment_id,
+      ready: readinessProbe.ready,
+      attempt_count: readinessProbe.attempt_count,
+      last_error: readinessProbe.last_error,
+    });
+    if (!readinessProbe.ready) {
+      throw new Error(`Production gateway rollout readiness probe failed at ${percentage}%: ${readinessProbe.last_error}`);
+    }
+  }
+
+  const record = buildProdPromotionRecord({
+    releaseCommitSha: candidateManifest.release_commit_sha,
+    sourceCandidate,
+    promotionMode: 'gradual',
+    previousDeploymentIdentity: extractBaselineDeploymentIdentity(resolvedBaselineRecord),
+    currentDeploymentIdentity: {
+      environment_id: PRODUCTION_ENVIRONMENT_NAME,
+      deployment_ids: [
+        jobsDeploy.deployment_id,
+        opsDeploy.deployment_id,
+        latestGatewayDeploymentId,
+      ],
+      worker_version_ids: [
+        jobsUpload.worker_version_id,
+        opsUpload.worker_version_id,
+        gatewayUpload.worker_version_id,
+      ],
+    },
+    gatewayRolloutSteps,
+    readinessChecks: {
+      jobs_promoted: jobsReadiness,
+      ops_promoted: opsReadiness,
+    },
+    rollbackHandle: buildProductionRollbackHandle({
+      workers_subdomain: extractBaselineWorkersSubdomain(resolvedBaselineRecord) ?? provisionedEnvironment.workers_subdomain,
+      workers: {
+        ...resolvedBaselineRecord.workers,
+        'jobs-worker': {
+          ...resolvedBaselineRecord.workers?.['jobs-worker'],
+          script_name: resolvedBaselineRecord.workers?.['jobs-worker']?.script_name ?? provisionedEnvironment.plan.worker_scripts['jobs-worker'],
+          deployment_id: currentIdentity.deployment_ids[WORKER_DEPLOYMENT_ORDER.indexOf('jobs-worker')],
+          worker_version_id: currentIdentity.worker_version_ids[WORKER_DEPLOYMENT_ORDER.indexOf('jobs-worker')],
+        },
+        'ops-worker': {
+          ...resolvedBaselineRecord.workers?.['ops-worker'],
+          script_name: resolvedBaselineRecord.workers?.['ops-worker']?.script_name ?? provisionedEnvironment.plan.worker_scripts['ops-worker'],
+          deployment_id: currentIdentity.deployment_ids[WORKER_DEPLOYMENT_ORDER.indexOf('ops-worker')],
+          worker_version_id: currentIdentity.worker_version_ids[WORKER_DEPLOYMENT_ORDER.indexOf('ops-worker')],
+        },
+        'gateway-worker': {
+          ...resolvedBaselineRecord.workers?.['gateway-worker'],
+          script_name: resolvedBaselineRecord.workers?.['gateway-worker']?.script_name ?? provisionedEnvironment.plan.worker_scripts['gateway-worker'],
+          deployment_id: currentIdentity.deployment_ids[WORKER_DEPLOYMENT_ORDER.indexOf('gateway-worker')],
+          worker_version_id: currentIdentity.worker_version_ids[WORKER_DEPLOYMENT_ORDER.indexOf('gateway-worker')],
+        },
+      },
+    }),
+    promotionId: resolvedPromotionId,
+    originRunIdentity: buildGitHubActionsProducerRunIdentity(claims),
+  });
+  assertArtifactRepositoryMatchesCurrent('prodPromotionRecord', record, currentRepository);
+  if (outputPath != null) {
+    await fs.mkdir(path.dirname(outputPath), { recursive: true });
+    await fs.writeFile(outputPath, stableJson(record));
+  }
+  return {
+    provisioned_environment: provisionedEnvironment,
+    access_session: accessSession,
+    promotion_mode: 'gradual',
+    record,
+    output_path: outputPath,
+  };
+}
+
+export async function rollbackProductionEnvironment({
+  repoRoot = process.cwd(),
+  promotionRecord,
+  workingRoot = null,
+  outputPath = null,
+  rollbackId = null,
+  accountId: explicitAccountId = null,
+  apiToken: explicitApiToken = null,
+} = {}) {
+  const claims = await requireGitHubActionsExecution('rollbackProductionEnvironment', {
+    expectedEnvironmentName: PRODUCTION_ENVIRONMENT_NAME,
+  });
+  const currentRepository = await resolveCurrentGitHubRepository(repoRoot, claims);
+  const promotionValidation = validateProdPromotionRecord(promotionRecord, {
+    expectedGitHubRepository: currentRepository,
+  });
+  if (!promotionValidation.valid) {
+    throw new TypeError(`promotionRecord is invalid: ${promotionValidation.error}`);
+  }
+  assertArtifactRepositoryMatchesCurrent('promotionRecord', promotionRecord, currentRepository);
+  if (promotionRecord.promotion_mode !== 'gradual' || promotionRecord.rollback_handle == null) {
+    throw new Error('rollbackProductionEnvironment only supports gradual promotions with a recorded rollback_handle');
+  }
+  const { accountId, apiToken } = requireCloudflareCredentials({
+    accountId: explicitAccountId,
+    apiToken: explicitApiToken,
+  });
+  const resolvedWorkingRoot = path.resolve(workingRoot ?? path.join(repoRoot, '.tmp', 'prod-rollback'));
+  await fs.mkdir(resolvedWorkingRoot, { recursive: true });
+  const rollbackHandleValidation = validateProdRollbackHandle(promotionRecord.rollback_handle);
+  if (!rollbackHandleValidation.valid) {
+    throw new TypeError(`promotionRecord.rollback_handle is invalid: ${rollbackHandleValidation.error}`);
+  }
+  const provisionedEnvironment = await ensureProductionEnvironmentResources({
+    repoRoot,
+    preferredWorkersSubdomain: promotionRecord.rollback_handle.workers_subdomain,
+    accountId,
+    apiToken,
+  });
+  const accessSession = await prepareProductionOpsAccessSession({
+    repoRoot,
+    provisionedEnvironment,
+    deploymentSummary: {
+      environment_name: PRODUCTION_ENVIRONMENT_NAME,
+      workers: {
+        'ops-worker': {
+          url: provisionedEnvironment.plan.worker_urls['ops-worker'],
+        },
+      },
+    },
+    workingRoot: path.join(resolvedWorkingRoot, 'ops-access'),
+    accountId,
+    apiToken,
+  });
+  const currentDeploymentSummary = {
+    environment_name: PRODUCTION_ENVIRONMENT_NAME,
+    workers: {},
+  };
+  const currentIdentity = {
+    environment_id: PRODUCTION_ENVIRONMENT_NAME,
+    deployment_ids: [],
+    worker_version_ids: [],
+  };
+  for (const workerName of WORKER_DEPLOYMENT_ORDER) {
+    const currentState = await fetchWorkerDeploymentState({
+      accountId,
+      apiToken,
+      scriptName: provisionedEnvironment.plan.worker_scripts[workerName],
+    });
+    if (!isNonEmptyString(currentState.latest_active_deployment_id)) {
+      throw new Error(`Cloudflare did not expose an active deployment id for ${provisionedEnvironment.plan.worker_scripts[workerName]} before rollback`);
+    }
+    if (!Array.isArray(currentState.active_worker_version_ids) || currentState.active_worker_version_ids.length !== 1) {
+      throw new Error(`Cloudflare must expose exactly one active worker version id for ${provisionedEnvironment.plan.worker_scripts[workerName]} before rollback`);
+    }
+    currentIdentity.deployment_ids.push(currentState.latest_active_deployment_id);
+    currentIdentity.worker_version_ids.push(currentState.active_worker_version_ids[0]);
+    updateProductionDeploymentSummaryWorker(currentDeploymentSummary, provisionedEnvironment.plan, workerName, {
+      deploymentId: currentState.latest_active_deployment_id,
+      workerVersionId: currentState.active_worker_version_ids[0],
+      workerVersionTag: null,
+    });
+  }
+  assertProductionRecordedIdentityMatchesCurrent(
+    promotionRecord.current_deployment_identity,
+    currentIdentity,
+    'promotionRecord.current_deployment_identity',
+  );
+  const workerResults = {};
+  for (const workerName of WORKER_DEPLOYMENT_ORDER) {
+    const handle = promotionRecord.rollback_handle.worker_versions[workerName];
+    const configWrite = await writeEnvironmentWranglerConfig(workerName, provisionedEnvironment.plan, {
+      outputPath: path.join(resolvedWorkingRoot, workerName, `${workerName}.wrangler.json`),
+      repoRoot,
+      d1DatabaseId: provisionedEnvironment.resources.d1_database.id,
+      kvNamespaceId: provisionedEnvironment.resources.kv_namespace.id,
+      deploymentId: `${promotionRecord.promotion_id}-rollback`,
+      workerVersionId: handle.previous_worker_version_id,
+      activeDeploymentComposition: buildDeploymentCompositionFromSummary(currentDeploymentSummary),
+      access: provisionedEnvironment.access,
+      cloudflareAccountId: accountId,
+      cloudflareResourceIds: buildOpsWorkerCloudflareResourceIds(provisionedEnvironment),
+    });
+    const deployResult = await deployProductionWorkerVersion(
+      workerName,
+      configWrite.output_path,
+      handle.restore_version_specs,
+      {
+        repoRoot,
+        accountId,
+        apiToken,
+        deploymentMessage: `${promotionRecord.promotion_id}:${workerName}:rollback`,
+        scriptName: handle.script_name,
+      },
+    );
+    const restoredVersionId = handle.previous_worker_version_id;
+    workerResults[workerName] = {
+      restored: true,
+      deployment_id: deployResult.deployment_id,
+      worker_version_id: restoredVersionId,
+    };
+    updateProductionDeploymentSummaryWorker(currentDeploymentSummary, provisionedEnvironment.plan, workerName, {
+      deploymentId: deployResult.deployment_id,
+      workerVersionId: restoredVersionId,
+      workerVersionTag: null,
+    });
+  }
+  const readinessProbe = await waitForProductionDeploymentReadiness(
+    buildRemoteHarnessEnvironmentVariablesWithAccessSession(
+      buildRemoteHarnessEnvironmentVariables(provisionedEnvironment.plan),
+      accessSession,
+    ),
+  );
+  const record = buildProdRollbackRecord({
+    sourcePromotionId: promotionRecord.promotion_id,
+    releaseCommitSha: promotionRecord.release_commit_sha,
+    requestedRollbackHandle: promotionRecord.rollback_handle,
+    restoredDeploymentIdentity: {
+      environment_id: PRODUCTION_ENVIRONMENT_NAME,
+      deployment_ids: WORKER_DEPLOYMENT_ORDER.map((workerName) => workerResults[workerName].deployment_id),
+      worker_version_ids: WORKER_DEPLOYMENT_ORDER.map((workerName) => workerResults[workerName].worker_version_id),
+    },
+    workerResults,
+    readinessProbe,
+    rollbackId,
+    originRunIdentity: buildGitHubActionsProducerRunIdentity(claims),
+  });
+  assertArtifactRepositoryMatchesCurrent('prodRollbackRecord', record, currentRepository);
+  if (outputPath != null) {
+    await fs.mkdir(path.dirname(outputPath), { recursive: true });
+    await fs.writeFile(outputPath, stableJson(record));
+  }
+  if (!readinessProbe.ready) {
+    throw new Error(`Production rollback readiness probe failed: ${readinessProbe.last_error}`);
+  }
+  return {
+    provisioned_environment: provisionedEnvironment,
+    access_session: accessSession,
+    readiness_probe: readinessProbe,
+    record,
+    output_path: outputPath,
+  };
+}
+
 export async function uploadImmutableArtifactToR2({
   repoRoot = process.cwd(),
   bucketName,
@@ -4341,6 +5549,47 @@ export async function uploadImmutableArtifactToR2({
   return result;
 }
 
+export async function downloadImmutableArtifactFromR2({
+  repoRoot = process.cwd(),
+  bucketName,
+  objectKey,
+  outputPath,
+  accountId: explicitAccountId = null,
+  apiToken: explicitApiToken = null,
+} = {}, {
+  requireGitHubActionsExecutionImpl = requireGitHubActionsExecution,
+  requireCloudflareCredentialsImpl = requireCloudflareCredentials,
+  runWranglerImpl = runWrangler,
+  sha256FileHexImpl = sha256FileHex,
+} = {}) {
+  await requireGitHubActionsExecutionImpl('downloadImmutableArtifactFromR2');
+  const { accountId } = requireCloudflareCredentialsImpl({
+    accountId: explicitAccountId,
+    apiToken: explicitApiToken,
+  });
+  const resolvedOutputPath = path.resolve(outputPath);
+  await fs.mkdir(path.dirname(resolvedOutputPath), { recursive: true });
+  await runWranglerImpl([
+    'r2',
+    'object',
+    'get',
+    `${bucketName}/${objectKey}`,
+    '--remote',
+    '--file',
+    resolvedOutputPath,
+  ], {
+    repoRoot,
+    accountId,
+  });
+  return {
+    bucket_name: bucketName,
+    object_key: objectKey,
+    object_uri: `r2://${bucketName}/${objectKey}`,
+    output_path: resolvedOutputPath,
+    file_sha256: await sha256FileHexImpl(resolvedOutputPath),
+  };
+}
+
 export function buildGitHubRunUrl(repository, runId) {
   if (typeof repository !== 'string' || repository.length === 0) {
     throw new RangeError('repository must be non-empty');
@@ -4349,6 +5598,651 @@ export function buildGitHubRunUrl(repository, runId) {
     throw new RangeError('runId must be a string or number');
   }
   return `https://github.com/${repository}/actions/runs/${runId}`;
+}
+
+function extractGitHubActionsRunRepository(runUrl) {
+  const match = /^https:\/\/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/actions\/runs\/\d+$/u.exec(String(runUrl ?? ''));
+  return match?.[1] ?? null;
+}
+
+function extractGitHubActionsRunId(runUrl) {
+  const match = /^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/actions\/runs\/(\d+)$/u.exec(String(runUrl ?? ''));
+  return match?.[1] ?? null;
+}
+
+function buildGitHubActionsProducerRunIdentity(claims) {
+  const originRepository = String(claims?.repository ?? '');
+  const originRunId = String(claims?.run_id ?? '');
+  const originRunAttempt = Number.parseInt(String(claims?.run_attempt ?? ''), 10);
+  return Object.freeze({
+    origin_repository: originRepository,
+    origin_run_id: originRunId,
+    origin_run_attempt: originRunAttempt,
+    origin_run_uri: buildGitHubRunUrl(originRepository, originRunId),
+  });
+}
+
+function isRfc3339UtcTimestamp(value) {
+  return isNonEmptyString(value)
+    && RFC3339_UTC_TIMESTAMP_RE.test(value)
+    && Number.isFinite(Date.parse(value));
+}
+
+function isGitHubRepositorySlug(value) {
+  return isNonEmptyString(value) && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(value);
+}
+
+function parseGitHubRepositoryFromRemoteUrl(remoteUrl) {
+  if (!isNonEmptyString(remoteUrl)) {
+    return null;
+  }
+  const normalized = remoteUrl.trim();
+  const patterns = [
+    /^https:\/\/github\.com\/([^/]+\/[^/]+?)(?:\.git)?$/u,
+    /^git@github\.com:([^/]+\/[^/]+?)(?:\.git)?$/u,
+    /^ssh:\/\/git@github\.com\/([^/]+\/[^/]+?)(?:\.git)?$/u,
+  ];
+  for (const pattern of patterns) {
+    const match = pattern.exec(normalized);
+    if (match) {
+      return match[1];
+    }
+  }
+  return null;
+}
+
+function isGitHubActionsRunUrl(value) {
+  return isNonEmptyString(value) && /^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/actions\/runs\/\d+$/u.test(value);
+}
+
+function isLowercaseGitSha(value) {
+  return isNonEmptyString(value) && GIT_SHA1_RE.test(value);
+}
+
+async function resolveCurrentGitHubRepository(repoRoot, claims = null) {
+  const candidateValues = [
+    stableString(claims?.repository),
+    stableString(process.env.GITHUB_REPOSITORY),
+  ];
+  for (const candidate of candidateValues) {
+    if (isGitHubRepositorySlug(candidate)) {
+      return candidate;
+    }
+  }
+  const result = await runCommand('git', ['remote', 'get-url', 'origin'], {
+    cwd: repoRoot,
+    allowFailure: true,
+  });
+  const repository = parseGitHubRepositoryFromRemoteUrl(result.stdout);
+  if (!isGitHubRepositorySlug(repository)) {
+    throw new Error('Unable to resolve the current GitHub repository slug');
+  }
+  return repository;
+}
+
+async function resolveCurrentGitCommitSha(repoRoot) {
+  const result = await runCommand('git', ['rev-parse', 'HEAD'], {
+    cwd: repoRoot,
+  });
+  const headSha = stableString(result.stdout);
+  if (!isLowercaseGitSha(headSha)) {
+    throw new Error('Unable to resolve the current git HEAD sha');
+  }
+  return headSha;
+}
+
+function assertArtifactRepositoryMatchesCurrent(label, payload, currentRepository) {
+  if (!isPlainObject(payload)) {
+    throw new TypeError(`${label} must be an object`);
+  }
+  if (payload.origin_repository !== currentRepository) {
+    throw new Error(`${label}.origin_repository must match the current repository ${currentRepository}`);
+  }
+}
+
+function assertReleaseCommitMatchesCurrentHead(label, releaseCommitSha, currentHeadSha) {
+  if (releaseCommitSha !== currentHeadSha) {
+    throw new Error(`${label} must match the current checked-out git HEAD ${currentHeadSha}`);
+  }
+}
+
+function validateProducerRunIdentity(originRunIdentity, label = 'origin run identity') {
+  if (!isPlainObject(originRunIdentity)) {
+    return {
+      valid: false,
+      error: `${label} must be an object`,
+    };
+  }
+  if (!isGitHubRepositorySlug(originRunIdentity.origin_repository)) {
+    return {
+      valid: false,
+      error: `${label}.origin_repository must be a GitHub owner/repo slug`,
+    };
+  }
+  if (!isNonEmptyString(originRunIdentity.origin_run_id)) {
+    return {
+      valid: false,
+      error: `${label}.origin_run_id must be non-empty`,
+    };
+  }
+  if (!Number.isInteger(originRunIdentity.origin_run_attempt) || originRunIdentity.origin_run_attempt <= 0) {
+    return {
+      valid: false,
+      error: `${label}.origin_run_attempt must be a positive integer`,
+    };
+  }
+  if (!isGitHubActionsRunUrl(originRunIdentity.origin_run_uri)) {
+    return {
+      valid: false,
+      error: `${label}.origin_run_uri must be a GitHub Actions run URL`,
+    };
+  }
+  if (extractGitHubActionsRunRepository(originRunIdentity.origin_run_uri) !== originRunIdentity.origin_repository) {
+    return {
+      valid: false,
+      error: `${label}.origin_run_uri must match origin_repository`,
+    };
+  }
+  if (extractGitHubActionsRunId(originRunIdentity.origin_run_uri) !== originRunIdentity.origin_run_id) {
+    return {
+      valid: false,
+      error: `${label}.origin_run_uri must match origin_run_id`,
+    };
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function assertProductionRecordedIdentityMatchesCurrent(expectedIdentity, currentIdentity, label) {
+  if (JSON.stringify(expectedIdentity?.deployment_ids ?? []) !== JSON.stringify(currentIdentity?.deployment_ids ?? [])) {
+    throw new Error(`${label} deployment_ids do not match the current Cloudflare production deployment state`);
+  }
+  if (JSON.stringify(expectedIdentity?.worker_version_ids ?? []) !== JSON.stringify(currentIdentity?.worker_version_ids ?? [])) {
+    throw new Error(`${label} worker_version_ids do not match the current Cloudflare production deployment state`);
+  }
+}
+
+async function assertProductionTopologyInstallAllowed({
+  accountId,
+  apiToken,
+} = {}) {
+  const workerStates = await Promise.all(WORKER_DEPLOYMENT_ORDER.map(async (workerName) => {
+    const scriptName = buildProductionWorkerScriptName(workerName);
+    const state = await fetchWorkerDeploymentState({
+      accountId,
+      apiToken,
+      scriptName,
+      allowMissingScript: true,
+    });
+    return {
+      worker_name: workerName,
+      script_name: scriptName,
+      state,
+    };
+  }));
+  const activeWorkers = workerStates.filter((entry) => isNonEmptyString(entry.state.latest_active_deployment_id));
+  if (activeWorkers.length > 0) {
+    throw new Error(
+      `prod-install only supports an unbootstrapped production topology; current Cloudflare production workers already expose active deployments (${activeWorkers.map((entry) => entry.script_name).join(', ')}), use promote-prod instead`,
+    );
+  }
+}
+
+function validateProdRecordCloudflareResources(resources) {
+  if (!isPlainObject(resources)) {
+    return {
+      valid: false,
+      error: 'cloudflare_resources must be an object',
+    };
+  }
+  const expectedResources = buildExpectedProductionCloudflareResources();
+  for (const key of Object.keys(expectedResources)) {
+    if (!Array.isArray(resources[key]) || !resources[key].every((entry) => isNonEmptyString(entry))) {
+      return {
+        valid: false,
+        error: `cloudflare_resources.${key} must be a non-empty string array`,
+      };
+    }
+    const actualValues = sortUniqueStringArray(resources[key]);
+    const expectedValues = sortUniqueStringArray(expectedResources[key]);
+    if (
+      actualValues.length !== expectedValues.length
+      || actualValues.some((entry, index) => entry !== expectedValues[index])
+    ) {
+      return {
+        valid: false,
+        error: `cloudflare_resources.${key} must match the fixed production topology`,
+      };
+    }
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validateProductionDeploymentIdentity(deploymentIdentity, label = 'deployment_identity') {
+  if (!isPlainObject(deploymentIdentity)) {
+    return {
+      valid: false,
+      error: `${label} must be an object`,
+    };
+  }
+  if (deploymentIdentity.environment_id !== PRODUCTION_ENVIRONMENT_NAME) {
+    return {
+      valid: false,
+      error: `${label}.environment_id must be prod`,
+    };
+  }
+  if (!isNonEmptyStringArray(deploymentIdentity.deployment_ids)) {
+    return {
+      valid: false,
+      error: `${label}.deployment_ids must be a non-empty string array`,
+    };
+  }
+  if (!isNonEmptyStringArray(deploymentIdentity.worker_version_ids)) {
+    return {
+      valid: false,
+      error: `${label}.worker_version_ids must be a non-empty string array`,
+    };
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validateProdWorkerRecordSet(workers, deploymentIdentity, {
+  workersSubdomain = null,
+} = {}) {
+  if (!isPlainObject(workers)) {
+    return {
+      valid: false,
+      error: 'workers must be an object',
+    };
+  }
+  for (const workerName of WORKER_DEPLOYMENT_ORDER) {
+    try {
+      const normalized = validateDeploymentWorker(workerName, PRODUCTION_ENVIRONMENT_NAME, workers[workerName], {
+        workersSubdomain,
+        expectedDeploymentId: deploymentIdentity?.deployment_ids?.[WORKER_DEPLOYMENT_ORDER.indexOf(workerName)] ?? null,
+        expectedWorkerVersionId: deploymentIdentity?.worker_version_ids?.[WORKER_DEPLOYMENT_ORDER.indexOf(workerName)] ?? null,
+      });
+      if (!isNonEmptyString(workers[workerName]?.worker_version_tag)) {
+        return {
+          valid: false,
+          error: `workers.${workerName}.worker_version_tag must be non-empty`,
+        };
+      }
+      if (normalized.script_name !== buildProductionWorkerScriptName(workerName)) {
+        return {
+          valid: false,
+          error: `workers.${workerName}.script_name must equal ${buildProductionWorkerScriptName(workerName)}`,
+        };
+      }
+    } catch (error) {
+      return {
+        valid: false,
+        error: error.message,
+      };
+    }
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+export function validateReleaseCandidateManifest(payload, {
+  expectedGitHubRepository = null,
+} = {}) {
+  const validation = validateManualArtifactPayload('prod_release_candidate', payload);
+  if (!validation.valid) {
+    return validation;
+  }
+  if (isNonEmptyString(expectedGitHubRepository) && payload.source_repository !== expectedGitHubRepository) {
+    return {
+      valid: false,
+      error: 'release candidate manifest source_repository must match the current repository',
+    };
+  }
+  if (isNonEmptyString(expectedGitHubRepository) && payload.origin_repository !== expectedGitHubRepository) {
+    return {
+      valid: false,
+      error: 'release candidate manifest origin_repository must match the current repository',
+    };
+  }
+  return validation;
+}
+
+export function buildReleaseCandidateManifest({
+  releaseRef,
+  releaseCommitSha,
+  requiresDoMigration,
+  sourceRepository,
+  sourceRunUri,
+  originRunIdentity,
+  ciIntegrationAttestation,
+  stagingAttestation,
+  preReleaseAttestation,
+  candidateId = null,
+  createdAt = new Date().toISOString(),
+}) {
+  const originRunValidation = validateProducerRunIdentity(originRunIdentity, 'originRunIdentity');
+  if (!originRunValidation.valid) {
+    throw new Error(`ReleaseCandidateManifest is invalid: ${originRunValidation.error}`);
+  }
+  const resolvedCandidateId = candidateId ?? `candidate-${sha256Hex(`${releaseCommitSha}:${sourceRunUri}`).slice(0, 16)}`;
+  const manifest = {
+    schema_version: 1,
+    artifact_id: 'prod_release_candidate',
+    candidate_id: resolvedCandidateId,
+    created_at: createdAt,
+    release_ref: String(releaseRef ?? ''),
+    release_commit_sha: String(releaseCommitSha ?? ''),
+    requires_do_migration: requiresDoMigration === true,
+    source_repository: String(sourceRepository ?? ''),
+    source_run_uri: String(sourceRunUri ?? ''),
+    origin_repository: originRunIdentity.origin_repository,
+    origin_run_id: originRunIdentity.origin_run_id,
+    origin_run_attempt: originRunIdentity.origin_run_attempt,
+    origin_run_uri: originRunIdentity.origin_run_uri,
+    topology_kind: 'cloudflare-prod',
+    ci_integration_attestation: structuredCloneJson(ciIntegrationAttestation),
+    staging_attestation: structuredCloneJson(stagingAttestation),
+    pre_release_attestation: structuredCloneJson(preReleaseAttestation),
+  };
+  const validation = validateReleaseCandidateManifest(manifest, {
+    expectedGitHubRepository: manifest.source_repository,
+  });
+  if (!validation.valid) {
+    throw new Error(`ReleaseCandidateManifest is invalid: ${validation.error}`);
+  }
+  return Object.freeze(manifest);
+}
+
+export async function writeReleaseCandidateManifest(outputPath, options) {
+  const claims = await requireGitHubActionsExecution('writeReleaseCandidateManifest', {
+    expectedEnvironmentName: PRODUCTION_ENVIRONMENT_NAME,
+  });
+  const manifest = buildReleaseCandidateManifest({
+    ...options,
+    originRunIdentity: options.originRunIdentity ?? buildGitHubActionsProducerRunIdentity(claims),
+  });
+  await fs.mkdir(path.dirname(outputPath), { recursive: true });
+  await fs.writeFile(outputPath, stableJson(manifest));
+  return {
+    output_path: outputPath,
+    manifest,
+  };
+}
+
+export function validateProdInstallRecord(payload, {
+  expectedGitHubRepository = null,
+} = {}) {
+  const validation = validateManualArtifactPayload('prod_install_record', payload);
+  if (!validation.valid) {
+    return validation;
+  }
+  if (isNonEmptyString(expectedGitHubRepository) && payload.origin_repository !== expectedGitHubRepository) {
+    return {
+      valid: false,
+      error: 'prod install record origin_repository must match the current repository',
+    };
+  }
+  return validation;
+}
+
+export function buildProdInstallRecord({
+  releaseCommitSha,
+  provisionedEnvironment,
+  deploymentSummary,
+  originRunIdentity,
+  installId = null,
+  installedAt = new Date().toISOString(),
+}) {
+  const originRunValidation = validateProducerRunIdentity(originRunIdentity, 'originRunIdentity');
+  if (!originRunValidation.valid) {
+    throw new Error(`ProdInstallRecord is invalid: ${originRunValidation.error}`);
+  }
+  const record = {
+    schema_version: 1,
+    artifact_id: 'prod_install_record',
+    source_environment: PRODUCTION_ENVIRONMENT_NAME,
+    install_id: installId ?? `install-${sha256Hex(`${releaseCommitSha}:${installedAt}`).slice(0, 16)}`,
+    installed_at: installedAt,
+    origin_repository: originRunIdentity.origin_repository,
+    origin_run_id: originRunIdentity.origin_run_id,
+    origin_run_attempt: originRunIdentity.origin_run_attempt,
+    origin_run_uri: originRunIdentity.origin_run_uri,
+    release_commit_sha: String(releaseCommitSha ?? ''),
+    topology_kind: 'cloudflare-prod',
+    workers_subdomain: String(provisionedEnvironment?.workers_subdomain ?? ''),
+    cloudflare_resources: structuredCloneJson({
+      ...deploymentSummary?.cloudflare_resources,
+      r2_buckets: sortUniqueStringArray(deploymentSummary?.cloudflare_resources?.r2_buckets ?? []),
+    }),
+    access: {
+      auth_domain: String(provisionedEnvironment?.access?.auth_domain ?? ''),
+      application_id: String(provisionedEnvironment?.access?.application_id ?? ''),
+      application_audience: String(provisionedEnvironment?.access?.application_audience ?? ''),
+      application_domain: String(provisionedEnvironment?.access?.application_domain ?? ''),
+      protected_ops_url: String(provisionedEnvironment?.access?.protected_ops_url ?? deploymentSummary?.access?.protected_ops_url ?? ''),
+    },
+    deployment_identity: structuredCloneJson(deploymentSummary?.deployment_identity ?? {}),
+    workers: structuredCloneJson(deploymentSummary?.workers ?? {}),
+  };
+  const validation = validateProdInstallRecord(record);
+  if (!validation.valid) {
+    throw new Error(`ProdInstallRecord is invalid: ${validation.error}`);
+  }
+  return Object.freeze(record);
+}
+
+export async function writeProdInstallRecord(outputPath, options) {
+  const record = buildProdInstallRecord(options);
+  await fs.mkdir(path.dirname(outputPath), { recursive: true });
+  await fs.writeFile(outputPath, stableJson(record));
+  return {
+    output_path: outputPath,
+    record,
+  };
+}
+
+function validateProdRollbackHandle(value) {
+  if (!isPlainObject(value)) {
+    return {
+      valid: false,
+      error: 'rollback_handle must be an object',
+    };
+  }
+  if (!isNonEmptyString(value.workers_subdomain)) {
+    return {
+      valid: false,
+      error: 'rollback_handle.workers_subdomain must be non-empty',
+    };
+  }
+  if (!isPlainObject(value.worker_versions)) {
+    return {
+      valid: false,
+      error: 'rollback_handle.worker_versions must be an object',
+    };
+  }
+  for (const workerName of WORKER_DEPLOYMENT_ORDER) {
+    const entry = value.worker_versions[workerName];
+    if (!isPlainObject(entry)) {
+      return {
+        valid: false,
+        error: `rollback_handle.worker_versions.${workerName} must be an object`,
+      };
+    }
+    if (!isNonEmptyString(entry.script_name)) {
+      return {
+        valid: false,
+        error: `rollback_handle.worker_versions.${workerName}.script_name must be non-empty`,
+      };
+    }
+    if (!isNonEmptyString(entry.previous_deployment_id)) {
+      return {
+        valid: false,
+        error: `rollback_handle.worker_versions.${workerName}.previous_deployment_id must be non-empty`,
+      };
+    }
+    if (!isNonEmptyString(entry.previous_worker_version_id)) {
+      return {
+        valid: false,
+        error: `rollback_handle.worker_versions.${workerName}.previous_worker_version_id must be non-empty`,
+      };
+    }
+    if (!Array.isArray(entry.restore_version_specs) || entry.restore_version_specs.length === 0 || !entry.restore_version_specs.every((spec) => isNonEmptyString(spec))) {
+      return {
+        valid: false,
+        error: `rollback_handle.worker_versions.${workerName}.restore_version_specs must be a non-empty string array`,
+      };
+    }
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+export function validateProdPromotionRecord(payload, {
+  expectedGitHubRepository = null,
+} = {}) {
+  const validation = validateManualArtifactPayload('prod_promotion_record', payload);
+  if (!validation.valid) {
+    return validation;
+  }
+  if (isNonEmptyString(expectedGitHubRepository) && payload.origin_repository !== expectedGitHubRepository) {
+    return {
+      valid: false,
+      error: 'prod promotion record origin_repository must match the current repository',
+    };
+  }
+  return validation;
+}
+
+export function buildProdPromotionRecord({
+  releaseCommitSha,
+  sourceCandidate,
+  promotionMode,
+  previousDeploymentIdentity,
+  currentDeploymentIdentity,
+  originRunIdentity,
+  gatewayRolloutSteps = [],
+  readinessChecks = null,
+  rollbackHandle = null,
+  promotionId = null,
+  promotedAt = new Date().toISOString(),
+}) {
+  const originRunValidation = validateProducerRunIdentity(originRunIdentity, 'originRunIdentity');
+  if (!originRunValidation.valid) {
+    throw new Error(`ProdPromotionRecord is invalid: ${originRunValidation.error}`);
+  }
+  const record = {
+    schema_version: 1,
+    artifact_id: 'prod_promotion_record',
+    source_environment: PRODUCTION_ENVIRONMENT_NAME,
+    promotion_id: promotionId ?? `promotion-${sha256Hex(`${releaseCommitSha}:${promotedAt}`).slice(0, 16)}`,
+    promoted_at: promotedAt,
+    origin_repository: originRunIdentity.origin_repository,
+    origin_run_id: originRunIdentity.origin_run_id,
+    origin_run_attempt: originRunIdentity.origin_run_attempt,
+    origin_run_uri: originRunIdentity.origin_run_uri,
+    release_commit_sha: String(releaseCommitSha ?? ''),
+    promotion_mode: String(promotionMode ?? ''),
+    source_candidate: structuredCloneJson(sourceCandidate ?? {}),
+    previous_deployment_identity: structuredCloneJson(previousDeploymentIdentity ?? {}),
+    current_deployment_identity: structuredCloneJson(currentDeploymentIdentity ?? {}),
+    gateway_rollout_steps: structuredCloneJson(gatewayRolloutSteps),
+    rollback_handle: rollbackHandle == null ? null : structuredCloneJson(rollbackHandle),
+  };
+  if (readinessChecks != null) {
+    record.readiness_checks = structuredCloneJson(readinessChecks);
+  }
+  const validation = validateProdPromotionRecord(record);
+  if (!validation.valid) {
+    throw new Error(`ProdPromotionRecord is invalid: ${validation.error}`);
+  }
+  return Object.freeze(record);
+}
+
+export async function writeProdPromotionRecord(outputPath, options) {
+  const record = buildProdPromotionRecord(options);
+  await fs.mkdir(path.dirname(outputPath), { recursive: true });
+  await fs.writeFile(outputPath, stableJson(record));
+  return {
+    output_path: outputPath,
+    record,
+  };
+}
+
+export function validateProdRollbackRecord(payload, {
+  expectedGitHubRepository = null,
+} = {}) {
+  const validation = validateManualArtifactPayload('prod_rollback_record', payload);
+  if (!validation.valid) {
+    return validation;
+  }
+  if (isNonEmptyString(expectedGitHubRepository) && payload.origin_repository !== expectedGitHubRepository) {
+    return {
+      valid: false,
+      error: 'prod rollback record origin_repository must match the current repository',
+    };
+  }
+  return validation;
+}
+
+export function buildProdRollbackRecord({
+  sourcePromotionId,
+  releaseCommitSha,
+  originRunIdentity,
+  requestedRollbackHandle,
+  restoredDeploymentIdentity,
+  workerResults,
+  readinessProbe,
+  rollbackId = null,
+  rolledBackAt = new Date().toISOString(),
+}) {
+  const originRunValidation = validateProducerRunIdentity(originRunIdentity, 'originRunIdentity');
+  if (!originRunValidation.valid) {
+    throw new Error(`ProdRollbackRecord is invalid: ${originRunValidation.error}`);
+  }
+  const record = {
+    schema_version: 1,
+    artifact_id: 'prod_rollback_record',
+    source_environment: PRODUCTION_ENVIRONMENT_NAME,
+    rollback_id: rollbackId ?? `rollback-${sha256Hex(`${sourcePromotionId}:${rolledBackAt}`).slice(0, 16)}`,
+    rolled_back_at: rolledBackAt,
+    origin_repository: originRunIdentity.origin_repository,
+    origin_run_id: originRunIdentity.origin_run_id,
+    origin_run_attempt: originRunIdentity.origin_run_attempt,
+    origin_run_uri: originRunIdentity.origin_run_uri,
+    source_promotion_id: String(sourcePromotionId ?? ''),
+    release_commit_sha: String(releaseCommitSha ?? ''),
+    requested_rollback_handle: structuredCloneJson(requestedRollbackHandle ?? {}),
+    restored_deployment_identity: structuredCloneJson(restoredDeploymentIdentity ?? {}),
+    worker_results: structuredCloneJson(workerResults ?? {}),
+    readiness_probe: structuredCloneJson(readinessProbe ?? {}),
+  };
+  const validation = validateProdRollbackRecord(record);
+  if (!validation.valid) {
+    throw new Error(`ProdRollbackRecord is invalid: ${validation.error}`);
+  }
+  return Object.freeze(record);
+}
+
+export async function writeProdRollbackRecord(outputPath, options) {
+  const record = buildProdRollbackRecord(options);
+  await fs.mkdir(path.dirname(outputPath), { recursive: true });
+  await fs.writeFile(outputPath, stableJson(record));
+  return {
+    output_path: outputPath,
+    record,
+  };
 }
 
 export function buildEnvironmentRunProvenance({
@@ -4588,7 +6482,7 @@ export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
     normalizedEnvironmentName,
     remoteHarnessEnv,
   );
-  const readinessLogText = formatNonLocalReadinessProbeLog(readinessProbe);
+  const readinessLogText = formatDeploymentReadinessProbeLog(readinessProbe);
   const combinedChunks = [Buffer.from(`${readinessLogText}\n`, 'utf8')];
   let exitCode = 1;
   if (readinessProbe.ready) {

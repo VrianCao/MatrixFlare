@@ -781,6 +781,17 @@
 
 ### 08.05 完成 L1 证据
 
+### 08.05A 建立 production topology install/promote/rollback automation prerequisite
+
+- [ ] 通过 `DEC-0005` 把 production automation contract 固化到 Spec/TODO，再落 GitHub Actions + CLI/tooling 的 `prod-install` / `release-candidate` / `promote-prod` / `rollback-prod` / `prod-cost-monthly` 基础设施；若 remote 验证尚未执行，或 fail-closed 时仍留不下 raw blocker artifact，不得把本项写成已完成。
+  Spec refs: `42` 2.1-2.3, `24` `DATA-OPS-014`,`DATA-OPS-015`,`DATA-OPS-016`,`DATA-OPS-017`, `25` `FLOW-OPS-PROD-CANDIDATE`,`FLOW-OPS-PROD-INSTALL`,`FLOW-OPS-PROD-PROMOTE`,`FLOW-OPS-PROD-ROLLBACK`,`FLOW-OPS-PROD-COST-SNAPSHOT`,`STATE-PROD-ROLLOUT`,`STATE-PROD-COST-SNAPSHOT`, `26` 5.22-5.25, `41` `REQ-OPS-003`, `43` `TEST-OPS-003`, `44` `EVID-OPS-003`, `13` `CF-WKR-012`,`CF-WKR-014`, `DEC-0005`, `OQ-0002`
+  产出:
+  reviewed candidate manifest contract、prod topology bootstrap contract、prod promotion / rollback records、对应 workflow/tooling/local tests。
+  完成标准:
+  仓库中真实存在 `prod-install` / `release-candidate` / `promote-prod` / `rollback-prod` / `prod-cost-monthly` workflow 与对应 CLI/tooling；其中 `promote-prod` 只能消费 `ReleaseCandidateManifest`，`rollback-prod` 只能消费 `ProdPromotionRecord` 中的 rollback handle，`prod-install` 不得在 active prod topology 已存在时继续充当 redeploy bypass，migration-safe promote 不得再复用 bootstrap gateway 路径；并且至少有 same-head GitHub Actions 证明 target account 中的 `matrix-*-prod` topology 已被这些入口真实建立，workflow fail-closed 时仍留下 raw blocker artifact，或把 remote blocker 诚实写回正确 artifact。
+  当前状态:
+  该项在当前 worktree 中已不再是“完全未落地”的状态：`prod-install` / `release-candidate` / `promote-prod` / `rollback-prod` / `prod-cost-monthly` workflow 以及对应 `CLI/tooling/local tests` 现已真实存在，并继续补 current-repo/current-head 绑定、active-topology/current-state fail-closed guard、migration-safe promote path 与 raw failure-artifact retention。但这仍不构成完成依据，因为 same-head remote verification 还未执行：截至当前 truth，`prod-cost-monthly` 路径已在 earlier pushed-head run 上真实证明 Billing API access 与 raw bundle R2 upload 可用，但 `prod-install` / `release-candidate` / `promote-prod` / `rollback-prod` 仍未拿到 current-head remote proof，target account 中 `matrix-*-prod` 固定命名 topology 也尚未被当前 head 真实建立。在新的 same-head GitHub Actions run 真实证明 prod topology 已建立，或把 remaining blocker 继续写回正确 artifact 之前，本项继续保持未完成。
+
 - [ ] 生成 `EVID-GOV-001`,`EVID-CS-001`,`EVID-CS-002`,`EVID-CS-003`,`EVID-CS-004`,`EVID-ROOM-001`,`EVID-ROOM-002`,`EVID-MEDIA-001`,`EVID-DER-001`,`EVID-SEC-001`,`EVID-OPS-001`,`EVID-COST-001`。
   Spec refs: `44` 2.4, 3, 4, 6
   产出:

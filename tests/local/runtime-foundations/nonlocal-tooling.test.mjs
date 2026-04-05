@@ -8,11 +8,16 @@ import test from 'node:test';
 
 import {
   buildProdCostSnapshotProvenance,
+  buildProdInstallRecord,
+  buildProdPromotionRecord,
+  buildProdRollbackRecord,
   buildPreReleaseRolloutVersionSpecs,
   buildEnvironmentRunProvenance,
   buildGitHubRunUrl,
   buildNonLocalEnvironmentPlan,
   buildNonProductionSecretBundle,
+  buildProductionEnvironmentPlan,
+  buildReleaseCandidateManifest,
   buildRemoteHarnessEnvironmentVariables,
   buildRemoteHarnessEnvironmentVariablesFromDeployment,
   buildWranglerDeployArguments,
@@ -28,6 +33,10 @@ import {
   uploadImmutableArtifactToR2,
   validateDeploymentSummaryAgainstCurrentCloudflareState,
   validateLatestActiveCloudflareWorkerIdentity,
+  validateProdInstallRecord,
+  validateProdPromotionRecord,
+  validateProdRollbackRecord,
+  validateReleaseCandidateManifest,
   validateRemoteHarnessEnvironmentVariables,
   waitForNonLocalDeploymentReadiness,
   writeProdCostSnapshotProvenance,
@@ -88,6 +97,256 @@ function buildDeploymentSummaryFixture(environmentName) {
         url: plan.worker_urls['ops-worker'],
       },
     },
+  };
+}
+
+function buildProductionProvisioningFixture() {
+  const plan = buildProductionEnvironmentPlan({
+    workersSubdomain: 'matrixflare',
+  });
+  return {
+    environment_name: 'prod',
+    account_id: 'cf-account',
+    workers_subdomain: 'matrixflare',
+    plan,
+    access: {
+      auth_domain: 'matrixflare.cloudflareaccess.com',
+      application_id: 'cf-access-app-prod',
+      application_audience: 'prod-aud',
+      application_domain: 'matrix-ops-worker-prod.matrixflare.workers.dev',
+      protected_ops_url: 'https://matrix-ops-worker-prod.matrixflare.workers.dev',
+    },
+    resources: {
+      d1_database: {
+        id: 'd1-prod',
+        name: plan.d1_database_name,
+      },
+      kv_namespace: {
+        id: 'kv-prod',
+        title: plan.kv_namespace_title,
+      },
+    },
+  };
+}
+
+function buildProductionDeploymentSummaryFixture() {
+  const provisionedEnvironment = buildProductionProvisioningFixture();
+  const { plan } = provisionedEnvironment;
+  return {
+    environment_name: 'prod',
+    account_id: 'cf-account',
+    workers_subdomain: 'matrixflare',
+    cloudflare_resources: {
+      ...plan.cloudflare_resources,
+      r2_buckets: [...plan.cloudflare_resources.r2_buckets, plan.artifact_bucket_name].sort(),
+    },
+    access: {
+      protected_ops_url: provisionedEnvironment.access.protected_ops_url,
+    },
+    deployment_identity: {
+      environment_id: 'prod',
+      deployment_ids: ['jobs-prod-deployment-v1', 'ops-prod-deployment-v1', 'gateway-prod-deployment-v1'],
+      worker_version_ids: ['jobs@prod-v1', 'ops@prod-v1', 'gateway@prod-v1'],
+    },
+    workers: {
+      'gateway-worker': {
+        worker_name: 'gateway-worker',
+        deployment_id: 'gateway-prod-deployment-v1',
+        worker_version_id: 'gateway@prod-v1',
+        worker_version_tag: 'mx-gw-d-prod1',
+        script_name: plan.worker_scripts['gateway-worker'],
+        url: plan.worker_urls['gateway-worker'],
+      },
+      'jobs-worker': {
+        worker_name: 'jobs-worker',
+        deployment_id: 'jobs-prod-deployment-v1',
+        worker_version_id: 'jobs@prod-v1',
+        worker_version_tag: 'mx-jw-d-prod1',
+        script_name: plan.worker_scripts['jobs-worker'],
+        url: plan.worker_urls['jobs-worker'],
+      },
+      'ops-worker': {
+        worker_name: 'ops-worker',
+        deployment_id: 'ops-prod-deployment-v1',
+        worker_version_id: 'ops@prod-v1',
+        worker_version_tag: 'mx-ow-d-prod1',
+        script_name: plan.worker_scripts['ops-worker'],
+        url: plan.worker_urls['ops-worker'],
+      },
+    },
+  };
+}
+
+function buildProducerRunIdentityFixture({
+  repository = 'VrianCao/MatrixFlare',
+  runId = '912345',
+  runAttempt = 1,
+} = {}) {
+  return {
+    origin_repository: repository,
+    origin_run_id: runId,
+    origin_run_attempt: runAttempt,
+    origin_run_uri: buildGitHubRunUrl(repository, runId),
+  };
+}
+
+function buildEnvironmentAttestationFixture(environmentName, runTimestamp, {
+  sourceRepository = 'VrianCao/MatrixFlare',
+  sourceRunId = '81234',
+  sourceRunAttempt = 1,
+  sourceRunUri = null,
+} = {}) {
+  const resolvedSourceRunUri = sourceRunUri ?? buildGitHubRunUrl(sourceRepository, sourceRunId);
+  const canonicalTestFile = environmentName === 'ci-integration'
+    ? 'tests/integration/test-cs-001.test.mjs'
+    : `tests/${environmentName}/test-cs-001.test.mjs`;
+  const readinessSteps = [
+    { step: 'versions', ok: true, detail: { versions_count: 1 } },
+    { step: 'public_rooms', ok: true, detail: { chunk_length: 0 } },
+    { step: 'register_challenge', ok: true, detail: { session_present: true, flows_count: 1 } },
+    { step: 'register_complete', ok: true, detail: { user_id_present: true, access_token_present: true } },
+    { step: 'sync', ok: true, detail: { next_batch_present: true } },
+    { step: 'media_create', ok: true, detail: { content_uri_present: true } },
+  ];
+  if (environmentName !== 'ci-integration') {
+    readinessSteps.push(
+      { step: 'ops_healthz', ok: true, detail: { service: 'ops-worker', status: 'ok' } },
+      { step: 'ops_rebuild_start', ok: true, detail: { job_id_present: true, job_type: 'rebuild', state: 'accepted' } },
+    );
+  }
+  const artifactId = environmentName === 'ci-integration'
+    ? 'ci_integration_run_report'
+    : environmentName === 'staging'
+      ? 'staging_run_report'
+      : 'pre_release_run_report';
+  return {
+    schema_version: 1,
+    artifact_id: artifactId,
+    attestation_kind: 'environment_run',
+    source_environment: environmentName,
+    run_timestamp: runTimestamp,
+    attested_at: '2026-03-31T14:06:00.000Z',
+    provenance: {
+      origin_system: 'github-actions',
+      origin_repository: sourceRepository,
+      origin_run_id: sourceRunId,
+      origin_run_attempt: sourceRunAttempt,
+      origin_run_uri: resolvedSourceRunUri,
+      artifact_store_uri: `r2://matrix-evidence-${environmentName}/gha/${sourceRunId}/${sourceRunAttempt}/${environmentName}/${runTimestamp}/run-bundle.tgz`,
+      artifact_store_key: `gha/${sourceRunId}/${sourceRunAttempt}/${environmentName}/${runTimestamp}/run-bundle.tgz`,
+      artifact_sha256: 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789',
+      review_record_uri: resolvedSourceRunUri,
+      topology_kind: `cloudflare-${environmentName}`,
+      deployment_identity: {
+        environment_id: environmentName,
+        deployment_ids: [`${environmentName}-deployment-001`],
+        worker_version_ids: [`gateway@${environmentName}-v1`, `jobs@${environmentName}-v1`, `ops@${environmentName}-v1`],
+      },
+    },
+    payload: {
+      artifact_id: artifactId,
+      environment_name: environmentName,
+      source_environment: environmentName,
+      run_timestamp: runTimestamp,
+      status: 'pass',
+      exit_code: 0,
+      started_at: '2026-03-31T14:00:00.000Z',
+      completed_at: '2026-03-31T14:05:00.000Z',
+      duration_ms: 300000,
+      command: `/usr/bin/node --test ${canonicalTestFile}`,
+      test_directory: `tests/${environmentName === 'ci-integration' ? 'integration' : environmentName}`,
+      test_file_count: 1,
+      test_files: [canonicalTestFile],
+      expanded_test_file_count: 1,
+      expanded_test_files: [canonicalTestFile],
+      output_sha256: 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789',
+      error_message: null,
+      log_artifact: `https://example.invalid/logs/${environmentName}/${runTimestamp}.txt`,
+      executed_by: 'ci-runner',
+      reviewed_by: 'release-reviewer',
+      source_run_uri: resolvedSourceRunUri,
+      topology_kind: `cloudflare-${environmentName}`,
+      cloudflare_resources: environmentName === 'ci-integration'
+        ? {
+          ...buildNonLocalEnvironmentPlan('ci-integration', { workersSubdomain: 'matrixflare' }).cloudflare_resources,
+          r2_buckets: [
+            ...buildNonLocalEnvironmentPlan('ci-integration', { workersSubdomain: 'matrixflare' }).cloudflare_resources.r2_buckets,
+            buildNonLocalEnvironmentPlan('ci-integration', { workersSubdomain: 'matrixflare' }).artifact_bucket_name,
+          ].sort(),
+        }
+        : {
+          ...buildNonLocalEnvironmentPlan(environmentName, { workersSubdomain: 'matrixflare' }).cloudflare_resources,
+          r2_buckets: [
+            ...buildNonLocalEnvironmentPlan(environmentName, { workersSubdomain: 'matrixflare' }).cloudflare_resources.r2_buckets,
+            buildNonLocalEnvironmentPlan(environmentName, { workersSubdomain: 'matrixflare' }).artifact_bucket_name,
+          ].sort(),
+        },
+      rollout_skew_probe: null,
+      pre_release_cost_observation: null,
+      readiness_probe: {
+        ready: true,
+        environment_name: environmentName,
+        started_at: '2026-03-31T13:59:00.000Z',
+        completed_at: '2026-03-31T13:59:30.000Z',
+        duration_ms: 30000,
+        attempt_count: 1,
+        last_error: null,
+        attempts: [
+          {
+            attempt: 1,
+            started_at: '2026-03-31T13:59:00.000Z',
+            completed_at: '2026-03-31T13:59:30.000Z',
+            duration_ms: 30000,
+            ok: true,
+            steps: readinessSteps,
+            failure: null,
+            delay_before_next_attempt_ms: null,
+          },
+        ],
+      },
+      deployment_identity_validation: {
+        before_readiness: {
+          validated_at: '2026-03-31T13:58:30.000Z',
+          workers: {},
+        },
+        before_suite: {
+          validated_at: '2026-03-31T13:59:31.000Z',
+          workers: {},
+        },
+      },
+    },
+  };
+}
+
+function buildProductionReadinessProbeFixture(overrides = {}) {
+  return {
+    environment_name: 'prod',
+    ready: true,
+    started_at: '2026-03-31T14:10:00.000Z',
+    completed_at: '2026-03-31T14:10:30.000Z',
+    duration_ms: 30000,
+    attempt_count: 1,
+    last_error: null,
+    attempts: [
+      {
+        attempt: 1,
+        started_at: '2026-03-31T14:10:00.000Z',
+        completed_at: '2026-03-31T14:10:30.000Z',
+        duration_ms: 30000,
+        ok: true,
+        steps: [
+          { step: 'versions', ok: true, detail: { versions_count: 1 } },
+          { step: 'public_rooms', ok: true, detail: { chunk_length: 0 } },
+          { step: 'register_complete', ok: true, detail: { user_id_present: true, access_token_present: true } },
+          { step: 'media_create', ok: true, detail: { content_uri_present: true } },
+          { step: 'ops_healthz', ok: true, detail: { service: 'ops-worker', status: 'ok' } },
+          { step: 'ops_rebuild_start', ok: true, detail: { job_id_present: true, job_type: 'rebuild', state: 'accepted' } },
+        ],
+        failure: null,
+        delay_before_next_attempt_ms: null,
+      },
+    ],
+    ...overrides,
   };
 }
 
@@ -2768,6 +3027,532 @@ test('prod cost attestation writing requires the GitHub Actions prod environment
     }),
     /stop after verifying expected prod environment/,
   );
+});
+
+test('production automation builders emit records that satisfy the shared evidence contract', () => {
+  const runTimestamp = '20260331T140000Z';
+  const sourceRunUri = buildGitHubRunUrl('VrianCao/MatrixFlare', '81234');
+  const releaseCandidate = buildReleaseCandidateManifest({
+    releaseRef: 'refs/heads/phase08-nonlocal-closure',
+    releaseCommitSha: '0123456789abcdef0123456789abcdef01234567',
+    requiresDoMigration: false,
+    sourceRepository: 'VrianCao/MatrixFlare',
+    sourceRunUri,
+    originRunIdentity: buildProducerRunIdentityFixture(),
+    ciIntegrationAttestation: buildEnvironmentAttestationFixture('ci-integration', runTimestamp, {
+      sourceRunUri,
+    }),
+    stagingAttestation: buildEnvironmentAttestationFixture('staging', runTimestamp, {
+      sourceRunUri,
+    }),
+    preReleaseAttestation: buildEnvironmentAttestationFixture('pre-release', runTimestamp, {
+      sourceRunUri,
+    }),
+  });
+  assert.deepEqual(validateReleaseCandidateManifest(releaseCandidate), {
+    valid: true,
+    error: null,
+  });
+
+  const provisionedEnvironment = buildProductionProvisioningFixture();
+  const deploymentSummary = buildProductionDeploymentSummaryFixture();
+  const installRecord = buildProdInstallRecord({
+    releaseCommitSha: '0123456789abcdef0123456789abcdef01234567',
+    provisionedEnvironment,
+    deploymentSummary,
+    originRunIdentity: buildProducerRunIdentityFixture(),
+    installId: 'install-prod-topology-v1',
+    installedAt: '2026-03-31T14:08:00.000Z',
+  });
+  assert.deepEqual(validateProdInstallRecord(installRecord), {
+    valid: true,
+    error: null,
+  });
+
+  const promotionRecord = buildProdPromotionRecord({
+    releaseCommitSha: '89abcdef0123456789abcdef0123456789abcdef',
+    sourceCandidate: {
+      candidate_id: releaseCandidate.candidate_id,
+      source_run_uri: releaseCandidate.source_run_uri,
+    },
+    originRunIdentity: buildProducerRunIdentityFixture({ runId: '912346' }),
+    promotionMode: 'gradual',
+    previousDeploymentIdentity: installRecord.deployment_identity,
+    currentDeploymentIdentity: {
+      environment_id: 'prod',
+      deployment_ids: ['jobs-prod-deployment-v2', 'ops-prod-deployment-v2', 'gateway-prod-deployment-v2'],
+      worker_version_ids: ['jobs@prod-v2', 'ops@prod-v2', 'gateway@prod-v2'],
+    },
+    gatewayRolloutSteps: [
+      { percentage: 10, deployment_id: 'gateway-prod-rollout-10', ready: true, attempt_count: 1, last_error: null },
+      { percentage: 50, deployment_id: 'gateway-prod-rollout-50', ready: true, attempt_count: 1, last_error: null },
+      { percentage: 100, deployment_id: 'gateway-prod-rollout-100', ready: true, attempt_count: 1, last_error: null },
+    ],
+    readinessChecks: {
+      jobs_promoted: buildProductionReadinessProbeFixture(),
+      ops_promoted: buildProductionReadinessProbeFixture(),
+    },
+    rollbackHandle: {
+      workers_subdomain: installRecord.workers_subdomain,
+      worker_versions: {
+        'gateway-worker': {
+          script_name: installRecord.workers['gateway-worker'].script_name,
+          previous_deployment_id: installRecord.workers['gateway-worker'].deployment_id,
+          previous_worker_version_id: installRecord.workers['gateway-worker'].worker_version_id,
+          restore_version_specs: [`${installRecord.workers['gateway-worker'].worker_version_id}@100`],
+        },
+        'jobs-worker': {
+          script_name: installRecord.workers['jobs-worker'].script_name,
+          previous_deployment_id: installRecord.workers['jobs-worker'].deployment_id,
+          previous_worker_version_id: installRecord.workers['jobs-worker'].worker_version_id,
+          restore_version_specs: [`${installRecord.workers['jobs-worker'].worker_version_id}@100`],
+        },
+        'ops-worker': {
+          script_name: installRecord.workers['ops-worker'].script_name,
+          previous_deployment_id: installRecord.workers['ops-worker'].deployment_id,
+          previous_worker_version_id: installRecord.workers['ops-worker'].worker_version_id,
+          restore_version_specs: [`${installRecord.workers['ops-worker'].worker_version_id}@100`],
+        },
+      },
+    },
+    promotionId: 'promotion-prod-v2',
+    promotedAt: '2026-03-31T14:09:00.000Z',
+  });
+  assert.deepEqual(validateProdPromotionRecord(promotionRecord), {
+    valid: true,
+    error: null,
+  });
+
+  const migrationPromotionRecord = buildProdPromotionRecord({
+    releaseCommitSha: 'fedcba9876543210fedcba9876543210fedcba98',
+    sourceCandidate: {
+      candidate_id: releaseCandidate.candidate_id,
+      source_run_uri: releaseCandidate.source_run_uri,
+    },
+    originRunIdentity: buildProducerRunIdentityFixture({ runId: '912347' }),
+    promotionMode: 'deploy_with_migration',
+    previousDeploymentIdentity: installRecord.deployment_identity,
+    currentDeploymentIdentity: {
+      environment_id: 'prod',
+      deployment_ids: ['jobs-prod-deployment-v3', 'ops-prod-deployment-v3', 'gateway-prod-deployment-v3'],
+      worker_version_ids: ['jobs@prod-v3', 'ops@prod-v3', 'gateway@prod-v3'],
+    },
+    gatewayRolloutSteps: [],
+    readinessChecks: {
+      jobs_promoted: buildProductionReadinessProbeFixture(),
+      ops_promoted: buildProductionReadinessProbeFixture(),
+      gateway_promoted: buildProductionReadinessProbeFixture(),
+    },
+    rollbackHandle: null,
+    promotionId: 'promotion-prod-v3-migration',
+    promotedAt: '2026-03-31T14:10:00.000Z',
+  });
+  assert.deepEqual(validateProdPromotionRecord(migrationPromotionRecord), {
+    valid: true,
+    error: null,
+  });
+
+  const rollbackRecord = buildProdRollbackRecord({
+    sourcePromotionId: promotionRecord.promotion_id,
+    releaseCommitSha: installRecord.release_commit_sha,
+    originRunIdentity: buildProducerRunIdentityFixture({ runId: '912348' }),
+    requestedRollbackHandle: promotionRecord.rollback_handle,
+    restoredDeploymentIdentity: installRecord.deployment_identity,
+    workerResults: {
+      'gateway-worker': {
+        restored: true,
+        deployment_id: installRecord.workers['gateway-worker'].deployment_id,
+        worker_version_id: installRecord.workers['gateway-worker'].worker_version_id,
+      },
+      'jobs-worker': {
+        restored: true,
+        deployment_id: installRecord.workers['jobs-worker'].deployment_id,
+        worker_version_id: installRecord.workers['jobs-worker'].worker_version_id,
+      },
+      'ops-worker': {
+        restored: true,
+        deployment_id: installRecord.workers['ops-worker'].deployment_id,
+        worker_version_id: installRecord.workers['ops-worker'].worker_version_id,
+      },
+    },
+    readinessProbe: buildProductionReadinessProbeFixture(),
+    rollbackId: 'rollback-prod-v1',
+    rolledBackAt: '2026-03-31T14:11:00.000Z',
+  });
+  assert.deepEqual(validateProdRollbackRecord(rollbackRecord), {
+    valid: true,
+    error: null,
+  });
+});
+
+test('production automation validators can bind consumed artifacts to the current repository', () => {
+  const runTimestamp = '20260331T140000Z';
+  const sourceRunUri = buildGitHubRunUrl('VrianCao/MatrixFlare', '81234');
+  const releaseCandidate = buildReleaseCandidateManifest({
+    releaseRef: 'refs/heads/phase08-nonlocal-closure',
+    releaseCommitSha: '0123456789abcdef0123456789abcdef01234567',
+    requiresDoMigration: false,
+    sourceRepository: 'VrianCao/MatrixFlare',
+    sourceRunUri,
+    originRunIdentity: buildProducerRunIdentityFixture(),
+    ciIntegrationAttestation: buildEnvironmentAttestationFixture('ci-integration', runTimestamp, {
+      sourceRunUri,
+    }),
+    stagingAttestation: buildEnvironmentAttestationFixture('staging', runTimestamp, {
+      sourceRunUri,
+    }),
+    preReleaseAttestation: buildEnvironmentAttestationFixture('pre-release', runTimestamp, {
+      sourceRunUri,
+    }),
+  });
+  assert.deepEqual(validateReleaseCandidateManifest({
+    ...releaseCandidate,
+    origin_repository: 'OtherOrg/OtherRepo',
+    origin_run_uri: buildGitHubRunUrl('OtherOrg/OtherRepo', '912345'),
+  }, {
+    expectedGitHubRepository: 'VrianCao/MatrixFlare',
+  }), {
+    valid: false,
+    error: 'release candidate manifest origin_repository must match the current repository',
+  });
+
+  const installRecord = buildProdInstallRecord({
+    releaseCommitSha: '0123456789abcdef0123456789abcdef01234567',
+    provisionedEnvironment: buildProductionProvisioningFixture(),
+    deploymentSummary: buildProductionDeploymentSummaryFixture(),
+    originRunIdentity: buildProducerRunIdentityFixture(),
+    installId: 'install-prod-topology-v1',
+    installedAt: '2026-03-31T14:08:00.000Z',
+  });
+  assert.deepEqual(validateProdInstallRecord({
+    ...installRecord,
+    origin_repository: 'OtherOrg/OtherRepo',
+    origin_run_uri: buildGitHubRunUrl('OtherOrg/OtherRepo', '912345'),
+  }, {
+    expectedGitHubRepository: 'VrianCao/MatrixFlare',
+  }), {
+    valid: false,
+    error: 'prod install record origin_repository must match the current repository',
+  });
+
+  const promotionRecord = buildProdPromotionRecord({
+    releaseCommitSha: '89abcdef0123456789abcdef0123456789abcdef',
+    sourceCandidate: {
+      candidate_id: releaseCandidate.candidate_id,
+      source_run_uri: releaseCandidate.source_run_uri,
+    },
+    originRunIdentity: buildProducerRunIdentityFixture({ runId: '912347' }),
+    promotionMode: 'gradual',
+    previousDeploymentIdentity: installRecord.deployment_identity,
+    currentDeploymentIdentity: {
+      environment_id: 'prod',
+      deployment_ids: ['jobs-prod-deployment-v2', 'ops-prod-deployment-v2', 'gateway-prod-deployment-v2'],
+      worker_version_ids: ['jobs@prod-v2', 'ops@prod-v2', 'gateway@prod-v2'],
+    },
+    gatewayRolloutSteps: [
+      { percentage: 10, deployment_id: 'gateway-prod-rollout-10', ready: true, attempt_count: 1, last_error: null },
+      { percentage: 50, deployment_id: 'gateway-prod-rollout-50', ready: true, attempt_count: 1, last_error: null },
+      { percentage: 100, deployment_id: 'gateway-prod-rollout-100', ready: true, attempt_count: 1, last_error: null },
+    ],
+    readinessChecks: {
+      jobs_promoted: buildProductionReadinessProbeFixture(),
+      ops_promoted: buildProductionReadinessProbeFixture(),
+    },
+    rollbackHandle: {
+      workers_subdomain: installRecord.workers_subdomain,
+      worker_versions: {
+        'gateway-worker': {
+          script_name: installRecord.workers['gateway-worker'].script_name,
+          previous_deployment_id: installRecord.workers['gateway-worker'].deployment_id,
+          previous_worker_version_id: installRecord.workers['gateway-worker'].worker_version_id,
+          restore_version_specs: [`${installRecord.workers['gateway-worker'].worker_version_id}@100`],
+        },
+        'jobs-worker': {
+          script_name: installRecord.workers['jobs-worker'].script_name,
+          previous_deployment_id: installRecord.workers['jobs-worker'].deployment_id,
+          previous_worker_version_id: installRecord.workers['jobs-worker'].worker_version_id,
+          restore_version_specs: [`${installRecord.workers['jobs-worker'].worker_version_id}@100`],
+        },
+        'ops-worker': {
+          script_name: installRecord.workers['ops-worker'].script_name,
+          previous_deployment_id: installRecord.workers['ops-worker'].deployment_id,
+          previous_worker_version_id: installRecord.workers['ops-worker'].worker_version_id,
+          restore_version_specs: [`${installRecord.workers['ops-worker'].worker_version_id}@100`],
+        },
+      },
+    },
+    promotionId: 'promotion-prod-v2',
+    promotedAt: '2026-03-31T14:09:00.000Z',
+  });
+  assert.deepEqual(validateProdPromotionRecord({
+    ...promotionRecord,
+    origin_repository: 'OtherOrg/OtherRepo',
+    origin_run_uri: buildGitHubRunUrl('OtherOrg/OtherRepo', '912347'),
+  }, {
+    expectedGitHubRepository: 'VrianCao/MatrixFlare',
+  }), {
+    valid: false,
+    error: 'prod promotion record origin_repository must match the current repository',
+  });
+
+  const rollbackRecord = buildProdRollbackRecord({
+    sourcePromotionId: promotionRecord.promotion_id,
+    releaseCommitSha: installRecord.release_commit_sha,
+    originRunIdentity: buildProducerRunIdentityFixture({ runId: '912348' }),
+    requestedRollbackHandle: promotionRecord.rollback_handle,
+    restoredDeploymentIdentity: installRecord.deployment_identity,
+    workerResults: {
+      'gateway-worker': {
+        restored: true,
+        deployment_id: installRecord.workers['gateway-worker'].deployment_id,
+        worker_version_id: installRecord.workers['gateway-worker'].worker_version_id,
+      },
+      'jobs-worker': {
+        restored: true,
+        deployment_id: installRecord.workers['jobs-worker'].deployment_id,
+        worker_version_id: installRecord.workers['jobs-worker'].worker_version_id,
+      },
+      'ops-worker': {
+        restored: true,
+        deployment_id: installRecord.workers['ops-worker'].deployment_id,
+        worker_version_id: installRecord.workers['ops-worker'].worker_version_id,
+      },
+    },
+    readinessProbe: buildProductionReadinessProbeFixture(),
+    rollbackId: 'rollback-prod-v1',
+    rolledBackAt: '2026-03-31T14:11:00.000Z',
+  });
+  assert.deepEqual(validateProdRollbackRecord({
+    ...rollbackRecord,
+    origin_repository: 'OtherOrg/OtherRepo',
+    origin_run_uri: buildGitHubRunUrl('OtherOrg/OtherRepo', '912348'),
+  }, {
+    expectedGitHubRepository: 'VrianCao/MatrixFlare',
+  }), {
+    valid: false,
+    error: 'prod rollback record origin_repository must match the current repository',
+  });
+});
+
+test('production automation validators fail closed on missing rollback data and wrong promotion shape', () => {
+  assert.deepEqual(validateProdPromotionRecord({
+    schema_version: 1,
+    artifact_id: 'prod_promotion_record',
+    source_environment: 'prod',
+    promotion_id: 'promotion-prod-invalid',
+    promoted_at: '2026-03-31T14:09:00.000Z',
+    ...buildProducerRunIdentityFixture({ runId: '912349' }),
+    release_commit_sha: '89abcdef0123456789abcdef0123456789abcdef',
+    promotion_mode: 'gradual',
+    source_candidate: {
+      candidate_id: 'candidate-20260331t140000z',
+      source_run_uri: buildGitHubRunUrl('VrianCao/MatrixFlare', '81234'),
+    },
+    previous_deployment_identity: {
+      environment_id: 'prod',
+      deployment_ids: ['jobs-prod-deployment-v1', 'ops-prod-deployment-v1', 'gateway-prod-deployment-v1'],
+      worker_version_ids: ['jobs@prod-v1', 'ops@prod-v1', 'gateway@prod-v1'],
+    },
+    current_deployment_identity: {
+      environment_id: 'prod',
+      deployment_ids: ['jobs-prod-deployment-v2', 'ops-prod-deployment-v2', 'gateway-prod-deployment-v2'],
+      worker_version_ids: ['jobs@prod-v2', 'ops@prod-v2', 'gateway@prod-v2'],
+    },
+    gateway_rollout_steps: [],
+    rollback_handle: null,
+  }), {
+    valid: false,
+    error: 'prod_promotion_record gateway_rollout_steps must be non-empty for gradual promotion',
+  });
+
+  assert.deepEqual(validateProdPromotionRecord({
+    schema_version: 1,
+    artifact_id: 'prod_promotion_record',
+    source_environment: 'prod',
+    promotion_id: 'promotion-prod-invalid-migration',
+    promoted_at: '2026-03-31T14:09:00.000Z',
+    ...buildProducerRunIdentityFixture({ runId: '912350' }),
+    release_commit_sha: '89abcdef0123456789abcdef0123456789abcdef',
+    promotion_mode: 'deploy_with_migration',
+    source_candidate: {
+      candidate_id: 'candidate-20260331t140000z',
+      source_run_uri: buildGitHubRunUrl('VrianCao/MatrixFlare', '81234'),
+    },
+    previous_deployment_identity: {
+      environment_id: 'prod',
+      deployment_ids: ['jobs-prod-deployment-v1', 'ops-prod-deployment-v1', 'gateway-prod-deployment-v1'],
+      worker_version_ids: ['jobs@prod-v1', 'ops@prod-v1', 'gateway@prod-v1'],
+    },
+    current_deployment_identity: {
+      environment_id: 'prod',
+      deployment_ids: ['jobs-prod-deployment-v2', 'ops-prod-deployment-v2', 'gateway-prod-deployment-v2'],
+      worker_version_ids: ['jobs@prod-v2', 'ops@prod-v2', 'gateway@prod-v2'],
+    },
+    gateway_rollout_steps: [],
+    readiness_checks: {
+      jobs_promoted: buildProductionReadinessProbeFixture(),
+      ops_promoted: buildProductionReadinessProbeFixture(),
+      gateway_promoted: buildProductionReadinessProbeFixture(),
+    },
+    rollback_handle: {
+      workers_subdomain: 'matrixflare',
+      worker_versions: {},
+    },
+  }), {
+    valid: false,
+    error: 'prod_promotion_record rollback_handle must be null for deploy_with_migration promotions',
+  });
+});
+
+test('production automation builders fail closed on missing reviewed candidate or baseline deployment identity', () => {
+  const runTimestamp = '20260331T140000Z';
+  const sourceRunUri = buildGitHubRunUrl('VrianCao/MatrixFlare', '81234');
+
+  assert.throws(
+    () => buildReleaseCandidateManifest({
+      releaseRef: 'refs/heads/phase08-nonlocal-closure',
+      releaseCommitSha: '0123456789abcdef0123456789abcdef01234567',
+      requiresDoMigration: false,
+      sourceRepository: 'VrianCao/MatrixFlare',
+      sourceRunUri,
+      originRunIdentity: buildProducerRunIdentityFixture(),
+      ciIntegrationAttestation: buildEnvironmentAttestationFixture('ci-integration', runTimestamp, {
+        sourceRunUri,
+      }),
+      stagingAttestation: buildEnvironmentAttestationFixture('staging', runTimestamp, {
+        sourceRunUri,
+      }),
+      preReleaseAttestation: null,
+    }),
+    /ReleaseCandidateManifest is invalid: prod_release_candidate pre_release_attestation invalid:/,
+  );
+
+  assert.throws(
+    () => buildProdInstallRecord({
+      releaseCommitSha: '0123456789abcdef0123456789abcdef01234567',
+      provisionedEnvironment: buildProductionProvisioningFixture(),
+      originRunIdentity: buildProducerRunIdentityFixture(),
+      deploymentSummary: {
+        ...buildProductionDeploymentSummaryFixture(),
+        deployment_identity: {
+          environment_id: 'prod',
+          deployment_ids: [],
+          worker_version_ids: ['jobs@prod-v1', 'ops@prod-v1', 'gateway@prod-v1'],
+        },
+      },
+      installId: 'install-prod-invalid',
+      installedAt: '2026-03-31T14:08:00.000Z',
+    }),
+    /ProdInstallRecord is invalid: prod_install_record deployment_identity\.deployment_ids must be a non-empty string array/,
+  );
+
+  assert.deepEqual(validateProdPromotionRecord({
+    schema_version: 1,
+    artifact_id: 'prod_promotion_record',
+    source_environment: 'prod',
+    promotion_id: 'promotion-prod-missing-previous',
+    promoted_at: '2026-03-31T14:09:00.000Z',
+    ...buildProducerRunIdentityFixture({ runId: '912351' }),
+    release_commit_sha: '89abcdef0123456789abcdef0123456789abcdef',
+    promotion_mode: 'gradual',
+    source_candidate: {
+      candidate_id: 'candidate-20260331t140000z',
+      source_run_uri: buildGitHubRunUrl('VrianCao/MatrixFlare', '81234'),
+    },
+    previous_deployment_identity: {
+      environment_id: 'prod',
+      deployment_ids: [],
+      worker_version_ids: ['jobs@prod-v1', 'ops@prod-v1', 'gateway@prod-v1'],
+    },
+    current_deployment_identity: {
+      environment_id: 'prod',
+      deployment_ids: ['jobs-prod-deployment-v2', 'ops-prod-deployment-v2', 'gateway-prod-deployment-v2'],
+      worker_version_ids: ['jobs@prod-v2', 'ops@prod-v2', 'gateway@prod-v2'],
+    },
+    gateway_rollout_steps: [
+      { percentage: 100, deployment_id: 'gateway-prod-rollout-100', ready: true, attempt_count: 1, last_error: null },
+    ],
+    readiness_checks: {
+      jobs_promoted: buildProductionReadinessProbeFixture(),
+      ops_promoted: buildProductionReadinessProbeFixture(),
+    },
+    rollback_handle: {
+      workers_subdomain: 'matrixflare',
+      worker_versions: {
+        'gateway-worker': {
+          script_name: 'matrix-gateway-worker-prod',
+          previous_deployment_id: 'gateway-prod-deployment-v1',
+          previous_worker_version_id: 'gateway@prod-v1',
+          restore_version_specs: ['gateway@prod-v1@100'],
+        },
+        'jobs-worker': {
+          script_name: 'matrix-jobs-worker-prod',
+          previous_deployment_id: 'jobs-prod-deployment-v1',
+          previous_worker_version_id: 'jobs@prod-v1',
+          restore_version_specs: ['jobs@prod-v1@100'],
+        },
+        'ops-worker': {
+          script_name: 'matrix-ops-worker-prod',
+          previous_deployment_id: 'ops-prod-deployment-v1',
+          previous_worker_version_id: 'ops@prod-v1',
+          restore_version_specs: ['ops@prod-v1@100'],
+        },
+      },
+    },
+  }), {
+    valid: false,
+    error: 'prod_promotion_record previous_deployment_identity.deployment_ids must be a non-empty string array',
+  });
+});
+
+test('production workflow YAMLs stay aligned with the prod automation CLI contract', async () => {
+  const prodInstallWorkflow = await fs.readFile(new URL('../../../.github/workflows/prod-install.yml', import.meta.url), 'utf8');
+  const releaseCandidateWorkflow = await fs.readFile(new URL('../../../.github/workflows/release-candidate.yml', import.meta.url), 'utf8');
+  const promoteProdWorkflow = await fs.readFile(new URL('../../../.github/workflows/promote-prod.yml', import.meta.url), 'utf8');
+  const rollbackProdWorkflow = await fs.readFile(new URL('../../../.github/workflows/rollback-prod.yml', import.meta.url), 'utf8');
+  const prodCostWorkflow = await fs.readFile(new URL('../../../.github/workflows/prod-cost-monthly.yml', import.meta.url), 'utf8');
+
+  assert.match(prodInstallWorkflow, /environment:\s+prod/u, 'prod-install must run in the protected GitHub prod environment');
+  assert.match(prodInstallWorkflow, /node packages\/testing\/src\/cli\.mjs prod-install/u, 'prod-install workflow must invoke the prod-install CLI entry');
+  assert.match(prodInstallWorkflow, /--install-id/u, 'prod-install workflow must pass an explicit install id');
+  assert.match(prodInstallWorkflow, /id:\s+install_topology[\s\S]*?continue-on-error:\s+true/u, 'prod-install must preserve raw state before failing closed');
+  assert.match(prodInstallWorkflow, /prod-install-raw-state-/u, 'prod-install must upload a dedicated raw-state artifact');
+
+  assert.match(releaseCandidateWorkflow, /node packages\/testing\/src\/cli\.mjs prod-candidate-write/u, 'release-candidate workflow must write a reviewed candidate manifest');
+  assert.match(releaseCandidateWorkflow, /\.github\/workflows\/nonlocal-phase08\.yml/u, 'release-candidate workflow must require the reviewed source run to come from nonlocal-phase08');
+  assert.match(releaseCandidateWorkflow, /--ci-integration-attestation/u, 'release-candidate workflow must require ci-integration attestation input');
+  assert.match(releaseCandidateWorkflow, /--staging-attestation/u, 'release-candidate workflow must require staging attestation input');
+  assert.match(releaseCandidateWorkflow, /--pre-release-attestation/u, 'release-candidate workflow must require pre-release attestation input');
+
+  assert.match(promoteProdWorkflow, /node packages\/testing\/src\/cli\.mjs prod-promote/u, 'promote-prod workflow must invoke the prod-promote CLI entry');
+  assert.match(promoteProdWorkflow, /\.github\/workflows\/release-candidate\.yml/u, 'promote-prod workflow must require candidate runs from release-candidate.yml');
+  assert.match(promoteProdWorkflow, /baseline_artifact_prefix/u, 'promote-prod workflow must derive the exact baseline artifact prefix from the upstream workflow path');
+  assert.match(promoteProdWorkflow, /--baseline-record/u, 'promote-prod workflow must consume a baseline record');
+  assert.match(promoteProdWorkflow, /--candidate-manifest/u, 'promote-prod workflow must consume the reviewed candidate manifest');
+  assert.match(promoteProdWorkflow, /--promotion-id/u, 'promote-prod workflow must persist an explicit promotion id');
+  assert.doesNotMatch(promoteProdWorkflow, /--install-record/u, 'promote-prod workflow must not use the superseded install-record flag');
+  assert.doesNotMatch(promoteProdWorkflow, /workers_subdomain:/u, 'promote-prod must not reintroduce manual workers_subdomain input friction');
+  assert.match(promoteProdWorkflow, /id:\s+promote_candidate[\s\S]*?continue-on-error:\s+true/u, 'promote-prod must preserve raw state before failing closed');
+  assert.match(promoteProdWorkflow, /prod-promote-raw-state-/u, 'promote-prod must upload a dedicated raw-state artifact');
+
+  assert.match(rollbackProdWorkflow, /node packages\/testing\/src\/cli\.mjs prod-rollback/u, 'rollback-prod workflow must invoke the prod-rollback CLI entry');
+  assert.match(rollbackProdWorkflow, /\.github\/workflows\/promote-prod\.yml/u, 'rollback-prod workflow must require source runs from promote-prod.yml');
+  assert.match(rollbackProdWorkflow, /--promotion-record/u, 'rollback-prod workflow must consume the promotion record artifact');
+  assert.match(rollbackProdWorkflow, /--rollback-id/u, 'rollback-prod workflow must persist an explicit rollback id');
+  assert.equal((rollbackProdWorkflow.match(/uses:\s+actions\/checkout@v4/gu) ?? []).length, 1, 'rollback-prod must not perform a second checkout to the promoted commit');
+  assert.doesNotMatch(rollbackProdWorkflow, /Resolve promotion commit sha/u, 'rollback-prod must not require a promotion commit checkout precondition');
+  assert.doesNotMatch(rollbackProdWorkflow, /workers_subdomain:/u, 'rollback-prod must not reintroduce manual workers_subdomain input friction');
+  assert.match(rollbackProdWorkflow, /id:\s+execute_rollback[\s\S]*?continue-on-error:\s+true/u, 'rollback-prod must preserve raw state before failing closed');
+  assert.match(rollbackProdWorkflow, /prod-rollback-raw-state-/u, 'rollback-prod must upload a dedicated raw-state artifact');
+
+  assert.match(prodCostWorkflow, /node packages\/testing\/src\/cli\.mjs prod-cost-snapshot/u, 'prod-cost-monthly must capture the monthly production cost snapshot');
+  assert.match(prodCostWorkflow, /cron:\s*'17 3 1 \* \*'/u, 'prod-cost-monthly must run on a monthly UTC schedule in addition to manual dispatch');
+  assert.match(prodCostWorkflow, /--from/u, 'prod-cost-monthly must pass the closed billing window start');
+  assert.match(prodCostWorkflow, /--to/u, 'prod-cost-monthly must pass the closed billing window end');
+  assert.match(prodCostWorkflow, /node packages\/testing\/src\/cli\.mjs prod-cost-provenance/u, 'prod-cost-monthly must emit provenance before attestation');
+  assert.match(prodCostWorkflow, /prod-cost-attestation-/u, 'prod-cost-monthly must upload a dedicated prod-cost attestation artifact');
+  assert.match(prodCostWorkflow, /id:\s+capture_snapshot[\s\S]*?continue-on-error:\s+true/u, 'prod-cost-monthly must preserve raw blocker artifacts before failing closed');
+  assert.match(prodCostWorkflow, /if:\s+always\(\)/u, 'prod-cost-monthly must keep raw artifact preservation steps on always()');
 });
 
 test('prod cost snapshot capture requires the GitHub Actions prod environment claim', async () => {

@@ -542,6 +542,115 @@
 * release-gate evidence 只接受 `ProdCostSnapshotAttestation`，不得直接接受裸 `ProdCostSnapshot`。
 * 若 attestation 缺少 audited artifact reference、review record 或 deployment identity，consumer 必须 fail-closed。
 
+### 5.22 `ReleaseCandidateManifest`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `schema_version` | integer | 固定为 `1` |
+| `artifact_id` | string | 固定为 `prod_release_candidate` |
+| `candidate_id` | string | 非空；同一 reviewed candidate 的稳定标识 |
+| `created_at` | string | RFC 3339 UTC |
+| `release_ref` | string | 非空；用户选择的 ref/tag/sha |
+| `release_commit_sha` | string | 40 字符小写 git sha |
+| `requires_do_migration` | boolean | 显式声明这次 promote 是否必须走 migration-safe path |
+| `source_repository` | string | 非空 GitHub `owner/repo` slug |
+| `source_run_uri` | string | GitHub Actions run URL |
+| `origin_repository` | string | 非空 GitHub `owner/repo` slug；必须是生成该 manifest 的 workflow 所在仓库 |
+| `origin_run_id` | string | 非空；必须与 `origin_run_uri` 对应 |
+| `origin_run_attempt` | integer | 正整数 |
+| `origin_run_uri` | string | GitHub Actions run URL；必须回链当前 `release-candidate` workflow run |
+| `topology_kind` | string | 非本地拓扑标识；不得为 `local` |
+| `ci_integration_attestation` | `EnvironmentRunAttestation` | `source_environment` 必须为 `ci-integration` |
+| `staging_attestation` | `EnvironmentRunAttestation` | `source_environment` 必须为 `staging` |
+| `pre_release_attestation` | `EnvironmentRunAttestation` | `source_environment` 必须为 `pre-release` |
+
+附加规则：
+
+* 三个 attestation 的 `run_timestamp` 必须一致。
+* 三个 attestation 的 `provenance.origin_repository` 必须与 `source_repository` 一致。
+* `origin_repository` / `origin_run_id` / `origin_run_attempt` / `origin_run_uri` 必须回链生成该 manifest 的当前 `release-candidate` workflow run；它们不得与 reviewed source run identity 混淆。
+* consumer 在用于 prod promote 前，必须额外验证 `source_repository` 与 `origin_repository` 都等于当前仓库。
+* prod promote 只接受 `ReleaseCandidateManifest`；不得直接用“当前 pushed head”跳过 reviewed candidate manifest。
+
+### 5.23 `ProdInstallRecord`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `schema_version` | integer | 固定为 `1` |
+| `artifact_id` | string | 固定为 `prod_install_record` |
+| `source_environment` | string | 固定为 `prod` |
+| `install_id` | string | 非空 |
+| `installed_at` | string | RFC 3339 UTC |
+| `origin_repository` | string | 非空 GitHub `owner/repo` slug；必须是生成该 record 的 workflow 所在仓库 |
+| `origin_run_id` | string | 非空；必须与 `origin_run_uri` 对应 |
+| `origin_run_attempt` | integer | 正整数 |
+| `origin_run_uri` | string | GitHub Actions run URL；必须回链当前 `prod-install` workflow run |
+| `release_commit_sha` | string | 40 字符小写 git sha |
+| `topology_kind` | string | 非本地拓扑标识；不得为 `local` |
+| `workers_subdomain` | string | 非空 account-owned workers.dev subdomain |
+| `cloudflare_resources` | `CloudflareResourceSnapshot` | 必须包含 prod 固定命名资源 |
+| `access` | object | 至少包含 `auth_domain`,`application_id`,`application_audience`,`application_domain`,`protected_ops_url` |
+| `deployment_identity` | `EvidenceDeploymentIdentity` | 不得省略 |
+| `workers` | object | 至少包含 `gateway-worker`,`jobs-worker`,`ops-worker` 的 deployment / version / script identity |
+
+附加规则：
+
+* `workers.gateway-worker.url`、`workers.jobs-worker.url`、`workers.ops-worker.url` 必须与 `workers_subdomain` 及各自 `script_name` 一致，禁止只保留“某个 `*.workers.dev` URL”而不证明它属于当前 prod topology。
+* consumer 在用于 prod promote / rollback / prod-cost 前，必须额外验证 `origin_repository` 等于当前仓库。
+
+### 5.24 `ProdPromotionRecord`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `schema_version` | integer | 固定为 `1` |
+| `artifact_id` | string | 固定为 `prod_promotion_record` |
+| `source_environment` | string | 固定为 `prod` |
+| `promotion_id` | string | 非空 |
+| `promoted_at` | string | RFC 3339 UTC |
+| `origin_repository` | string | 非空 GitHub `owner/repo` slug；必须是生成该 record 的 workflow 所在仓库 |
+| `origin_run_id` | string | 非空；必须与 `origin_run_uri` 对应 |
+| `origin_run_attempt` | integer | 正整数 |
+| `origin_run_uri` | string | GitHub Actions run URL；必须回链当前 `promote-prod` workflow run |
+| `release_commit_sha` | string | 40 字符小写 git sha |
+| `promotion_mode` | string | `gradual` 或 `deploy_with_migration` |
+| `source_candidate` | object | 至少包含 `candidate_id`,`source_run_uri`；它表示被当前 workflow 消费的 reviewed candidate manifest 引用 |
+| `previous_deployment_identity` | `EvidenceDeploymentIdentity` | 不得省略 |
+| `current_deployment_identity` | `EvidenceDeploymentIdentity` | 不得省略 |
+| `gateway_rollout_steps` | array | `promotion_mode = gradual` 时必须非空；每步至少记录 `percentage`,`deployment_id`,`ready`,`attempt_count`,`last_error` |
+| `readiness_checks` | object | `promotion_mode = gradual` 时至少包含 `jobs_promoted`,`ops_promoted`；`promotion_mode = deploy_with_migration` 时至少包含 `jobs_promoted`,`ops_promoted`,`gateway_promoted` |
+| `rollback_handle` | object or null | 无 migration 的 promote 必须非空；至少包含 `workers_subdomain`，以及每个 worker 的 `script_name`,`previous_deployment_id`,`previous_worker_version_id`,`restore_version_specs` |
+
+附加规则：
+
+* consumer 在执行 promote 前，必须额外验证 `origin_repository` 等于当前仓库，且当前 checked-out git `HEAD` 等于 `release_commit_sha`。
+* producer 在写出 gradual promote record 前，必须先证明当前 Cloudflare prod identity 等于 `previous_deployment_identity`；若发生漂移，record 不得生成。
+* `promotion_mode = deploy_with_migration` 时，不得复用首次安装的 `gateway bootstrap` 阶段；`readiness_checks.jobs_promoted`、`ops_promoted`、`gateway_promoted` 必须分别对应 live prod 上每次关键切换后的 readiness snapshot。
+
+### 5.25 `ProdRollbackRecord`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `schema_version` | integer | 固定为 `1` |
+| `artifact_id` | string | 固定为 `prod_rollback_record` |
+| `source_environment` | string | 固定为 `prod` |
+| `rollback_id` | string | 非空 |
+| `rolled_back_at` | string | RFC 3339 UTC |
+| `origin_repository` | string | 非空 GitHub `owner/repo` slug；必须是生成该 record 的 workflow 所在仓库 |
+| `origin_run_id` | string | 非空；必须与 `origin_run_uri` 对应 |
+| `origin_run_attempt` | integer | 正整数 |
+| `origin_run_uri` | string | GitHub Actions run URL；必须回链当前 `rollback-prod` workflow run |
+| `source_promotion_id` | string | 非空；必须回链 `ProdPromotionRecord.promotion_id` |
+| `release_commit_sha` | string | 40 字符小写 git sha |
+| `requested_rollback_handle` | object | 不得省略；必须回链当前 workflow 实际消费的 rollback handle |
+| `restored_deployment_identity` | `EvidenceDeploymentIdentity` | 不得省略 |
+| `worker_results` | object | 至少包含 `gateway-worker`,`jobs-worker`,`ops-worker` 的 restore 结果 |
+| `readiness_probe` | object | 不得省略；至少记录 `ready`,`attempt_count`,`last_error` |
+
+附加规则：
+
+* consumer 在 replay `requested_rollback_handle` 前，必须先证明当前 Cloudflare prod identity 仍等于 source `ProdPromotionRecord.current_deployment_identity`；否则该 rollback request 必须 fail-closed。
+* consumer 在用于审计前，必须额外验证 `origin_repository` 等于当前仓库。
+
 ## 6. 内部 RPC 与异步作业 Payload
 
 * 除显式采用 stream 或 locator 的契约外，任何内部 RPC request/response 的普通 serialized payload 都必须小于等于 `32 MiB`；更大的数据必须分页、分段或外置到 R2 后只传 locator。引用：`CF-WKR-023`。

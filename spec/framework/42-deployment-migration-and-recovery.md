@@ -51,6 +51,24 @@
 * 每次 non-local run 都必须记录 GitHub run identity、Cloudflare deployment identity（每个 Worker 的 deployment/version IDs）以及不可变 artifact object locator；GitHub workflow artifact 只作为补充审计链，不替代对象存储中的 immutable locator。
 * non-local suite 在消费 deployment summary 时，必须用当前目标 Cloudflare account 的真实 `workers.dev` subdomain 复核 Worker URL，不得只凭 `*.workers.dev` host 形状信任 deployment 文件。
 
+### 2.3 Production Automation Contract
+
+* 生产自动化必须与 non-local harness 分离，固定为四条 GitHub Actions workflow 责任：
+  * `prod-install`：ensure 固定命名 prod topology，并完成首次 bootstrap deploy；
+  * `release-candidate`：生成 reviewed `ReleaseCandidateManifest`；
+  * `promote-prod`：只消费 reviewed candidate manifest 做 production promotion；
+  * `rollback-prod`：只消费先前 `ProdPromotionRecord` 中的 rollback handle 做恢复。
+  月度 `prod-cost-monthly` 继续独立存在，不得和日常 promote 混写。
+* `prod-install` 必须先 ensure account-owned workers.dev subdomain、prod Access application、固定命名 D1/KV/R2/Queues，再按 `gateway bootstrap -> jobs -> ops -> gateway full` 顺序 deploy；它的成功产物必须是 `ProdInstallRecord`，而不是口头说明“prod topology 已存在”。一旦当前 target account 已存在 active `matrix-*-prod` Worker deployment identity，`prod-install` 就不得继续把自己当作日常 redeploy 入口，而必须 fail-closed 并要求转入 `promote-prod` / `rollback-prod`。
+* `release-candidate` 必须只在 `ci-integration` / `staging` / `pre-release` attestation 已真实存在时生成 `ReleaseCandidateManifest`；缺任一 attestation 时必须 fail-closed。production promote 不得重新脑补“当前 pushed head 即已验证候选”；consumer 还必须验证 `ReleaseCandidateManifest.source_repository` / `origin_repository` 与当前仓库一致。
+* `promote-prod` 在 `requires_do_migration = false` 时，必须使用 Cloudflare Worker versions/deployments 渐进发布 `gateway-worker`；`jobs-worker` / `ops-worker` 可先行切到单版本，但仍必须记录新的 deployment/version IDs。
+* `promote-prod` 在 `requires_do_migration = true` 或 prod 尚未 bootstrap 时，不得走 `wrangler versions upload`; 必须改用 `wrangler deploy` 路径，并把 migration-safe all-at-once path 记录到 `ProdPromotionRecord.promotion_mode = deploy_with_migration`。该路径在 live prod 上不得再复用 `gateway bootstrap -> jobs -> ops -> gateway full` 的首次安装序列；它必须以当前 prod deployment identity 作为 runtime baseline，按 `jobs -> ops -> gateway full` 的 migration-safe 顺序切换。
+* production rollout 必须在每个关键切换点执行 bounded readiness probe，并记录 attempt 数、最终通过时间或最后失败原因；若任一步 readiness 未通过，则必须 fail-closed 并停止后续 rollout。对 `deploy_with_migration` 路径，这个要求同样适用，至少要在 `jobs`、`ops`、`gateway` 三次切换后分别留下 readiness snapshot，而不是只在最后做一次总体验证。
+* `promote-prod` 在消费 baseline record 与 reviewed candidate manifest 前，必须验证它们的 `origin_repository` / `source_repository` 与当前仓库一致，并验证当前 checked-out git `HEAD` 等于 `ReleaseCandidateManifest.release_commit_sha`；否则必须 fail-closed。
+* `rollback-prod` 只允许消费上一轮 `ProdPromotionRecord` 中已记录的 rollback handle；若 source promotion 带 DO migration 或没有可恢复的 previous version identity，则 workflow 必须 fail-closed，并把“需要 forward-fix / restore path”写入 rollback artifact，而不是伪造“一键回滚”。在真正 replay rollback handle 前，还必须先验证当前 Cloudflare prod deployment identity 仍等于该 `ProdPromotionRecord.current_deployment_identity`；若 prod 已漂移，则必须 fail-closed。
+* production automation 的可审计基线固定为：`ReleaseCandidateManifest`、`ProdInstallRecord`、`ProdPromotionRecord`、`ProdRollbackRecord` 与 `ProdCostSnapshotAttestation`。这些工件都必须回链 GitHub run identity 与 Cloudflare deployment identity。
+* `prod-install`、`promote-prod`、`rollback-prod`、`prod-cost-monthly` 即使最终 fail-closed，也必须尽可能先把 raw state / blocker artifact 上传为 workflow artifact；`prod-cost-monthly` 还必须先把 raw cost bundle 上传到 immutable R2，再允许后续 provenance / attestation 阶段失败。
+
 ## 3. Backward Compatibility Rules
 
 ### 3.1 Worker <-> DO

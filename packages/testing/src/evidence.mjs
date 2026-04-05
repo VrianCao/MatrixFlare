@@ -53,6 +53,7 @@ const NON_LOCAL_ENVIRONMENT_ARTIFACT_REQUIREMENTS = Object.freeze({
 });
 
 const ATTESTATION_SCHEMA_VERSION = 1;
+const GIT_COMMIT_SHA_RE = /^[a-f0-9]{40}$/;
 
 const MANUAL_ARTIFACT_ATTESTATION_REQUIREMENTS = Object.freeze({
   ci_integration_run_report: Object.freeze({
@@ -80,6 +81,7 @@ const MANUAL_ARTIFACT_ATTESTATION_REQUIREMENTS = Object.freeze({
 const SHA256_HEX_RE = /^[a-f0-9]{64}$/;
 const WELL_FORMED_URN_RE = /^urn:[a-z0-9][a-z0-9-]{0,31}:.+/i;
 const RUN_TIMESTAMP_RE = /^\d{8}T\d{6}Z$/;
+const GIT_SHA_RE = /^[a-f0-9]{40}$/;
 const L1_SHARED_TEST_RUN_ROOT = 'evidence/common/_test-runs';
 const CLOUDFLARE_RESOURCE_NAMES = Object.freeze([
   'workers',
@@ -120,6 +122,25 @@ const PRE_RELEASE_COST_SURFACES = Object.freeze([
   'r2',
   'kv',
   'queues',
+]);
+const RELEASE_CANDIDATE_ENVIRONMENTS = Object.freeze([
+  'ci-integration',
+  'staging',
+  'pre-release',
+]);
+const PRODUCTION_AUTOMATION_ARTIFACT_IDS = Object.freeze([
+  'release_candidate_manifest',
+  'prod_install_record',
+  'prod_promotion_record',
+  'prod_rollback_record',
+]);
+const PRODUCTION_READINESS_REQUIRED_STEPS = Object.freeze([
+  'versions',
+  'public_rooms',
+  'register_complete',
+  'media_create',
+  'ops_healthz',
+  'ops_rebuild_start',
 ]);
 
 function parseGitHubRepositoryFromRemoteUrl(remoteUrl) {
@@ -561,6 +582,1018 @@ function validateExpectedCloudflareResources(payloadLabel, environmentName, reso
 
 function isNonNegativeNumber(value) {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+}
+
+function isGitCommitSha(value) {
+  return isNonEmptyString(value) && GIT_SHA_RE.test(value);
+}
+
+function validateGitHubRepositorySlug(label, value) {
+  if (!isNonEmptyString(value) || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(value)) {
+    return {
+      valid: false,
+      error: `${label} must be a GitHub owner/repo slug`,
+    };
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validateGitHubRunUri(label, value, {
+  expectedRepository = null,
+} = {}) {
+  if (!isGitHubActionsRunUri(value)) {
+    return {
+      valid: false,
+      error: `${label} must be a GitHub Actions run URL`,
+    };
+  }
+  if (expectedRepository != null && extractGitHubActionsRunRepository(value) !== expectedRepository) {
+    return {
+      valid: false,
+      error: `${label} must match ${expectedRepository}`,
+    };
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validateProducerRunIdentity(payloadLabel, payload) {
+  const repositoryValidation = validateGitHubRepositorySlug(`${payloadLabel} origin_repository`, payload.origin_repository);
+  if (!repositoryValidation.valid) {
+    return repositoryValidation;
+  }
+  if (!isNonEmptyString(payload.origin_run_id)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} origin_run_id must be non-empty`,
+    };
+  }
+  if (!Number.isInteger(payload.origin_run_attempt) || payload.origin_run_attempt <= 0) {
+    return {
+      valid: false,
+      error: `${payloadLabel} origin_run_attempt must be a positive integer`,
+    };
+  }
+  const runUriValidation = validateGitHubRunUri(`${payloadLabel} origin_run_uri`, payload.origin_run_uri, {
+    expectedRepository: payload.origin_repository,
+  });
+  if (!runUriValidation.valid) {
+    return runUriValidation;
+  }
+  if (extractGitHubActionsRunId(payload.origin_run_uri) !== payload.origin_run_id) {
+    return {
+      valid: false,
+      error: `${payloadLabel} origin_run_uri must match origin_run_id`,
+    };
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validateDeploymentIdentityLike(label, deploymentIdentity, {
+  expectedEnvironment = null,
+} = {}) {
+  if (!isPlainObject(deploymentIdentity)) {
+    return {
+      valid: false,
+      error: `${label} must be an object`,
+    };
+  }
+  if (!isNonEmptyString(deploymentIdentity.environment_id)) {
+    return {
+      valid: false,
+      error: `${label}.environment_id must be non-empty`,
+    };
+  }
+  if (expectedEnvironment != null && deploymentIdentity.environment_id !== expectedEnvironment) {
+    return {
+      valid: false,
+      error: `${label}.environment_id must be ${expectedEnvironment}`,
+    };
+  }
+  if (!isNonEmptyStringArray(deploymentIdentity.deployment_ids)) {
+    return {
+      valid: false,
+      error: `${label}.deployment_ids must be a non-empty string array`,
+    };
+  }
+  if (!isNonEmptyStringArray(deploymentIdentity.worker_version_ids)) {
+    return {
+      valid: false,
+      error: `${label}.worker_version_ids must be a non-empty string array`,
+    };
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validateProductionAccessMetadata(label, access) {
+  if (!isPlainObject(access)) {
+    return {
+      valid: false,
+      error: `${label} must be an object`,
+    };
+  }
+  for (const fieldName of ['auth_domain', 'application_id', 'application_audience', 'application_domain', 'protected_ops_url']) {
+    if (!isNonEmptyString(access[fieldName])) {
+      return {
+        valid: false,
+        error: `${label}.${fieldName} must be non-empty`,
+      };
+    }
+  }
+  if (!isAbsoluteExternalUri(access.protected_ops_url)) {
+    return {
+      valid: false,
+      error: `${label}.protected_ops_url must be an absolute external URI`,
+    };
+  }
+  if (new URL(access.protected_ops_url).host !== access.application_domain) {
+    return {
+      valid: false,
+      error: `${label}.application_domain must match ${label}.protected_ops_url host`,
+    };
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validateProductionPlanSnapshot(label, plan) {
+  if (!isPlainObject(plan)) {
+    return {
+      valid: false,
+      error: `${label} must be an object`,
+    };
+  }
+  if (plan.environment_name !== 'prod') {
+    return {
+      valid: false,
+      error: `${label}.environment_name must be prod`,
+    };
+  }
+  if (!isPlainObject(plan.worker_scripts) || !isPlainObject(plan.worker_urls)) {
+    return {
+      valid: false,
+      error: `${label} must include worker_scripts and worker_urls`,
+    };
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validateProductionResourceSnapshot(label, resources) {
+  if (!isPlainObject(resources)) {
+    return {
+      valid: false,
+      error: `${label} must be an object`,
+    };
+  }
+  if (!isNonEmptyString(resources?.d1_database?.id) || !isNonEmptyString(resources?.d1_database?.name)) {
+    return {
+      valid: false,
+      error: `${label}.d1_database must include id and name`,
+    };
+  }
+  if (!isNonEmptyString(resources?.kv_namespace?.id) || !isNonEmptyString(resources?.kv_namespace?.title)) {
+    return {
+      valid: false,
+      error: `${label}.kv_namespace must include id and title`,
+    };
+  }
+  if (
+    !isPlainObject(resources?.r2_buckets)
+    || !isNonEmptyString(resources.r2_buckets.media?.name)
+    || !isNonEmptyString(resources.r2_buckets.archive?.name)
+    || !isNonEmptyString(resources.r2_buckets.evidence?.name)
+  ) {
+    return {
+      valid: false,
+      error: `${label}.r2_buckets must include media/archive/evidence names`,
+    };
+  }
+  if (!Array.isArray(resources.queues) || resources.queues.length === 0) {
+    return {
+      valid: false,
+      error: `${label}.queues must be a non-empty array`,
+    };
+  }
+  const invalidQueue = resources.queues.find((queue) => !isPlainObject(queue) || !isNonEmptyString(queue.id) || !isNonEmptyString(queue.name));
+  if (invalidQueue != null) {
+    return {
+      valid: false,
+      error: `${label}.queues must include id and name for every queue`,
+    };
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validateProductionWorkerSummaryMap(label, workers, {
+  deploymentIdentity = null,
+} = {}) {
+  if (!isPlainObject(workers)) {
+    return {
+      valid: false,
+      error: `${label} must be an object`,
+    };
+  }
+  const declaredDeploymentIds = new Set(deploymentIdentity?.deployment_ids ?? []);
+  const declaredVersionIds = new Set(deploymentIdentity?.worker_version_ids ?? []);
+  for (const workerName of EXPECTED_WORKER_BASE_NAMES) {
+    const worker = workers[workerName];
+    if (!isPlainObject(worker)) {
+      return {
+        valid: false,
+        error: `${label}.${workerName} must be an object`,
+      };
+    }
+    for (const fieldName of ['script_name', 'deployment_id', 'worker_version_id', 'url']) {
+      if (!isNonEmptyString(worker[fieldName])) {
+        return {
+          valid: false,
+          error: `${label}.${workerName}.${fieldName} must be non-empty`,
+        };
+      }
+    }
+    if (!isAbsoluteExternalUri(worker.url)) {
+      return {
+        valid: false,
+        error: `${label}.${workerName}.url must be an absolute external URI`,
+      };
+    }
+    if (deploymentIdentity != null) {
+      if (!declaredDeploymentIds.has(worker.deployment_id)) {
+        return {
+          valid: false,
+          error: `${label}.${workerName}.deployment_id must be present in deployment_identity`,
+        };
+      }
+      if (!declaredVersionIds.has(worker.worker_version_id)) {
+        return {
+          valid: false,
+          error: `${label}.${workerName}.worker_version_id must be present in deployment_identity`,
+        };
+      }
+    }
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validateProductionReadinessProbe(label, readinessProbe) {
+  if (!isPlainObject(readinessProbe)) {
+    return {
+      valid: false,
+      error: `${label} must be an object`,
+    };
+  }
+  if (readinessProbe.environment_name !== 'prod') {
+    return {
+      valid: false,
+      error: `${label}.environment_name must be prod`,
+    };
+  }
+  if (typeof readinessProbe.ready !== 'boolean') {
+    return {
+      valid: false,
+      error: `${label}.ready must be boolean`,
+    };
+  }
+  if (!isRfc3339UtcTimestamp(readinessProbe.started_at) || !isRfc3339UtcTimestamp(readinessProbe.completed_at)) {
+    return {
+      valid: false,
+      error: `${label} must include RFC 3339 UTC started_at and completed_at timestamps`,
+    };
+  }
+  if (!isNonNegativeInteger(readinessProbe.duration_ms)) {
+    return {
+      valid: false,
+      error: `${label}.duration_ms must be a non-negative integer`,
+    };
+  }
+  if (!isNonNegativeInteger(readinessProbe.attempt_count) || readinessProbe.attempt_count === 0) {
+    return {
+      valid: false,
+      error: `${label}.attempt_count must be a positive integer`,
+    };
+  }
+  if (!Array.isArray(readinessProbe.attempts) || readinessProbe.attempts.length !== readinessProbe.attempt_count) {
+    return {
+      valid: false,
+      error: `${label}.attempts must match attempt_count`,
+    };
+  }
+  const invalidAttempt = readinessProbe.attempts.find((attempt, index) => (
+    !isPlainObject(attempt)
+    || attempt.attempt !== index + 1
+    || !isRfc3339UtcTimestamp(attempt.started_at)
+    || !isRfc3339UtcTimestamp(attempt.completed_at)
+    || !isNonNegativeInteger(attempt.duration_ms)
+    || typeof attempt.ok !== 'boolean'
+    || !Array.isArray(attempt.steps)
+    || attempt.steps.length === 0
+    || attempt.steps.some((step) => !isPlainObject(step) || !isNonEmptyString(step.step) || typeof step.ok !== 'boolean' || !('detail' in step))
+    || (attempt.delay_before_next_attempt_ms !== null && !isNonNegativeInteger(attempt.delay_before_next_attempt_ms))
+    || (attempt.ok ? attempt.failure !== null : !isPlainObject(attempt.failure))
+  ));
+  if (invalidAttempt != null) {
+    return {
+      valid: false,
+      error: `${label}.attempts must include structured steps and failures`,
+    };
+  }
+  const finalAttempt = readinessProbe.attempts.at(-1);
+  if (readinessProbe.ready !== finalAttempt.ok) {
+    return {
+      valid: false,
+      error: `${label}.ready must match the final attempt result`,
+    };
+  }
+  if (readinessProbe.ready) {
+    const successfulFinalStepNames = new Set(
+      finalAttempt.steps.filter((step) => step.ok === true).map((step) => step.step),
+    );
+    const missingSteps = PRODUCTION_READINESS_REQUIRED_STEPS.filter((stepName) => !successfulFinalStepNames.has(stepName));
+    if (missingSteps.length > 0) {
+      return {
+        valid: false,
+        error: `${label} successful final attempt must include steps: ${missingSteps.join(', ')}`,
+      };
+    }
+    if (readinessProbe.last_error !== null) {
+      return {
+        valid: false,
+        error: `${label}.last_error must be null when ready`,
+      };
+    }
+  } else if (!isNonEmptyString(readinessProbe.last_error)) {
+    return {
+      valid: false,
+      error: `${label}.last_error must be non-empty when ready is false`,
+    };
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validateReleaseCandidateSource(label, sourceCandidate) {
+  if (!isPlainObject(sourceCandidate)) {
+    return {
+      valid: false,
+      error: `${label} must be an object`,
+    };
+  }
+  if (!isNonEmptyString(sourceCandidate.candidate_id)) {
+    return {
+      valid: false,
+      error: `${label}.candidate_id must be non-empty`,
+    };
+  }
+  const runUriValidation = validateGitHubRunUri(`${label}.source_run_uri`, sourceCandidate.source_run_uri);
+  if (!runUriValidation.valid) {
+    return runUriValidation;
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validateProductionRollbackHandle(label, rollbackHandle) {
+  if (!isPlainObject(rollbackHandle)) {
+    return {
+      valid: false,
+      error: `${label} must be an object`,
+    };
+  }
+  if (!isNonEmptyString(rollbackHandle.workers_subdomain)) {
+    return {
+      valid: false,
+      error: `${label}.workers_subdomain must be non-empty`,
+    };
+  }
+  if (!isPlainObject(rollbackHandle.worker_versions)) {
+    return {
+      valid: false,
+      error: `${label}.worker_versions must be an object`,
+    };
+  }
+  for (const workerName of EXPECTED_WORKER_BASE_NAMES) {
+    const worker = rollbackHandle.worker_versions[workerName];
+    if (!isPlainObject(worker)) {
+      return {
+        valid: false,
+        error: `${label}.worker_versions.${workerName} must be an object`,
+      };
+    }
+    for (const fieldName of ['script_name', 'previous_deployment_id', 'previous_worker_version_id']) {
+      if (!isNonEmptyString(worker[fieldName])) {
+        return {
+          valid: false,
+          error: `${label}.worker_versions.${workerName}.${fieldName} must be non-empty`,
+        };
+      }
+    }
+    if (!isNonEmptyStringArray(worker.restore_version_specs)) {
+      return {
+        valid: false,
+        error: `${label}.worker_versions.${workerName}.restore_version_specs must be a non-empty string array`,
+      };
+    }
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validateProductionPromotionReadinessChecks(label, promotionMode, readinessChecks) {
+  if (!isPlainObject(readinessChecks)) {
+    return {
+      valid: false,
+      error: `${label} must be an object`,
+    };
+  }
+  const requiredFields = promotionMode === 'deploy_with_migration'
+    ? ['jobs_promoted', 'ops_promoted', 'gateway_promoted']
+    : ['jobs_promoted', 'ops_promoted'];
+  for (const fieldName of requiredFields) {
+    const validation = validateProductionReadinessProbe(`${label}.${fieldName}`, readinessChecks[fieldName]);
+    if (!validation.valid) {
+      return validation;
+    }
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validateProdReleaseCommitSha(payloadLabel, releaseCommitSha) {
+  if (!isNonEmptyString(releaseCommitSha) || !GIT_COMMIT_SHA_RE.test(releaseCommitSha)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} release_commit_sha must be a 40-character lowercase git sha`,
+    };
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validateEvidenceDeploymentIdentity(payloadLabel, identity, {
+  expectedEnvironmentName = 'prod',
+  deploymentFieldName = 'deployment_identity',
+} = {}) {
+  if (!isPlainObject(identity)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} must include ${deploymentFieldName}`,
+    };
+  }
+  if (identity.environment_id !== expectedEnvironmentName) {
+    return {
+      valid: false,
+      error: `${payloadLabel} ${deploymentFieldName}.environment_id must be ${expectedEnvironmentName}`,
+    };
+  }
+  if (!isNonEmptyStringArray(identity.deployment_ids)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} ${deploymentFieldName}.deployment_ids must be a non-empty string array`,
+    };
+  }
+  if (!isNonEmptyStringArray(identity.worker_version_ids)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} ${deploymentFieldName}.worker_version_ids must be a non-empty string array`,
+    };
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validateExpectedWorkerRecordMap(payloadLabel, workers, expectedEnvironmentName, {
+  expectedWorkersSubdomain = null,
+} = {}) {
+  if (!isPlainObject(workers)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} must include workers`,
+    };
+  }
+  for (const workerName of EXPECTED_WORKER_BASE_NAMES) {
+    const worker = workers[workerName];
+    const expectedScriptName = `matrix-${workerName}-${expectedEnvironmentName}`;
+    if (!isPlainObject(worker)) {
+      return {
+        valid: false,
+        error: `${payloadLabel} workers.${workerName} must be an object`,
+      };
+    }
+    if (worker.worker_name !== workerName) {
+      return {
+        valid: false,
+        error: `${payloadLabel} workers.${workerName}.worker_name must equal ${workerName}`,
+      };
+    }
+    if (worker.script_name !== expectedScriptName) {
+      return {
+        valid: false,
+        error: `${payloadLabel} workers.${workerName}.script_name must equal ${expectedScriptName}`,
+      };
+    }
+    if (!isNonEmptyString(worker.deployment_id)) {
+      return {
+        valid: false,
+        error: `${payloadLabel} workers.${workerName}.deployment_id must be non-empty`,
+      };
+    }
+    if (!isNonEmptyString(worker.worker_version_id)) {
+      return {
+        valid: false,
+        error: `${payloadLabel} workers.${workerName}.worker_version_id must be non-empty`,
+      };
+    }
+    if (!isAbsoluteExternalUri(worker.url)) {
+      return {
+        valid: false,
+        error: `${payloadLabel} workers.${workerName}.url must be an absolute external URI`,
+      };
+    }
+    if (expectedWorkersSubdomain != null) {
+      const expectedHost = `${expectedScriptName}.${expectedWorkersSubdomain}.workers.dev`;
+      if (new URL(worker.url).hostname !== expectedHost) {
+        return {
+          valid: false,
+          error: `${payloadLabel} workers.${workerName}.url must match ${expectedHost}`,
+        };
+      }
+    }
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validateReleaseCandidateManifestPayload(payload, {
+  runTimestamp = null,
+} = {}) {
+  const payloadLabel = 'prod_release_candidate';
+  if (payload.artifact_id !== 'prod_release_candidate') {
+    return {
+      valid: false,
+      error: `${payloadLabel} artifact_id must be "prod_release_candidate"`,
+    };
+  }
+  if (payload.schema_version !== 1) {
+    return {
+      valid: false,
+      error: `${payloadLabel} schema_version must be 1`,
+    };
+  }
+  if (!isNonEmptyString(payload.candidate_id)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} candidate_id must be non-empty`,
+    };
+  }
+  if (!isRfc3339UtcTimestamp(payload.created_at)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} created_at must be an RFC 3339 UTC timestamp`,
+    };
+  }
+  if (!isNonEmptyString(payload.release_ref)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} release_ref must be non-empty`,
+    };
+  }
+  const releaseCommitValidation = validateProdReleaseCommitSha(payloadLabel, payload.release_commit_sha);
+  if (!releaseCommitValidation.valid) {
+    return releaseCommitValidation;
+  }
+  if (typeof payload.requires_do_migration !== 'boolean') {
+    return {
+      valid: false,
+      error: `${payloadLabel} requires_do_migration must be boolean`,
+    };
+  }
+  if (!isNonEmptyString(payload.source_repository) || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(payload.source_repository)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} source_repository must be a GitHub owner/repo slug`,
+    };
+  }
+  if (!isGitHubActionsRunUri(payload.source_run_uri)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} source_run_uri must be a GitHub Actions run URL`,
+    };
+  }
+  if (extractGitHubActionsRunRepository(payload.source_run_uri) !== payload.source_repository) {
+    return {
+      valid: false,
+      error: `${payloadLabel} source_repository must match source_run_uri`,
+    };
+  }
+  const originRunValidation = validateProducerRunIdentity(payloadLabel, payload);
+  if (!originRunValidation.valid) {
+    return originRunValidation;
+  }
+  if (payload.topology_kind !== 'cloudflare-prod') {
+    return {
+      valid: false,
+      error: `${payloadLabel} topology_kind must be "cloudflare-prod"`,
+    };
+  }
+  const nestedAttestations = [
+    ['ci_integration_run_report', 'ci_integration_attestation', 'ci-integration'],
+    ['staging_run_report', 'staging_attestation', 'staging'],
+    ['pre_release_run_report', 'pre_release_attestation', 'pre-release'],
+  ];
+  let observedRunTimestamp = null;
+  for (const [artifactId, fieldName, expectedEnvironmentName] of nestedAttestations) {
+    const attestation = payload[fieldName];
+    const validation = validateEvidenceAttestationBundle(artifactId, attestation, {
+      expectedGitHubRepository: payload.source_repository,
+    });
+    if (!validation.valid) {
+      return {
+        valid: false,
+        error: `${payloadLabel} ${fieldName} invalid: ${validation.error}`,
+      };
+    }
+    if (attestation.source_environment !== expectedEnvironmentName) {
+      return {
+        valid: false,
+        error: `${payloadLabel} ${fieldName}.source_environment must be ${expectedEnvironmentName}`,
+      };
+    }
+    if (attestation.provenance.origin_run_uri !== payload.source_run_uri) {
+      return {
+        valid: false,
+        error: `${payloadLabel} ${fieldName} provenance.origin_run_uri must equal source_run_uri`,
+      };
+    }
+    observedRunTimestamp ??= attestation.run_timestamp;
+    if (attestation.run_timestamp !== observedRunTimestamp) {
+      return {
+        valid: false,
+        error: `${payloadLabel} environment attestations must share the same run_timestamp`,
+      };
+    }
+  }
+  if (runTimestamp != null && observedRunTimestamp !== runTimestamp) {
+    return {
+      valid: false,
+      error: `${payloadLabel} environment attestations must have run_timestamp ${runTimestamp}`,
+    };
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validateProdInstallRecordPayload(payload) {
+  const payloadLabel = 'prod_install_record';
+  if (payload.artifact_id !== 'prod_install_record') {
+    return {
+      valid: false,
+      error: `${payloadLabel} artifact_id must be "prod_install_record"`,
+    };
+  }
+  if (payload.schema_version !== 1) {
+    return {
+      valid: false,
+      error: `${payloadLabel} schema_version must be 1`,
+    };
+  }
+  if (payload.source_environment !== 'prod') {
+    return {
+      valid: false,
+      error: `${payloadLabel} source_environment must be "prod"`,
+    };
+  }
+  if (!isNonEmptyString(payload.install_id)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} install_id must be non-empty`,
+    };
+  }
+  if (!isRfc3339UtcTimestamp(payload.installed_at)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} installed_at must be an RFC 3339 UTC timestamp`,
+    };
+  }
+  const releaseCommitValidation = validateProdReleaseCommitSha(payloadLabel, payload.release_commit_sha);
+  if (!releaseCommitValidation.valid) {
+    return releaseCommitValidation;
+  }
+  const originRunValidation = validateProducerRunIdentity(payloadLabel, payload);
+  if (!originRunValidation.valid) {
+    return originRunValidation;
+  }
+  if (payload.topology_kind !== 'cloudflare-prod') {
+    return {
+      valid: false,
+      error: `${payloadLabel} topology_kind must be "cloudflare-prod"`,
+    };
+  }
+  if (!isNonEmptyString(payload.workers_subdomain)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} workers_subdomain must be non-empty`,
+    };
+  }
+  const resourceValidation = validateExpectedCloudflareResources(payloadLabel, 'prod', payload.cloudflare_resources);
+  if (!resourceValidation.valid) {
+    return resourceValidation;
+  }
+  const accessValidation = validateProductionAccessMetadata(`${payloadLabel} access`, payload.access);
+  if (!accessValidation.valid) {
+    return accessValidation;
+  }
+  const deploymentValidation = validateEvidenceDeploymentIdentity(payloadLabel, payload.deployment_identity);
+  if (!deploymentValidation.valid) {
+    return deploymentValidation;
+  }
+  return validateExpectedWorkerRecordMap(payloadLabel, payload.workers, 'prod', {
+    expectedWorkersSubdomain: payload.workers_subdomain,
+  });
+}
+
+function validateProdPromotionRecordPayload(payload) {
+  const payloadLabel = 'prod_promotion_record';
+  if (payload.artifact_id !== 'prod_promotion_record') {
+    return {
+      valid: false,
+      error: `${payloadLabel} artifact_id must be "prod_promotion_record"`,
+    };
+  }
+  if (payload.schema_version !== 1) {
+    return {
+      valid: false,
+      error: `${payloadLabel} schema_version must be 1`,
+    };
+  }
+  if (payload.source_environment !== 'prod') {
+    return {
+      valid: false,
+      error: `${payloadLabel} source_environment must be "prod"`,
+    };
+  }
+  if (!isNonEmptyString(payload.promotion_id)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} promotion_id must be non-empty`,
+    };
+  }
+  if (!isRfc3339UtcTimestamp(payload.promoted_at)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} promoted_at must be an RFC 3339 UTC timestamp`,
+    };
+  }
+  const releaseCommitValidation = validateProdReleaseCommitSha(payloadLabel, payload.release_commit_sha);
+  if (!releaseCommitValidation.valid) {
+    return releaseCommitValidation;
+  }
+  const originRunValidation = validateProducerRunIdentity(payloadLabel, payload);
+  if (!originRunValidation.valid) {
+    return originRunValidation;
+  }
+  if (payload.promotion_mode !== 'gradual' && payload.promotion_mode !== 'deploy_with_migration') {
+    return {
+      valid: false,
+      error: `${payloadLabel} promotion_mode must be "gradual" or "deploy_with_migration"`,
+    };
+  }
+  if (!isPlainObject(payload.source_candidate) || !isNonEmptyString(payload.source_candidate.candidate_id)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} source_candidate.candidate_id must be non-empty`,
+    };
+  }
+  if (!isGitHubActionsRunUri(payload.source_candidate.source_run_uri)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} source_candidate.source_run_uri must be a GitHub Actions run URL`,
+    };
+  }
+  const previousValidation = validateEvidenceDeploymentIdentity(payloadLabel, payload.previous_deployment_identity, {
+    deploymentFieldName: 'previous_deployment_identity',
+  });
+  if (!previousValidation.valid) {
+    return previousValidation;
+  }
+  const currentValidation = validateEvidenceDeploymentIdentity(payloadLabel, payload.current_deployment_identity, {
+    deploymentFieldName: 'current_deployment_identity',
+  });
+  if (!currentValidation.valid) {
+    return currentValidation;
+  }
+  if (!Array.isArray(payload.gateway_rollout_steps)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} gateway_rollout_steps must be an array`,
+    };
+  }
+  if (payload.promotion_mode === 'gradual' && payload.gateway_rollout_steps.length === 0) {
+    return {
+      valid: false,
+      error: `${payloadLabel} gateway_rollout_steps must be non-empty for gradual promotion`,
+    };
+  }
+  if (payload.promotion_mode === 'deploy_with_migration' && payload.gateway_rollout_steps.length !== 0) {
+    return {
+      valid: false,
+      error: `${payloadLabel} gateway_rollout_steps must be empty for deploy_with_migration promotions`,
+    };
+  }
+  for (const [index, step] of payload.gateway_rollout_steps.entries()) {
+    if (!isPlainObject(step)) {
+      return {
+        valid: false,
+        error: `${payloadLabel} gateway_rollout_steps[${index}] must be an object`,
+      };
+    }
+    if (!isNonNegativeInteger(step.percentage) || step.percentage === 0 || step.percentage > 100) {
+      return {
+        valid: false,
+        error: `${payloadLabel} gateway_rollout_steps[${index}].percentage must be an integer between 1 and 100`,
+      };
+    }
+    if (!isNonEmptyString(step.deployment_id)) {
+      return {
+        valid: false,
+        error: `${payloadLabel} gateway_rollout_steps[${index}].deployment_id must be non-empty`,
+      };
+    }
+    if (typeof step.ready !== 'boolean') {
+      return {
+        valid: false,
+        error: `${payloadLabel} gateway_rollout_steps[${index}].ready must be boolean`,
+      };
+    }
+    if (!isNonNegativeInteger(step.attempt_count) || step.attempt_count === 0) {
+      return {
+        valid: false,
+        error: `${payloadLabel} gateway_rollout_steps[${index}].attempt_count must be a positive integer`,
+      };
+    }
+    if (step.last_error !== null && !isNonEmptyString(step.last_error)) {
+      return {
+        valid: false,
+        error: `${payloadLabel} gateway_rollout_steps[${index}].last_error must be null or a non-empty string`,
+      };
+    }
+  }
+  const readinessChecksValidation = validateProductionPromotionReadinessChecks(
+    `${payloadLabel} readiness_checks`,
+    payload.promotion_mode,
+    payload.readiness_checks,
+  );
+  if (!readinessChecksValidation.valid) {
+    return readinessChecksValidation;
+  }
+  if (payload.promotion_mode === 'gradual') {
+    if (!isPlainObject(payload.rollback_handle)) {
+      return {
+        valid: false,
+        error: `${payloadLabel} rollback_handle must be present for gradual promotion`,
+      };
+    }
+    return validateProductionRollbackHandle(`${payloadLabel} rollback_handle`, payload.rollback_handle);
+  }
+  if (payload.rollback_handle != null) {
+    return {
+      valid: false,
+      error: `${payloadLabel} rollback_handle must be null for deploy_with_migration promotions`,
+    };
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validateProdRollbackRecordPayload(payload) {
+  const payloadLabel = 'prod_rollback_record';
+  if (payload.artifact_id !== 'prod_rollback_record') {
+    return {
+      valid: false,
+      error: `${payloadLabel} artifact_id must be "prod_rollback_record"`,
+    };
+  }
+  if (payload.schema_version !== 1) {
+    return {
+      valid: false,
+      error: `${payloadLabel} schema_version must be 1`,
+    };
+  }
+  if (payload.source_environment !== 'prod') {
+    return {
+      valid: false,
+      error: `${payloadLabel} source_environment must be "prod"`,
+    };
+  }
+  if (!isNonEmptyString(payload.rollback_id)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} rollback_id must be non-empty`,
+    };
+  }
+  if (!isRfc3339UtcTimestamp(payload.rolled_back_at)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} rolled_back_at must be an RFC 3339 UTC timestamp`,
+    };
+  }
+  if (!isNonEmptyString(payload.source_promotion_id)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} source_promotion_id must be non-empty`,
+    };
+  }
+  const releaseCommitValidation = validateProdReleaseCommitSha(payloadLabel, payload.release_commit_sha);
+  if (!releaseCommitValidation.valid) {
+    return releaseCommitValidation;
+  }
+  const originRunValidation = validateProducerRunIdentity(payloadLabel, payload);
+  if (!originRunValidation.valid) {
+    return originRunValidation;
+  }
+  const rollbackHandleValidation = validateProductionRollbackHandle(`${payloadLabel} requested_rollback_handle`, payload.requested_rollback_handle);
+  if (!rollbackHandleValidation.valid) {
+    return rollbackHandleValidation;
+  }
+  const deploymentValidation = validateEvidenceDeploymentIdentity(payloadLabel, payload.restored_deployment_identity, {
+    deploymentFieldName: 'restored_deployment_identity',
+  });
+  if (!deploymentValidation.valid) {
+    return deploymentValidation;
+  }
+  if (!isPlainObject(payload.worker_results)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} worker_results must be an object`,
+    };
+  }
+  for (const workerName of EXPECTED_WORKER_BASE_NAMES) {
+    const result = payload.worker_results[workerName];
+    if (!isPlainObject(result)) {
+      return {
+        valid: false,
+        error: `${payloadLabel} worker_results.${workerName} must be an object`,
+      };
+    }
+    if (typeof result.restored !== 'boolean') {
+      return {
+        valid: false,
+        error: `${payloadLabel} worker_results.${workerName}.restored must be boolean`,
+      };
+    }
+    if (!isNonEmptyString(result.deployment_id)) {
+      return {
+        valid: false,
+        error: `${payloadLabel} worker_results.${workerName}.deployment_id must be non-empty`,
+      };
+    }
+    if (!isNonEmptyString(result.worker_version_id)) {
+      return {
+        valid: false,
+        error: `${payloadLabel} worker_results.${workerName}.worker_version_id must be non-empty`,
+      };
+    }
+  }
+  return validateProductionReadinessProbe(`${payloadLabel} readiness_probe`, payload.readiness_probe);
 }
 
 function listReportCoverageFiles(payload) {
@@ -4357,6 +5390,22 @@ export function validateManualArtifactPayload(artifactId, payload, {
         error: 'prod_cost_snapshot model_comparison.drift_ratio must be a non-negative number',
       };
     }
+  }
+
+  if (artifactId === 'prod_release_candidate') {
+    return validateReleaseCandidateManifestPayload(payload, { runTimestamp });
+  }
+
+  if (artifactId === 'prod_install_record') {
+    return validateProdInstallRecordPayload(payload);
+  }
+
+  if (artifactId === 'prod_promotion_record') {
+    return validateProdPromotionRecordPayload(payload);
+  }
+
+  if (artifactId === 'prod_rollback_record') {
+    return validateProdRollbackRecordPayload(payload);
   }
 
   return {

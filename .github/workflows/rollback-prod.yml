@@ -1,0 +1,135 @@
+name: Rollback Prod
+
+on:
+  workflow_dispatch:
+    inputs:
+      promotion_run_id:
+        description: Promote-prod workflow run id to roll back
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+  id-token: write
+
+concurrency:
+  group: rollback-prod
+  cancel-in-progress: false
+
+jobs:
+  rollback-prod:
+    runs-on: ubuntu-latest
+    environment: prod
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_OBSERVABILITY_API_TOKEN: ${{ secrets.CLOUDFLARE_OBSERVABILITY_API_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Resolve promotion run metadata
+        id: promotion_run
+        uses: actions/github-script@v7
+        env:
+          PROMOTION_RUN_ID: ${{ inputs.promotion_run_id }}
+        with:
+          script: |
+            const { data } = await github.rest.actions.getWorkflowRun({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: Number(process.env.PROMOTION_RUN_ID),
+            });
+            if (data.path !== '.github/workflows/promote-prod.yml') {
+              core.setFailed(`promotion_run_id must come from .github/workflows/promote-prod.yml, got ${data.path}`);
+              return;
+            }
+            core.setOutput('run_attempt', String(data.run_attempt));
+
+      - name: Define rollback paths
+        id: paths
+        shell: bash
+        run: |
+          run_timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+          workspace_root=".tmp/github/rollback-prod"
+          state_root="${workspace_root}/state"
+          download_root="${workspace_root}/downloaded"
+          artifact_root="${workspace_root}/artifacts"
+          record_key="gha/${{ github.run_id }}/${{ github.run_attempt }}/prod/${run_timestamp}/prod-rollback-record.json"
+          artifact_name="prod-rollback-record-${run_timestamp}-${{ github.run_id }}-${{ github.run_attempt }}"
+          raw_state_artifact_name="prod-rollback-raw-state-${run_timestamp}-${{ github.run_id }}-${{ github.run_attempt }}"
+          echo "run_timestamp=${run_timestamp}" >> "$GITHUB_OUTPUT"
+          echo "workspace_root=${workspace_root}" >> "$GITHUB_OUTPUT"
+          echo "state_root=${state_root}" >> "$GITHUB_OUTPUT"
+          echo "download_root=${download_root}" >> "$GITHUB_OUTPUT"
+          echo "artifact_root=${artifact_root}" >> "$GITHUB_OUTPUT"
+          echo "record=${artifact_root}/prod-rollback-record.json" >> "$GITHUB_OUTPUT"
+          echo "record_key=${record_key}" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=${artifact_name}" >> "$GITHUB_OUTPUT"
+          echo "raw_state_artifact_name=${raw_state_artifact_name}" >> "$GITHUB_OUTPUT"
+          mkdir -p "$workspace_root" "$state_root" "$download_root" "$artifact_root"
+          printf '{"run_timestamp":"%s","workflow":"rollback-prod"}\n' "$run_timestamp" > "${state_root}/raw-state-metadata.json"
+
+      - name: Download promotion record
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.promotion_run_id }}
+          pattern: prod-promotion-record-*-${{ inputs.promotion_run_id }}-${{ steps.promotion_run.outputs.run_attempt }}
+          merge-multiple: true
+          path: ${{ steps.paths.outputs.download_root }}
+
+      - name: Execute rollback
+        id: execute_rollback
+        continue-on-error: true
+        run: |
+          node packages/testing/src/cli.mjs prod-rollback \
+            --promotion-record "${{ steps.paths.outputs.download_root }}/prod-promotion-record.json" \
+            --working-root "${{ steps.paths.outputs.state_root }}/rollback" \
+            --output "${{ steps.paths.outputs.record }}" \
+            --rollback-id "gha-prod-rollback-${{ steps.paths.outputs.run_timestamp }}-${{ github.run_id }}-${{ github.run_attempt }}"
+
+      - name: Upload prod-rollback raw state artifact
+        if: always() && steps.paths.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.paths.outputs.raw_state_artifact_name }}
+          path: |
+            ${{ steps.paths.outputs.state_root }}
+            ${{ steps.paths.outputs.download_root }}
+            ${{ steps.paths.outputs.artifact_root }}
+          if-no-files-found: error
+
+      - name: Upload rollback record artifact
+        if: steps.execute_rollback.outcome == 'success'
+        id: upload_record
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.paths.outputs.artifact_name }}
+          path: ${{ steps.paths.outputs.record }}
+          if-no-files-found: error
+
+      - name: Upload rollback record to R2
+        if: steps.execute_rollback.outcome == 'success'
+        id: upload_r2
+        run: |
+          node packages/testing/src/cli.mjs nonlocal-upload-r2 \
+            --bucket "matrix-evidence-prod" \
+            --key "${{ steps.paths.outputs.record_key }}" \
+            --file "${{ steps.paths.outputs.record }}" \
+            --content-type "application/json; charset=utf-8" \
+            --output "${{ steps.paths.outputs.state_root }}/record-upload.json"
+
+      - name: Enforce rollback-prod fail-closed outcome after raw artifact preservation
+        if: always()
+        shell: bash
+        run: |
+          if [ "${{ steps.execute_rollback.outcome }}" != "success" ]; then
+            echo "Rollback failed after raw state preservation." >&2
+            exit 1
+          fi

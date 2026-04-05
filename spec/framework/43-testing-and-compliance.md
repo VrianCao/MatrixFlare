@@ -50,6 +50,7 @@
 | `TEST-SEC-002` | advanced abuse resistance, SSRF, provider trust, and conditional external integrations | staging + pre-release | `L3` | 在 `TEST-SEC-001` baseline 之上，覆盖 URL preview 的 SSRF / fetch guard；若启用 pushers / external push gateway、email/SMS `requestToken` bootstrap 或 TURN credential issuance，也必须把对应 provider trust、鉴权、回调/credential 边界纳入同一门禁。 |
 | `TEST-OPS-001` | new Worker -> old DO and old Worker -> new DO compatibility | pre-release | `L1-L3` | 版本偏斜门禁；必须以 dual-version deployment + explicit version targeting + attested `RolloutSkewProbeResponse` 证明两类 pairing，不能退化为 healthz/deployment smoke。 |
 | `TEST-OPS-002` | replay, rebuild, export, restore, scoped repair | pre-release + periodic drill | `L3` | 恢复门禁；必须显式注入“shard truth 已提交但 `DATA-OPS-010` registry upsert 失败”的故障，并验证同一幂等请求或内部 pending-marker 重试会补齐 registry row 而不会重复创建 shard truth。 |
+| `TEST-OPS-003` | production install/promote/rollback/cost automation contract and failure-artifact retention | CI + prod | support prerequisite | 必须同时覆盖 reviewed candidate manifest 验证、producer/current-repo 绑定、prod install active-topology guard、migration vs non-migration promote path 选择、rollback 前 current-state guard，以及 `prod-install` / `promote-prod` / `rollback-prod` / `prod-cost-monthly` 在 fail-closed 时仍保留 raw blocker artifacts 的 workflow contract。它不是 `TEST-OPS-001` 或 `TEST-COST-001` 的替代，而是 production automation prerequisite。 |
 | `TEST-PERF-001` | `/sync` concurrency and online device scaling | pre-release | `L3` | 重点看 Worker wall time、wake latency。 |
 | `TEST-PERF-002` | hot room send / receipt / typing / derived lag | pre-release | `L3` | 重点看单房间热点；`L2` 可选执行但不构成 release gate。 |
 | `TEST-COST-001` | quota accounting and budget guardrail validation | monthly + pre-release | `L1-L3` | pre-release half 必须对 bounded workload 执行 official Cloudflare metrics/billing query 并产出 attested `PreReleaseCostObservation`；monthly half 继续要求 production `ProdCostSnapshotAttestation`。 |
@@ -121,6 +122,7 @@
 * 必须验证 gradual deployment 期间 `/sync`、房间写入、联邦发送不破坏语义。
 * 必须验证 deploy 时 DO wake websocket 断开后的 `/sync` 重试行为。
 * `TEST-OPS-001` 的 canonical non-local pass 还必须证明 dual-version deployment 被真实创建并恢复，且 `RolloutSkewProbeResponse.assertions.new_worker_old_authority == true`、`old_worker_new_authority == true`。
+* `TEST-OPS-003` 必须覆盖 production automation contract：reviewed candidate manifest 验证、producer/current-repo 绑定、prod install record 生成、migration vs non-migration promote path 选择、rollback handle 序列化、上游 workflow/CLI contract 对齐、active-topology / current-state drift 的 fail-closed 行为，以及 workflow 层 raw blocker artifact 保留。它属于 production automation prerequisite，不得被误写成 `TEST-OPS-001`、`TEST-COST-001` 或其他 non-local gate 的替代。
 
 ## 9. Release Gates
 

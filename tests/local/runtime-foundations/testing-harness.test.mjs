@@ -518,6 +518,268 @@ function buildValidProdCostSnapshotAttestation(runTimestamp, payloadOverrides = 
   };
 }
 
+function buildValidProdWorkerRecordMap(overrides = {}) {
+  const base = {
+    'gateway-worker': {
+      worker_name: 'gateway-worker',
+      script_name: 'matrix-gateway-worker-prod',
+      deployment_id: 'gateway-prod-deployment-v1',
+      worker_version_id: 'gateway@prod-v1',
+      worker_version_tag: 'mx-gw-d-prod1',
+      url: 'https://matrix-gateway-worker-prod.matrixflare.workers.dev',
+    },
+    'jobs-worker': {
+      worker_name: 'jobs-worker',
+      script_name: 'matrix-jobs-worker-prod',
+      deployment_id: 'jobs-prod-deployment-v1',
+      worker_version_id: 'jobs@prod-v1',
+      worker_version_tag: 'mx-jw-d-prod1',
+      url: 'https://matrix-jobs-worker-prod.matrixflare.workers.dev',
+    },
+    'ops-worker': {
+      worker_name: 'ops-worker',
+      script_name: 'matrix-ops-worker-prod',
+      deployment_id: 'ops-prod-deployment-v1',
+      worker_version_id: 'ops@prod-v1',
+      worker_version_tag: 'mx-ow-d-prod1',
+      url: 'https://matrix-ops-worker-prod.matrixflare.workers.dev',
+    },
+  };
+  return {
+    ...base,
+    ...overrides,
+  };
+}
+
+function buildValidProdDeploymentIdentity(overrides = {}) {
+  return {
+    environment_id: 'prod',
+    deployment_ids: [
+      'jobs-prod-deployment-v1',
+      'ops-prod-deployment-v1',
+      'gateway-prod-deployment-v1',
+    ],
+    worker_version_ids: [
+      'jobs@prod-v1',
+      'ops@prod-v1',
+      'gateway@prod-v1',
+    ],
+    ...overrides,
+  };
+}
+
+function buildValidProdReadinessProbe(overrides = {}) {
+  return {
+    environment_name: 'prod',
+    ready: true,
+    started_at: '2026-03-31T14:10:00.000Z',
+    completed_at: '2026-03-31T14:10:30.000Z',
+    duration_ms: 30000,
+    attempt_count: 1,
+    last_error: null,
+    attempts: [
+      {
+        attempt: 1,
+        started_at: '2026-03-31T14:10:00.000Z',
+        completed_at: '2026-03-31T14:10:30.000Z',
+        duration_ms: 30000,
+        ok: true,
+        steps: [
+          { step: 'versions', ok: true, detail: { versions_count: 1 } },
+          { step: 'public_rooms', ok: true, detail: { chunk_length: 0 } },
+          { step: 'register_complete', ok: true, detail: { user_id_present: true, access_token_present: true } },
+          { step: 'media_create', ok: true, detail: { content_uri_present: true } },
+          { step: 'ops_healthz', ok: true, detail: { service: 'ops-worker', status: 'ok' } },
+          { step: 'ops_rebuild_start', ok: true, detail: { job_id_present: true, job_type: 'rebuild', state: 'accepted' } },
+        ],
+        failure: null,
+        delay_before_next_attempt_ms: null,
+      },
+    ],
+    ...overrides,
+  };
+}
+
+function buildValidProdRollbackHandle(overrides = {}) {
+  return {
+    workers_subdomain: 'matrixflare',
+    worker_versions: {
+      'gateway-worker': {
+        script_name: 'matrix-gateway-worker-prod',
+        previous_deployment_id: 'gateway-prod-deployment-v1',
+        previous_worker_version_id: 'gateway@prod-v1',
+        restore_version_specs: ['gateway@prod-v1@100'],
+      },
+      'jobs-worker': {
+        script_name: 'matrix-jobs-worker-prod',
+        previous_deployment_id: 'jobs-prod-deployment-v1',
+        previous_worker_version_id: 'jobs@prod-v1',
+        restore_version_specs: ['jobs@prod-v1@100'],
+      },
+      'ops-worker': {
+        script_name: 'matrix-ops-worker-prod',
+        previous_deployment_id: 'ops-prod-deployment-v1',
+        previous_worker_version_id: 'ops@prod-v1',
+        restore_version_specs: ['ops@prod-v1@100'],
+      },
+    },
+    ...overrides,
+  };
+}
+
+function buildValidProducerRunIdentity(overrides = {}) {
+  return {
+    origin_repository: DEFAULT_TEST_GITHUB_REPOSITORY,
+    origin_run_id: buildGitHubRunId('prod', '20260331T140000Z'),
+    origin_run_attempt: 1,
+    origin_run_uri: buildGitHubRunUri('prod', '20260331T140000Z'),
+    ...overrides,
+  };
+}
+
+function buildValidProdPromotionReadinessChecks(overrides = {}) {
+  return {
+    jobs_promoted: buildValidProdReadinessProbe(),
+    ops_promoted: buildValidProdReadinessProbe(),
+    ...overrides,
+  };
+}
+
+function buildValidProdReleaseCandidateManifest(runTimestamp, overrides = {}) {
+  const sharedRunId = buildGitHubRunId('prod', runTimestamp);
+  const sharedRunUri = buildGitHubRunUri('prod', runTimestamp);
+  const sourceRepository = DEFAULT_TEST_GITHUB_REPOSITORY;
+  const buildCandidateAttestation = (environmentName) => buildValidEnvironmentAttestation(
+    environmentName,
+    runTimestamp,
+    {
+      source_run_uri: sharedRunUri,
+    },
+    {
+      provenance: {
+        origin_repository: sourceRepository,
+        origin_run_id: sharedRunId,
+        origin_run_attempt: 1,
+        origin_run_uri: sharedRunUri,
+      },
+    },
+  );
+  return {
+    schema_version: 1,
+    artifact_id: 'prod_release_candidate',
+    candidate_id: `candidate-${runTimestamp.toLowerCase()}`,
+    created_at: '2026-03-31T14:07:00.000Z',
+    release_ref: 'refs/heads/phase08-nonlocal-closure',
+    release_commit_sha: '0123456789abcdef0123456789abcdef01234567',
+    requires_do_migration: false,
+    source_repository: sourceRepository,
+    source_run_uri: sharedRunUri,
+    ...buildValidProducerRunIdentity(),
+    topology_kind: 'cloudflare-prod',
+    ci_integration_attestation: buildCandidateAttestation('ci-integration'),
+    staging_attestation: buildCandidateAttestation('staging'),
+    pre_release_attestation: buildCandidateAttestation('pre-release'),
+    ...overrides,
+  };
+}
+
+function buildValidProdInstallRecord(overrides = {}) {
+  return {
+    schema_version: 1,
+    artifact_id: 'prod_install_record',
+    source_environment: 'prod',
+    install_id: 'install-prod-topology-v1',
+    installed_at: '2026-03-31T14:08:00.000Z',
+    ...buildValidProducerRunIdentity(),
+    release_commit_sha: '0123456789abcdef0123456789abcdef01234567',
+    topology_kind: 'cloudflare-prod',
+    workers_subdomain: 'matrixflare',
+    cloudflare_resources: buildExpectedCloudflareResources('prod'),
+    access: {
+      auth_domain: 'matrixflare.cloudflareaccess.com',
+      application_id: 'cf-access-app-prod',
+      application_audience: 'prod-aud',
+      application_domain: 'matrix-ops-worker-prod.matrixflare.workers.dev',
+      protected_ops_url: 'https://matrix-ops-worker-prod.matrixflare.workers.dev',
+    },
+    deployment_identity: buildValidProdDeploymentIdentity(),
+    workers: buildValidProdWorkerRecordMap(),
+    ...overrides,
+  };
+}
+
+function buildValidProdPromotionRecord(overrides = {}) {
+  return {
+    schema_version: 1,
+    artifact_id: 'prod_promotion_record',
+    source_environment: 'prod',
+    promotion_id: 'promotion-prod-v2',
+    promoted_at: '2026-03-31T14:09:00.000Z',
+    ...buildValidProducerRunIdentity({ origin_run_id: buildGitHubRunId('prod', '20260331T140900Z'), origin_run_uri: buildGitHubRunUri('prod', '20260331T140900Z') }),
+    release_commit_sha: '89abcdef0123456789abcdef0123456789abcdef',
+    promotion_mode: 'gradual',
+    source_candidate: {
+      candidate_id: 'candidate-20260331t140000z',
+      source_run_uri: buildGitHubRunUri('prod', '20260331T140000Z'),
+    },
+    previous_deployment_identity: buildValidProdDeploymentIdentity(),
+    current_deployment_identity: buildValidProdDeploymentIdentity({
+      deployment_ids: [
+        'jobs-prod-deployment-v2',
+        'ops-prod-deployment-v2',
+        'gateway-prod-deployment-v2',
+      ],
+      worker_version_ids: [
+        'jobs@prod-v2',
+        'ops@prod-v2',
+        'gateway@prod-v2',
+      ],
+    }),
+    gateway_rollout_steps: [
+      { percentage: 10, deployment_id: 'gateway-prod-rollout-10', ready: true, attempt_count: 1, last_error: null },
+      { percentage: 50, deployment_id: 'gateway-prod-rollout-50', ready: true, attempt_count: 1, last_error: null },
+      { percentage: 100, deployment_id: 'gateway-prod-rollout-100', ready: true, attempt_count: 1, last_error: null },
+    ],
+    readiness_checks: buildValidProdPromotionReadinessChecks(),
+    rollback_handle: buildValidProdRollbackHandle(),
+    ...overrides,
+  };
+}
+
+function buildValidProdRollbackRecord(overrides = {}) {
+  return {
+    schema_version: 1,
+    artifact_id: 'prod_rollback_record',
+    source_environment: 'prod',
+    rollback_id: 'rollback-prod-v1',
+    rolled_back_at: '2026-03-31T14:11:00.000Z',
+    ...buildValidProducerRunIdentity({ origin_run_id: buildGitHubRunId('prod', '20260331T141100Z'), origin_run_uri: buildGitHubRunUri('prod', '20260331T141100Z') }),
+    source_promotion_id: 'promotion-prod-v2',
+    release_commit_sha: '0123456789abcdef0123456789abcdef01234567',
+    requested_rollback_handle: buildValidProdRollbackHandle(),
+    restored_deployment_identity: buildValidProdDeploymentIdentity(),
+    worker_results: {
+      'gateway-worker': {
+        restored: true,
+        deployment_id: 'gateway-prod-deployment-v1',
+        worker_version_id: 'gateway@prod-v1',
+      },
+      'jobs-worker': {
+        restored: true,
+        deployment_id: 'jobs-prod-deployment-v1',
+        worker_version_id: 'jobs@prod-v1',
+      },
+      'ops-worker': {
+        restored: true,
+        deployment_id: 'ops-prod-deployment-v1',
+        worker_version_id: 'ops@prod-v1',
+      },
+    },
+    readiness_probe: buildValidProdReadinessProbe(),
+    ...overrides,
+  };
+}
+
 function buildSingleFileEnvironmentReportOverrides(relativeTestFile, overrides = {}) {
   return {
     test_files: [relativeTestFile],
@@ -1909,6 +2171,136 @@ test('manual artifact payload validation requires structured non-local reports a
     {
       valid: false,
       error: 'prod_cost_snapshot model_comparison.drift_ratio must be a non-negative number',
+    },
+  );
+});
+
+test('manual artifact payload validation enforces production automation artifact contracts', () => {
+  const runTimestamp = '20260331T140000Z';
+  const validReleaseCandidate = buildValidProdReleaseCandidateManifest(runTimestamp);
+  const validInstallRecord = buildValidProdInstallRecord();
+  const validPromotionRecord = buildValidProdPromotionRecord();
+  const validRollbackRecord = buildValidProdRollbackRecord();
+
+  assert.deepEqual(
+    validateManualArtifactPayload('prod_release_candidate', validReleaseCandidate, { runTimestamp }),
+    {
+      valid: true,
+      error: null,
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('prod_release_candidate', {
+      ...validReleaseCandidate,
+      topology_kind: 'cloudflare-pre-release',
+    }, { runTimestamp }),
+    {
+      valid: false,
+      error: 'prod_release_candidate topology_kind must be "cloudflare-prod"',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('prod_install_record', validInstallRecord),
+    {
+      valid: true,
+      error: null,
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('prod_install_record', {
+      ...validInstallRecord,
+      access: {
+        ...validInstallRecord.access,
+        application_domain: '',
+      },
+    }),
+    {
+      valid: false,
+      error: 'prod_install_record access.application_domain must be non-empty',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('prod_promotion_record', validPromotionRecord),
+    {
+      valid: true,
+      error: null,
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('prod_promotion_record', {
+      ...validPromotionRecord,
+      gateway_rollout_steps: [
+        { percentage: 0, deployment_id: 'gateway-prod-rollout-0', ready: true },
+      ],
+    }),
+    {
+      valid: false,
+      error: 'prod_promotion_record gateway_rollout_steps[0].percentage must be an integer between 1 and 100',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('prod_promotion_record', {
+      ...validPromotionRecord,
+      promotion_mode: 'deploy_with_migration',
+      gateway_rollout_steps: [],
+      readiness_checks: {
+        jobs_promoted: buildValidProdReadinessProbe(),
+        ops_promoted: buildValidProdReadinessProbe(),
+        gateway_promoted: buildValidProdReadinessProbe(),
+      },
+      rollback_handle: buildValidProdRollbackHandle(),
+    }),
+    {
+      valid: false,
+      error: 'prod_promotion_record rollback_handle must be null for deploy_with_migration promotions',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('prod_promotion_record', {
+      ...validPromotionRecord,
+      rollback_handle: {
+        ...validPromotionRecord.rollback_handle,
+        worker_versions: {
+          ...validPromotionRecord.rollback_handle.worker_versions,
+          'gateway-worker': {
+            ...validPromotionRecord.rollback_handle.worker_versions['gateway-worker'],
+            restore_version_specs: [],
+          },
+        },
+      },
+    }),
+    {
+      valid: false,
+      error: 'prod_promotion_record rollback_handle.worker_versions.gateway-worker.restore_version_specs must be a non-empty string array',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('prod_rollback_record', validRollbackRecord),
+    {
+      valid: true,
+      error: null,
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('prod_rollback_record', {
+      ...validRollbackRecord,
+      readiness_probe: {
+        ...validRollbackRecord.readiness_probe,
+        attempts: [],
+      },
+    }),
+    {
+      valid: false,
+      error: 'prod_rollback_record readiness_probe.attempts must match attempt_count',
     },
   );
 });
