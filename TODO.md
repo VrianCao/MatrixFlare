@@ -363,6 +363,8 @@
   `/.well-known`、`/versions`、`/capabilities`、`/login`、`/register/available`、registration token validity handlers。
   完成标准:
   discoverability truth 与当前启用能力完全一致。
+  当前状态:
+  `gateway-worker` 现在会对 `/.well-known/matrix/client`、`/_matrix/client/versions` 与 `/_matrix/client/*` 的 browser `Origin` 请求统一附加 CORS 响应头，并在 `OPTIONS` preflight 时直接返回 `204`，不再把标准浏览器预检请求误落到 `M_UNRECOGNIZED`。
 
 ### 04.02 实现 Access/Refresh token 真相与 session 解析
 

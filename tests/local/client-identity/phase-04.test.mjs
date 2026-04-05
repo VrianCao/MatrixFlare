@@ -148,6 +148,69 @@ test('Phase 04 discovery surfaces return spec-aligned truth', async (t) => {
   assert.deepEqual(await tokenValidity.json(), { valid: false });
 });
 
+test('Phase 04 discovery and login surfaces serve browser CORS and preflight truth', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const browserOrigin = 'https://app.element.io';
+  const versions = await rig.gatewayFetch('/_matrix/client/versions', {
+    headers: {
+      origin: browserOrigin,
+    },
+  });
+  assert.equal(versions.status, 200);
+  assert.equal(versions.headers.get('access-control-allow-origin'), browserOrigin);
+  assert.match(versions.headers.get('vary') ?? '', /Origin/i);
+
+  const loginFlows = await rig.gatewayFetch('/_matrix/client/v3/login', {
+    headers: {
+      origin: browserOrigin,
+    },
+  });
+  assert.equal(loginFlows.status, 200);
+  assert.equal(loginFlows.headers.get('access-control-allow-origin'), browserOrigin);
+  assert.match(loginFlows.headers.get('vary') ?? '', /Origin/i);
+
+  const clientWellKnown = await rig.gatewayFetch('/.well-known/matrix/client', {
+    headers: {
+      origin: browserOrigin,
+    },
+  });
+  assert.equal(clientWellKnown.status, 200);
+  assert.equal(clientWellKnown.headers.get('access-control-allow-origin'), browserOrigin);
+
+  const serverWellKnown = await rig.gatewayFetch('/.well-known/matrix/server', {
+    headers: {
+      origin: browserOrigin,
+    },
+  });
+  assert.equal(serverWellKnown.status, 200);
+  assert.equal(serverWellKnown.headers.get('access-control-allow-origin'), null);
+
+  const preflight = await rig.gatewayFetch('/_matrix/client/v3/login', {
+    method: 'OPTIONS',
+    headers: {
+      origin: browserOrigin,
+      'access-control-request-method': 'POST',
+      'access-control-request-headers': 'content-type,authorization',
+    },
+  });
+  assert.equal(preflight.status, 204);
+  assert.equal(preflight.headers.get('access-control-allow-origin'), browserOrigin);
+  assert.equal(preflight.headers.get('access-control-allow-headers'), 'content-type,authorization');
+  assert.match(preflight.headers.get('access-control-allow-methods') ?? '', /\bPOST\b/);
+  assert.match(preflight.headers.get('vary') ?? '', /Origin/i);
+  assert.match(preflight.headers.get('vary') ?? '', /Access-Control-Request-Headers/i);
+
+  const missingUsername = await rig.gatewayFetch('/_matrix/client/v3/register/available', {
+    headers: {
+      origin: browserOrigin,
+    },
+  });
+  assert.equal(missingUsername.status, 400);
+  assert.equal(missingUsername.headers.get('access-control-allow-origin'), browserOrigin);
+});
+
 test('Phase 04 session lifecycle covers register, login, refresh, logout, whoami, and capabilities', async (t) => {
   const rig = createGatewayPhase04Rig();
   t.after(() => rig.close());
