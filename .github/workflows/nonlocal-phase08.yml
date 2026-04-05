@@ -372,6 +372,16 @@ jobs:
           echo "attestation_artifact_name=${attestation_artifact_name}" >> "$GITHUB_OUTPUT"
           mkdir -p "$state_root" "$artifact_root"
 
+      - name: Define closed monthly billing window
+        id: billing_window
+        shell: bash
+        run: |
+          current_month_start="$(date -u +%Y-%m-01)"
+          from_date="$(date -u -d "${current_month_start} -1 month" +%Y-%m-01)"
+          to_date="$(date -u -d "${current_month_start} -1 day" +%Y-%m-%d)"
+          echo "from_date=${from_date}" >> "$GITHUB_OUTPUT"
+          echo "to_date=${to_date}" >> "$GITHUB_OUTPUT"
+
       - name: Capture production cost snapshot
         id: snapshot
         continue-on-error: true
@@ -380,6 +390,8 @@ jobs:
             --timestamp "${MATRIX_PHASE08_RUN_TIMESTAMP}" \
             --artifact-root "${{ steps.paths.outputs.artifact_root }}" \
             --output "${{ steps.paths.outputs.snapshot }}" \
+            --from "${{ steps.billing_window.outputs.from_date }}" \
+            --to "${{ steps.billing_window.outputs.to_date }}" \
             --captured-by "github-actions:${{ github.actor }}" \
             --reviewed-by "github-actions-run:${{ github.run_id }}"
 
@@ -418,13 +430,21 @@ jobs:
 
       - name: Upload raw prod-cost bundle to R2
         if: always()
+        id: upload_bundle_r2
+        continue-on-error: true
+        shell: bash
         run: |
+          if [ ! -f "${{ steps.paths.outputs.artifact_root }}/cost-bundle.tgz" ]; then
+            echo "prod-cost bundle missing before R2 upload" >&2
+            exit 1
+          fi
           node packages/testing/src/cli.mjs nonlocal-upload-r2 \
             --bucket "matrix-evidence-prod" \
             --key "${{ steps.paths.outputs.bundle_key }}" \
             --file "${{ steps.paths.outputs.artifact_root }}/cost-bundle.tgz" \
             --content-type "application/gzip" \
             --output "${{ steps.paths.outputs.bundle_upload }}"
+          test -f "${{ steps.paths.outputs.bundle_upload }}"
 
       - name: Write prod-cost provenance
         if: always()
@@ -434,6 +454,10 @@ jobs:
         run: |
           if [ ! -f "${{ steps.paths.outputs.deployment_identity }}" ]; then
             echo "prod deployment identity missing; cannot attest prod cost snapshot" >&2
+            exit 1
+          fi
+          if [ ! -f "${{ steps.paths.outputs.bundle_upload }}" ]; then
+            echo "prod-cost R2 upload record missing; cannot attest prod cost snapshot" >&2
             exit 1
           fi
           node packages/testing/src/cli.mjs prod-cost-provenance \
@@ -452,10 +476,18 @@ jobs:
             echo "prod-cost snapshot generation did not pass" >&2
             exit 1
           fi
+          if [ "${{ steps.upload_bundle_r2.outcome }}" != "success" ]; then
+            echo "prod-cost R2 upload did not pass" >&2
+            exit 1
+          fi
+          test -f "${{ steps.paths.outputs.snapshot }}"
+          test -f "${{ steps.paths.outputs.deployment_identity }}"
+          test -f "${{ steps.paths.outputs.bundle_upload }}"
           if [ "${{ steps.provenance.outcome }}" != "success" ]; then
             echo "prod-cost provenance generation did not pass" >&2
             exit 1
           fi
+          test -f "${{ steps.paths.outputs.provenance }}"
 
       - name: Write prod-cost attestation
         if: steps.prod_cost_gate.outcome == 'success'

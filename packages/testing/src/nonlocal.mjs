@@ -1932,6 +1932,64 @@ function buildBillingUsageApiPath({
   return `/billing/usage/paygo${query.length > 0 ? `?${query}` : ''}`;
 }
 
+function parseBillingPeriodDateToUtcMillis(value, label) {
+  const normalized = assertBillingPeriodDate(value, label);
+  const parsed = Date.parse(`${normalized}T00:00:00.000Z`);
+  if (!Number.isFinite(parsed)) {
+    throw new RangeError(`${label} must be a valid UTC date`);
+  }
+  return parsed;
+}
+
+function normalizeObservedBillingDate(value, label) {
+  if (!isNonEmptyString(value)) {
+    throw new RangeError(`${label} must be non-empty`);
+  }
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) {
+    throw new RangeError(`${label} must be a valid date`);
+  }
+  return new Date(parsed).toISOString().slice(0, 10);
+}
+
+function normalizeClosedMonthlyBillingWindow({
+  fromDate = null,
+  toDate = null,
+} = {}) {
+  if (fromDate == null || toDate == null) {
+    throw new Error('production cost snapshot requires explicit --from and --to dates for a closed monthly billing window');
+  }
+  const normalizedFromDate = assertBillingPeriodDate(fromDate, 'billing from date');
+  const normalizedToDate = assertBillingPeriodDate(toDate, 'billing to date');
+  const fromMillis = parseBillingPeriodDateToUtcMillis(normalizedFromDate, 'billing from date');
+  const toMillis = parseBillingPeriodDateToUtcMillis(normalizedToDate, 'billing to date');
+  const fromDateValue = new Date(fromMillis);
+  if (fromDateValue.getUTCDate() !== 1) {
+    throw new Error('production cost snapshot from date must be the first day of a calendar month');
+  }
+  const expectedToMillis = Date.UTC(
+    fromDateValue.getUTCFullYear(),
+    fromDateValue.getUTCMonth() + 1,
+    0,
+  );
+  if (toMillis !== expectedToMillis) {
+    throw new Error('production cost snapshot to date must be the last day of the same calendar month');
+  }
+  const now = new Date();
+  const todayStartMillis = Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate(),
+  );
+  if (toMillis >= todayStartMillis) {
+    throw new Error('production cost snapshot requires a closed monthly billing window that ends before today');
+  }
+  return Object.freeze({
+    fromDate: normalizedFromDate,
+    toDate: normalizedToDate,
+  });
+}
+
 function normalizeBillingLookupKey(value) {
   return stableString(value)
     .toLowerCase()
@@ -2061,7 +2119,6 @@ function classifyBillingUsageRecord(record) {
   if (
     serviceKey === 'workers'
     || serviceKey.includes('workersstandard')
-    || serviceKey.includes('pagesfunctions')
   ) {
     if (unitKey.includes('request')) {
       return { surface_name: 'workers', metric_name: 'request_count' };
@@ -2069,6 +2126,11 @@ function classifyBillingUsageRecord(record) {
     if (unitKey.includes('cpu') && (unitKey.includes('ms') || unitKey.includes('millisecond'))) {
       return { surface_name: 'workers', metric_name: 'cpu_ms' };
     }
+  }
+  if (serviceKey.includes('pagesfunctions')) {
+    return {
+      unsupported_reason: `Pages Functions billing record ${record.service_name}/${record.consumed_unit} is not attributable to the Matrix production worker topology`,
+    };
   }
   if (serviceKey.includes('durableobjects')) {
     if (unitKey.includes('request')) {
@@ -2275,13 +2337,41 @@ function deriveBillingPeriodFromUsageRecords(billingUsageRecords) {
   });
 }
 
+function assertBillingUsageMatchesClosedMonthlyWindow(billingUsageRecords, billingWindow) {
+  for (const [index, record] of billingUsageRecords.entries()) {
+    const observedBillingPeriodStart = normalizeObservedBillingDate(record.billing_period_start, `billing usage record ${index} BillingPeriodStart`);
+    const observedChargePeriodStart = normalizeObservedBillingDate(record.charge_period_start, `billing usage record ${index} ChargePeriodStart`);
+    const observedChargePeriodEnd = normalizeObservedBillingDate(record.charge_period_end, `billing usage record ${index} ChargePeriodEnd`);
+    if (observedBillingPeriodStart !== billingWindow.fromDate) {
+      throw new Error(
+        `Cloudflare billing usage record ${index} BillingPeriodStart ${observedBillingPeriodStart} does not match requested production monthly window start ${billingWindow.fromDate}`,
+      );
+    }
+    if (observedChargePeriodStart !== billingWindow.fromDate) {
+      throw new Error(
+        `Cloudflare billing usage record ${index} ChargePeriodStart ${observedChargePeriodStart} does not match requested production monthly window start ${billingWindow.fromDate}`,
+      );
+    }
+    if (observedChargePeriodEnd !== billingWindow.toDate) {
+      throw new Error(
+        `Cloudflare billing usage record ${index} ChargePeriodEnd ${observedChargePeriodEnd} does not match requested production monthly window end ${billingWindow.toDate}`,
+      );
+    }
+  }
+}
+
 async function listProdCloudflareResourceNames({
   accountId,
   apiToken,
 }, {
   callCloudflareApiImpl = callCloudflareApi,
 } = {}) {
-  const [databasesPayload, kvNamespacesPayload, bucketsPayload, queuesPayload] = await Promise.all([
+  const [workersPayload, databasesPayload, kvNamespacesPayload, bucketsPayload, queuesPayload] = await Promise.all([
+    callCloudflareApiImpl({
+      accountId,
+      apiToken,
+      pathname: '/workers/scripts',
+    }),
     callCloudflareApiImpl({
       accountId,
       apiToken,
@@ -2304,6 +2394,7 @@ async function listProdCloudflareResourceNames({
     }),
   ]);
   return Object.freeze({
+    workers: Object.freeze(extractArrayResult(workersPayload.result).map((entry) => extractStringField(entry, ['id', 'script_name', 'name', 'tag'])).filter(Boolean).sort()),
     d1_databases: Object.freeze(extractArrayResult(databasesPayload.result).map((entry) => extractStringField(entry, ['name', 'database_name'])).filter(Boolean).sort()),
     kv_namespaces: Object.freeze(extractArrayResult(kvNamespacesPayload.result).map((entry) => extractStringField(entry, ['title', 'namespace'])).filter(Boolean).sort()),
     r2_buckets: Object.freeze(extractArrayResult(bucketsPayload.result, ['buckets']).map((entry) => extractStringField(entry, ['name'])).filter(Boolean).sort()),
@@ -2311,9 +2402,67 @@ async function listProdCloudflareResourceNames({
   });
 }
 
+function buildKnownNonProductionCloudflareResourceNames() {
+  const workers = [];
+  const d1Databases = [];
+  const kvNamespaces = [];
+  const r2Buckets = [];
+  const queues = [];
+  for (const environmentName of NON_LOCAL_ENVIRONMENT_NAMES) {
+    workers.push(...listWorkerNames().map((workerName) => buildWorkerScriptName(workerName, environmentName)));
+    d1Databases.push(`matrix-control-and-derived-${environmentName}`);
+    kvNamespaces.push(`matrix-edge-cache-${environmentName}`);
+    r2Buckets.push(
+      `matrix-archive-${environmentName}`,
+      `matrix-evidence-${environmentName}`,
+      `matrix-media-${environmentName}`,
+    );
+    for (const [, baseQueueName] of QUEUE_BINDING_NAMES) {
+      queues.push(`${baseQueueName}-${environmentName}`);
+    }
+  }
+  return Object.freeze({
+    workers: Object.freeze(sortUniqueStringArray(workers)),
+    d1_databases: Object.freeze(sortUniqueStringArray(d1Databases)),
+    kv_namespaces: Object.freeze(sortUniqueStringArray(kvNamespaces)),
+    r2_buckets: Object.freeze(sortUniqueStringArray(r2Buckets)),
+    queues: Object.freeze(sortUniqueStringArray(queues)),
+  });
+}
+
+function assertProdBillingAccountIsolation(actualResourceNames, expectedResources) {
+  const knownNonProductionResources = buildKnownNonProductionCloudflareResourceNames();
+  const unexpectedResources = [];
+  const overlappingResources = [];
+  for (const key of ['workers', 'd1_databases', 'kv_namespaces', 'r2_buckets', 'queues']) {
+    const actualNames = new Set(actualResourceNames[key]);
+    const overlaps = knownNonProductionResources[key].filter((entry) => actualNames.has(entry));
+    if (overlaps.length > 0) {
+      overlappingResources.push(`${key}: ${overlaps.join(', ')}`);
+    }
+    const expectedNames = new Set(expectedResources[key]);
+    const extras = actualResourceNames[key].filter((entry) => !expectedNames.has(entry));
+    if (extras.length > 0) {
+      unexpectedResources.push(`${key}: ${extras.join(', ')}`);
+    }
+  }
+  if (overlappingResources.length > 0) {
+    throw new Error(
+      'production cost snapshot remains fail-closed under OQ-0002: Cloudflare Billing Usage API is account-scoped, '
+      + `and the current account still contains non-production Matrix resources (${overlappingResources.join('; ')})`,
+    );
+  }
+  if (unexpectedResources.length > 0) {
+    throw new Error(
+      'production cost snapshot remains fail-closed under OQ-0002: Cloudflare Billing Usage API is account-scoped, '
+      + `and the current account still contains unexpected non-Matrix Cloudflare resources (${unexpectedResources.join('; ')})`,
+    );
+  }
+}
+
 function assertProdResourcesPresent(actualResourceNames, expectedResources) {
   const mismatches = [];
-  const requiredKeys = ['d1_databases', 'kv_namespaces', 'r2_buckets', 'queues'];
+  const requiredKeys = ['workers', 'd1_databases', 'kv_namespaces', 'r2_buckets', 'queues'];
   for (const key of requiredKeys) {
     const actualNames = new Set(actualResourceNames[key]);
     const missingNames = expectedResources[key].filter((entry) => !actualNames.has(entry));
@@ -2417,6 +2566,10 @@ export async function captureProdCostSnapshot({
   if (!isNonEmptyString(runTimestamp)) {
     throw new RangeError('runTimestamp is required');
   }
+  const billingWindow = normalizeClosedMonthlyBillingWindow({
+    fromDate,
+    toDate,
+  });
   const { accountId, apiToken } = requireCloudflareCredentialsImpl({
     accountId: explicitAccountId,
     apiToken: explicitApiToken,
@@ -2451,8 +2604,8 @@ export async function captureProdCostSnapshot({
   const deploymentIdentityPath = path.join(resolvedArtifactRoot, 'prod-deployment-identity.json');
 
   const billingUsagePathname = buildBillingUsageApiPath({
-    fromDate,
-    toDate,
+    fromDate: billingWindow.fromDate,
+    toDate: billingWindow.toDate,
   });
   const billingUsagePayload = await callCloudflareApiImpl({
     accountId,
@@ -2473,11 +2626,13 @@ export async function captureProdCostSnapshot({
   if (billingUsageRecords.length === 0) {
     throw new Error('Cloudflare billing usage API returned zero records for the requested production billing window');
   }
+  assertBillingUsageMatchesClosedMonthlyWindow(billingUsageRecords, billingWindow);
   const billingCurrencies = sortUniqueStringArray(billingUsageRecords.map((record) => record.billing_currency));
   if (billingCurrencies.length !== 1) {
     throw new Error(`Cloudflare billing usage API returned multiple billing currencies: ${billingCurrencies.join(', ')}`);
   }
   assertProdResourcesPresent(actualResourceNames, expectedResources);
+  assertProdBillingAccountIsolation(actualResourceNames, expectedResources);
   const gatewayRatelimitNamespaces = sortUniqueStringArray(gatewayBindingState.ratelimit_namespace_ids ?? []);
   const expectedRatelimitNamespaces = [...expectedResources.ratelimit_namespaces];
   if (JSON.stringify(gatewayRatelimitNamespaces) !== JSON.stringify(expectedRatelimitNamespaces)) {
@@ -2492,11 +2647,13 @@ export async function captureProdCostSnapshot({
       return entry.state.latest_active_deployment_id;
     }),
     worker_version_ids: workerStateEntries.map((entry) => {
-      const activeVersionId = entry.state.active_worker_version_ids?.[0] ?? null;
-      if (!isNonEmptyString(activeVersionId)) {
-        throw new Error(`Cloudflare did not expose an active worker version id for ${entry.script_name}`);
+      const activeVersionIds = sortUniqueStringArray(entry.state.active_worker_version_ids ?? []);
+      if (activeVersionIds.length !== 1) {
+        throw new Error(
+          `Cloudflare must expose exactly one active worker version id for ${entry.script_name} when capturing a production monthly snapshot`,
+        );
       }
-      return activeVersionId;
+      return activeVersionIds[0];
     }),
   };
   await fs.writeFile(deploymentIdentityPath, stableJson(deploymentIdentity));
@@ -4135,14 +4292,27 @@ export async function uploadImmutableArtifactToR2({
   contentType = 'application/octet-stream',
   outputPath = null,
   accountId: explicitAccountId = null,
+  apiToken: explicitApiToken = null,
+} = {}, {
+  requireGitHubActionsExecutionImpl = requireGitHubActionsExecution,
+  requireCloudflareCredentialsImpl = requireCloudflareCredentials,
+  ensureR2BucketImpl = ensureR2Bucket,
+  sha256FileHexImpl = sha256FileHex,
+  runWranglerImpl = runWrangler,
 } = {}) {
-  await requireGitHubActionsExecution('uploadImmutableArtifactToR2');
-  const { accountId } = requireCloudflareCredentials({
+  await requireGitHubActionsExecutionImpl('uploadImmutableArtifactToR2');
+  const { accountId, apiToken } = requireCloudflareCredentialsImpl({
     accountId: explicitAccountId,
+    apiToken: explicitApiToken,
   });
   const resolvedFilePath = path.resolve(filePath);
-  const sha256 = await sha256FileHex(resolvedFilePath);
-  await runWrangler([
+  const sha256 = await sha256FileHexImpl(resolvedFilePath);
+  await ensureR2BucketImpl({
+    accountId,
+    apiToken,
+    bucketName,
+  });
+  await runWranglerImpl([
     'r2',
     'object',
     'put',
