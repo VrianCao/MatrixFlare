@@ -729,11 +729,13 @@ function buildValidProdPromotionRecord(overrides = {}) {
     promoted_at: '2026-03-31T14:09:00.000Z',
     ...buildValidProducerRunIdentity({ origin_run_id: buildGitHubRunId('prod', '20260331T140900Z'), origin_run_uri: buildGitHubRunUri('prod', '20260331T140900Z') }),
     release_commit_sha: '89abcdef0123456789abcdef0123456789abcdef',
+    promotion_authority: 'reviewed_candidate',
     promotion_mode: 'gradual',
     source_candidate: {
       candidate_id: 'candidate-20260331t140000z',
       source_run_uri: buildGitHubRunUri('prod', '20260331T140000Z'),
     },
+    operational_unblock: null,
     previous_deployment_identity: buildValidProdDeploymentIdentity(),
     current_deployment_identity: buildValidProdDeploymentIdentity({
       deployment_ids: [
@@ -2403,6 +2405,41 @@ test('manual artifact payload validation enforces production automation artifact
     {
       valid: true,
       error: null,
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('prod_promotion_record', {
+      ...validPromotionRecord,
+      promotion_authority: 'operational_unblock',
+      source_candidate: null,
+      operational_unblock: {
+        reason: 'Operational prod refresh to unblock Phase 08 cost closure',
+        blocked_by_open_questions: ['OQ-0002', 'OQ-0006'],
+      },
+    }),
+    {
+      valid: true,
+      error: null,
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('prod_promotion_record', {
+      ...validPromotionRecord,
+      promotion_authority: 'operational_unblock',
+      source_candidate: {
+        candidate_id: 'candidate-20260331t140000z',
+        source_run_uri: buildGitHubRunUri('prod', '20260331T140000Z'),
+      },
+      operational_unblock: {
+        reason: 'Operational prod refresh to unblock Phase 08 cost closure',
+        blocked_by_open_questions: ['OQ-0002', 'OQ-0006'],
+      },
+    }),
+    {
+      valid: false,
+      error: 'prod_promotion_record source_candidate must be null for operational_unblock promotions',
     },
   );
 

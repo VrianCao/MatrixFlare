@@ -663,6 +663,8 @@
 
 ## Phase 08: L1 Security, Observability, Compatibility, And Release Gate
 
+`2026-04-05` 新确认的结构性事实：若继续坚持“必须先通过正式 reviewed candidate promote，才能让 prod 给真实用户使用”，则 `OQ-0002` 会进入死锁，因为项目永远拿不到 fixed prod topology 的 post-install真实月度成本窗口。current accepted handling 见 `DEC-0006`：允许一条明确标记为 `operational_unblock` 的受控 `operational-prod-refresh` 路径，把当前 `master` 刷新到现有 prod topology，仅用于解开 `OQ-0002` / `OQ-0006` 成本闭环死锁；这不等于 `08.05` 完成，也不等于 `L1 Local-Core` 达成。
+
 目标：补齐 `Local-Core` 必需门禁，拿到第一个可验证 profile。
 
 ### 08.01 实现 baseline abuse guard

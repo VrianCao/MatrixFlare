@@ -615,10 +615,12 @@
 | `origin_repository` | string | 非空 GitHub `owner/repo` slug；必须是生成该 record 的 workflow 所在仓库 |
 | `origin_run_id` | string | 非空；必须与 `origin_run_uri` 对应 |
 | `origin_run_attempt` | integer | 正整数 |
-| `origin_run_uri` | string | GitHub Actions run URL；必须回链当前 `promote-prod` workflow run |
+| `origin_run_uri` | string | GitHub Actions run URL；必须回链当前生成该 record 的 workflow run（`promote-prod` 或 `operational-prod-refresh`） |
 | `release_commit_sha` | string | 40 字符小写 git sha |
+| `promotion_authority` | string | `reviewed_candidate` 或 `operational_unblock` |
 | `promotion_mode` | string | `gradual` 或 `deploy_with_migration` |
-| `source_candidate` | object | 至少包含 `candidate_id`,`source_run_uri`；它表示被当前 workflow 消费的 reviewed candidate manifest 引用 |
+| `source_candidate` | object or null | `promotion_authority = reviewed_candidate` 时必须至少包含 `candidate_id`,`source_run_uri`；`promotion_authority = operational_unblock` 时必须为 `null` |
+| `operational_unblock` | object or null | `promotion_authority = operational_unblock` 时必须包含 `reason` 非空字符串与 `blocked_by_open_questions` 非空字符串数组；`promotion_authority = reviewed_candidate` 时必须为 `null` |
 | `previous_deployment_identity` | `EvidenceDeploymentIdentity` | 不得省略 |
 | `current_deployment_identity` | `EvidenceDeploymentIdentity` | 不得省略 |
 | `gateway_rollout_steps` | array | `promotion_mode = gradual` 时必须非空；每步至少记录 `percentage`,`deployment_id`,`ready`,`attempt_count`,`last_error` |
@@ -630,6 +632,7 @@
 * consumer 在执行 promote 前，必须额外验证 `origin_repository` 等于当前仓库，且当前 checked-out git `HEAD` 等于 `release_commit_sha`。
 * producer 在写出 gradual promote record 前，必须先证明当前 Cloudflare prod identity 等于 `previous_deployment_identity`；若发生漂移，record 不得生成。
 * `promotion_mode = deploy_with_migration` 时，不得复用首次安装的 `gateway bootstrap` 阶段；`readiness_checks.jobs_promoted`、`ops_promoted`、`gateway_promoted` 必须分别对应 live prod 上每次关键切换后的 readiness snapshot。
+* `promotion_authority = operational_unblock` 时，该 record 只能表示一次受控运营部署，用于解开成本门禁死锁；不得被解释为 reviewed release candidate promotion。
 
 ### 5.25 `ProdRollbackRecord`
 
