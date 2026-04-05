@@ -323,11 +323,178 @@ jobs:
             exit 1
           fi
 
+  prod-cost:
+    needs:
+      - metadata
+      - local-foundation
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    environment: prod
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      MATRIX_PHASE08_RUN_TIMESTAMP: ${{ needs.metadata.outputs.run_timestamp }}
+      MATRIX_PHASE08_RUN_URL: ${{ needs.metadata.outputs.run_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Require Cloudflare credentials
+        shell: bash
+        run: |
+          test -n "$CLOUDFLARE_ACCOUNT_ID"
+          test -n "$CLOUDFLARE_API_TOKEN"
+
+      - name: Define prod-cost paths
+        id: paths
+        shell: bash
+        run: |
+          state_root=".tmp/github/prod-cost/state"
+          artifact_root=".tmp/github/prod-cost/artifacts"
+          bundle_key="gha/${{ github.run_id }}/${{ github.run_attempt }}/prod/${MATRIX_PHASE08_RUN_TIMESTAMP}/cost-bundle.tgz"
+          raw_artifact_name="phase08-prod-cost-raw-${MATRIX_PHASE08_RUN_TIMESTAMP}-${{ github.run_id }}-${{ github.run_attempt }}"
+          attestation_artifact_name="phase08-prod-cost-attestation-${MATRIX_PHASE08_RUN_TIMESTAMP}-${{ github.run_id }}-${{ github.run_attempt }}"
+          echo "state_root=${state_root}" >> "$GITHUB_OUTPUT"
+          echo "artifact_root=${artifact_root}" >> "$GITHUB_OUTPUT"
+          echo "snapshot=${artifact_root}/prod-cost-snapshot.json" >> "$GITHUB_OUTPUT"
+          echo "deployment_identity=${artifact_root}/prod-deployment-identity.json" >> "$GITHUB_OUTPUT"
+          echo "github_artifact=${state_root}/github-artifact.json" >> "$GITHUB_OUTPUT"
+          echo "bundle_upload=${state_root}/bundle-upload.json" >> "$GITHUB_OUTPUT"
+          echo "provenance=${state_root}/prod-cost-provenance.json" >> "$GITHUB_OUTPUT"
+          echo "attestation=${state_root}/prod-cost-attestation.json" >> "$GITHUB_OUTPUT"
+          echo "bundle_key=${bundle_key}" >> "$GITHUB_OUTPUT"
+          echo "raw_artifact_name=${raw_artifact_name}" >> "$GITHUB_OUTPUT"
+          echo "attestation_artifact_name=${attestation_artifact_name}" >> "$GITHUB_OUTPUT"
+          mkdir -p "$state_root" "$artifact_root"
+
+      - name: Capture production cost snapshot
+        id: snapshot
+        continue-on-error: true
+        run: |
+          node packages/testing/src/cli.mjs prod-cost-snapshot \
+            --timestamp "${MATRIX_PHASE08_RUN_TIMESTAMP}" \
+            --artifact-root "${{ steps.paths.outputs.artifact_root }}" \
+            --output "${{ steps.paths.outputs.snapshot }}" \
+            --captured-by "github-actions:${{ github.actor }}" \
+            --reviewed-by "github-actions-run:${{ github.run_id }}"
+
+      - name: Bundle raw prod-cost artifacts
+        if: always()
+        shell: bash
+        run: |
+          bundle_tmp="${{ steps.paths.outputs.state_root }}/cost-bundle.tgz"
+          tar -czf "$bundle_tmp" \
+            -C "${{ steps.paths.outputs.artifact_root }}" \
+            .
+          mv "$bundle_tmp" "${{ steps.paths.outputs.artifact_root }}/cost-bundle.tgz"
+
+      - name: Upload raw prod-cost artifacts
+        if: always()
+        id: upload_raw
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.paths.outputs.raw_artifact_name }}
+          path: |
+            ${{ steps.paths.outputs.artifact_root }}
+          if-no-files-found: error
+
+      - name: Record GitHub artifact metadata
+        if: always()
+        shell: bash
+        run: |
+          cat > "${{ steps.paths.outputs.github_artifact }}" <<'EOF'
+          {
+            "artifact_name": "${{ steps.paths.outputs.raw_artifact_name }}",
+            "artifact_id": "${{ steps.upload_raw.outputs.artifact-id }}",
+            "artifact_url": "${{ steps.upload_raw.outputs.artifact-url }}",
+            "artifact_digest": "${{ steps.upload_raw.outputs.artifact-digest }}"
+          }
+          EOF
+
+      - name: Upload raw prod-cost bundle to R2
+        if: always()
+        run: |
+          node packages/testing/src/cli.mjs nonlocal-upload-r2 \
+            --bucket "matrix-evidence-prod" \
+            --key "${{ steps.paths.outputs.bundle_key }}" \
+            --file "${{ steps.paths.outputs.artifact_root }}/cost-bundle.tgz" \
+            --content-type "application/gzip" \
+            --output "${{ steps.paths.outputs.bundle_upload }}"
+
+      - name: Write prod-cost provenance
+        if: always()
+        id: provenance
+        continue-on-error: true
+        shell: bash
+        run: |
+          if [ ! -f "${{ steps.paths.outputs.deployment_identity }}" ]; then
+            echo "prod deployment identity missing; cannot attest prod cost snapshot" >&2
+            exit 1
+          fi
+          node packages/testing/src/cli.mjs prod-cost-provenance \
+            --deployment-identity "${{ steps.paths.outputs.deployment_identity }}" \
+            --artifact-upload "${{ steps.paths.outputs.bundle_upload }}" \
+            --github-artifact "${{ steps.paths.outputs.github_artifact }}" \
+            --output "${{ steps.paths.outputs.provenance }}"
+
+      - name: Enforce pre-attestation prod-cost gate
+        if: always()
+        id: prod_cost_gate
+        continue-on-error: true
+        shell: bash
+        run: |
+          if [ "${{ steps.snapshot.outcome }}" != "success" ]; then
+            echo "prod-cost snapshot generation did not pass" >&2
+            exit 1
+          fi
+          if [ "${{ steps.provenance.outcome }}" != "success" ]; then
+            echo "prod-cost provenance generation did not pass" >&2
+            exit 1
+          fi
+
+      - name: Write prod-cost attestation
+        if: steps.prod_cost_gate.outcome == 'success'
+        id: attest
+        continue-on-error: true
+        run: |
+          node packages/testing/src/cli.mjs prod-cost-attest \
+            --timestamp "${MATRIX_PHASE08_RUN_TIMESTAMP}" \
+            --payload "${{ steps.paths.outputs.snapshot }}" \
+            --provenance "${{ steps.paths.outputs.provenance }}" \
+            --output "${{ steps.paths.outputs.attestation }}"
+
+      - name: Upload prod-cost attestation artifact
+        if: steps.prod_cost_gate.outcome == 'success' && steps.attest.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.paths.outputs.attestation_artifact_name }}
+          path: ${{ steps.paths.outputs.attestation }}
+          if-no-files-found: error
+
+      - name: Enforce prod-cost gate
+        if: always()
+        shell: bash
+        run: |
+          if [ "${{ steps.prod_cost_gate.outcome }}" != "success" ]; then
+            echo "prod-cost pre-attestation gate did not pass" >&2
+            exit 1
+          fi
+          if [ "${{ steps.attest.outcome }}" != "success" ]; then
+            echo "prod-cost attestation generation did not pass" >&2
+            exit 1
+          fi
+
   evidence-l1:
     needs:
       - metadata
       - local-foundation
       - nonlocal
+      - prod-cost
     if: always()
     runs-on: ubuntu-latest
     steps:

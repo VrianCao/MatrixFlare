@@ -17,6 +17,7 @@ import { writeL1Evidence } from './evidence.mjs';
 import {
   buildNonLocalEnvironmentPlan,
   buildNonProductionSecretBundle,
+  captureProdCostSnapshot,
   createEnvironmentWranglerConfig,
   deployNonLocalEnvironment,
   ensureNonLocalEnvironmentResources,
@@ -25,6 +26,7 @@ import {
   runEnvironmentBackedSuite,
   startPreReleaseGatewayRollout,
   uploadImmutableArtifactToR2,
+  writeProdCostSnapshotProvenance,
   writeEnvironmentRunProvenance,
   writeEnvironmentRunAttestation,
   writeEnvironmentWranglerConfig,
@@ -415,6 +417,45 @@ async function main() {
       githubRunId: requireOption(options, 'github-run-id'),
       githubRunAttempt: requireOption(options, 'github-run-attempt'),
       deploymentSummary,
+      artifactUpload,
+      githubArtifact,
+      reviewRecordUri: typeof options['review-record-uri'] === 'string' ? options['review-record-uri'] : null,
+    });
+    process.stdout.write(`${JSON.stringify({
+      provenance_path: path.relative(process.cwd(), result.output_path),
+    }, null, 2)}\n`);
+    return;
+  }
+  if (requestedEnvironment === 'prod-cost-snapshot') {
+    const options = parseKeyValueOptions(process.argv);
+    const result = await captureProdCostSnapshot({
+      runTimestamp: requireOption(options, 'timestamp'),
+      outputPath: path.resolve(process.cwd(), requireOption(options, 'output')),
+      artifactRoot: path.resolve(process.cwd(), requireOption(options, 'artifact-root')),
+      fromDate: typeof options.from === 'string' ? options.from : null,
+      toDate: typeof options.to === 'string' ? options.to : null,
+      capturedBy: typeof options['captured-by'] === 'string' ? options['captured-by'] : null,
+      reviewedBy: typeof options['reviewed-by'] === 'string' ? options['reviewed-by'] : null,
+      accountId: typeof options['account-id'] === 'string' ? options['account-id'] : null,
+      apiToken: typeof options['api-token'] === 'string' ? options['api-token'] : null,
+    });
+    process.stdout.write(`${JSON.stringify({
+      output_path: path.relative(process.cwd(), result.output_path),
+      deployment_identity_path: path.relative(process.cwd(), result.deployment_identity_path),
+      billing_usage_path: path.relative(process.cwd(), result.billing_usage_path),
+      resource_snapshot_path: path.relative(process.cwd(), result.resource_snapshot_path),
+    }, null, 2)}\n`);
+    return;
+  }
+  if (requestedEnvironment === 'prod-cost-provenance') {
+    const options = parseKeyValueOptions(process.argv);
+    const deploymentIdentity = await readJsonFile(path.resolve(process.cwd(), requireOption(options, 'deployment-identity')));
+    const artifactUpload = await readJsonFile(path.resolve(process.cwd(), requireOption(options, 'artifact-upload')));
+    const githubArtifact = typeof options['github-artifact'] === 'string'
+      ? await readJsonFile(path.resolve(process.cwd(), options['github-artifact']))
+      : null;
+    const result = await writeProdCostSnapshotProvenance(path.resolve(process.cwd(), requireOption(options, 'output')), {
+      deploymentIdentity,
       artifactUpload,
       githubArtifact,
       reviewRecordUri: typeof options['review-record-uri'] === 'string' ? options['review-record-uri'] : null,

@@ -30,6 +30,7 @@ import {
 import {
   buildEnvironmentRateLimitNamespaceId,
   listEnvironmentRateLimitNamespaces,
+  listProductionRateLimitNamespaces,
 } from './cloudflare-resources.mjs';
 import {
   getTestEnvironmentDirectory,
@@ -41,6 +42,7 @@ const NON_LOCAL_ENVIRONMENT_NAMES = Object.freeze([
   'staging',
   'pre-release',
 ]);
+const PRODUCTION_ENVIRONMENT_NAME = 'prod';
 
 const WORKER_DEPLOYMENT_ORDER = Object.freeze([
   'jobs-worker',
@@ -102,6 +104,7 @@ const NON_LOCAL_READINESS_MAX_DELAY_MS = 15_000;
 const NON_LOCAL_READINESS_REQUEST_TIMEOUT_MS = 10_000;
 const PRE_RELEASE_ROLLOUT_BASELINE_PERCENTAGE = 50;
 const PRE_RELEASE_ROLLOUT_CANDIDATE_PERCENTAGE = 50;
+const BILLING_PERIOD_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 let githubActionsOidcIdentityPromise = null;
 let githubActionsJwksPromise = null;
 
@@ -436,6 +439,10 @@ export function buildWorkerScriptName(workerName, environmentName) {
   return `${buildWorkerScriptBaseName(workerName)}-${assertNonLocalEnvironmentName(environmentName)}`;
 }
 
+function buildProductionWorkerScriptName(workerName) {
+  return `${buildWorkerScriptBaseName(workerName)}-${PRODUCTION_ENVIRONMENT_NAME}`;
+}
+
 function buildResourceSuffix(environmentName) {
   return assertNonLocalEnvironmentName(environmentName);
 }
@@ -519,6 +526,22 @@ export function buildNonLocalEnvironmentPlan(environmentName, {
     }),
     deployment_order: WORKER_DEPLOYMENT_ORDER,
     bootstrap_order: WORKER_BOOTSTRAP_ORDER,
+  });
+}
+
+function buildExpectedProductionCloudflareResources() {
+  return Object.freeze({
+    workers: Object.freeze(listWorkerNames().map((workerName) => buildProductionWorkerScriptName(workerName)).sort()),
+    durable_objects: Object.freeze(listDurableObjectClassNames()),
+    d1_databases: Object.freeze(['matrix-control-and-derived-prod']),
+    r2_buckets: Object.freeze([
+      'matrix-archive-prod',
+      'matrix-evidence-prod',
+      'matrix-media-prod',
+    ].sort()),
+    kv_namespaces: Object.freeze(['matrix-edge-cache-prod']),
+    ratelimit_namespaces: listProductionRateLimitNamespaces(),
+    queues: Object.freeze(QUEUE_BINDING_NAMES.map(([, baseQueueName]) => `${baseQueueName}-prod`).sort()),
   });
 }
 
@@ -1885,6 +1908,630 @@ export async function fetchWorkerBindingState({
   return summarizeWorkerBindingState({
     bindings: extractArrayResult(settingsPayload.result, ['bindings']),
   });
+}
+
+function assertBillingPeriodDate(value, label) {
+  if (!isNonEmptyString(value) || !BILLING_PERIOD_DATE_RE.test(value)) {
+    throw new RangeError(`${label} must use YYYY-MM-DD format`);
+  }
+  return value;
+}
+
+function buildBillingUsageApiPath({
+  fromDate = null,
+  toDate = null,
+} = {}) {
+  const params = new URLSearchParams();
+  if (fromDate != null) {
+    params.set('from', assertBillingPeriodDate(fromDate, 'billing from date'));
+  }
+  if (toDate != null) {
+    params.set('to', assertBillingPeriodDate(toDate, 'billing to date'));
+  }
+  const query = params.toString();
+  return `/billing/usage/paygo${query.length > 0 ? `?${query}` : ''}`;
+}
+
+function normalizeBillingLookupKey(value) {
+  return stableString(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '');
+}
+
+function normalizeBillingUsageRecord(value, index) {
+  if (!isPlainObject(value)) {
+    throw new TypeError(`Cloudflare billing usage record ${index} must be an object`);
+  }
+  const serviceName = stableString(value.ServiceName);
+  const consumedUnit = stableString(value.ConsumedUnit);
+  const billingCurrency = stableString(value.BillingCurrency);
+  const billingPeriodStart = stableString(value.BillingPeriodStart);
+  const chargePeriodStart = stableString(value.ChargePeriodStart);
+  const chargePeriodEnd = stableString(value.ChargePeriodEnd);
+  const consumedQuantity = Number(value.ConsumedQuantity);
+  const contractedCost = Number(value.ContractedCost);
+  const pricingQuantity = Number(value.PricingQuantity);
+  if (!isNonEmptyString(serviceName)) {
+    throw new TypeError(`Cloudflare billing usage record ${index} must include ServiceName`);
+  }
+  if (!isNonEmptyString(consumedUnit)) {
+    throw new TypeError(`Cloudflare billing usage record ${index} must include ConsumedUnit`);
+  }
+  if (!isNonEmptyString(billingCurrency)) {
+    throw new TypeError(`Cloudflare billing usage record ${index} must include BillingCurrency`);
+  }
+  if (!Number.isFinite(consumedQuantity) || consumedQuantity < 0) {
+    throw new TypeError(`Cloudflare billing usage record ${index} must include a non-negative ConsumedQuantity`);
+  }
+  if (!Number.isFinite(contractedCost) || contractedCost < 0) {
+    throw new TypeError(`Cloudflare billing usage record ${index} must include a non-negative ContractedCost`);
+  }
+  if (!Number.isFinite(pricingQuantity) || pricingQuantity < 0) {
+    throw new TypeError(`Cloudflare billing usage record ${index} must include a non-negative PricingQuantity`);
+  }
+  if (!isNonEmptyString(billingPeriodStart) || !Number.isFinite(Date.parse(billingPeriodStart))) {
+    throw new TypeError(`Cloudflare billing usage record ${index} must include a valid BillingPeriodStart`);
+  }
+  if (!isNonEmptyString(chargePeriodStart) || !Number.isFinite(Date.parse(chargePeriodStart))) {
+    throw new TypeError(`Cloudflare billing usage record ${index} must include a valid ChargePeriodStart`);
+  }
+  if (!isNonEmptyString(chargePeriodEnd) || !Number.isFinite(Date.parse(chargePeriodEnd))) {
+    throw new TypeError(`Cloudflare billing usage record ${index} must include a valid ChargePeriodEnd`);
+  }
+  return Object.freeze({
+    service_name: serviceName,
+    service_key: normalizeBillingLookupKey(serviceName),
+    consumed_unit: consumedUnit,
+    unit_key: normalizeBillingLookupKey(consumedUnit),
+    billing_currency: billingCurrency,
+    billing_period_start: billingPeriodStart,
+    charge_period_start: chargePeriodStart,
+    charge_period_end: chargePeriodEnd,
+    consumed_quantity: consumedQuantity,
+    contracted_cost: contractedCost,
+    pricing_quantity: pricingQuantity,
+  });
+}
+
+function createZeroProdCostSurfaces() {
+  return {
+    workers: {
+      request_count: 0,
+      cpu_ms: 0,
+      log_event_count: 0,
+    },
+    durable_objects: {
+      request_count: 0,
+      duration_gb_s: 0,
+      sqlite_row_reads: 0,
+      sqlite_row_writes: 0,
+      sql_storage_gb_month: 0,
+    },
+    d1: {
+      read_rows: 0,
+      write_rows: 0,
+      storage_gb_month: 0,
+    },
+    r2: {
+      storage_gb_month: 0,
+      class_a_ops: 0,
+      class_b_ops: 0,
+    },
+    kv: {
+      read_ops: 0,
+      write_ops: 0,
+      delete_ops: 0,
+      list_ops: 0,
+      storage_gb_month: 0,
+    },
+    queues: {
+      write_ops: 0,
+      read_ops: 0,
+      delete_ops: 0,
+    },
+  };
+}
+
+function incrementSurfaceMetric(costSurfaces, surfaceName, metricName, value) {
+  if (!Number.isFinite(value) || value < 0) {
+    throw new TypeError(`cost surface ${surfaceName}.${metricName} must be a non-negative number`);
+  }
+  costSurfaces[surfaceName][metricName] = Number(costSurfaces[surfaceName][metricName] ?? 0) + value;
+}
+
+function classifyBillingUsageRecord(record) {
+  const serviceKey = record.service_key;
+  const unitKey = record.unit_key;
+  if (serviceKey.includes('trace') || serviceKey.includes('opentelemetry') || serviceKey.includes('logpush')) {
+    return {
+      unsupported_reason: `telemetry-export billing record ${record.service_name}/${record.consumed_unit} remains unresolved under OQ-0002`,
+    };
+  }
+  if (
+    serviceKey.includes('workers')
+    && (unitKey === 'month' || unitKey === 'months' || unitKey.includes('subscription'))
+  ) {
+    return {
+      pass_through_kind: 'workers_subscription',
+    };
+  }
+  if (serviceKey.includes('workerslogs') && unitKey.includes('logevent')) {
+    return { surface_name: 'workers', metric_name: 'log_event_count' };
+  }
+  if (
+    serviceKey === 'workers'
+    || serviceKey.includes('workersstandard')
+    || serviceKey.includes('pagesfunctions')
+  ) {
+    if (unitKey.includes('request')) {
+      return { surface_name: 'workers', metric_name: 'request_count' };
+    }
+    if (unitKey.includes('cpu') && (unitKey.includes('ms') || unitKey.includes('millisecond'))) {
+      return { surface_name: 'workers', metric_name: 'cpu_ms' };
+    }
+  }
+  if (serviceKey.includes('durableobjects')) {
+    if (unitKey.includes('request')) {
+      return { surface_name: 'durable_objects', metric_name: 'request_count' };
+    }
+    if (unitKey.includes('duration') && unitKey.includes('gb')) {
+      return { surface_name: 'durable_objects', metric_name: 'duration_gb_s' };
+    }
+    if (unitKey.includes('row') && unitKey.includes('read')) {
+      return { surface_name: 'durable_objects', metric_name: 'sqlite_row_reads' };
+    }
+    if (unitKey.includes('row') && (unitKey.includes('write') || unitKey.includes('written'))) {
+      return { surface_name: 'durable_objects', metric_name: 'sqlite_row_writes' };
+    }
+    if (
+      unitKey.includes('storage')
+      || unitKey.includes('storeddata')
+      || (unitKey.includes('gbmonth') && unitKey.includes('sql'))
+    ) {
+      return { surface_name: 'durable_objects', metric_name: 'sql_storage_gb_month' };
+    }
+  }
+  if (serviceKey === 'd1' || serviceKey.includes('workersd1')) {
+    if (unitKey.includes('row') && unitKey.includes('read')) {
+      return { surface_name: 'd1', metric_name: 'read_rows' };
+    }
+    if (unitKey.includes('row') && (unitKey.includes('write') || unitKey.includes('written'))) {
+      return { surface_name: 'd1', metric_name: 'write_rows' };
+    }
+    if (unitKey.includes('storage') || unitKey.includes('gbmonth')) {
+      return { surface_name: 'd1', metric_name: 'storage_gb_month' };
+    }
+  }
+  if (serviceKey === 'r2' || serviceKey.startsWith('r2')) {
+    if (unitKey.includes('classa')) {
+      return { surface_name: 'r2', metric_name: 'class_a_ops' };
+    }
+    if (unitKey.includes('classb')) {
+      return { surface_name: 'r2', metric_name: 'class_b_ops' };
+    }
+    if (unitKey.includes('storage') || unitKey.includes('gbmonth')) {
+      if (serviceKey.includes('infrequentaccess') || unitKey.includes('retrieval')) {
+        return {
+          unsupported_reason: `R2 Infrequent Access billing record ${record.service_name}/${record.consumed_unit} is not representable by the current ProdCostSnapshot contract`,
+        };
+      }
+      return { surface_name: 'r2', metric_name: 'storage_gb_month' };
+    }
+    if (unitKey.includes('retrieval')) {
+      return {
+        unsupported_reason: `R2 retrieval billing record ${record.service_name}/${record.consumed_unit} is not representable by the current ProdCostSnapshot contract`,
+      };
+    }
+  }
+  if (serviceKey === 'kv' || serviceKey.includes('workerskv')) {
+    if (unitKey.includes('list')) {
+      return { surface_name: 'kv', metric_name: 'list_ops' };
+    }
+    if (unitKey.includes('delete')) {
+      return { surface_name: 'kv', metric_name: 'delete_ops' };
+    }
+    if (unitKey.includes('write') || unitKey.includes('written')) {
+      return { surface_name: 'kv', metric_name: 'write_ops' };
+    }
+    if (unitKey.includes('read')) {
+      return { surface_name: 'kv', metric_name: 'read_ops' };
+    }
+    if (unitKey.includes('storage') || unitKey.includes('gbmonth')) {
+      return { surface_name: 'kv', metric_name: 'storage_gb_month' };
+    }
+  }
+  if (serviceKey.includes('queues')) {
+    if (unitKey.includes('write')) {
+      return { surface_name: 'queues', metric_name: 'write_ops' };
+    }
+    if (unitKey.includes('read')) {
+      return { surface_name: 'queues', metric_name: 'read_ops' };
+    }
+    if (unitKey.includes('delete')) {
+      return { surface_name: 'queues', metric_name: 'delete_ops' };
+    }
+    if (unitKey.includes('operation')) {
+      return {
+        unsupported_reason: `Queues billing record ${record.service_name}/${record.consumed_unit} does not distinguish write/read/delete operations`,
+      };
+    }
+  }
+  return {
+    unsupported_reason: `unsupported billing usage record ${record.service_name}/${record.consumed_unit}`,
+  };
+}
+
+function calculateModeledProdCost(costSurfaces, {
+  passThroughFixedCostUsd = 0,
+} = {}) {
+  let modeledTotal = 0;
+  const addOverage = (quantity, included, unitPricePerMillion) => {
+    modeledTotal += Math.max(0, quantity - included) / 1_000_000 * unitPricePerMillion;
+  };
+  const addStorageOverage = (quantity, included, pricePerGbMonth) => {
+    modeledTotal += Math.max(0, quantity - included) * pricePerGbMonth;
+  };
+  addOverage(costSurfaces.workers.request_count, 10_000_000, 0.30);
+  addOverage(costSurfaces.workers.cpu_ms, 30_000_000, 0.02);
+  addOverage(costSurfaces.workers.log_event_count, 20_000_000, 0.60);
+  addOverage(costSurfaces.durable_objects.request_count, 1_000_000, 0.15);
+  addOverage(costSurfaces.durable_objects.duration_gb_s, 400_000, 12.50);
+  addOverage(costSurfaces.durable_objects.sqlite_row_reads, 25_000_000_000, 0.001);
+  addOverage(costSurfaces.durable_objects.sqlite_row_writes, 50_000_000, 1.00);
+  addStorageOverage(costSurfaces.durable_objects.sql_storage_gb_month, 5, 0.20);
+  addOverage(costSurfaces.d1.read_rows, 25_000_000_000, 0.001);
+  addOverage(costSurfaces.d1.write_rows, 50_000_000, 1.00);
+  addStorageOverage(costSurfaces.d1.storage_gb_month, 5, 0.75);
+  addStorageOverage(costSurfaces.r2.storage_gb_month, 10, 0.015);
+  addOverage(costSurfaces.r2.class_a_ops, 1_000_000, 4.50);
+  addOverage(costSurfaces.r2.class_b_ops, 10_000_000, 0.36);
+  addOverage(costSurfaces.kv.read_ops, 10_000_000, 0.50);
+  addOverage(costSurfaces.kv.write_ops, 1_000_000, 5.00);
+  addOverage(costSurfaces.kv.delete_ops, 1_000_000, 5.00);
+  addOverage(costSurfaces.kv.list_ops, 1_000_000, 5.00);
+  addStorageOverage(costSurfaces.kv.storage_gb_month, 1, 0.50);
+  const queueTotalOps = costSurfaces.queues.write_ops + costSurfaces.queues.read_ops + costSurfaces.queues.delete_ops;
+  addOverage(queueTotalOps, 1_000_000, 0.40);
+  modeledTotal += passThroughFixedCostUsd;
+  return modeledTotal;
+}
+
+function buildProdCostModelComparison(actualTotalUsd, modeledTotalUsd, {
+  passThroughFixedCostUsd = 0,
+} = {}) {
+  const denominator = Math.max(actualTotalUsd, modeledTotalUsd, 1);
+  const driftRatio = denominator === 0 ? 0 : Math.abs(actualTotalUsd - modeledTotalUsd) / denominator;
+  const status = driftRatio <= 0.10
+    ? 'within_expected'
+    : driftRatio <= 0.25
+      ? 'review_required'
+      : 'out_of_expected';
+  const summaryParts = [];
+  if (passThroughFixedCostUsd > 0) {
+    summaryParts.push(`pass-through fixed charges ${passThroughFixedCostUsd.toFixed(2)} USD`);
+  }
+  summaryParts.push(`actual ${actualTotalUsd.toFixed(2)} USD vs modeled ${modeledTotalUsd.toFixed(2)} USD`);
+  if (status === 'within_expected') {
+    summaryParts.push('no abnormal budget drift detected');
+  } else if (status === 'review_required') {
+    summaryParts.push('drift exceeds the normal review threshold');
+  } else {
+    summaryParts.push('drift is outside the expected budget range');
+  }
+  return Object.freeze({
+    status,
+    summary: summaryParts.join('; '),
+    actual_total_usd: actualTotalUsd,
+    modeled_total_usd: modeledTotalUsd,
+    drift_ratio: driftRatio,
+  });
+}
+
+function aggregateProdCostSurfaces(billingUsageRecords) {
+  const costSurfaces = createZeroProdCostSurfaces();
+  let actualTotalUsd = 0;
+  let matchedRecordCount = 0;
+  let passThroughFixedCostUsd = 0;
+  const unsupportedReasons = [];
+  for (const record of billingUsageRecords) {
+    const classification = classifyBillingUsageRecord(record);
+    if (classification.unsupported_reason) {
+      if (record.contracted_cost > 0 || record.consumed_quantity > 0) {
+        unsupportedReasons.push(classification.unsupported_reason);
+      }
+      continue;
+    }
+    matchedRecordCount += 1;
+    actualTotalUsd += record.contracted_cost;
+    if (classification.pass_through_kind != null) {
+      passThroughFixedCostUsd += record.contracted_cost;
+      continue;
+    }
+    incrementSurfaceMetric(costSurfaces, classification.surface_name, classification.metric_name, record.consumed_quantity);
+  }
+  if (matchedRecordCount === 0) {
+    throw new Error('Cloudflare billing usage API did not return any recognizable records for the production account');
+  }
+  if (unsupportedReasons.length > 0) {
+    throw new Error(`Cloudflare billing usage records remain unsupported for prod cost normalization: ${unsupportedReasons.join('; ')}`);
+  }
+  const modeledTotalUsd = calculateModeledProdCost(costSurfaces, {
+    passThroughFixedCostUsd,
+  });
+  return Object.freeze({
+    cost_surfaces: costSurfaces,
+    model_comparison: buildProdCostModelComparison(actualTotalUsd, modeledTotalUsd, {
+      passThroughFixedCostUsd,
+    }),
+  });
+}
+
+function deriveBillingPeriodFromUsageRecords(billingUsageRecords) {
+  const starts = billingUsageRecords.map((record) => Date.parse(record.billing_period_start));
+  const ends = billingUsageRecords.map((record) => Date.parse(record.charge_period_end));
+  return Object.freeze({
+    start: new Date(Math.min(...starts)).toISOString(),
+    end: new Date(Math.max(...ends)).toISOString(),
+  });
+}
+
+async function listProdCloudflareResourceNames({
+  accountId,
+  apiToken,
+}, {
+  callCloudflareApiImpl = callCloudflareApi,
+} = {}) {
+  const [databasesPayload, kvNamespacesPayload, bucketsPayload, queuesPayload] = await Promise.all([
+    callCloudflareApiImpl({
+      accountId,
+      apiToken,
+      pathname: '/d1/database',
+    }),
+    callCloudflareApiImpl({
+      accountId,
+      apiToken,
+      pathname: '/storage/kv/namespaces',
+    }),
+    callCloudflareApiImpl({
+      accountId,
+      apiToken,
+      pathname: '/r2/buckets',
+    }),
+    callCloudflareApiImpl({
+      accountId,
+      apiToken,
+      pathname: '/queues',
+    }),
+  ]);
+  return Object.freeze({
+    d1_databases: Object.freeze(extractArrayResult(databasesPayload.result).map((entry) => extractStringField(entry, ['name', 'database_name'])).filter(Boolean).sort()),
+    kv_namespaces: Object.freeze(extractArrayResult(kvNamespacesPayload.result).map((entry) => extractStringField(entry, ['title', 'namespace'])).filter(Boolean).sort()),
+    r2_buckets: Object.freeze(extractArrayResult(bucketsPayload.result, ['buckets']).map((entry) => extractStringField(entry, ['name'])).filter(Boolean).sort()),
+    queues: Object.freeze(extractArrayResult(queuesPayload.result).map((entry) => extractStringField(entry, ['queue_name', 'name'])).filter(Boolean).sort()),
+  });
+}
+
+function assertProdResourcesPresent(actualResourceNames, expectedResources) {
+  const mismatches = [];
+  const requiredKeys = ['d1_databases', 'kv_namespaces', 'r2_buckets', 'queues'];
+  for (const key of requiredKeys) {
+    const actualNames = new Set(actualResourceNames[key]);
+    const missingNames = expectedResources[key].filter((entry) => !actualNames.has(entry));
+    if (missingNames.length > 0) {
+      mismatches.push(`${key}: missing ${missingNames.join(', ')}`);
+    }
+  }
+  if (mismatches.length > 0) {
+    throw new Error(`production Cloudflare resources are incomplete: ${mismatches.join('; ')}`);
+  }
+}
+
+export function buildProdCostSnapshotProvenance({
+  githubRepository,
+  githubRunId,
+  githubRunAttempt,
+  oidcClaims = null,
+  deploymentIdentity,
+  artifactUpload,
+  githubArtifact = null,
+  reviewRecordUri = null,
+}) {
+  if (oidcClaims != null) {
+    if (String(oidcClaims.repository ?? '') !== String(githubRepository ?? '')) {
+      throw new Error('GitHub Actions OIDC repository claim must match provenance repository');
+    }
+    if (String(oidcClaims.run_id ?? '') !== String(githubRunId ?? '')) {
+      throw new Error('GitHub Actions OIDC run_id claim must match provenance run id');
+    }
+    if (String(oidcClaims.run_attempt ?? '') !== String(githubRunAttempt ?? '')) {
+      throw new Error('GitHub Actions OIDC run_attempt claim must match provenance run attempt');
+    }
+  }
+  if (deploymentIdentity?.environment_id !== PRODUCTION_ENVIRONMENT_NAME) {
+    throw new Error('deployment identity environment_id must equal prod');
+  }
+  if (artifactUpload?.object_uri !== `r2://${artifactUpload?.bucket_name}/${artifactUpload?.object_key}`) {
+    throw new Error('artifact upload must provide a canonical immutable R2 object_uri');
+  }
+  const originRunUri = buildGitHubRunUrl(githubRepository, githubRunId);
+  const provenance = {
+    origin_system: 'github-actions',
+    origin_repository: String(githubRepository),
+    origin_run_id: String(githubRunId),
+    origin_run_attempt: Number(githubRunAttempt),
+    origin_run_uri: originRunUri,
+    artifact_store_uri: artifactUpload.object_uri,
+    artifact_store_key: artifactUpload.object_key,
+    artifact_sha256: artifactUpload.file_sha256,
+    review_record_uri: reviewRecordUri ?? originRunUri,
+    topology_kind: 'cloudflare-prod',
+    deployment_identity: structuredCloneJson(deploymentIdentity),
+  };
+  if (githubArtifact != null) {
+    provenance.origin_artifact = structuredCloneJson(githubArtifact);
+  }
+  return provenance;
+}
+
+export async function writeProdCostSnapshotProvenance(outputPath, options, {
+  requireGitHubActionsExecutionImpl = requireGitHubActionsExecution,
+} = {}) {
+  const claims = await requireGitHubActionsExecutionImpl('writeProdCostSnapshotProvenance', {
+    expectedEnvironmentName: PRODUCTION_ENVIRONMENT_NAME,
+  });
+  const provenance = buildProdCostSnapshotProvenance({
+    ...options,
+    githubRepository: String(claims.repository),
+    githubRunId: String(claims.run_id),
+    githubRunAttempt: String(claims.run_attempt),
+    oidcClaims: claims,
+  });
+  await fs.mkdir(path.dirname(outputPath), { recursive: true });
+  await fs.writeFile(outputPath, stableJson(provenance));
+  return {
+    output_path: outputPath,
+    provenance,
+  };
+}
+
+export async function captureProdCostSnapshot({
+  runTimestamp,
+  outputPath,
+  artifactRoot,
+  fromDate = null,
+  toDate = null,
+  capturedBy = null,
+  reviewedBy = null,
+  accountId: explicitAccountId = null,
+  apiToken: explicitApiToken = null,
+} = {}, {
+  requireGitHubActionsExecutionImpl = requireGitHubActionsExecution,
+  requireCloudflareCredentialsImpl = requireCloudflareCredentials,
+  callCloudflareApiImpl = callCloudflareApi,
+  fetchWorkerDeploymentStateImpl = fetchWorkerDeploymentState,
+  fetchWorkerBindingStateImpl = fetchWorkerBindingState,
+} = {}) {
+  const claims = await requireGitHubActionsExecutionImpl('captureProdCostSnapshot', {
+    expectedEnvironmentName: PRODUCTION_ENVIRONMENT_NAME,
+  });
+  if (!isNonEmptyString(runTimestamp)) {
+    throw new RangeError('runTimestamp is required');
+  }
+  const { accountId, apiToken } = requireCloudflareCredentialsImpl({
+    accountId: explicitAccountId,
+    apiToken: explicitApiToken,
+  });
+  const expectedResources = buildExpectedProductionCloudflareResources();
+  const resolvedArtifactRoot = path.resolve(artifactRoot ?? path.join(process.cwd(), '.tmp', 'prod-cost'));
+  await fs.mkdir(resolvedArtifactRoot, { recursive: true });
+
+  const workerStateEntries = await Promise.all(expectedResources.workers.map(async (scriptName) => ({
+    script_name: scriptName,
+    state: await fetchWorkerDeploymentStateImpl({
+      accountId,
+      apiToken,
+      scriptName,
+      allowMissingScript: false,
+    }),
+  })));
+  const gatewayBindingState = await fetchWorkerBindingStateImpl({
+    accountId,
+    apiToken,
+    scriptName: buildProductionWorkerScriptName('gateway-worker'),
+  });
+  const actualResourceNames = await listProdCloudflareResourceNames({
+    accountId,
+    apiToken,
+  }, {
+    callCloudflareApiImpl,
+  });
+  const billingUsagePath = path.join(resolvedArtifactRoot, 'billing-usage-paygo.json');
+  const workerStatePath = path.join(resolvedArtifactRoot, 'prod-worker-state.json');
+  const resourceSnapshotPath = path.join(resolvedArtifactRoot, 'prod-resource-snapshot.json');
+  const deploymentIdentityPath = path.join(resolvedArtifactRoot, 'prod-deployment-identity.json');
+
+  const billingUsagePathname = buildBillingUsageApiPath({
+    fromDate,
+    toDate,
+  });
+  const billingUsagePayload = await callCloudflareApiImpl({
+    accountId,
+    apiToken,
+    pathname: billingUsagePathname,
+  });
+  await Promise.all([
+    fs.writeFile(billingUsagePath, stableJson(billingUsagePayload)),
+    fs.writeFile(workerStatePath, stableJson(workerStateEntries)),
+    fs.writeFile(resourceSnapshotPath, stableJson({
+      expected_resources: expectedResources,
+      actual_resource_names: actualResourceNames,
+      gateway_binding_state: gatewayBindingState,
+    })),
+  ]);
+
+  const billingUsageRecords = extractArrayResult(billingUsagePayload.result).map((entry, index) => normalizeBillingUsageRecord(entry, index));
+  if (billingUsageRecords.length === 0) {
+    throw new Error('Cloudflare billing usage API returned zero records for the requested production billing window');
+  }
+  const billingCurrencies = sortUniqueStringArray(billingUsageRecords.map((record) => record.billing_currency));
+  if (billingCurrencies.length !== 1) {
+    throw new Error(`Cloudflare billing usage API returned multiple billing currencies: ${billingCurrencies.join(', ')}`);
+  }
+  assertProdResourcesPresent(actualResourceNames, expectedResources);
+  const gatewayRatelimitNamespaces = sortUniqueStringArray(gatewayBindingState.ratelimit_namespace_ids ?? []);
+  const expectedRatelimitNamespaces = [...expectedResources.ratelimit_namespaces];
+  if (JSON.stringify(gatewayRatelimitNamespaces) !== JSON.stringify(expectedRatelimitNamespaces)) {
+    throw new Error(`gateway-worker prod ratelimit namespaces must match expected production bindings ${expectedRatelimitNamespaces.join(', ')}`);
+  }
+  const deploymentIdentity = {
+    environment_id: PRODUCTION_ENVIRONMENT_NAME,
+    deployment_ids: workerStateEntries.map((entry) => {
+      if (!isNonEmptyString(entry.state.latest_active_deployment_id)) {
+        throw new Error(`Cloudflare did not expose an active deployment id for ${entry.script_name}`);
+      }
+      return entry.state.latest_active_deployment_id;
+    }),
+    worker_version_ids: workerStateEntries.map((entry) => {
+      const activeVersionId = entry.state.active_worker_version_ids?.[0] ?? null;
+      if (!isNonEmptyString(activeVersionId)) {
+        throw new Error(`Cloudflare did not expose an active worker version id for ${entry.script_name}`);
+      }
+      return activeVersionId;
+    }),
+  };
+  await fs.writeFile(deploymentIdentityPath, stableJson(deploymentIdentity));
+
+  const aggregated = aggregateProdCostSurfaces(billingUsageRecords);
+  const snapshot = {
+    artifact_id: 'prod_cost_snapshot',
+    source_environment: PRODUCTION_ENVIRONMENT_NAME,
+    run_timestamp: runTimestamp,
+    captured_at: new Date().toISOString(),
+    captured_by: capturedBy ?? `github-actions:${process.env.GITHUB_ACTOR ?? 'unknown'}`,
+    reviewed_by: reviewedBy ?? `github-actions-run:${claims.run_id}`,
+    source_dashboard_uri: `https://api.cloudflare.com/client/v4/accounts/${accountId}${billingUsagePathname}`,
+    topology_kind: 'cloudflare-prod',
+    cloudflare_resources: expectedResources,
+    billing_period: deriveBillingPeriodFromUsageRecords(billingUsageRecords),
+    cost_surfaces: aggregated.cost_surfaces,
+    model_comparison: aggregated.model_comparison,
+  };
+  const validation = validateManualArtifactPayload('prod_cost_snapshot', snapshot, {
+    runTimestamp,
+  });
+  if (!validation.valid) {
+    throw new Error(`Generated prod_cost_snapshot payload is invalid: ${validation.error}`);
+  }
+  await fs.mkdir(path.dirname(outputPath), { recursive: true });
+  await fs.writeFile(outputPath, stableJson(snapshot));
+  return {
+    output_path: outputPath,
+    deployment_identity_path: deploymentIdentityPath,
+    billing_usage_path: billingUsagePath,
+    resource_snapshot_path: resourceSnapshotPath,
+    snapshot,
+    deployment_identity: deploymentIdentity,
+  };
 }
 
 function isMissingWorkerScriptObservationError(scriptName, error) {

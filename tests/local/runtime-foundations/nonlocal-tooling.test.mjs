@@ -7,6 +7,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 import {
+  buildProdCostSnapshotProvenance,
   buildPreReleaseRolloutVersionSpecs,
   buildEnvironmentRunProvenance,
   buildGitHubRunUrl,
@@ -17,6 +18,7 @@ import {
   buildWranglerDeployArguments,
   buildRuntimeWorkerVersionTag,
   buildWorkerScriptName,
+  captureProdCostSnapshot,
   createEnvironmentWranglerConfig,
   fetchWorkerDeploymentState,
   resolveFreshCloudflareIdentity,
@@ -27,6 +29,7 @@ import {
   validateLatestActiveCloudflareWorkerIdentity,
   validateRemoteHarnessEnvironmentVariables,
   waitForNonLocalDeploymentReadiness,
+  writeProdCostSnapshotProvenance,
   writeProdCostSnapshotAttestation,
   writeEnvironmentWranglerConfig,
   writeEnvironmentRunProvenance,
@@ -34,6 +37,9 @@ import {
 import {
   buildEnvironmentRateLimitNamespaceId,
 } from '../../../packages/testing/src/cloudflare-resources.mjs';
+import {
+  validateManualArtifactPayload,
+} from '../../../packages/testing/src/evidence.mjs';
 import {
   GATEWAY_RATE_LIMIT_BINDING_DEFINITIONS,
 } from '../../../packages/runtime-core/src/abuse-guard.mjs';
@@ -2744,6 +2750,437 @@ test('prod cost attestation writing requires the GitHub Actions prod environment
   );
 });
 
+test('prod cost snapshot capture requires the GitHub Actions prod environment claim', async () => {
+  await assert.rejects(
+    () => captureProdCostSnapshot({
+      runTimestamp: '20260405T010203Z',
+      artifactRoot: '/tmp/unused-prod-cost-artifacts',
+      outputPath: '/tmp/unused-prod-cost-snapshot.json',
+    }, {
+      requireGitHubActionsExecutionImpl: async (operationName, {
+        expectedEnvironmentName = null,
+      } = {}) => {
+        assert.equal(operationName, 'captureProdCostSnapshot');
+        assert.equal(expectedEnvironmentName, 'prod');
+        throw new Error('stop after verifying expected prod environment');
+      },
+    }),
+    /stop after verifying expected prod environment/,
+  );
+});
+
+test('prod cost snapshot capture normalizes official billing usage into a valid prod_cost_snapshot payload', async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-prod-cost-snapshot-'));
+  const outputPath = path.join(tempRoot, 'snapshot.json');
+  const artifactRoot = path.join(tempRoot, 'artifacts');
+  const runTimestamp = '20260405T010203Z';
+  const billingRecords = [
+    {
+      BillingCurrency: 'USD',
+      BillingPeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodEnd: '2026-04-30T00:00:00Z',
+      ConsumedQuantity: 1,
+      ConsumedUnit: 'Month',
+      ContractedCost: 5,
+      PricingQuantity: 1,
+      ServiceName: 'Workers Paid Plan',
+    },
+    {
+      BillingCurrency: 'USD',
+      BillingPeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodEnd: '2026-04-30T00:00:00Z',
+      ConsumedQuantity: 12_000_000,
+      ConsumedUnit: 'Requests',
+      ContractedCost: 0.6,
+      PricingQuantity: 12_000_000,
+      ServiceName: 'Workers Standard',
+    },
+    {
+      BillingCurrency: 'USD',
+      BillingPeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodEnd: '2026-04-30T00:00:00Z',
+      ConsumedQuantity: 35_000_000,
+      ConsumedUnit: 'CPU Milliseconds',
+      ContractedCost: 0.1,
+      PricingQuantity: 35_000_000,
+      ServiceName: 'Workers Standard',
+    },
+    {
+      BillingCurrency: 'USD',
+      BillingPeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodEnd: '2026-04-30T00:00:00Z',
+      ConsumedQuantity: 25_000_000,
+      ConsumedUnit: 'Log Events Written',
+      ContractedCost: 3,
+      PricingQuantity: 25_000_000,
+      ServiceName: 'Workers Logs',
+    },
+    {
+      BillingCurrency: 'USD',
+      BillingPeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodEnd: '2026-04-30T00:00:00Z',
+      ConsumedQuantity: 1_500_000,
+      ConsumedUnit: 'Requests',
+      ContractedCost: 0.075,
+      PricingQuantity: 1_500_000,
+      ServiceName: 'Durable Objects',
+    },
+    {
+      BillingCurrency: 'USD',
+      BillingPeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodEnd: '2026-04-30T00:00:00Z',
+      ConsumedQuantity: 500_000,
+      ConsumedUnit: 'Duration GB-s',
+      ContractedCost: 1.25,
+      PricingQuantity: 500_000,
+      ServiceName: 'Durable Objects',
+    },
+    {
+      BillingCurrency: 'USD',
+      BillingPeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodEnd: '2026-04-30T00:00:00Z',
+      ConsumedQuantity: 26_000_000_000,
+      ConsumedUnit: 'Rows Read',
+      ContractedCost: 1,
+      PricingQuantity: 26_000_000_000,
+      ServiceName: 'Durable Objects',
+    },
+    {
+      BillingCurrency: 'USD',
+      BillingPeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodEnd: '2026-04-30T00:00:00Z',
+      ConsumedQuantity: 52_000_000,
+      ConsumedUnit: 'Rows Written',
+      ContractedCost: 2,
+      PricingQuantity: 52_000_000,
+      ServiceName: 'Durable Objects',
+    },
+    {
+      BillingCurrency: 'USD',
+      BillingPeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodEnd: '2026-04-30T00:00:00Z',
+      ConsumedQuantity: 7,
+      ConsumedUnit: 'SQL Storage GB-Month',
+      ContractedCost: 0.4,
+      PricingQuantity: 7,
+      ServiceName: 'Durable Objects',
+    },
+    {
+      BillingCurrency: 'USD',
+      BillingPeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodEnd: '2026-04-30T00:00:00Z',
+      ConsumedQuantity: 26_000_000_000,
+      ConsumedUnit: 'Rows Read',
+      ContractedCost: 1,
+      PricingQuantity: 26_000_000_000,
+      ServiceName: 'D1',
+    },
+    {
+      BillingCurrency: 'USD',
+      BillingPeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodEnd: '2026-04-30T00:00:00Z',
+      ConsumedQuantity: 51_000_000,
+      ConsumedUnit: 'Rows Written',
+      ContractedCost: 1,
+      PricingQuantity: 51_000_000,
+      ServiceName: 'D1',
+    },
+    {
+      BillingCurrency: 'USD',
+      BillingPeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodEnd: '2026-04-30T00:00:00Z',
+      ConsumedQuantity: 6,
+      ConsumedUnit: 'Storage GB-Month',
+      ContractedCost: 0.75,
+      PricingQuantity: 6,
+      ServiceName: 'D1',
+    },
+    {
+      BillingCurrency: 'USD',
+      BillingPeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodEnd: '2026-04-30T00:00:00Z',
+      ConsumedQuantity: 12,
+      ConsumedUnit: 'Storage GB-Month',
+      ContractedCost: 0.03,
+      PricingQuantity: 12,
+      ServiceName: 'R2',
+    },
+    {
+      BillingCurrency: 'USD',
+      BillingPeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodEnd: '2026-04-30T00:00:00Z',
+      ConsumedQuantity: 2_000_000,
+      ConsumedUnit: 'Class A Operations',
+      ContractedCost: 4.5,
+      PricingQuantity: 2_000_000,
+      ServiceName: 'R2',
+    },
+    {
+      BillingCurrency: 'USD',
+      BillingPeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodEnd: '2026-04-30T00:00:00Z',
+      ConsumedQuantity: 12_000_000,
+      ConsumedUnit: 'Class B Operations',
+      ContractedCost: 0.72,
+      PricingQuantity: 12_000_000,
+      ServiceName: 'R2',
+    },
+    {
+      BillingCurrency: 'USD',
+      BillingPeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodEnd: '2026-04-30T00:00:00Z',
+      ConsumedQuantity: 12_000_000,
+      ConsumedUnit: 'Keys Read',
+      ContractedCost: 1,
+      PricingQuantity: 12_000_000,
+      ServiceName: 'Workers KV',
+    },
+    {
+      BillingCurrency: 'USD',
+      BillingPeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodEnd: '2026-04-30T00:00:00Z',
+      ConsumedQuantity: 2_000_000,
+      ConsumedUnit: 'Keys Written',
+      ContractedCost: 5,
+      PricingQuantity: 2_000_000,
+      ServiceName: 'Workers KV',
+    },
+    {
+      BillingCurrency: 'USD',
+      BillingPeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodEnd: '2026-04-30T00:00:00Z',
+      ConsumedQuantity: 1_500_000,
+      ConsumedUnit: 'Keys Deleted',
+      ContractedCost: 2.5,
+      PricingQuantity: 1_500_000,
+      ServiceName: 'Workers KV',
+    },
+    {
+      BillingCurrency: 'USD',
+      BillingPeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodEnd: '2026-04-30T00:00:00Z',
+      ConsumedQuantity: 1_400_000,
+      ConsumedUnit: 'List Requests',
+      ContractedCost: 2,
+      PricingQuantity: 1_400_000,
+      ServiceName: 'Workers KV',
+    },
+    {
+      BillingCurrency: 'USD',
+      BillingPeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodEnd: '2026-04-30T00:00:00Z',
+      ConsumedQuantity: 2,
+      ConsumedUnit: 'Storage GB-Month',
+      ContractedCost: 0.5,
+      PricingQuantity: 2,
+      ServiceName: 'Workers KV',
+    },
+    {
+      BillingCurrency: 'USD',
+      BillingPeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodEnd: '2026-04-30T00:00:00Z',
+      ConsumedQuantity: 300_000,
+      ConsumedUnit: 'Write Operations',
+      ContractedCost: 0,
+      PricingQuantity: 300_000,
+      ServiceName: 'Queues',
+    },
+    {
+      BillingCurrency: 'USD',
+      BillingPeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodEnd: '2026-04-30T00:00:00Z',
+      ConsumedQuantity: 300_000,
+      ConsumedUnit: 'Read Operations',
+      ContractedCost: 0,
+      PricingQuantity: 300_000,
+      ServiceName: 'Queues',
+    },
+    {
+      BillingCurrency: 'USD',
+      BillingPeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodStart: '2026-04-01T00:00:00Z',
+      ChargePeriodEnd: '2026-04-30T00:00:00Z',
+      ConsumedQuantity: 300_000,
+      ConsumedUnit: 'Delete Operations',
+      ContractedCost: 0,
+      PricingQuantity: 300_000,
+      ServiceName: 'Queues',
+    },
+  ];
+
+  try {
+    const result = await captureProdCostSnapshot({
+      runTimestamp,
+      artifactRoot,
+      outputPath,
+    }, {
+      requireGitHubActionsExecutionImpl: async (operationName, {
+        expectedEnvironmentName = null,
+      } = {}) => {
+        assert.equal(operationName, 'captureProdCostSnapshot');
+        assert.equal(expectedEnvironmentName, 'prod');
+        return {
+          repository: 'VrianCao/MatrixFlare',
+          run_id: '81234',
+        };
+      },
+      requireCloudflareCredentialsImpl: () => ({
+        accountId: 'cf-account',
+        apiToken: 'cf-token',
+      }),
+      fetchWorkerDeploymentStateImpl: async ({ scriptName }) => ({
+        deployment_ids: [`${scriptName}-dep`],
+        active_worker_version_ids: [`${scriptName}-ver`],
+        latest_active_deployment_id: `${scriptName}-dep`,
+        worker_version_ids: [`${scriptName}-ver`],
+      }),
+      fetchWorkerBindingStateImpl: async ({ scriptName }) => {
+        assert.equal(scriptName, 'matrix-gateway-worker-prod');
+        return {
+          ratelimit_namespace_ids: Object.values(GATEWAY_RATE_LIMIT_BINDING_DEFINITIONS)
+            .map((definition) => definition.default_namespace_id)
+            .sort(),
+        };
+      },
+      callCloudflareApiImpl: async ({ pathname }) => {
+        if (pathname.startsWith('/billing/usage/paygo')) {
+          return {
+            success: true,
+            result: billingRecords,
+          };
+        }
+        if (pathname === '/d1/database') {
+          return {
+            success: true,
+            result: [{ name: 'matrix-control-and-derived-prod', uuid: 'd1-prod' }],
+          };
+        }
+        if (pathname === '/storage/kv/namespaces') {
+          return {
+            success: true,
+            result: [{ title: 'matrix-edge-cache-prod', id: 'kv-prod' }],
+          };
+        }
+        if (pathname === '/r2/buckets') {
+          return {
+            success: true,
+            result: {
+              buckets: [
+                { name: 'matrix-archive-prod' },
+                { name: 'matrix-evidence-prod' },
+                { name: 'matrix-media-prod' },
+              ],
+            },
+          };
+        }
+        if (pathname === '/queues') {
+          return {
+            success: true,
+            result: [
+              { queue_name: 'matrix-search-index-job-prod' },
+              { queue_name: 'matrix-media-thumbnail-job-prod' },
+              { queue_name: 'matrix-appservice-txn-job-prod' },
+              { queue_name: 'matrix-rebuild-shard-job-prod' },
+              { queue_name: 'matrix-export-shard-job-prod' },
+              { queue_name: 'matrix-restore-shard-job-prod' },
+              { queue_name: 'matrix-repair-shard-job-prod' },
+            ],
+          };
+        }
+        throw new Error(`Unexpected Cloudflare API pathname: ${pathname}`);
+      },
+    });
+
+    const snapshot = JSON.parse(await fs.readFile(outputPath, 'utf8'));
+    const validation = validateManualArtifactPayload('prod_cost_snapshot', snapshot, { runTimestamp });
+    assert.deepEqual(validation, { valid: true, error: null });
+    assert.equal(result.snapshot.model_comparison.status, 'within_expected');
+    assert.equal(result.snapshot.model_comparison.actual_total_usd, result.snapshot.model_comparison.modeled_total_usd);
+    assert.equal(result.snapshot.cost_surfaces.workers.request_count, 12_000_000);
+    assert.equal(result.snapshot.cost_surfaces.durable_objects.sql_storage_gb_month, 7);
+    assert.equal(result.snapshot.cost_surfaces.d1.storage_gb_month, 6);
+    assert.equal(result.snapshot.cost_surfaces.kv.storage_gb_month, 2);
+    assert.equal(result.snapshot.cost_surfaces.queues.write_ops, 300_000);
+    assert.equal(result.snapshot.source_dashboard_uri, 'https://api.cloudflare.com/client/v4/accounts/cf-account/billing/usage/paygo');
+    assert.ok(await fs.stat(path.join(artifactRoot, 'billing-usage-paygo.json')));
+    assert.ok(await fs.stat(path.join(artifactRoot, 'prod-resource-snapshot.json')));
+  } finally {
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('prod cost provenance writing requires the GitHub Actions prod environment claim', async () => {
+  await assert.rejects(
+    () => writeProdCostSnapshotProvenance('/tmp/unused-prod-provenance.json', {
+      deploymentIdentity: {
+        environment_id: 'prod',
+        deployment_ids: ['dep-1'],
+        worker_version_ids: ['ver-1'],
+      },
+      artifactUpload: {
+        bucket_name: 'matrix-evidence-prod',
+        object_uri: 'r2://matrix-evidence-prod/gha/81234/1/prod/20260405T010203Z/cost-bundle.tgz',
+        object_key: 'gha/81234/1/prod/20260405T010203Z/cost-bundle.tgz',
+        file_sha256: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+      },
+    }, {
+      requireGitHubActionsExecutionImpl: async (operationName, {
+        expectedEnvironmentName = null,
+      } = {}) => {
+        assert.equal(operationName, 'writeProdCostSnapshotProvenance');
+        assert.equal(expectedEnvironmentName, 'prod');
+        throw new Error('stop after verifying expected prod environment');
+      },
+    }),
+    /stop after verifying expected prod environment/,
+  );
+});
+
+test('prod cost provenance builder emits cloudflare-prod provenance for prod deployment identity', () => {
+  const provenance = buildProdCostSnapshotProvenance({
+    githubRepository: 'VrianCao/MatrixFlare',
+    githubRunId: '81234',
+    githubRunAttempt: '2',
+    deploymentIdentity: {
+      environment_id: 'prod',
+      deployment_ids: ['dep-gateway', 'dep-jobs', 'dep-ops'],
+      worker_version_ids: ['ver-gateway', 'ver-jobs', 'ver-ops'],
+    },
+    artifactUpload: {
+      bucket_name: 'matrix-evidence-prod',
+      object_uri: 'r2://matrix-evidence-prod/gha/81234/2/prod/20260405T010203Z/cost-bundle.tgz',
+      object_key: 'gha/81234/2/prod/20260405T010203Z/cost-bundle.tgz',
+      file_sha256: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+    },
+  });
+
+  assert.equal(provenance.origin_run_uri, 'https://github.com/VrianCao/MatrixFlare/actions/runs/81234');
+  assert.equal(provenance.topology_kind, 'cloudflare-prod');
+  assert.equal(provenance.deployment_identity.environment_id, 'prod');
+});
+
 test('pre-release rollout deployment retains non-zero share for both baseline and candidate versions', () => {
   const versionSpecs = buildPreReleaseRolloutVersionSpecs('gateway-baseline-v1', 'gateway-candidate-v2');
 
@@ -2752,6 +3189,32 @@ test('pre-release rollout deployment retains non-zero share for both baseline an
     'gateway-candidate-v2@50',
   ]);
   assert.ok(versionSpecs.every((entry) => !entry.endsWith('@0')), 'rollout skew proof must not zero out either version');
+});
+
+test('nonlocal workflow routes prod-cost attestation into the L1 evidence gate', async () => {
+  const workflowPath = new URL('../../../.github/workflows/nonlocal-phase08.yml', import.meta.url);
+  const workflow = await fs.readFile(workflowPath, 'utf8');
+
+  assert.match(
+    workflow,
+    /prod-cost:\n[\s\S]*?environment: prod[\s\S]*?- name: Capture production cost snapshot[\s\S]*?node packages\/testing\/src\/cli\.mjs prod-cost-snapshot/s,
+    'workflow must define a dedicated prod-cost job in the GitHub Actions prod environment',
+  );
+  assert.match(
+    workflow,
+    /- name: Write prod-cost provenance[\s\S]*?node packages\/testing\/src\/cli\.mjs prod-cost-provenance/s,
+    'workflow must generate dedicated prod-cost provenance before attestation',
+  );
+  assert.match(
+    workflow,
+    /- name: Write prod-cost attestation[\s\S]*?node packages\/testing\/src\/cli\.mjs prod-cost-attest/s,
+    'workflow must emit a dedicated prod-cost attestation artifact',
+  );
+  assert.match(
+    workflow,
+    /evidence-l1:\n[\s\S]*?needs:\n[\s\S]*?- prod-cost\n/s,
+    'L1 evidence must wait on the prod-cost job',
+  );
 });
 
 test('nonlocal workflow keeps pre-release restore failures from generating or uploading attestations', async () => {
