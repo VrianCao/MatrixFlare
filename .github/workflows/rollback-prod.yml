@@ -31,7 +31,7 @@ jobs:
         shell: bash
         run: |
           run_timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-          workspace_root=".tmp/github/rollback-prod"
+          workspace_root="${RUNNER_TEMP}/matrix-rollback-prod-${{ github.run_id }}-${{ github.run_attempt }}"
           state_root="${workspace_root}/state"
           download_root="${workspace_root}/downloaded"
           artifact_root="${workspace_root}/artifacts"

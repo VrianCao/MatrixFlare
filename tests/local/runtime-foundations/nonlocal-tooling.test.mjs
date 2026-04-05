@@ -3523,6 +3523,7 @@ test('production workflow YAMLs stay aligned with the prod automation CLI contra
   assertStepOrder(prodInstallWorkflow, 'paths', 'id: checkout_release', 'prod-install must define raw-artifact paths before checkout');
   assert.match(prodInstallWorkflow, /id:\s+require_secrets[\s\S]*?continue-on-error:\s+true/u, 'prod-install secret preflight must fail closed only after raw state can be preserved');
   assert.match(prodInstallWorkflow, /id:\s+resolve_release_commit[\s\S]*?continue-on-error:\s+true/u, 'prod-install must preserve raw state when release commit resolution fails');
+  assert.match(prodInstallWorkflow, /RUNNER_TEMP/u, 'prod-install raw blocker artifacts must live outside the checkout-cleaned workspace');
   assert.match(prodInstallWorkflow, /secret-check\.json/u, 'prod-install must persist a machine-readable secret blocker artifact');
   assert.match(prodInstallWorkflow, /dispatch-request\.json/u, 'prod-install raw state must retain the requested release inputs');
   assert.match(prodInstallWorkflow, /id:\s+install_topology[\s\S]*?continue-on-error:\s+true/u, 'prod-install must preserve raw state before failing closed');
@@ -3531,6 +3532,7 @@ test('production workflow YAMLs stay aligned with the prod automation CLI contra
   assertStepOrder(releaseCandidateWorkflow, 'paths', 'id: checkout_release', 'release-candidate must define raw-artifact paths before checkout');
   assert.match(releaseCandidateWorkflow, /node packages\/testing\/src\/cli\.mjs prod-candidate-write/u, 'release-candidate workflow must write a reviewed candidate manifest');
   assert.match(releaseCandidateWorkflow, /\.github\/workflows\/nonlocal-phase08\.yml/u, 'release-candidate workflow must require the reviewed source run to come from nonlocal-phase08');
+  assert.match(releaseCandidateWorkflow, /RUNNER_TEMP/u, 'release-candidate raw blocker artifacts must live outside the checkout-cleaned workspace');
   assert.match(releaseCandidateWorkflow, /dispatch-request\.json/u, 'release-candidate raw state must retain the requested source run and release inputs');
   assert.match(releaseCandidateWorkflow, /--ci-integration-attestation/u, 'release-candidate workflow must require ci-integration attestation input');
   assert.match(releaseCandidateWorkflow, /--staging-attestation/u, 'release-candidate workflow must require staging attestation input');
@@ -3551,6 +3553,7 @@ test('production workflow YAMLs stay aligned with the prod automation CLI contra
   assert.doesNotMatch(promoteProdWorkflow, /workers_subdomain:/u, 'promote-prod must not reintroduce manual workers_subdomain input friction');
   assertStepOrder(promoteProdWorkflow, 'paths', 'id: checkout_workflow_ref', 'promote-prod must define raw-artifact paths before checkout');
   assert.match(promoteProdWorkflow, /id:\s+require_secrets[\s\S]*?continue-on-error:\s+true/u, 'promote-prod secret preflight must fail closed only after raw state can be preserved');
+  assert.match(promoteProdWorkflow, /RUNNER_TEMP/u, 'promote-prod raw blocker artifacts must live outside the checkout-cleaned workspace');
   assert.match(promoteProdWorkflow, /secret-check\.json/u, 'promote-prod must persist a machine-readable secret blocker artifact');
   assert.match(promoteProdWorkflow, /dispatch-request\.json/u, 'promote-prod raw state must retain the requested candidate and baseline inputs');
   assert.match(promoteProdWorkflow, /id:\s+runs[\s\S]*?continue-on-error:\s+true/u, 'promote-prod must preserve raw state when upstream run resolution fails');
@@ -3565,6 +3568,7 @@ test('production workflow YAMLs stay aligned with the prod automation CLI contra
   assert.match(rollbackProdWorkflow, /node packages\/testing\/src\/cli\.mjs prod-rollback/u, 'rollback-prod workflow must invoke the prod-rollback CLI entry');
   assert.match(rollbackProdWorkflow, /\.github\/workflows\/promote-prod\.yml/u, 'rollback-prod workflow must require source runs from promote-prod.yml');
   assertStepOrder(rollbackProdWorkflow, 'paths', 'id: checkout_workflow_ref', 'rollback-prod must define raw-artifact paths before checkout');
+  assert.match(rollbackProdWorkflow, /RUNNER_TEMP/u, 'rollback-prod raw blocker artifacts must live outside the checkout-cleaned workspace');
   assert.match(rollbackProdWorkflow, /--promotion-record/u, 'rollback-prod workflow must consume the promotion record artifact');
   assert.match(rollbackProdWorkflow, /--rollback-id/u, 'rollback-prod workflow must persist an explicit rollback id');
   assert.equal((rollbackProdWorkflow.match(/uses:\s+actions\/checkout@v4/gu) ?? []).length, 1, 'rollback-prod must not perform a second checkout to the promoted commit');
@@ -3579,6 +3583,7 @@ test('production workflow YAMLs stay aligned with the prod automation CLI contra
   assertStepOrder(prodCostWorkflow, 'paths', 'id: checkout_workflow_ref', 'prod-cost-monthly must define raw-artifact paths before checkout');
   assert.match(prodCostWorkflow, /node packages\/testing\/src\/cli\.mjs prod-cost-snapshot/u, 'prod-cost-monthly must capture the monthly production cost snapshot');
   assert.match(prodCostWorkflow, /cron:\s*'17 3 1 \* \*'/u, 'prod-cost-monthly must run on a monthly UTC schedule in addition to manual dispatch');
+  assert.match(prodCostWorkflow, /RUNNER_TEMP/u, 'prod-cost-monthly raw blocker artifacts must live outside the checkout-cleaned workspace');
   assert.match(prodCostWorkflow, /--from/u, 'prod-cost-monthly must pass the closed billing window start');
   assert.match(prodCostWorkflow, /--to/u, 'prod-cost-monthly must pass the closed billing window end');
   assert.match(prodCostWorkflow, /credentials-check\.json/u, 'prod-cost-monthly must persist a machine-readable credentials blocker artifact');

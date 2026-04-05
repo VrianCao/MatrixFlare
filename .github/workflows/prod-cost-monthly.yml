@@ -48,11 +48,13 @@ jobs:
         shell: bash
         run: |
           run_timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-          state_root=".tmp/github/prod-cost/state"
-          artifact_root=".tmp/github/prod-cost/artifacts"
+          workspace_root="${RUNNER_TEMP}/matrix-prod-cost-${{ github.run_id }}-${{ github.run_attempt }}"
+          state_root="${workspace_root}/state"
+          artifact_root="${workspace_root}/artifacts"
           raw_artifact_name="prod-cost-raw-${run_timestamp}-${{ github.run_id }}-${{ github.run_attempt }}"
           attestation_artifact_name="prod-cost-attestation-${run_timestamp}-${{ github.run_id }}-${{ github.run_attempt }}"
           echo "run_timestamp=${run_timestamp}" >> "$GITHUB_OUTPUT"
+          echo "workspace_root=${workspace_root}" >> "$GITHUB_OUTPUT"
           echo "state_root=${state_root}" >> "$GITHUB_OUTPUT"
           echo "artifact_root=${artifact_root}" >> "$GITHUB_OUTPUT"
           echo "snapshot=${artifact_root}/prod-cost-snapshot.json" >> "$GITHUB_OUTPUT"

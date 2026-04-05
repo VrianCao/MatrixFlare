@@ -35,7 +35,7 @@ jobs:
         shell: bash
         run: |
           run_timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-          workspace_root=".tmp/github/prod-install"
+          workspace_root="${RUNNER_TEMP}/matrix-prod-install-${{ github.run_id }}-${{ github.run_attempt }}"
           state_root="${workspace_root}/state"
           artifact_root="${workspace_root}/artifacts"
           record_key="gha/${{ github.run_id }}/${{ github.run_attempt }}/prod/${run_timestamp}/prod-install-record.json"
