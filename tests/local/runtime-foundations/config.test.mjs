@@ -42,6 +42,7 @@ function makeGatewayEnv(overrides = {}) {
 test('gateway runtime config validates explicit vars, feature gates, and secrets', () => {
   const config = loadWorkerRuntimeConfig('gateway-worker', makeGatewayEnv());
   assert.equal(config.compatibilityDate, '2026-03-26');
+  assert.ok(config.compatibilityFlags.includes('nodejs_compat'));
   assert.equal(config.environmentName, 'local');
   assert.equal(config.releaseProfile, 'L1');
   assert.equal(config.text.MATRIX_MEDIA_MAX_UPLOAD_BYTES, 1048576);
@@ -84,7 +85,9 @@ test('ops worker enforces Access JWT binding configuration', () => {
         ENVIRONMENT_NAME: 'staging',
         MATRIX_SERVER_NAME: 'matrix.example.test',
         RELEASE_PROFILE: 'L1',
+        MATRIX_PUBLIC_BASE_URL: 'https://matrix.example.test',
         MANAGEMENT_API_BASE_URL: 'https://ops.example.test',
+        GATEWAY_WORKER_SCRIPT_NAME: 'matrix-gateway-worker-staging',
       }),
     /ACCESS_TEAM_DOMAIN/,
   );

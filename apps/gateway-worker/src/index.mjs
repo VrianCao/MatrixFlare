@@ -38,7 +38,9 @@ import {
   resolveThumbnailAnimationPreference,
   startRequestMetrics,
   teeBodyStreamWithDigest,
+  uploadStreamToR2MultipartWithDigest,
   classifyGatewayRequest,
+  resolveRuntimeWorkerVersionId,
 } from '../../../packages/runtime-core/src/index.mjs';
 import {
   buildProfileCapabilities,
@@ -50,10 +52,12 @@ import {
 } from '../../../packages/runtime-core/src/client-domain.mjs';
 import {
   DEFAULT_ROOM_VERSION,
+  decodeRoomCursor,
   deriveCreateRoomIdentity,
   resolveRequestedRoomVersion,
 } from '../../../packages/runtime-core/src/room-domain.mjs';
 import { canonicalJsonHash } from '../../../packages/runtime-core/src/fingerprints.mjs';
+import { MEDIA_WRITE_BACKOFF_TTL_SECONDS } from '../../../packages/runtime-core/src/media-domain.mjs';
 import {
   DEFAULT_UIA_CHALLENGE_TTL_MS,
   buildLocalUserId,
@@ -122,6 +126,42 @@ function matrixErrorResponse(status, errcode, error, extra = null, headers = {})
     status,
     headers,
   );
+}
+
+const ROLLOUT_PROBE_SECRET_HEADER = 'x-matrix-rollout-probe-secret';
+const ROLLOUT_PROBE_GATEWAY_VERSION_ID_HEADER = 'x-matrix-rollout-probe-gateway-version-id';
+const ROLLOUT_PROBE_GATEWAY_VERSION_TAG_HEADER = 'x-matrix-rollout-probe-gateway-version-tag';
+
+function shouldExposeRolloutProbeHeaders(request, env) {
+  const configuredSecret = typeof env.ROLLOUT_PROBE_SHARED_SECRET === 'string'
+    ? env.ROLLOUT_PROBE_SHARED_SECRET.trim()
+    : '';
+  const providedSecret = request.headers.get(ROLLOUT_PROBE_SECRET_HEADER)?.trim() ?? '';
+  return configuredSecret.length > 0 && providedSecret.length > 0 && configuredSecret === providedSecret;
+}
+
+function attachRolloutProbeHeaders(request, env, response) {
+  if (!shouldExposeRolloutProbeHeaders(request, env)) {
+    return response;
+  }
+  const headers = new Headers(response.headers);
+  const versionId = typeof env.CF_VERSION_METADATA?.id === 'string'
+    ? env.CF_VERSION_METADATA.id.trim()
+    : '';
+  if (versionId.length > 0) {
+    headers.set(ROLLOUT_PROBE_GATEWAY_VERSION_ID_HEADER, versionId);
+  }
+  const versionTag = typeof env.CF_VERSION_METADATA?.tag === 'string'
+    ? env.CF_VERSION_METADATA.tag.trim()
+    : '';
+  if (versionTag.length > 0) {
+    headers.set(ROLLOUT_PROBE_GATEWAY_VERSION_TAG_HEADER, versionTag);
+  }
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
 }
 
 function stubRouteResponse() {
@@ -264,6 +304,23 @@ function decodePublicRoomsCursor(value) {
   }
 }
 
+function parsePublicRoomsCursorOffset(value, label) {
+  if (typeof value === 'number') {
+    if (Number.isSafeInteger(value) && value >= 0) {
+      return value;
+    }
+    throw createInvalidQueryParamError(`${label} must be an integer >= 0`);
+  }
+  if (typeof value !== 'string' || !/^\d+$/.test(value)) {
+    throw createInvalidQueryParamError(`${label} must be an integer >= 0`);
+  }
+  const parsedOffset = Number.parseInt(value, 10);
+  if (!Number.isSafeInteger(parsedOffset)) {
+    throw createInvalidQueryParamError(`${label} must be an integer >= 0`);
+  }
+  return parsedOffset;
+}
+
 function isPublicDirectoryRowComplete(row) {
   return row != null
     && typeof row.room_id === 'string'
@@ -328,34 +385,77 @@ function applyPublicRoomsQuery(rows, {
   since = null,
   searchTerm = null,
 } = {}) {
+  const paging = normalizePublicRoomsPaging({ limit, since, searchTerm });
+  const filteredRows = filterPublicRoomsCandidateRows(rows, paging.lowered_search_term);
+  return buildPublicRoomsQueryResult(filteredRows.slice(
+    paging.offset,
+    paging.offset + paging.normalized_limit,
+  ), {
+    normalizedLimit: paging.normalized_limit,
+    offset: paging.offset,
+    nextOffset: paging.offset + paging.normalized_limit < filteredRows.length
+      ? paging.offset + paging.normalized_limit
+      : null,
+    totalRoomCountEstimate: filteredRows.length,
+  });
+}
+
+function normalizePublicRoomsPaging({
+  limit = 10,
+  since = null,
+  searchTerm = null,
+} = {}) {
   const normalizedLimit = Number.isInteger(limit) && limit >= 1
     ? limit
     : (() => {
       throw createInvalidQueryParamError('limit must be an integer >= 1');
     })();
   const cursor = decodePublicRoomsCursor(since);
-  const offset = cursor?.offset == null
-    ? 0
-    : (() => {
-      const parsedOffset = Number.parseInt(cursor.offset, 10);
-      if (!Number.isInteger(parsedOffset) || parsedOffset < 0) {
-        throw createInvalidQueryParamError('since.offset must be an integer >= 0');
-      }
-      return parsedOffset;
-    })();
+  // Legacy unversioned cursors only expose a public offset field. Treat them as visible-row
+  // offsets so rollout does not reintroduce hidden-candidate overlap or leak filtered-row counts.
+  const offset = cursor?.visible_offset != null
+    ? parsePublicRoomsCursorOffset(cursor.visible_offset, 'since.visible_offset')
+    : cursor?.offset != null
+      ? parsePublicRoomsCursorOffset(cursor.offset, 'since.offset')
+      : 0;
   const loweredSearchTerm = typeof searchTerm === 'string' ? searchTerm.toLowerCase() : '';
-  const filteredRows = rows
-    .filter((row) => row.is_public === true)
-    .filter((row) => loweredSearchTerm.length === 0 || (
-      (row.name ?? '').toLowerCase().includes(loweredSearchTerm)
-      || (row.topic ?? '').toLowerCase().includes(loweredSearchTerm)
-      || (row.canonical_alias ?? '').toLowerCase().includes(loweredSearchTerm)
-      || row.room_id.toLowerCase().includes(loweredSearchTerm)
-    ))
-    .sort((left, right) => right.joined_members - left.joined_members || left.room_id.localeCompare(right.room_id));
-  const page = filteredRows.slice(offset, offset + normalizedLimit);
   return {
-    chunk: page.map((row) => ({
+    normalized_limit: normalizedLimit,
+    offset,
+    lowered_search_term: loweredSearchTerm,
+  };
+}
+
+function matchesPublicRoomsSearchTerm(row, loweredSearchTerm) {
+  if (loweredSearchTerm.length === 0) {
+    return true;
+  }
+  return (row.name ?? '').toLowerCase().includes(loweredSearchTerm)
+    || (row.topic ?? '').toLowerCase().includes(loweredSearchTerm)
+    || (row.canonical_alias ?? '').toLowerCase().includes(loweredSearchTerm)
+    || row.room_id.toLowerCase().includes(loweredSearchTerm);
+}
+
+function sortPublicRoomsRows(left, right) {
+  return right.joined_members - left.joined_members || left.room_id.localeCompare(right.room_id);
+}
+
+function filterPublicRoomsCandidateRows(rows, loweredSearchTerm = '') {
+  return rows
+    .filter((row) => isPublicDirectoryRowComplete(row) && row.is_public === true)
+    .filter((row) => matchesPublicRoomsSearchTerm(row, loweredSearchTerm))
+    .sort(sortPublicRoomsRows);
+}
+
+function buildPublicRoomsQueryResult(rows, {
+  normalizedLimit,
+  offset,
+  nextOffset = null,
+  prevOffset = offset > 0 ? Math.max(0, offset - normalizedLimit) : null,
+  totalRoomCountEstimate,
+}) {
+  return {
+    chunk: rows.map((row) => ({
       room_id: row.room_id,
       name: row.name ?? undefined,
       topic: row.topic ?? undefined,
@@ -366,17 +466,61 @@ function applyPublicRoomsQuery(rows, {
       guest_can_join: row.guest_can_join === true,
       join_rule: row.join_rules ?? 'invite',
     })),
-    next_batch: offset + normalizedLimit < filteredRows.length
-      ? encodePublicRoomsCursor({ offset: offset + normalizedLimit })
+    next_batch: Number.isInteger(nextOffset)
+      ? encodePublicRoomsCursor({
+        cursor_version: 2,
+        visible_offset: nextOffset,
+      })
       : undefined,
-    prev_batch: offset > 0
-      ? encodePublicRoomsCursor({ offset: Math.max(0, offset - normalizedLimit) })
+    prev_batch: Number.isInteger(prevOffset)
+      ? encodePublicRoomsCursor({
+        cursor_version: 2,
+        visible_offset: prevOffset,
+      })
       : undefined,
-    total_room_count_estimate: filteredRows.length,
+    total_room_count_estimate: totalRoomCountEstimate,
   };
 }
 
-async function queryPublicRoomsWithTruthFallback(env, queryInput) {
+async function collectValidatedPublicRoomsPage(env, candidateRows, {
+  normalizedLimit,
+  offset,
+}) {
+  const pageRows = [];
+  const prevOffset = offset > 0 ? Math.max(0, offset - normalizedLimit) : null;
+  let visibleOffset = 0;
+  for (let scanIndex = 0; scanIndex < candidateRows.length; scanIndex += 1) {
+    const validated = await resolveValidatedPublicRoomRow(env, candidateRows[scanIndex].room_id, {
+      derivedRow: candidateRows[scanIndex],
+      forceTruth: false,
+    });
+    if (validated) {
+      if (visibleOffset < offset) {
+        visibleOffset += 1;
+        continue;
+      }
+      if (pageRows.length < normalizedLimit) {
+        pageRows.push(validated);
+        visibleOffset += 1;
+        continue;
+      }
+      return {
+        pageRows,
+        nextOffset: visibleOffset,
+        prevOffset,
+        visibleCountLowerBound: visibleOffset + 1,
+      };
+    }
+  }
+  return {
+    pageRows,
+    nextOffset: null,
+    prevOffset,
+    visibleCountLowerBound: visibleOffset,
+  };
+}
+
+async function queryPublicRoomsByFullTruthScan(env, queryInput) {
   await ensureDerivedSchema(env);
   const derived = getDerivedPersistence(env);
   const derivedRows = await derived.publicRoomDirectory.list();
@@ -394,6 +538,34 @@ async function queryPublicRoomsWithTruthFallback(env, queryInput) {
     }
   }
   return applyPublicRoomsQuery(validatedRows, queryInput);
+}
+
+async function queryPublicRoomsWithTruthFallback(env, queryInput) {
+  await ensureDerivedSchema(env);
+  const derived = getDerivedPersistence(env);
+  const derivedRows = await derived.publicRoomDirectory.list();
+  const paging = normalizePublicRoomsPaging(queryInput);
+  const candidateRows = filterPublicRoomsCandidateRows(derivedRows, paging.lowered_search_term);
+  const {
+    pageRows,
+    nextOffset,
+    prevOffset,
+    visibleCountLowerBound,
+  } = await collectValidatedPublicRoomsPage(env, candidateRows, {
+    normalizedLimit: paging.normalized_limit,
+    offset: paging.offset,
+  });
+  if (pageRows.length > 0 || paging.lowered_search_term.length === 0) {
+    return buildPublicRoomsQueryResult(pageRows, {
+      normalizedLimit: paging.normalized_limit,
+      offset: paging.offset,
+      nextOffset,
+      prevOffset,
+      // Count estimates must remain fail-closed when stale derived candidates validate away.
+      totalRoomCountEstimate: visibleCountLowerBound,
+    });
+  }
+  return queryPublicRoomsByFullTruthScan(env, queryInput);
 }
 
 async function resolveRoomAliasWithTruthFallback(env, alias) {
@@ -505,6 +677,9 @@ function toResponseBody(body) {
   if (body == null) {
     return null;
   }
+  if (typeof body?.getReader === 'function') {
+    return body;
+  }
   if (typeof body === 'string' || body instanceof Uint8Array || Buffer.isBuffer(body)) {
     return body;
   }
@@ -531,6 +706,35 @@ function buildMediaResponse(object, {
   });
 }
 
+async function writeMediaObjectWithDigest(env, objectKey, source, putOptions, {
+  maxBytes,
+  lockObjectKey = true,
+} = {}) {
+  const runObjectWrite = (operation) => (
+    lockObjectKey
+      ? withMediaKeyBackoff(env, objectKey, operation)
+      : operation()
+  );
+  const streamedBody = teeBodyStreamWithDigest(source, { maxBytes });
+  if (streamedBody) {
+    const [, streamedInfo] = await Promise.all([
+      runObjectWrite(() => env.MATRIX_MEDIA_BUCKET.put(objectKey, streamedBody.upload_stream, putOptions)),
+      streamedBody.digest_promise,
+    ]);
+    return streamedInfo;
+  }
+  if (source?.body && typeof source.body.getReader === 'function' && typeof env.MATRIX_MEDIA_BUCKET.createMultipartUpload === 'function') {
+    return runObjectWrite(
+      () => uploadStreamToR2MultipartWithDigest(env.MATRIX_MEDIA_BUCKET, objectKey, source.body, putOptions, {
+        maxBytes,
+      }),
+    );
+  }
+  const bodyInfo = await readBodyWithDigest(source, { maxBytes });
+  await runObjectWrite(() => env.MATRIX_MEDIA_BUCKET.put(objectKey, bodyInfo.bytes, putOptions));
+  return bodyInfo;
+}
+
 async function withMediaKeyBackoff(env, objectKey, operation) {
   const cache = env.MATRIX_EDGE_CACHE;
   const cacheKey = `media_write_backoff:${objectKey}`;
@@ -542,7 +746,7 @@ async function withMediaKeyBackoff(env, objectKey, operation) {
       try {
         if (cache && typeof cache.put === 'function') {
           await cache.put(cacheKey, JSON.stringify({ locked_at: new Date().toISOString() }), {
-            expirationTtl: 5,
+            expirationTtl: MEDIA_WRITE_BACKOFF_TTL_SECONDS,
           });
         }
         return await operation();
@@ -585,9 +789,9 @@ function getOptionalUiaLocalpart(auth, serverName) {
   return null;
 }
 
-function buildRequestFingerprint(routeTemplate, principalId, body) {
+function buildRequestFingerprint(routeTemplate, principalId, body, method = 'POST') {
   return createRequestFingerprint({
-    method: 'POST',
+    method,
     routeTemplate,
     principalId,
     body,
@@ -669,6 +873,18 @@ function normalizePathUserId(pathValue, env) {
   }
   try {
     const localpart = normalizeLocalUserIdentifier(decoded, env.MATRIX_SERVER_NAME);
+    return buildLocalUserId(localpart, env.MATRIX_SERVER_NAME);
+  } catch {
+    return null;
+  }
+}
+
+function normalizeRequestUserId(value, env) {
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    return null;
+  }
+  try {
+    const localpart = normalizeLocalUserIdentifier(value, env.MATRIX_SERVER_NAME);
     return buildLocalUserId(localpart, env.MATRIX_SERVER_NAME);
   } catch {
     return null;
@@ -905,6 +1121,13 @@ function ensureRoomProjectionTarget(targets, roomId) {
   return targets.get(roomId);
 }
 
+function decodeRoomCursorOrNull(cursor) {
+  if (typeof cursor !== 'string' || cursor.length === 0) {
+    return null;
+  }
+  return decodeRoomCursor(cursor);
+}
+
 function mergeRoomDeltaIntoTarget(target, delta) {
   if (!delta || typeof delta !== 'object' || Array.isArray(delta)) {
     return;
@@ -932,7 +1155,11 @@ function mergeRoomDeltaIntoTarget(target, delta) {
     target.limited = true;
   }
   if (typeof delta.prev_batch === 'string' && delta.prev_batch.length > 0) {
-    target.prev_batch = delta.prev_batch;
+    const nextPrevBatch = decodeRoomCursorOrNull(delta.prev_batch);
+    const currentPrevBatch = decodeRoomCursorOrNull(target.prev_batch);
+    if (currentPrevBatch == null || (nextPrevBatch != null && nextPrevBatch < currentPrevBatch)) {
+      target.prev_batch = delta.prev_batch;
+    }
   }
   if (Number.isInteger(delta.notification_count) && delta.notification_count >= 0) {
     target.notification_count = delta.notification_count;
@@ -949,6 +1176,9 @@ function buildRoomSyncEntry(projection, target) {
   if (!projection) {
     return null;
   }
+  const effectivePrevBatch = typeof projection.prev_batch === 'string' && projection.prev_batch.length > 0
+    ? projection.prev_batch
+    : target.prev_batch;
   const entry = {};
   if (projection.membership_bucket === 'invite') {
     entry.invite_state = {
@@ -962,11 +1192,11 @@ function buildRoomSyncEntry(projection, target) {
     };
     return entry;
   }
-  if (projection.timeline_events?.length > 0 || projection.limited === true || target.prev_batch) {
+  if (projection.timeline_events?.length > 0 || projection.limited === true || effectivePrevBatch) {
     entry.timeline = {
       events: structuredClone(projection.timeline_events ?? []),
       limited: projection.limited === true,
-      ...(target.prev_batch ? { prev_batch: target.prev_batch } : {}),
+      ...(effectivePrevBatch ? { prev_batch: effectivePrevBatch } : {}),
     };
   }
   if (projection.state_after_events != null) {
@@ -1016,11 +1246,11 @@ async function assembleSyncResponse(env, batch, {
   const response = {
     next_batch: batch.next_batch,
     device_lists: {
-      changed: [],
-      left: [],
+      changed: structuredClone(batch.device_lists_changed ?? []),
+      left: structuredClone(batch.device_lists_left ?? []),
     },
-    device_one_time_keys_count: {},
-    device_unused_fallback_key_types: [],
+    device_one_time_keys_count: structuredClone(batch.device_one_time_keys_count ?? {}),
+    device_unused_fallback_key_types: structuredClone(batch.device_unused_fallback_key_types ?? []),
   };
 
   if (batch.account_data_events.length > 0) {
@@ -1225,12 +1455,13 @@ function resolvePasswordUiaContext({
   auth,
   accessSession,
   hintedLocalpart,
+  method = 'POST',
 }) {
   if (!auth || auth.type !== 'm.login.password' || typeof auth.session !== 'string') {
     return { ok: false, reason: 'challenge' };
   }
 
-  const payload = verifyRouteBoundUia(env, auth.session, auth.route_family, 'POST');
+  const payload = verifyRouteBoundUia(env, auth.session, auth.route_family, method);
   if (!payload) {
     return { ok: false, reason: 'challenge' };
   }
@@ -1269,6 +1500,35 @@ function resolvePasswordUiaContext({
     user_do: getUserDoStub(env, expectedUserId),
     payload,
   };
+}
+
+function crossSigningUploadRequiresUia(currentSnapshot, requestBody) {
+  const currentMaster = currentSnapshot?.master_keys && typeof currentSnapshot.master_keys === 'object'
+    ? Object.values(currentSnapshot.master_keys)[0] ?? null
+    : null;
+  if (!currentMaster) {
+    return false;
+  }
+  const requestedMaster = requestBody?.master_key ?? null;
+  if (!requestedMaster) {
+    return true;
+  }
+  if (canonicalJsonHash(currentMaster) !== canonicalJsonHash(requestedMaster)) {
+    return true;
+  }
+  const currentSelf = currentSnapshot?.self_signing_keys && typeof currentSnapshot.self_signing_keys === 'object'
+    ? Object.values(currentSnapshot.self_signing_keys)[0] ?? null
+    : null;
+  const currentUser = currentSnapshot?.user_signing_keys && typeof currentSnapshot.user_signing_keys === 'object'
+    ? Object.values(currentSnapshot.user_signing_keys)[0] ?? null
+    : null;
+  if (requestBody?.self_signing_key && canonicalJsonHash(currentSelf ?? null) !== canonicalJsonHash(requestBody.self_signing_key)) {
+    return true;
+  }
+  if (requestBody?.user_signing_key && canonicalJsonHash(currentUser ?? null) !== canonicalJsonHash(requestBody.user_signing_key)) {
+    return true;
+  }
+  return false;
 }
 
 async function handleWellKnownClient(url, env) {
@@ -2249,39 +2509,18 @@ async function commitLocalMediaUpload(request, env, access, {
   const legacyFlag = computeLegacyUnauthAccessFlag(uploadedAt, getMediaFreezePolicy(env));
   const objectKey = buildLocalMediaObjectKey(grant.media_id);
   try {
-    const streamedBody = teeBodyStreamWithDigest(request, {
+    bodyInfo = await writeMediaObjectWithDigest(env, objectKey, request, {
+      customMetadata: {
+        first_ingested_at: uploadedAt,
+        legacy_unauth_access_flag: legacyFlag ? 'true' : 'false',
+        content_type: contentType,
+      },
+      httpMetadata: {
+        contentType,
+      },
+    }, {
       maxBytes: grant.max_bytes,
     });
-    if (streamedBody) {
-      const [, streamedInfo] = await Promise.all([
-        withMediaKeyBackoff(env, objectKey, () => env.MATRIX_MEDIA_BUCKET.put(objectKey, streamedBody.upload_stream, {
-          customMetadata: {
-            first_ingested_at: uploadedAt,
-            legacy_unauth_access_flag: legacyFlag ? 'true' : 'false',
-            content_type: contentType,
-          },
-          httpMetadata: {
-            contentType,
-          },
-        })),
-        streamedBody.digest_promise,
-      ]);
-      bodyInfo = streamedInfo;
-    } else {
-      bodyInfo = await readBodyWithDigest(request, {
-        maxBytes: grant.max_bytes,
-      });
-      await withMediaKeyBackoff(env, objectKey, () => env.MATRIX_MEDIA_BUCKET.put(objectKey, bodyInfo.bytes, {
-        customMetadata: {
-          first_ingested_at: uploadedAt,
-          legacy_unauth_access_flag: legacyFlag ? 'true' : 'false',
-          content_type: contentType,
-        },
-        httpMetadata: {
-          contentType,
-        },
-      }));
-    }
   } catch (error) {
     const reverted = await deleteMediaObjectBestEffort(env, objectKey);
     await access.user_do.finalizeMediaUpload({
@@ -2435,41 +2674,20 @@ async function fetchRemoteMediaIntoCache(env, {
       const cachedAt = new Date().toISOString();
       const legacyFlag = computeLegacyUnauthAccessFlag(cachedAt, getMediaFreezePolicy(env));
       const contentType = response.headers.get('content-type') ?? 'application/octet-stream';
-      const streamedBody = teeBodyStreamWithDigest(response, {
+      bodyInfo = await writeMediaObjectWithDigest(env, objectKey, response, {
+        customMetadata: {
+          first_cached_at: cachedAt,
+          legacy_unauth_access_flag: legacyFlag ? 'true' : 'false',
+          origin_server_name: normalizedServerName,
+          content_type: contentType,
+        },
+        httpMetadata: {
+          contentType,
+        },
+      }, {
+        lockObjectKey: false,
         maxBytes: resolveConfiguredMaxUploadBytes(env),
       });
-      if (streamedBody) {
-        const [, streamedInfo] = await Promise.all([
-          env.MATRIX_MEDIA_BUCKET.put(objectKey, streamedBody.upload_stream, {
-            customMetadata: {
-              first_cached_at: cachedAt,
-              legacy_unauth_access_flag: legacyFlag ? 'true' : 'false',
-              origin_server_name: normalizedServerName,
-              content_type: contentType,
-            },
-            httpMetadata: {
-              contentType,
-            },
-          }),
-          streamedBody.digest_promise,
-        ]);
-        bodyInfo = streamedInfo;
-      } else {
-        bodyInfo = await readBodyWithDigest(response, {
-          maxBytes: resolveConfiguredMaxUploadBytes(env),
-        });
-        await env.MATRIX_MEDIA_BUCKET.put(objectKey, bodyInfo.bytes, {
-          customMetadata: {
-            first_cached_at: cachedAt,
-            legacy_unauth_access_flag: legacyFlag ? 'true' : 'false',
-            origin_server_name: normalizedServerName,
-            content_type: contentType,
-          },
-          httpMetadata: {
-            contentType,
-          },
-        });
-      }
       const cachedObject = await env.MATRIX_MEDIA_BUCKET.get(objectKey);
       await queueMediaDerivedWork(env, {
         mxcUri: buildMxcUri(normalizedServerName, mediaId),
@@ -2958,6 +3176,683 @@ async function handleSendToDevice(request, env, eventType, txnId) {
     }
   }
   return jsonResponse({});
+}
+
+function mergeKeyQueryMaps(target, source) {
+  if (!source || typeof source !== 'object') {
+    return target;
+  }
+  for (const [outerKey, innerValue] of Object.entries(source)) {
+    if (isObjectRecord(innerValue) && isObjectRecord(target[outerKey])) {
+      target[outerKey] = {
+        ...target[outerKey],
+        ...structuredClone(innerValue),
+      };
+      continue;
+    }
+    target[outerKey] = structuredClone(innerValue);
+  }
+  return target;
+}
+
+async function handleListDevices(request, env) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const result = await access.user_do.listDevices({
+    user_id: access.session.user_id,
+  });
+  if (!result.ok) {
+    return jsonResponse(result.matrix_error.body, result.matrix_error.status);
+  }
+  return jsonResponse(result.response);
+}
+
+async function handleGetDevice(request, env, deviceId) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const decodedDeviceId = decodePathComponent(deviceId);
+  if (!decodedDeviceId) {
+    return matrixErrorResponse(400, 'M_INVALID_PARAM', 'Invalid device path');
+  }
+  const result = await access.user_do.getDevice({
+    user_id: access.session.user_id,
+    device_id: decodedDeviceId,
+  });
+  if (!result.ok) {
+    return jsonResponse(result.matrix_error.body, result.matrix_error.status);
+  }
+  return jsonResponse(result.response);
+}
+
+async function handleUpdateDevice(request, env, deviceId) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const decodedDeviceId = decodePathComponent(deviceId);
+  if (!decodedDeviceId) {
+    return matrixErrorResponse(400, 'M_INVALID_PARAM', 'Invalid device path');
+  }
+  const body = await readJsonObject(request);
+  if (body instanceof Response) {
+    return body;
+  }
+  if (body.display_name != null && typeof body.display_name !== 'string') {
+    return matrixErrorResponse(400, 'M_BAD_JSON', 'display_name must be a string when present');
+  }
+  const result = await access.user_do.updateDevice({
+    user_id: access.session.user_id,
+    device_id: decodedDeviceId,
+    display_name: body.display_name ?? null,
+  });
+  if (!result.ok) {
+    return jsonResponse(result.matrix_error.body, result.matrix_error.status);
+  }
+  return jsonResponse(result.response);
+}
+
+async function handleDeleteDevice(request, env, deviceId) {
+  const accessToken = getBearerToken(request);
+  let accessSession = null;
+  let accessFailureResponse = null;
+  const decodedDeviceId = decodePathComponent(deviceId);
+  if (!decodedDeviceId) {
+    return matrixErrorResponse(400, 'M_INVALID_PARAM', 'Invalid device path');
+  }
+  const body = await readJsonObject(request);
+  if (body instanceof Response) {
+    return body;
+  }
+  if (accessToken) {
+    const access = await requireAccessSession(request, env);
+    if (access.ok) {
+      accessSession = access;
+    } else {
+      accessFailureResponse = access.response;
+    }
+  } else {
+    accessFailureResponse = matrixErrorResponse(401, 'M_MISSING_TOKEN', 'Missing access token');
+  }
+  const auth = isObjectRecord(body.auth)
+    ? { ...body.auth, route_family: 'devices/delete' }
+    : null;
+  const hintedLocalpart = getOptionalUiaLocalpart(auth, env.MATRIX_SERVER_NAME);
+  const authSubjectHint = accessSession?.session.user_id ?? (
+    hintedLocalpart ? buildLocalUserId(hintedLocalpart, env.MATRIX_SERVER_NAME) : null
+  );
+  if (!auth || auth.type !== 'm.login.password' || typeof auth.session !== 'string') {
+    if (!accessSession) {
+      return accessFailureResponse;
+    }
+    return buildUiaChallengeResponse(env, 'devices/delete', 'DELETE', authSubjectHint);
+  }
+  const stage = resolvePasswordUiaContext({
+    env,
+    auth,
+    accessSession: accessSession?.session ?? null,
+    hintedLocalpart,
+    method: 'DELETE',
+  });
+  if (!stage.ok) {
+    if (!accessSession) {
+      return accessFailureResponse;
+    }
+    return stage.response ?? buildUiaChallengeResponse(env, 'devices/delete', 'DELETE', authSubjectHint);
+  }
+  if (!accessToken) {
+    return accessFailureResponse;
+  }
+  if (!accessSession) {
+    return accessFailureResponse;
+  }
+  const requestFingerprint = buildRequestFingerprint(
+    '/_matrix/client/v3/devices/{deviceId}',
+    stage.user_id,
+    { device_ids: [decodedDeviceId] },
+    'DELETE',
+  );
+  const replay = await stage.user_do.resolvePhase05DeviceDeleteReplay({
+    user_id: stage.user_id,
+    request_fingerprint: requestFingerprint,
+    uia_nonce: stage.payload.nonce,
+    access_token_hash: accessSession ? null : hashOpaqueToken(accessToken),
+  });
+  if (!replay.ok) {
+    return jsonResponse(replay.matrix_error.body, replay.matrix_error.status);
+  }
+  if (replay.handled) {
+    return jsonResponse(replay.response);
+  }
+  const verification = await stage.user_do.verifyPasswordAuth({
+    localpart: stage.localpart,
+    password: auth.password ?? '',
+  });
+  if (!verification.ok) {
+    return jsonResponse(verification.matrix_error.body, verification.matrix_error.status);
+  }
+  const result = await stage.user_do.deleteDevices({
+    user_id: stage.user_id,
+    device_ids: [decodedDeviceId],
+    request_fingerprint: requestFingerprint,
+    uia_nonce: stage.payload.nonce,
+    access_token_hash: hashOpaqueToken(accessToken),
+  });
+  if (!result.ok) {
+    return jsonResponse(result.matrix_error.body, result.matrix_error.status);
+  }
+  return jsonResponse(result.response);
+}
+
+async function handleDeleteDevices(request, env) {
+  const accessToken = getBearerToken(request);
+  let accessSession = null;
+  let accessFailureResponse = null;
+  const body = await readJsonObject(request);
+  if (body instanceof Response) {
+    return body;
+  }
+  if (accessToken) {
+    const access = await requireAccessSession(request, env);
+    if (access.ok) {
+      accessSession = access;
+    } else {
+      accessFailureResponse = access.response;
+    }
+  } else {
+    accessFailureResponse = matrixErrorResponse(401, 'M_MISSING_TOKEN', 'Missing access token');
+  }
+  const auth = isObjectRecord(body.auth)
+    ? { ...body.auth, route_family: 'delete_devices' }
+    : null;
+  const hintedLocalpart = getOptionalUiaLocalpart(auth, env.MATRIX_SERVER_NAME);
+  const authSubjectHint = accessSession?.session.user_id ?? (
+    hintedLocalpart ? buildLocalUserId(hintedLocalpart, env.MATRIX_SERVER_NAME) : null
+  );
+  if (!auth || auth.type !== 'm.login.password' || typeof auth.session !== 'string') {
+    if (!accessSession) {
+      return accessFailureResponse;
+    }
+    return buildUiaChallengeResponse(env, 'delete_devices', 'POST', authSubjectHint);
+  }
+  if (!Array.isArray(body.devices)) {
+    return matrixErrorResponse(400, 'M_MISSING_PARAM', 'devices is required');
+  }
+  const normalizedDeviceIds = [];
+  for (const deviceId of body.devices) {
+    const normalizedDeviceId = decodePathComponent(String(deviceId));
+    if (!normalizedDeviceId) {
+      return matrixErrorResponse(400, 'M_INVALID_PARAM', 'devices must contain valid device IDs');
+    }
+    normalizedDeviceIds.push(normalizedDeviceId);
+  }
+  const stage = resolvePasswordUiaContext({
+    env,
+    auth,
+    accessSession: accessSession?.session ?? null,
+    hintedLocalpart,
+    method: 'POST',
+  });
+  if (!stage.ok) {
+    if (!accessSession) {
+      return accessFailureResponse;
+    }
+    return stage.response ?? buildUiaChallengeResponse(env, 'delete_devices', 'POST', authSubjectHint);
+  }
+  if (!accessToken) {
+    return accessFailureResponse;
+  }
+  if (!accessSession) {
+    return accessFailureResponse;
+  }
+  const requestFingerprint = buildRequestFingerprint(
+    '/_matrix/client/v3/delete_devices',
+    stage.user_id,
+    { device_ids: normalizedDeviceIds },
+    'POST',
+  );
+  const replay = await stage.user_do.resolvePhase05DeviceDeleteReplay({
+    user_id: stage.user_id,
+    request_fingerprint: requestFingerprint,
+    uia_nonce: stage.payload.nonce,
+    access_token_hash: accessSession ? null : hashOpaqueToken(accessToken),
+  });
+  if (!replay.ok) {
+    return jsonResponse(replay.matrix_error.body, replay.matrix_error.status);
+  }
+  if (replay.handled) {
+    return jsonResponse(replay.response);
+  }
+  const verification = await stage.user_do.verifyPasswordAuth({
+    localpart: stage.localpart,
+    password: auth.password ?? '',
+  });
+  if (!verification.ok) {
+    return jsonResponse(verification.matrix_error.body, verification.matrix_error.status);
+  }
+  const result = await stage.user_do.deleteDevices({
+    user_id: stage.user_id,
+    device_ids: normalizedDeviceIds,
+    request_fingerprint: requestFingerprint,
+    uia_nonce: stage.payload.nonce,
+    access_token_hash: hashOpaqueToken(accessToken),
+  });
+  if (!result.ok) {
+    return jsonResponse(result.matrix_error.body, result.matrix_error.status);
+  }
+  return jsonResponse(result.response);
+}
+
+async function handleKeysUpload(request, env) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const body = await readJsonObject(request);
+  if (body instanceof Response) {
+    return body;
+  }
+  const result = await access.user_do.uploadKeys({
+    user_id: access.session.user_id,
+    device_id: access.session.device_id,
+    device_keys: body.device_keys ?? null,
+    one_time_keys: body.one_time_keys ?? null,
+    fallback_keys: body.fallback_keys ?? null,
+  });
+  if (!result.ok) {
+    return jsonResponse(result.matrix_error.body, result.matrix_error.status);
+  }
+  return jsonResponse(result.response);
+}
+
+async function handleKeysQuery(request, env) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const body = await readJsonObject(request);
+  if (body instanceof Response) {
+    return body;
+  }
+  if (!isObjectRecord(body.device_keys)) {
+    return matrixErrorResponse(400, 'M_MISSING_PARAM', 'device_keys is required');
+  }
+  const response = {
+    device_keys: {},
+    master_keys: {},
+    self_signing_keys: {},
+    user_signing_keys: {},
+  };
+  for (const [rawUserId, deviceIds] of Object.entries(body.device_keys)) {
+    if (!Array.isArray(deviceIds)) {
+      return matrixErrorResponse(400, 'M_BAD_JSON', `device_keys.${rawUserId} must be an array`);
+    }
+    const targetUserId = normalizeRequestUserId(rawUserId, env);
+    if (!targetUserId) {
+      continue;
+    }
+    const result = await getUserDoStub(env, targetUserId).queryDeviceKeys({
+      user_id: targetUserId,
+      requester_user_id: access.session.user_id,
+      device_ids: deviceIds,
+    });
+    if (!result.ok) {
+      return jsonResponse(result.matrix_error.body, result.matrix_error.status);
+    }
+    mergeKeyQueryMaps(response.device_keys, result.response.device_keys);
+    mergeKeyQueryMaps(response.master_keys, result.response.master_keys);
+    mergeKeyQueryMaps(response.self_signing_keys, result.response.self_signing_keys);
+    mergeKeyQueryMaps(response.user_signing_keys, result.response.user_signing_keys);
+  }
+  return jsonResponse(response);
+}
+
+async function handleKeysClaim(request, env) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const body = await readJsonObject(request);
+  if (body instanceof Response) {
+    return body;
+  }
+  if (!isObjectRecord(body.one_time_keys)) {
+    return matrixErrorResponse(400, 'M_MISSING_PARAM', 'one_time_keys is required');
+  }
+  const response = {
+    one_time_keys: {},
+  };
+  for (const [rawUserId, deviceRequests] of Object.entries(body.one_time_keys)) {
+    if (!isObjectRecord(deviceRequests)) {
+      return matrixErrorResponse(400, 'M_BAD_JSON', `one_time_keys.${rawUserId} must be an object`);
+    }
+    const targetUserId = normalizeRequestUserId(rawUserId, env);
+    if (!targetUserId) {
+      continue;
+    }
+    const result = await getUserDoStub(env, targetUserId).claimOneTimeKeys({
+      user_id: targetUserId,
+      requester_user_id: access.session.user_id,
+      device_requests: deviceRequests,
+    });
+    if (!result.ok) {
+      return jsonResponse(result.matrix_error.body, result.matrix_error.status);
+    }
+    mergeKeyQueryMaps(response.one_time_keys, result.response.one_time_keys);
+  }
+  return jsonResponse(response);
+}
+
+async function handleCrossSigningUpload(request, env) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const body = await readJsonObject(request);
+  if (body instanceof Response) {
+    return body;
+  }
+  const requestFingerprint = buildRequestFingerprint(
+    '/_matrix/client/v3/keys/device_signing/upload',
+    access.session.user_id,
+    {
+      master_key: body.master_key ?? null,
+      self_signing_key: body.self_signing_key ?? null,
+      user_signing_key: body.user_signing_key ?? null,
+    },
+    'POST',
+  );
+  const currentSnapshot = await access.user_do.queryDeviceKeys({
+    user_id: access.session.user_id,
+    requester_user_id: access.session.user_id,
+    device_ids: [],
+  });
+  if (!currentSnapshot.ok) {
+    return jsonResponse(currentSnapshot.matrix_error.body, currentSnapshot.matrix_error.status);
+  }
+  if (crossSigningUploadRequiresUia(currentSnapshot.response, body)) {
+    const auth = isObjectRecord(body.auth)
+      ? { ...body.auth, route_family: 'keys/device_signing/upload' }
+      : null;
+    if (!auth || auth.type !== 'm.login.password' || typeof auth.session !== 'string') {
+      return buildUiaChallengeResponse(env, 'keys/device_signing/upload', 'POST', access.session.user_id);
+    }
+    const stage = resolvePasswordUiaContext({
+      env,
+      auth,
+      accessSession: access.session,
+      hintedLocalpart: null,
+      method: 'POST',
+    });
+    if (!stage.ok) {
+      return stage.response ?? buildUiaChallengeResponse(env, 'keys/device_signing/upload', 'POST', access.session.user_id);
+    }
+    const replay = await stage.user_do.resolvePhase05CrossSigningReplay({
+      user_id: stage.user_id,
+      request_fingerprint: requestFingerprint,
+      uia_nonce: stage.payload.nonce,
+    });
+    if (!replay.ok) {
+      return jsonResponse(replay.matrix_error.body, replay.matrix_error.status);
+    }
+    if (replay.handled) {
+      return jsonResponse(replay.response);
+    }
+    const verification = await stage.user_do.verifyPasswordAuth({
+      localpart: stage.localpart,
+      password: auth.password ?? '',
+    });
+    if (!verification.ok) {
+      return jsonResponse(verification.matrix_error.body, verification.matrix_error.status);
+    }
+    const result = await stage.user_do.uploadCrossSigningKeys({
+      user_id: stage.user_id,
+      request_fingerprint: requestFingerprint,
+      uia_nonce: stage.payload.nonce,
+      master_key: body.master_key ?? null,
+      self_signing_key: body.self_signing_key ?? null,
+      user_signing_key: body.user_signing_key ?? null,
+    });
+    if (!result.ok) {
+      return jsonResponse(result.matrix_error.body, result.matrix_error.status);
+    }
+    return jsonResponse(result.response);
+  }
+  const result = await access.user_do.uploadCrossSigningKeys({
+    user_id: access.session.user_id,
+    master_key: body.master_key ?? null,
+    self_signing_key: body.self_signing_key ?? null,
+    user_signing_key: body.user_signing_key ?? null,
+  });
+  if (!result.ok) {
+    return jsonResponse(result.matrix_error.body, result.matrix_error.status);
+  }
+  return jsonResponse(result.response);
+}
+
+async function handleCrossSigningSignaturesUpload(request, env) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const body = await readJsonObject(request);
+  if (body instanceof Response) {
+    return body;
+  }
+  const failures = {};
+  for (const [rawUserId, signedObjects] of Object.entries(body)) {
+    if (!isObjectRecord(signedObjects)) {
+      return matrixErrorResponse(400, 'M_BAD_JSON', `signatures.${rawUserId} must be an object`);
+    }
+    const targetUserId = normalizeRequestUserId(rawUserId, env);
+    if (!targetUserId) {
+      continue;
+    }
+    const result = await getUserDoStub(env, targetUserId).uploadCrossSigningSignatures({
+      user_id: targetUserId,
+      requester_user_id: access.session.user_id,
+      signed_objects: signedObjects,
+    });
+    if (!result.ok) {
+      return jsonResponse(result.matrix_error.body, result.matrix_error.status);
+    }
+    mergeKeyQueryMaps(failures, result.response.failures);
+  }
+  return jsonResponse({ failures });
+}
+
+async function handleCreateRoomKeyBackupVersion(request, env) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const body = await readJsonObject(request);
+  if (body instanceof Response) {
+    return body;
+  }
+  const result = await access.user_do.createRoomKeyBackupVersion({
+    user_id: access.session.user_id,
+    algorithm: body.algorithm,
+    auth_data: body.auth_data ?? {},
+  });
+  if (!result.ok) {
+    return jsonResponse(result.matrix_error.body, result.matrix_error.status);
+  }
+  return jsonResponse(result.response);
+}
+
+async function handleGetCurrentRoomKeyBackupVersion(request, env) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const result = await access.user_do.getCurrentRoomKeyBackupVersion({
+    user_id: access.session.user_id,
+  });
+  if (!result.ok) {
+    return jsonResponse(result.matrix_error.body, result.matrix_error.status);
+  }
+  return jsonResponse(result.response);
+}
+
+async function handleGetRoomKeyBackupVersion(request, env, version) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const decodedVersion = decodePathComponent(version);
+  if (!decodedVersion) {
+    return matrixErrorResponse(400, 'M_INVALID_PARAM', 'Invalid backup version path');
+  }
+  const result = await access.user_do.getRoomKeyBackupVersion({
+    user_id: access.session.user_id,
+    backup_version: decodedVersion,
+  });
+  if (!result.ok) {
+    return jsonResponse(result.matrix_error.body, result.matrix_error.status);
+  }
+  return jsonResponse(result.response);
+}
+
+async function handleUpdateRoomKeyBackupVersion(request, env, version) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const decodedVersion = decodePathComponent(version);
+  if (!decodedVersion) {
+    return matrixErrorResponse(400, 'M_INVALID_PARAM', 'Invalid backup version path');
+  }
+  const body = await readJsonObject(request);
+  if (body instanceof Response) {
+    return body;
+  }
+  const result = await access.user_do.updateRoomKeyBackupVersion({
+    user_id: access.session.user_id,
+    backup_version: decodedVersion,
+    algorithm: body.algorithm,
+    auth_data: body.auth_data ?? {},
+  });
+  if (!result.ok) {
+    return jsonResponse(result.matrix_error.body, result.matrix_error.status);
+  }
+  return jsonResponse(result.response);
+}
+
+async function handleDeleteRoomKeyBackupVersion(request, env, version) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const decodedVersion = decodePathComponent(version);
+  if (!decodedVersion) {
+    return matrixErrorResponse(400, 'M_INVALID_PARAM', 'Invalid backup version path');
+  }
+  const result = await access.user_do.deleteRoomKeyBackupVersion({
+    user_id: access.session.user_id,
+    backup_version: decodedVersion,
+  });
+  if (!result.ok) {
+    return result.error
+      ? mapInternalErrorToResponse(result.error)
+      : jsonResponse(result.matrix_error.body, result.matrix_error.status);
+  }
+  return jsonResponse(result.response);
+}
+
+async function handlePutRoomKeyBackupData(request, env, {
+  version,
+  roomId = null,
+  sessionId = null,
+} = {}) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const decodedVersion = decodePathComponent(version);
+  const decodedRoomId = roomId == null ? null : decodePathComponent(roomId);
+  const decodedSessionId = sessionId == null ? null : decodePathComponent(sessionId);
+  if (!decodedVersion || (roomId != null && !decodedRoomId) || (sessionId != null && !decodedSessionId)) {
+    return matrixErrorResponse(400, 'M_INVALID_PARAM', 'Invalid backup data path');
+  }
+  const body = await readJsonObject(request);
+  if (body instanceof Response) {
+    return body;
+  }
+  const result = await access.user_do.putRoomKeyBackupData({
+    user_id: access.session.user_id,
+    backup_version: decodedVersion,
+    room_id: decodedRoomId,
+    session_id: decodedSessionId,
+    backup_data: body,
+  });
+  if (!result.ok) {
+    return result.error
+      ? mapInternalErrorToResponse(result.error)
+      : jsonResponse(result.matrix_error.body, result.matrix_error.status);
+  }
+  return jsonResponse(result.response);
+}
+
+async function handleGetRoomKeyBackupData(request, env, {
+  version,
+  roomId = null,
+  sessionId = null,
+} = {}) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const decodedVersion = decodePathComponent(version);
+  const decodedRoomId = roomId == null ? null : decodePathComponent(roomId);
+  const decodedSessionId = sessionId == null ? null : decodePathComponent(sessionId);
+  if (!decodedVersion || (roomId != null && !decodedRoomId) || (sessionId != null && !decodedSessionId)) {
+    return matrixErrorResponse(400, 'M_INVALID_PARAM', 'Invalid backup data path');
+  }
+  const result = await access.user_do.getRoomKeyBackupData({
+    user_id: access.session.user_id,
+    backup_version: decodedVersion,
+    room_id: decodedRoomId,
+    session_id: decodedSessionId,
+  });
+  if (!result.ok) {
+    return result.error
+      ? mapInternalErrorToResponse(result.error)
+      : jsonResponse(result.matrix_error.body, result.matrix_error.status);
+  }
+  return jsonResponse(result.response);
+}
+
+async function handleDeleteRoomKeyBackupData(request, env, {
+  version,
+  roomId = null,
+  sessionId = null,
+} = {}) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const decodedVersion = decodePathComponent(version);
+  const decodedRoomId = roomId == null ? null : decodePathComponent(roomId);
+  const decodedSessionId = sessionId == null ? null : decodePathComponent(sessionId);
+  if (!decodedVersion || (roomId != null && !decodedRoomId) || (sessionId != null && !decodedSessionId)) {
+    return matrixErrorResponse(400, 'M_INVALID_PARAM', 'Invalid backup data path');
+  }
+  const result = await access.user_do.deleteRoomKeyBackupData({
+    user_id: access.session.user_id,
+    backup_version: decodedVersion,
+    room_id: decodedRoomId,
+    session_id: decodedSessionId,
+  });
+  if (!result.ok) {
+    return result.error
+      ? mapInternalErrorToResponse(result.error)
+      : jsonResponse(result.matrix_error.body, result.matrix_error.status);
+  }
+  return jsonResponse(result.response);
 }
 
 async function admitRoomClientEvent(roomDo, {
@@ -3806,19 +4701,20 @@ async function handleRequest(request, env) {
     workerName: 'gateway-worker',
     config,
   });
+  const observedWorkerVersionId = resolveRuntimeWorkerVersionId(env, config.text.WORKER_VERSION_ID);
   const url = new URL(request.url);
   const { pathname } = url;
   const method = request.method.toUpperCase();
   const classification = classifyGatewayRequest(method, pathname);
   const requestContext = createRequestContext({
     workerName: 'gateway-worker',
-    workerVersion: config.text.WORKER_VERSION_ID,
+    workerVersion: observedWorkerVersionId,
     request,
     routeFamily: classification.route_family,
   });
   const requestMetrics = startRequestMetrics(env, {
     workerName: 'gateway-worker',
-    workerVersion: config.text.WORKER_VERSION_ID,
+    workerVersion: observedWorkerVersionId,
     routeFamily: classification.route_family,
   });
   const finalizeResponse = (response, {
@@ -3840,7 +4736,7 @@ async function handleRequest(request, env) {
         : { cpu_ms: Math.round(completed.cpu_ms) }),
       ...(errorClass == null ? {} : { error_class: errorClass }),
     });
-    return response;
+    return attachRolloutProbeHeaders(request, env, response);
   };
 
   requestContext.logger.info('gateway.request.start', {
@@ -3848,7 +4744,7 @@ async function handleRequest(request, env) {
     path: pathname,
   });
   try {
-    const abuseResponse = enforceGatewayAbuseGuard(request, env, classification);
+    const abuseResponse = await enforceGatewayAbuseGuard(request, env, classification);
     const response = await (async () => {
       if (abuseResponse) {
         return abuseResponse;
@@ -4246,6 +5142,112 @@ async function handleRequest(request, env) {
       const roomReceiptMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/receipt\/([^/]+)\/([^/]+)$/.exec(pathname);
       if (roomReceiptMatch && method === 'POST') {
         return handleRoomReceipt(request, env, roomReceiptMatch[1], roomReceiptMatch[2], roomReceiptMatch[3]);
+      }
+
+      if (pathname === '/_matrix/client/v3/devices' && method === 'GET') {
+        return handleListDevices(request, env);
+      }
+      const deviceMatch = /^\/_matrix\/client\/v3\/devices\/([^/]+)$/.exec(pathname);
+      if (deviceMatch && method === 'GET') {
+        return handleGetDevice(request, env, deviceMatch[1]);
+      }
+      if (deviceMatch && method === 'PUT') {
+        return handleUpdateDevice(request, env, deviceMatch[1]);
+      }
+      if (deviceMatch && method === 'DELETE') {
+        return handleDeleteDevice(request, env, deviceMatch[1]);
+      }
+      if (pathname === '/_matrix/client/v3/delete_devices' && method === 'POST') {
+        return handleDeleteDevices(request, env);
+      }
+
+      if (pathname === '/_matrix/client/v3/keys/upload' && method === 'POST') {
+        return handleKeysUpload(request, env);
+      }
+      if (pathname === '/_matrix/client/v3/keys/query' && method === 'POST') {
+        return handleKeysQuery(request, env);
+      }
+      if (pathname === '/_matrix/client/v3/keys/claim' && method === 'POST') {
+        return handleKeysClaim(request, env);
+      }
+      if (pathname === '/_matrix/client/v3/keys/device_signing/upload' && method === 'POST') {
+        return handleCrossSigningUpload(request, env);
+      }
+      if (pathname === '/_matrix/client/v3/keys/signatures/upload' && method === 'POST') {
+        return handleCrossSigningSignaturesUpload(request, env);
+      }
+
+      if (pathname === '/_matrix/client/v3/room_keys/version' && method === 'POST') {
+        return handleCreateRoomKeyBackupVersion(request, env);
+      }
+      if (pathname === '/_matrix/client/v3/room_keys/version' && method === 'GET') {
+        return handleGetCurrentRoomKeyBackupVersion(request, env);
+      }
+      const roomKeyVersionMatch = /^\/_matrix\/client\/v3\/room_keys\/version\/([^/]+)$/.exec(pathname);
+      if (roomKeyVersionMatch && method === 'GET') {
+        return handleGetRoomKeyBackupVersion(request, env, roomKeyVersionMatch[1]);
+      }
+      if (roomKeyVersionMatch && method === 'PUT') {
+        return handleUpdateRoomKeyBackupVersion(request, env, roomKeyVersionMatch[1]);
+      }
+      if (roomKeyVersionMatch && method === 'DELETE') {
+        return handleDeleteRoomKeyBackupVersion(request, env, roomKeyVersionMatch[1]);
+      }
+      const roomKeySessionMatch = /^\/_matrix\/client\/v3\/room_keys\/keys\/([^/]+)\/([^/]+)$/.exec(pathname);
+      if (roomKeySessionMatch && method === 'GET') {
+        return handleGetRoomKeyBackupData(request, env, {
+          version: url.searchParams.get('version'),
+          roomId: roomKeySessionMatch[1],
+          sessionId: roomKeySessionMatch[2],
+        });
+      }
+      if (roomKeySessionMatch && method === 'PUT') {
+        return handlePutRoomKeyBackupData(request, env, {
+          version: url.searchParams.get('version'),
+          roomId: roomKeySessionMatch[1],
+          sessionId: roomKeySessionMatch[2],
+        });
+      }
+      if (roomKeySessionMatch && method === 'DELETE') {
+        return handleDeleteRoomKeyBackupData(request, env, {
+          version: url.searchParams.get('version'),
+          roomId: roomKeySessionMatch[1],
+          sessionId: roomKeySessionMatch[2],
+        });
+      }
+      const roomKeyRoomMatch = /^\/_matrix\/client\/v3\/room_keys\/keys\/([^/]+)$/.exec(pathname);
+      if (roomKeyRoomMatch && method === 'GET') {
+        return handleGetRoomKeyBackupData(request, env, {
+          version: url.searchParams.get('version'),
+          roomId: roomKeyRoomMatch[1],
+        });
+      }
+      if (roomKeyRoomMatch && method === 'PUT') {
+        return handlePutRoomKeyBackupData(request, env, {
+          version: url.searchParams.get('version'),
+          roomId: roomKeyRoomMatch[1],
+        });
+      }
+      if (roomKeyRoomMatch && method === 'DELETE') {
+        return handleDeleteRoomKeyBackupData(request, env, {
+          version: url.searchParams.get('version'),
+          roomId: roomKeyRoomMatch[1],
+        });
+      }
+      if (pathname === '/_matrix/client/v3/room_keys/keys' && method === 'GET') {
+        return handleGetRoomKeyBackupData(request, env, {
+          version: url.searchParams.get('version'),
+        });
+      }
+      if (pathname === '/_matrix/client/v3/room_keys/keys' && method === 'PUT') {
+        return handlePutRoomKeyBackupData(request, env, {
+          version: url.searchParams.get('version'),
+        });
+      }
+      if (pathname === '/_matrix/client/v3/room_keys/keys' && method === 'DELETE') {
+        return handleDeleteRoomKeyBackupData(request, env, {
+          version: url.searchParams.get('version'),
+        });
       }
 
       const sendToDeviceMatch = /^\/_matrix\/client\/v3\/sendToDevice\/([^/]+)\/([^/]+)$/.exec(pathname);

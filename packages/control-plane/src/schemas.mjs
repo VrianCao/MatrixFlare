@@ -81,6 +81,12 @@ export const QUEUE_NAMES = Object.freeze({
   restore: 'matrix-restore-shard-job',
   repair: 'matrix-repair-shard-job',
 });
+const CONTROL_PLANE_QUEUE_BINDINGS = Object.freeze({
+  rebuild: 'REBUILD_SHARD_QUEUE',
+  export: 'EXPORT_SHARD_QUEUE',
+  restore: 'RESTORE_SHARD_QUEUE',
+  repair: 'REPAIR_SHARD_QUEUE',
+});
 export const JOB_TO_SCOPE = Object.freeze({
   export: 'ops.export.write',
   restore: 'ops.restore.write',
@@ -94,6 +100,8 @@ export const ROUTE_TEMPLATES = Object.freeze({
   restores: '/_ops/v1/restores',
   rebuilds: '/_ops/v1/rebuilds',
   repairs: '/_ops/v1/repairs',
+  rolloutSkewProbe: '/_ops/v1/rollout-skew/probe',
+  costObservation: '/_ops/v1/cost/observation',
   jobsList: '/_ops/v1/jobs',
   jobsItem: '/_ops/v1/jobs/{jobId}',
   jobsCancel: '/_ops/v1/jobs/{jobId}/cancel',
@@ -150,6 +158,19 @@ function normalizeInteger(value, label, { min = 0, allowNull = false } = {}) {
   return value;
 }
 
+function normalizeNumber(value, label, { min = 0, allowNull = false } = {}) {
+  if (value == null) {
+    if (allowNull) {
+      return null;
+    }
+    throw new TypeError(`${label} must be a number`);
+  }
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < min) {
+    throw new TypeError(`${label} must be a finite number >= ${min}`);
+  }
+  return value;
+}
+
 function normalizeEnum(value, label, allowedValues) {
   const normalized = normalizeString(value, label);
   if (!allowedValues.includes(normalized)) {
@@ -162,6 +183,11 @@ function normalizeNullableStringArray(value, label) {
   if (value == null) {
     return null;
   }
+  assertArray(value, label);
+  return value.map((entry, index) => normalizeString(entry, `${label}[${index}]`));
+}
+
+function normalizeStringArray(value, label) {
   assertArray(value, label);
   return value.map((entry, index) => normalizeString(entry, `${label}[${index}]`));
 }
@@ -227,6 +253,7 @@ export function normalizeOpsHealthResponse(value) {
     worker_version_id: normalizeString(value.worker_version_id, 'worker_version_id'),
     deployment_id: normalizeString(value.deployment_id, 'deployment_id'),
     compatibility_date: normalizeString(value.compatibility_date, 'compatibility_date'),
+    compatibility_flags: normalizeStringArray(value.compatibility_flags, 'compatibility_flags'),
     release_profile: normalizeString(value.release_profile, 'release_profile'),
     cpu_limit_class: normalizeString(value.cpu_limit_class, 'cpu_limit_class'),
     startup_time_ms: normalizeInteger(value.startup_time_ms, 'startup_time_ms', { min: 0 }),
@@ -238,6 +265,202 @@ export function normalizeOpsHealthResponse(value) {
       ? {}
       : (assertObject(value.secret_versions, 'secret_versions'), structuredClone(value.secret_versions)),
     dependencies,
+  };
+}
+
+const ROLLOUT_SKEW_PROBE_NAMES = Object.freeze([
+  'new-worker-old-authority',
+  'old-worker-new-authority',
+]);
+
+const ROLLOUT_SKEW_AUTHORITY_KINDS = Object.freeze([
+  'UserDO',
+  'RoomDO',
+]);
+
+export function normalizeRolloutSkewProbeRequest(value) {
+  assertObject(value, 'RolloutSkewProbeRequest');
+  const normalized = {
+    probe_run_id: normalizeString(value.probe_run_id, 'probe_run_id'),
+    baseline_gateway_version_id: normalizeString(value.baseline_gateway_version_id, 'baseline_gateway_version_id'),
+    baseline_gateway_version_tag: normalizeString(value.baseline_gateway_version_tag, 'baseline_gateway_version_tag'),
+    candidate_gateway_version_id: normalizeString(value.candidate_gateway_version_id, 'candidate_gateway_version_id'),
+    candidate_gateway_version_tag: normalizeString(value.candidate_gateway_version_tag, 'candidate_gateway_version_tag'),
+    dual_version_deployment_id: normalizeString(value.dual_version_deployment_id, 'dual_version_deployment_id'),
+    authority_kind: normalizeEnum(value.authority_kind, 'authority_kind', ['matrix-core']),
+    seed_prefix: normalizeString(value.seed_prefix, 'seed_prefix'),
+  };
+  if (normalized.baseline_gateway_version_id === normalized.candidate_gateway_version_id) {
+    throw new RangeError('candidate_gateway_version_id must differ from baseline_gateway_version_id');
+  }
+  if (normalized.baseline_gateway_version_tag === normalized.candidate_gateway_version_tag) {
+    throw new RangeError('candidate_gateway_version_tag must differ from baseline_gateway_version_tag');
+  }
+  return normalized;
+}
+
+export function normalizeRolloutSkewObservation(value, label = 'RolloutSkewObservation') {
+  assertObject(value, label);
+  const observedGatewayVersionId = normalizeString(
+    value.observed_gateway_version_id,
+    `${label}.observed_gateway_version_id`,
+    { allowNull: true },
+  );
+  const observedGatewayVersionTag = normalizeString(
+    value.observed_gateway_version_tag,
+    `${label}.observed_gateway_version_tag`,
+    { allowNull: true },
+  );
+  if (observedGatewayVersionId == null && observedGatewayVersionTag == null) {
+    throw new RangeError(`${label}.observed_gateway_version_id or ${label}.observed_gateway_version_tag must be present`);
+  }
+  return {
+    probe_name: normalizeEnum(value.probe_name, `${label}.probe_name`, ROLLOUT_SKEW_PROBE_NAMES),
+    request_gateway_version_id: normalizeString(value.request_gateway_version_id, `${label}.request_gateway_version_id`),
+    observed_gateway_version_id: observedGatewayVersionId,
+    observed_gateway_version_tag: observedGatewayVersionTag,
+    observed_authority_version_id: normalizeString(value.observed_authority_version_id, `${label}.observed_authority_version_id`),
+    authority_kind: normalizeEnum(value.authority_kind, `${label}.authority_kind`, ROLLOUT_SKEW_AUTHORITY_KINDS),
+    authority_key: normalizeString(value.authority_key, `${label}.authority_key`),
+    request_path: normalizeString(value.request_path, `${label}.request_path`),
+    observed_at: normalizeString(value.observed_at, `${label}.observed_at`),
+  };
+}
+
+export function normalizeRolloutSkewProbeResponse(value) {
+  assertObject(value, 'RolloutSkewProbeResponse');
+  const observations = (value.observations ?? []).map((entry, index) => normalizeRolloutSkewObservation(entry, `observations[${index}]`));
+  assertObject(value.assertions, 'assertions');
+  const assertions = {
+    new_worker_old_authority: normalizeBoolean(value.assertions.new_worker_old_authority, 'assertions.new_worker_old_authority'),
+    old_worker_new_authority: normalizeBoolean(value.assertions.old_worker_new_authority, 'assertions.old_worker_new_authority'),
+  };
+  return {
+    environment_name: normalizeString(value.environment_name, 'environment_name'),
+    probe_run_id: normalizeString(value.probe_run_id, 'probe_run_id'),
+    dual_version_deployment_id: normalizeString(value.dual_version_deployment_id, 'dual_version_deployment_id'),
+    baseline_gateway_version_id: normalizeString(value.baseline_gateway_version_id, 'baseline_gateway_version_id'),
+    baseline_gateway_version_tag: normalizeString(value.baseline_gateway_version_tag, 'baseline_gateway_version_tag'),
+    candidate_gateway_version_id: normalizeString(value.candidate_gateway_version_id, 'candidate_gateway_version_id'),
+    candidate_gateway_version_tag: normalizeString(value.candidate_gateway_version_tag, 'candidate_gateway_version_tag'),
+    override_strategy: normalizeString(value.override_strategy, 'override_strategy'),
+    observations,
+    assertions,
+  };
+}
+
+const PRE_RELEASE_COST_SURFACE_NAMES = Object.freeze([
+  'workers',
+  'durable_objects',
+  'd1',
+  'r2',
+  'kv',
+  'queues',
+]);
+
+function normalizeAbsoluteExternalUri(value, label) {
+  const normalized = normalizeString(value, label);
+  let parsed;
+  try {
+    parsed = new URL(normalized);
+  } catch (error) {
+    throw new TypeError(`${label} must be an absolute URI: ${error.message}`);
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+    throw new TypeError(`${label} must use http or https`);
+  }
+  if (parsed.host.length === 0) {
+    throw new TypeError(`${label} must include an authority`);
+  }
+  return normalized;
+}
+
+function normalizeOfficialCloudflareUri(value, label) {
+  const normalized = normalizeAbsoluteExternalUri(value, label);
+  const parsed = new URL(normalized);
+  const hostname = parsed.hostname.toLowerCase();
+  if (
+    parsed.protocol !== 'https:'
+    || (hostname !== 'cloudflare.com' && !hostname.endsWith('.cloudflare.com'))
+  ) {
+    throw new TypeError(`${label} must be an official Cloudflare HTTPS locator`);
+  }
+  return normalized;
+}
+
+function normalizeTimestamp(value, label) {
+  const normalized = normalizeString(value, label);
+  if (!normalized.endsWith('Z') || Number.isNaN(Date.parse(normalized))) {
+    throw new TypeError(`${label} must be an RFC 3339 UTC timestamp`);
+  }
+  return normalized;
+}
+
+function normalizeNonEmptyStringArray(value, label) {
+  assertArray(value, label);
+  if (value.length === 0) {
+    throw new TypeError(`${label} must not be empty`);
+  }
+  return value.map((entry, index) => normalizeString(entry, `${label}[${index}]`));
+}
+
+function normalizeCloudflareResourceSnapshot(value, label = 'cloudflare_resources') {
+  assertObject(value, label);
+  return Object.freeze({
+    workers: normalizeNonEmptyStringArray(value.workers, `${label}.workers`),
+    durable_objects: normalizeNonEmptyStringArray(value.durable_objects, `${label}.durable_objects`),
+    d1_databases: normalizeNonEmptyStringArray(value.d1_databases, `${label}.d1_databases`),
+    r2_buckets: normalizeNonEmptyStringArray(value.r2_buckets, `${label}.r2_buckets`),
+    kv_namespaces: normalizeNonEmptyStringArray(value.kv_namespaces, `${label}.kv_namespaces`),
+    ratelimit_namespaces: normalizeNonEmptyStringArray(value.ratelimit_namespaces, `${label}.ratelimit_namespaces`),
+    queues: normalizeNonEmptyStringArray(value.queues, `${label}.queues`),
+  });
+}
+
+function normalizeCostSurfaceMap(value, label = 'cost_surfaces') {
+  assertObject(value, label);
+  const normalized = {};
+  for (const surfaceName of PRE_RELEASE_COST_SURFACE_NAMES) {
+    assertObject(value[surfaceName], `${label}.${surfaceName}`);
+    normalized[surfaceName] = structuredClone(value[surfaceName]);
+  }
+  if (value.telemetry_export != null) {
+    assertObject(value.telemetry_export, `${label}.telemetry_export`);
+    normalized.telemetry_export = structuredClone(value.telemetry_export);
+  }
+  return Object.freeze(normalized);
+}
+
+export function normalizePreReleaseCostObservation(value) {
+  assertObject(value, 'PreReleaseCostObservation');
+  assertObject(value.capture_window, 'capture_window');
+  assertObject(value.model_comparison, 'model_comparison');
+  const captureWindow = {
+    start: normalizeTimestamp(value.capture_window.start, 'capture_window.start'),
+    end: normalizeTimestamp(value.capture_window.end, 'capture_window.end'),
+  };
+  if (Date.parse(captureWindow.start) > Date.parse(captureWindow.end)) {
+    throw new RangeError('capture_window.start must be <= capture_window.end');
+  }
+  const sourceQueryUris = normalizeNonEmptyStringArray(value.source_query_uris, 'source_query_uris')
+    .map((entry, index) => normalizeOfficialCloudflareUri(entry, `source_query_uris[${index}]`));
+  return {
+    observation_id: normalizeString(value.observation_id, 'observation_id'),
+    source_environment: normalizeString(value.source_environment, 'source_environment'),
+    captured_at: normalizeTimestamp(value.captured_at, 'captured_at'),
+    capture_window: captureWindow,
+    capture_method: normalizeString(value.capture_method, 'capture_method'),
+    source_query_uris: sourceQueryUris,
+    topology_kind: normalizeString(value.topology_kind, 'topology_kind'),
+    cloudflare_resources: normalizeCloudflareResourceSnapshot(value.cloudflare_resources),
+    cost_surfaces: normalizeCostSurfaceMap(value.cost_surfaces),
+    model_comparison: {
+      status: normalizeString(value.model_comparison.status, 'model_comparison.status'),
+      summary: normalizeString(value.model_comparison.summary, 'model_comparison.summary'),
+      actual_total_usd: normalizeNumber(value.model_comparison.actual_total_usd, 'model_comparison.actual_total_usd'),
+      modeled_total_usd: normalizeNumber(value.model_comparison.modeled_total_usd, 'model_comparison.modeled_total_usd'),
+      drift_ratio: normalizeNumber(value.model_comparison.drift_ratio, 'model_comparison.drift_ratio'),
+    },
   };
 }
 
@@ -658,8 +881,31 @@ export function buildRepairShardJob({
   };
 }
 
-export function normalizeQueuePayload(queueName, value) {
+export function resolveCanonicalControlPlaneQueueName(queueName, queueBindingNames = null) {
+  const effectiveQueueNames = {
+    rebuild: queueBindingNames?.[CONTROL_PLANE_QUEUE_BINDINGS.rebuild] ?? QUEUE_NAMES.rebuild,
+    export: queueBindingNames?.[CONTROL_PLANE_QUEUE_BINDINGS.export] ?? QUEUE_NAMES.export,
+    restore: queueBindingNames?.[CONTROL_PLANE_QUEUE_BINDINGS.restore] ?? QUEUE_NAMES.restore,
+    repair: queueBindingNames?.[CONTROL_PLANE_QUEUE_BINDINGS.repair] ?? QUEUE_NAMES.repair,
+  };
+  if (queueName === QUEUE_NAMES.export || queueName === effectiveQueueNames.export) {
+    return QUEUE_NAMES.export;
+  }
+  if (queueName === QUEUE_NAMES.rebuild || queueName === effectiveQueueNames.rebuild) {
+    return QUEUE_NAMES.rebuild;
+  }
+  if (queueName === QUEUE_NAMES.restore || queueName === effectiveQueueNames.restore) {
+    return QUEUE_NAMES.restore;
+  }
+  if (queueName === QUEUE_NAMES.repair || queueName === effectiveQueueNames.repair) {
+    return QUEUE_NAMES.repair;
+  }
+  throw new RangeError(`Unsupported queue name ${queueName}`);
+}
+
+export function normalizeQueuePayload(queueName, value, queueBindingNames = null) {
   assertObject(value, 'queue payload');
+  const canonicalQueueName = resolveCanonicalControlPlaneQueueName(queueName, queueBindingNames);
   const schemaVersion = normalizeInteger(value.schema_version, 'schema_version', { min: 1 });
   if (schemaVersion !== CONTROL_PLANE_SCHEMA_VERSION) {
     throw Object.assign(
@@ -667,7 +913,7 @@ export function normalizeQueuePayload(queueName, value) {
       { code: 'unsupported_schema_version', retryable: false },
     );
   }
-  if (queueName === QUEUE_NAMES.export) {
+  if (canonicalQueueName === QUEUE_NAMES.export) {
     return buildExportShardJob({
       jobId: value.job_id,
       exportEpoch: value.export_epoch,
@@ -677,7 +923,7 @@ export function normalizeQueuePayload(queueName, value) {
       attempt: value.attempt,
     });
   }
-  if (queueName === QUEUE_NAMES.rebuild) {
+  if (canonicalQueueName === QUEUE_NAMES.rebuild) {
     return buildRebuildShardJob({
       jobId: value.job_id,
       rebuildTarget: value.rebuild_target,
@@ -688,7 +934,7 @@ export function normalizeQueuePayload(queueName, value) {
       attempt: value.attempt,
     });
   }
-  if (queueName === QUEUE_NAMES.restore) {
+  if (canonicalQueueName === QUEUE_NAMES.restore) {
     return buildRestoreShardJob({
       jobId: value.job_id,
       checkpointId: value.checkpoint_id,
@@ -698,7 +944,7 @@ export function normalizeQueuePayload(queueName, value) {
       attempt: value.attempt,
     });
   }
-  if (queueName === QUEUE_NAMES.repair) {
+  if (canonicalQueueName === QUEUE_NAMES.repair) {
     return buildRepairShardJob({
       jobId: value.job_id,
       repairKind: value.repair_kind,
@@ -709,5 +955,4 @@ export function normalizeQueuePayload(queueName, value) {
       attempt: value.attempt,
     });
   }
-  throw new RangeError(`Unsupported queue name ${queueName}`);
 }

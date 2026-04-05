@@ -67,6 +67,7 @@ jobs:
     env:
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_OBSERVABILITY_API_TOKEN: ${{ secrets.CLOUDFLARE_OBSERVABILITY_API_TOKEN }}
       MATRIX_PHASE08_RUN_TIMESTAMP: ${{ needs.metadata.outputs.run_timestamp }}
       MATRIX_PHASE08_RUN_URL: ${{ needs.metadata.outputs.run_url }}
     steps:
@@ -96,6 +97,9 @@ jobs:
           echo "artifact_root=${artifact_root}" >> "$GITHUB_OUTPUT"
           echo "provisioning=${state_root}/provisioning.json" >> "$GITHUB_OUTPUT"
           echo "deployment=${state_root}/deployment.json" >> "$GITHUB_OUTPUT"
+          echo "access_session=${state_root}/ops-access-session.json" >> "$GITHUB_OUTPUT"
+          echo "rollout_state=${state_root}/rollout-state.json" >> "$GITHUB_OUTPUT"
+          echo "rollout_restore=${state_root}/rollout-restore.json" >> "$GITHUB_OUTPUT"
           echo "github_artifact=${state_root}/github-artifact.json" >> "$GITHUB_OUTPUT"
           echo "log_upload=${state_root}/log-upload.json" >> "$GITHUB_OUTPUT"
           echo "bundle_upload=${state_root}/bundle-upload.json" >> "$GITHUB_OUTPUT"
@@ -122,29 +126,84 @@ jobs:
             --output "${{ steps.paths.outputs.deployment }}" \
             --deployment-id "gha-${{ matrix.environment }}-${MATRIX_PHASE08_RUN_TIMESTAMP}-${{ github.run_id }}-${{ github.run_attempt }}"
 
+      - name: Prepare non-local ops Access session
+        if: matrix.environment != 'ci-integration'
+        id: access
+        run: |
+          node packages/testing/src/cli.mjs nonlocal-prepare-ops-access \
+            --environment "${{ matrix.environment }}" \
+            --provisioning "${{ steps.paths.outputs.provisioning }}" \
+            --deployment "${{ steps.paths.outputs.deployment }}" \
+            --working-root "${{ steps.paths.outputs.state_root }}/ops-access" \
+            --output "${{ steps.paths.outputs.access_session }}"
+
+      - name: Start pre-release rollout skew deployment
+        if: matrix.environment == 'pre-release'
+        id: rollout_start
+        run: |
+          node packages/testing/src/cli.mjs nonlocal-rollout-start \
+            --environment "${{ matrix.environment }}" \
+            --provisioning "${{ steps.paths.outputs.provisioning }}" \
+            --deployment "${{ steps.paths.outputs.deployment }}" \
+            --working-root "${{ steps.paths.outputs.state_root }}/rollout" \
+            --output "${{ steps.paths.outputs.rollout_state }}" \
+            --deployment-id "gha-${{ matrix.environment }}-rollout-${MATRIX_PHASE08_RUN_TIMESTAMP}-${{ github.run_id }}-${{ github.run_attempt }}"
+
       - name: Run environment-backed suite
         id: suite
         continue-on-error: true
+        shell: bash
         run: |
-          node packages/testing/src/cli.mjs nonlocal-run \
-            --environment "${{ matrix.environment }}" \
-            --deployment "${{ steps.paths.outputs.deployment }}" \
-            --timestamp "${MATRIX_PHASE08_RUN_TIMESTAMP}" \
-            --output-root "${{ steps.paths.outputs.artifact_root }}" \
-            --source-run-uri "${MATRIX_PHASE08_RUN_URL}" \
-            --log-artifact "r2://matrix-evidence-${{ matrix.environment }}/${{ steps.paths.outputs.log_key }}" \
-            --executed-by "github-actions:${{ github.actor }}" \
-            --reviewed-by "github-actions-run:${{ github.run_id }}" \
+          args=(
+            node packages/testing/src/cli.mjs nonlocal-run
+            --environment "${{ matrix.environment }}"
+            --deployment "${{ steps.paths.outputs.deployment }}"
+            --timestamp "${MATRIX_PHASE08_RUN_TIMESTAMP}"
+            --output-root "${{ steps.paths.outputs.artifact_root }}"
+            --source-run-uri "${MATRIX_PHASE08_RUN_URL}"
+            --log-artifact "r2://matrix-evidence-${{ matrix.environment }}/${{ steps.paths.outputs.log_key }}"
+            --executed-by "github-actions:${{ github.actor }}"
+            --reviewed-by "github-actions-run:${{ github.run_id }}"
             --topology-kind "cloudflare-${{ matrix.environment }}"
+          )
+          if [ "${{ matrix.environment }}" != "ci-integration" ]; then
+            args+=(--access-session "${{ steps.paths.outputs.access_session }}")
+          fi
+          if [ "${{ matrix.environment }}" = "pre-release" ]; then
+            args+=(--rollout-state "${{ steps.paths.outputs.rollout_state }}")
+          fi
+          "${args[@]}"
+
+      - name: Restore pre-release rollout skew deployment
+        if: always() && matrix.environment == 'pre-release'
+        id: rollout_restore
+        shell: bash
+        run: |
+          if [ ! -f "${{ steps.paths.outputs.rollout_state }}" ]; then
+            echo "Missing rollout state; cannot prove restore executed" >&2
+            exit 1
+          fi
+          node packages/testing/src/cli.mjs nonlocal-rollout-restore \
+            --environment "${{ matrix.environment }}" \
+            --rollout-state "${{ steps.paths.outputs.rollout_state }}" \
+            --output "${{ steps.paths.outputs.rollout_restore }}"
+          test -f "${{ steps.paths.outputs.rollout_restore }}"
 
       - name: Bundle raw non-local artifacts
         if: always()
         shell: bash
         run: |
-          tar -czf "${{ steps.paths.outputs.artifact_root }}/run-bundle.tgz" \
+          bundle_tmp="${{ steps.paths.outputs.state_root }}/run-bundle.tgz"
+          if [ -f "${{ steps.paths.outputs.rollout_state }}" ]; then
+            cp "${{ steps.paths.outputs.rollout_state }}" "${{ steps.paths.outputs.artifact_root }}/rollout-state.json"
+          fi
+          if [ -f "${{ steps.paths.outputs.rollout_restore }}" ]; then
+            cp "${{ steps.paths.outputs.rollout_restore }}" "${{ steps.paths.outputs.artifact_root }}/rollout-restore.json"
+          fi
+          tar -czf "$bundle_tmp" \
             -C "${{ steps.paths.outputs.artifact_root }}" \
-            "${{ matrix.environment }}.json" \
-            "${{ matrix.environment }}.log"
+            .
+          mv "$bundle_tmp" "${{ steps.paths.outputs.artifact_root }}/run-bundle.tgz"
 
       - name: Upload raw workflow artifacts
         if: always()
@@ -153,11 +212,11 @@ jobs:
         with:
           name: ${{ steps.paths.outputs.raw_artifact_name }}
           path: |
-            ${{ steps.paths.outputs.artifact_root }}/${{ matrix.environment }}.json
-            ${{ steps.paths.outputs.artifact_root }}/${{ matrix.environment }}.log
-            ${{ steps.paths.outputs.artifact_root }}/run-bundle.tgz
+            ${{ steps.paths.outputs.artifact_root }}
             ${{ steps.paths.outputs.deployment }}
             ${{ steps.paths.outputs.provisioning }}
+            ${{ steps.paths.outputs.rollout_state }}
+            ${{ steps.paths.outputs.rollout_restore }}
           if-no-files-found: error
 
       - name: Record GitHub artifact metadata
@@ -175,11 +234,21 @@ jobs:
 
       - name: Upload suite log to R2
         if: always()
+        shell: bash
         run: |
+          log_path="${{ steps.paths.outputs.artifact_root }}/${{ matrix.environment }}.log"
+          if [ ! -f "$log_path" ]; then
+            if [ "${{ steps.suite.outcome }}" = "success" ]; then
+              echo "Missing suite log for successful suite in ${{ matrix.environment }}" >&2
+              exit 1
+            fi
+            echo "Suite log missing because suite did not complete; skipping R2 log upload for ${{ matrix.environment }}" >&2
+            exit 0
+          fi
           node packages/testing/src/cli.mjs nonlocal-upload-r2 \
             --bucket "matrix-evidence-${{ matrix.environment }}" \
             --key "${{ steps.paths.outputs.log_key }}" \
-            --file "${{ steps.paths.outputs.artifact_root }}/${{ matrix.environment }}.log" \
+            --file "$log_path" \
             --content-type "text/plain; charset=utf-8" \
             --output "${{ steps.paths.outputs.log_upload }}"
 
@@ -206,8 +275,23 @@ jobs:
             --github-run-attempt "${{ github.run_attempt }}" \
             --output "${{ steps.paths.outputs.provenance }}"
 
-      - name: Write environment attestation
+      - name: Enforce pre-attestation environment gate
         if: always()
+        id: environment_gate
+        continue-on-error: true
+        shell: bash
+        run: |
+          if [ "${{ steps.suite.outcome }}" != "success" ]; then
+            echo "Environment-backed suite did not pass for ${{ matrix.environment }}" >&2
+            exit 1
+          fi
+          if [ "${{ matrix.environment }}" = "pre-release" ] && [ "${{ steps.rollout_restore.outcome }}" != "success" ]; then
+            echo "Pre-release rollout restore did not pass" >&2
+            exit 1
+          fi
+
+      - name: Write environment attestation
+        if: steps.environment_gate.outcome == 'success'
         id: attest
         continue-on-error: true
         run: |
@@ -219,7 +303,7 @@ jobs:
             --output "${{ steps.paths.outputs.attestation }}"
 
       - name: Upload attestation artifact
-        if: always() && steps.attest.outcome == 'success'
+        if: steps.environment_gate.outcome == 'success' && steps.attest.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.paths.outputs.attestation_artifact_name }}
@@ -230,12 +314,210 @@ jobs:
         if: always()
         shell: bash
         run: |
-          if [ "${{ steps.suite.outcome }}" != "success" ]; then
-            echo "Environment-backed suite did not pass for ${{ matrix.environment }}" >&2
+          if [ "${{ steps.environment_gate.outcome }}" != "success" ]; then
+            echo "Pre-attestation environment gate did not pass for ${{ matrix.environment }}" >&2
             exit 1
           fi
           if [ "${{ steps.attest.outcome }}" != "success" ]; then
             echo "Attestation generation did not pass for ${{ matrix.environment }}" >&2
+            exit 1
+          fi
+
+  prod-cost:
+    needs:
+      - metadata
+      - local-foundation
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    environment: prod
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      MATRIX_PHASE08_RUN_TIMESTAMP: ${{ needs.metadata.outputs.run_timestamp }}
+      MATRIX_PHASE08_RUN_URL: ${{ needs.metadata.outputs.run_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Require Cloudflare credentials
+        shell: bash
+        run: |
+          test -n "$CLOUDFLARE_ACCOUNT_ID"
+          test -n "$CLOUDFLARE_API_TOKEN"
+
+      - name: Define prod-cost paths
+        id: paths
+        shell: bash
+        run: |
+          state_root=".tmp/github/prod-cost/state"
+          artifact_root=".tmp/github/prod-cost/artifacts"
+          bundle_key="gha/${{ github.run_id }}/${{ github.run_attempt }}/prod/${MATRIX_PHASE08_RUN_TIMESTAMP}/cost-bundle.tgz"
+          raw_artifact_name="phase08-prod-cost-raw-${MATRIX_PHASE08_RUN_TIMESTAMP}-${{ github.run_id }}-${{ github.run_attempt }}"
+          attestation_artifact_name="phase08-prod-cost-attestation-${MATRIX_PHASE08_RUN_TIMESTAMP}-${{ github.run_id }}-${{ github.run_attempt }}"
+          echo "state_root=${state_root}" >> "$GITHUB_OUTPUT"
+          echo "artifact_root=${artifact_root}" >> "$GITHUB_OUTPUT"
+          echo "snapshot=${artifact_root}/prod-cost-snapshot.json" >> "$GITHUB_OUTPUT"
+          echo "deployment_identity=${artifact_root}/prod-deployment-identity.json" >> "$GITHUB_OUTPUT"
+          echo "github_artifact=${state_root}/github-artifact.json" >> "$GITHUB_OUTPUT"
+          echo "bundle_upload=${state_root}/bundle-upload.json" >> "$GITHUB_OUTPUT"
+          echo "provenance=${state_root}/prod-cost-provenance.json" >> "$GITHUB_OUTPUT"
+          echo "attestation=${state_root}/prod-cost-attestation.json" >> "$GITHUB_OUTPUT"
+          echo "bundle_key=${bundle_key}" >> "$GITHUB_OUTPUT"
+          echo "raw_artifact_name=${raw_artifact_name}" >> "$GITHUB_OUTPUT"
+          echo "attestation_artifact_name=${attestation_artifact_name}" >> "$GITHUB_OUTPUT"
+          mkdir -p "$state_root" "$artifact_root"
+
+      - name: Define closed monthly billing window
+        id: billing_window
+        shell: bash
+        run: |
+          current_month_start="$(date -u +%Y-%m-01)"
+          from_date="$(date -u -d "${current_month_start} -1 month" +%Y-%m-01)"
+          to_date="$(date -u -d "${current_month_start} -1 day" +%Y-%m-%d)"
+          echo "from_date=${from_date}" >> "$GITHUB_OUTPUT"
+          echo "to_date=${to_date}" >> "$GITHUB_OUTPUT"
+
+      - name: Capture production cost snapshot
+        id: snapshot
+        continue-on-error: true
+        run: |
+          node packages/testing/src/cli.mjs prod-cost-snapshot \
+            --timestamp "${MATRIX_PHASE08_RUN_TIMESTAMP}" \
+            --artifact-root "${{ steps.paths.outputs.artifact_root }}" \
+            --output "${{ steps.paths.outputs.snapshot }}" \
+            --from "${{ steps.billing_window.outputs.from_date }}" \
+            --to "${{ steps.billing_window.outputs.to_date }}" \
+            --captured-by "github-actions:${{ github.actor }}" \
+            --reviewed-by "github-actions-run:${{ github.run_id }}"
+
+      - name: Bundle raw prod-cost artifacts
+        if: always()
+        shell: bash
+        run: |
+          bundle_tmp="${{ steps.paths.outputs.state_root }}/cost-bundle.tgz"
+          tar -czf "$bundle_tmp" \
+            -C "${{ steps.paths.outputs.artifact_root }}" \
+            .
+          mv "$bundle_tmp" "${{ steps.paths.outputs.artifact_root }}/cost-bundle.tgz"
+
+      - name: Upload raw prod-cost artifacts
+        if: always()
+        id: upload_raw
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.paths.outputs.raw_artifact_name }}
+          path: |
+            ${{ steps.paths.outputs.artifact_root }}
+          if-no-files-found: error
+
+      - name: Record GitHub artifact metadata
+        if: always()
+        shell: bash
+        run: |
+          cat > "${{ steps.paths.outputs.github_artifact }}" <<'EOF'
+          {
+            "artifact_name": "${{ steps.paths.outputs.raw_artifact_name }}",
+            "artifact_id": "${{ steps.upload_raw.outputs.artifact-id }}",
+            "artifact_url": "${{ steps.upload_raw.outputs.artifact-url }}",
+            "artifact_digest": "${{ steps.upload_raw.outputs.artifact-digest }}"
+          }
+          EOF
+
+      - name: Upload raw prod-cost bundle to R2
+        if: always()
+        id: upload_bundle_r2
+        continue-on-error: true
+        shell: bash
+        run: |
+          if [ ! -f "${{ steps.paths.outputs.artifact_root }}/cost-bundle.tgz" ]; then
+            echo "prod-cost bundle missing before R2 upload" >&2
+            exit 1
+          fi
+          node packages/testing/src/cli.mjs nonlocal-upload-r2 \
+            --bucket "matrix-evidence-prod" \
+            --key "${{ steps.paths.outputs.bundle_key }}" \
+            --file "${{ steps.paths.outputs.artifact_root }}/cost-bundle.tgz" \
+            --content-type "application/gzip" \
+            --output "${{ steps.paths.outputs.bundle_upload }}"
+          test -f "${{ steps.paths.outputs.bundle_upload }}"
+
+      - name: Write prod-cost provenance
+        if: always()
+        id: provenance
+        continue-on-error: true
+        shell: bash
+        run: |
+          if [ ! -f "${{ steps.paths.outputs.deployment_identity }}" ]; then
+            echo "prod deployment identity missing; cannot attest prod cost snapshot" >&2
+            exit 1
+          fi
+          if [ ! -f "${{ steps.paths.outputs.bundle_upload }}" ]; then
+            echo "prod-cost R2 upload record missing; cannot attest prod cost snapshot" >&2
+            exit 1
+          fi
+          node packages/testing/src/cli.mjs prod-cost-provenance \
+            --deployment-identity "${{ steps.paths.outputs.deployment_identity }}" \
+            --artifact-upload "${{ steps.paths.outputs.bundle_upload }}" \
+            --github-artifact "${{ steps.paths.outputs.github_artifact }}" \
+            --output "${{ steps.paths.outputs.provenance }}"
+
+      - name: Enforce pre-attestation prod-cost gate
+        if: always()
+        id: prod_cost_gate
+        continue-on-error: true
+        shell: bash
+        run: |
+          if [ "${{ steps.snapshot.outcome }}" != "success" ]; then
+            echo "prod-cost snapshot generation did not pass" >&2
+            exit 1
+          fi
+          if [ "${{ steps.upload_bundle_r2.outcome }}" != "success" ]; then
+            echo "prod-cost R2 upload did not pass" >&2
+            exit 1
+          fi
+          test -f "${{ steps.paths.outputs.snapshot }}"
+          test -f "${{ steps.paths.outputs.deployment_identity }}"
+          test -f "${{ steps.paths.outputs.bundle_upload }}"
+          if [ "${{ steps.provenance.outcome }}" != "success" ]; then
+            echo "prod-cost provenance generation did not pass" >&2
+            exit 1
+          fi
+          test -f "${{ steps.paths.outputs.provenance }}"
+
+      - name: Write prod-cost attestation
+        if: steps.prod_cost_gate.outcome == 'success'
+        id: attest
+        continue-on-error: true
+        run: |
+          node packages/testing/src/cli.mjs prod-cost-attest \
+            --timestamp "${MATRIX_PHASE08_RUN_TIMESTAMP}" \
+            --payload "${{ steps.paths.outputs.snapshot }}" \
+            --provenance "${{ steps.paths.outputs.provenance }}" \
+            --output "${{ steps.paths.outputs.attestation }}"
+
+      - name: Upload prod-cost attestation artifact
+        if: steps.prod_cost_gate.outcome == 'success' && steps.attest.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.paths.outputs.attestation_artifact_name }}
+          path: ${{ steps.paths.outputs.attestation }}
+          if-no-files-found: error
+
+      - name: Enforce prod-cost gate
+        if: always()
+        shell: bash
+        run: |
+          if [ "${{ steps.prod_cost_gate.outcome }}" != "success" ]; then
+            echo "prod-cost pre-attestation gate did not pass" >&2
+            exit 1
+          fi
+          if [ "${{ steps.attest.outcome }}" != "success" ]; then
+            echo "prod-cost attestation generation did not pass" >&2
             exit 1
           fi
 
@@ -244,6 +526,7 @@ jobs:
       - metadata
       - local-foundation
       - nonlocal
+      - prod-cost
     if: always()
     runs-on: ubuntu-latest
     steps:

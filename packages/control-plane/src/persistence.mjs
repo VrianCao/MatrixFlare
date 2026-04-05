@@ -43,6 +43,17 @@ async function statementAll(statement, ...bindings) {
   return result?.results ?? [];
 }
 
+function assertSqlIdentifier(value, label) {
+  if (typeof value !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(value)) {
+    throw new TypeError(`${label} must be a safe SQL identifier`);
+  }
+  return value;
+}
+
+function quoteSqlIdentifier(value, label) {
+  return `"${assertSqlIdentifier(value, label)}"`;
+}
+
 function mapJobRow(row) {
   if (!row) {
     return null;
@@ -107,165 +118,325 @@ const REQUIRED_CONTROL_PLANE_TABLES = Object.freeze([
   'appservice_configs',
 ]);
 
-export const CONTROL_PLANE_SCHEMA_SQL = `
-CREATE TABLE IF NOT EXISTS operator_authz_policies (
-  principal_id TEXT PRIMARY KEY,
-  principal_type TEXT NOT NULL,
-  access_issuer TEXT NOT NULL,
-  access_audience TEXT NOT NULL,
-  access_subject_binding TEXT NOT NULL,
-  access_subject_value TEXT NOT NULL,
-  allowed_scopes TEXT NOT NULL,
-  target_scope_constraints TEXT NOT NULL,
-  expires_at TEXT,
-  disabled_at TEXT,
-  require_reason INTEGER NOT NULL DEFAULT 0,
-  require_ticket INTEGER NOT NULL DEFAULT 0,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_operator_authz_lookup
-  ON operator_authz_policies (access_issuer, access_audience, access_subject_value);
+const CONTROL_PLANE_SCHEMA_ADDITIVE_COLUMNS = Object.freeze({
+  operator_authz_policies: Object.freeze([
+    { column_name: 'target_scope_constraints', column_sql: `TEXT NOT NULL DEFAULT '{}'` },
+    { column_name: 'require_reason', column_sql: 'INTEGER NOT NULL DEFAULT 0' },
+    { column_name: 'require_ticket', column_sql: 'INTEGER NOT NULL DEFAULT 0' },
+  ]),
+  audit_events: Object.freeze([
+    { column_name: 'job_id', column_sql: 'TEXT' },
+    { column_name: 'causation_id', column_sql: 'TEXT' },
+    { column_name: 'details_json', column_sql: 'TEXT' },
+  ]),
+  request_dedupe_projection: Object.freeze([
+    { column_name: 'response_payload_json', column_sql: 'TEXT' },
+  ]),
+  jobs: Object.freeze([
+    { column_name: 'checkpoint_state_json', column_sql: 'TEXT' },
+    { column_name: 'progress_completed_units', column_sql: 'INTEGER NOT NULL DEFAULT 0' },
+    { column_name: 'progress_total_units', column_sql: 'INTEGER NOT NULL DEFAULT 0' },
+    { column_name: 'progress_unit_name', column_sql: `TEXT NOT NULL DEFAULT 'shard'` },
+    { column_name: 'last_error_json', column_sql: 'TEXT' },
+    { column_name: 'registry_snapshot_id', column_sql: 'TEXT' },
+    { column_name: 'export_epoch', column_sql: 'TEXT' },
+    { column_name: 'result_summary_json', column_sql: 'TEXT' },
+  ]),
+  replay_manifests: Object.freeze([
+    { column_name: 'export_epoch', column_sql: 'TEXT' },
+    { column_name: 'registry_snapshot_id', column_sql: 'TEXT' },
+    { column_name: 'r2_object_key', column_sql: 'TEXT' },
+  ]),
+  repair_decisions: Object.freeze([
+    { column_name: 'details_json', column_sql: 'TEXT' },
+  ]),
+  shard_registry: Object.freeze([
+    { column_name: 'disabled_at', column_sql: 'TEXT' },
+  ]),
+  registry_snapshots: Object.freeze([
+    { column_name: 'signature', column_sql: 'TEXT' },
+    { column_name: 'signing_key_version', column_sql: 'TEXT' },
+    { column_name: 'r2_object_key', column_sql: 'TEXT' },
+  ]),
+  appservice_configs: Object.freeze([
+    { column_name: 'disabled_at', column_sql: 'TEXT' },
+  ]),
+});
 
-CREATE TABLE IF NOT EXISTS audit_events (
-  event_id TEXT PRIMARY KEY,
-  event_type TEXT NOT NULL,
-  occurred_at TEXT NOT NULL,
-  operator_principal_id TEXT NOT NULL,
-  auth_mechanism TEXT NOT NULL,
-  scope_kind TEXT NOT NULL,
-  scope_id TEXT,
-  scope_token TEXT NOT NULL,
-  request_id TEXT,
-  idempotency_key TEXT,
-  request_fingerprint TEXT,
-  job_id TEXT,
-  causation_id TEXT,
-  result_code TEXT NOT NULL,
-  affected_objects TEXT NOT NULL,
-  details_json TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_audit_events_job_id
-  ON audit_events (job_id, occurred_at);
+const CONTROL_PLANE_SCHEMA_STATEMENTS = Object.freeze([
+  `
+  CREATE TABLE IF NOT EXISTS operator_authz_policies (
+    principal_id TEXT PRIMARY KEY,
+    principal_type TEXT NOT NULL,
+    access_issuer TEXT NOT NULL,
+    access_audience TEXT NOT NULL,
+    access_subject_binding TEXT NOT NULL,
+    access_subject_value TEXT NOT NULL,
+    allowed_scopes TEXT NOT NULL,
+    target_scope_constraints TEXT NOT NULL,
+    expires_at TEXT,
+    disabled_at TEXT,
+    require_reason INTEGER NOT NULL DEFAULT 0,
+    require_ticket INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )
+  `,
+  `
+  CREATE INDEX IF NOT EXISTS idx_operator_authz_lookup
+    ON operator_authz_policies (access_issuer, access_audience, access_subject_value)
+  `,
+  `
+  CREATE TABLE IF NOT EXISTS audit_events (
+    event_id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    operator_principal_id TEXT NOT NULL,
+    auth_mechanism TEXT NOT NULL,
+    scope_kind TEXT NOT NULL,
+    scope_id TEXT,
+    scope_token TEXT NOT NULL,
+    request_id TEXT,
+    idempotency_key TEXT,
+    request_fingerprint TEXT,
+    job_id TEXT,
+    causation_id TEXT,
+    result_code TEXT NOT NULL,
+    affected_objects TEXT NOT NULL,
+    details_json TEXT
+  )
+  `,
+  `
+  CREATE INDEX IF NOT EXISTS idx_audit_events_job_id
+    ON audit_events (job_id, occurred_at)
+  `,
+  `
+  CREATE TABLE IF NOT EXISTS request_dedupe_projection (
+    operator_principal_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    scope_token TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL,
+    job_id TEXT,
+    result_code TEXT NOT NULL,
+    response_payload_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (operator_principal_id, idempotency_key, scope_token)
+  )
+  `,
+  `
+  CREATE TABLE IF NOT EXISTS jobs (
+    job_id TEXT PRIMARY KEY,
+    job_type TEXT NOT NULL,
+    internal_state TEXT NOT NULL,
+    scope_kind TEXT NOT NULL,
+    scope_id TEXT,
+    scope_token TEXT NOT NULL,
+    operator_principal_id TEXT NOT NULL,
+    auth_mechanism TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL,
+    accepted_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    completed_at TEXT,
+    canceled_at TEXT,
+    cancel_reason TEXT,
+    spec_json TEXT NOT NULL,
+    checkpoint_state_json TEXT,
+    progress_completed_units INTEGER NOT NULL DEFAULT 0,
+    progress_total_units INTEGER NOT NULL DEFAULT 0,
+    progress_unit_name TEXT NOT NULL DEFAULT 'shard',
+    last_error_json TEXT,
+    registry_snapshot_id TEXT,
+    export_epoch TEXT,
+    result_summary_json TEXT
+  )
+  `,
+  `
+  CREATE INDEX IF NOT EXISTS idx_jobs_filters
+    ON jobs (job_type, internal_state, scope_token, created_at, job_id)
+  `,
+  `
+  CREATE TABLE IF NOT EXISTS job_checkpoints (
+    job_id TEXT NOT NULL,
+    shard_type TEXT NOT NULL,
+    shard_key TEXT NOT NULL,
+    checkpoint_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (job_id, shard_type, shard_key)
+  )
+  `,
+  `
+  CREATE TABLE IF NOT EXISTS replay_manifests (
+    job_id TEXT PRIMARY KEY,
+    manifest_kind TEXT NOT NULL,
+    manifest_json TEXT NOT NULL,
+    manifest_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    export_epoch TEXT,
+    registry_snapshot_id TEXT,
+    r2_object_key TEXT
+  )
+  `,
+  `
+  CREATE TABLE IF NOT EXISTS repair_decisions (
+    decision_id TEXT PRIMARY KEY,
+    repair_kind TEXT NOT NULL,
+    scope_kind TEXT NOT NULL,
+    scope_id TEXT,
+    scope_token TEXT NOT NULL,
+    dry_run INTEGER NOT NULL DEFAULT 0,
+    reason TEXT NOT NULL,
+    ticket_id TEXT,
+    created_at TEXT NOT NULL,
+    details_json TEXT
+  )
+  `,
+  `
+  CREATE TABLE IF NOT EXISTS shard_registry (
+    shard_type TEXT NOT NULL,
+    shard_key TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    schema_version INTEGER NOT NULL,
+    disabled_at TEXT,
+    PRIMARY KEY (shard_type, shard_key)
+  )
+  `,
+  `
+  CREATE TABLE IF NOT EXISTS registry_snapshots (
+    registry_snapshot_id TEXT PRIMARY KEY,
+    export_epoch TEXT NOT NULL,
+    scope_kind TEXT NOT NULL,
+    scope_id TEXT,
+    scope_token TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    row_count INTEGER NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    snapshot_hash TEXT NOT NULL,
+    signature TEXT,
+    signing_key_version TEXT,
+    r2_object_key TEXT
+  )
+  `,
+  `
+  CREATE TABLE IF NOT EXISTS appservice_configs (
+    appservice_id TEXT PRIMARY KEY,
+    descriptor_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    disabled_at TEXT
+  )
+  `,
+].map((statement) => statement.trim()));
 
-CREATE TABLE IF NOT EXISTS request_dedupe_projection (
-  operator_principal_id TEXT NOT NULL,
-  idempotency_key TEXT NOT NULL,
-  scope_token TEXT NOT NULL,
-  request_fingerprint TEXT NOT NULL,
-  job_id TEXT,
-  result_code TEXT NOT NULL,
-  response_payload_json TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  PRIMARY KEY (operator_principal_id, idempotency_key, scope_token)
-);
+export const CONTROL_PLANE_SCHEMA_SQL = `${CONTROL_PLANE_SCHEMA_STATEMENTS.join(';\n\n')};\n`;
 
-CREATE TABLE IF NOT EXISTS jobs (
-  job_id TEXT PRIMARY KEY,
-  job_type TEXT NOT NULL,
-  internal_state TEXT NOT NULL,
-  scope_kind TEXT NOT NULL,
-  scope_id TEXT,
-  scope_token TEXT NOT NULL,
-  operator_principal_id TEXT NOT NULL,
-  auth_mechanism TEXT NOT NULL,
-  idempotency_key TEXT NOT NULL,
-  request_fingerprint TEXT NOT NULL,
-  accepted_at TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  started_at TEXT,
-  completed_at TEXT,
-  canceled_at TEXT,
-  cancel_reason TEXT,
-  spec_json TEXT NOT NULL,
-  checkpoint_state_json TEXT,
-  progress_completed_units INTEGER NOT NULL DEFAULT 0,
-  progress_total_units INTEGER NOT NULL DEFAULT 0,
-  progress_unit_name TEXT NOT NULL DEFAULT 'shard',
-  last_error_json TEXT,
-  registry_snapshot_id TEXT,
-  export_epoch TEXT,
-  result_summary_json TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_jobs_filters
-  ON jobs (job_type, internal_state, scope_token, created_at, job_id);
+function isControlPlaneIndexStatement(statementSql) {
+  return /^\s*CREATE\s+INDEX\b/i.test(statementSql);
+}
 
-CREATE TABLE IF NOT EXISTS job_checkpoints (
-  job_id TEXT NOT NULL,
-  shard_type TEXT NOT NULL,
-  shard_key TEXT NOT NULL,
-  checkpoint_json TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  PRIMARY KEY (job_id, shard_type, shard_key)
-);
+async function listTableColumns(db, tableName) {
+  return statementAll(
+    db.prepare(`PRAGMA table_info('${assertSqlIdentifier(tableName, 'tableName')}')`),
+  );
+}
 
-CREATE TABLE IF NOT EXISTS replay_manifests (
-  job_id TEXT PRIMARY KEY,
-  manifest_kind TEXT NOT NULL,
-  manifest_json TEXT NOT NULL,
-  manifest_hash TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  export_epoch TEXT,
-  registry_snapshot_id TEXT,
-  r2_object_key TEXT
-);
-
-CREATE TABLE IF NOT EXISTS repair_decisions (
-  decision_id TEXT PRIMARY KEY,
-  repair_kind TEXT NOT NULL,
-  scope_kind TEXT NOT NULL,
-  scope_id TEXT,
-  scope_token TEXT NOT NULL,
-  dry_run INTEGER NOT NULL DEFAULT 0,
-  reason TEXT NOT NULL,
-  ticket_id TEXT,
-  created_at TEXT NOT NULL,
-  details_json TEXT
-);
-
-CREATE TABLE IF NOT EXISTS shard_registry (
-  shard_type TEXT NOT NULL,
-  shard_key TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  last_seen_at TEXT NOT NULL,
-  schema_version INTEGER NOT NULL,
-  disabled_at TEXT,
-  PRIMARY KEY (shard_type, shard_key)
-);
-
-CREATE TABLE IF NOT EXISTS registry_snapshots (
-  registry_snapshot_id TEXT PRIMARY KEY,
-  export_epoch TEXT NOT NULL,
-  scope_kind TEXT NOT NULL,
-  scope_id TEXT,
-  scope_token TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  row_count INTEGER NOT NULL,
-  snapshot_json TEXT NOT NULL,
-  snapshot_hash TEXT NOT NULL,
-  signature TEXT,
-  signing_key_version TEXT,
-  r2_object_key TEXT
-);
-
-CREATE TABLE IF NOT EXISTS appservice_configs (
-  appservice_id TEXT PRIMARY KEY,
-  descriptor_json TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  disabled_at TEXT
-);
-`;
+async function ensureAdditiveSchemaColumns(db) {
+  for (const [tableName, columns] of Object.entries(CONTROL_PLANE_SCHEMA_ADDITIVE_COLUMNS)) {
+    const existingColumns = new Set(
+      (await listTableColumns(db, tableName))
+        .map((row) => row?.name)
+        .filter((name) => typeof name === 'string' && name.length > 0),
+    );
+    for (const column of columns) {
+      if (existingColumns.has(column.column_name)) {
+        continue;
+      }
+      await statementRun(
+        db.prepare(
+          `ALTER TABLE ${quoteSqlIdentifier(tableName, 'tableName')} ADD COLUMN ${quoteSqlIdentifier(column.column_name, 'columnName')} ${column.column_sql}`,
+        ),
+      );
+      existingColumns.add(column.column_name);
+    }
+  }
+}
 
 export function createD1ControlPlanePersistence(db) {
   if (!db || typeof db.prepare !== 'function' || typeof db.exec !== 'function') {
     throw new TypeError('db must expose D1-compatible prepare() and exec() methods');
   }
+  let schemaReady = false;
+  let schemaReadyPromise = null;
+  let activeBatchStatements = null;
+  let activeTransactionContext = null;
 
-  return Object.freeze({
+  const createPersistenceFacade = (transactionContext = null) => {
+    const statementRun = async (statement, ...bindings) => {
+      const boundStatement = statement.bind(...bindings);
+      if (activeBatchStatements) {
+        if (transactionContext !== activeTransactionContext) {
+          throw new Error(
+            'control-plane D1 writes outside the active transaction are not allowed on the same persistence instance',
+          );
+        }
+        activeBatchStatements.push(boundStatement);
+        return { success: true };
+      }
+      return boundStatement.run();
+    };
+
+    const assertTransactionalReadAllowed = () => {
+      if (
+        transactionContext === activeTransactionContext &&
+        activeBatchStatements &&
+        activeBatchStatements.length > 0
+      ) {
+        throw new Error(
+          'control-plane D1 transaction cannot perform reads after queued transactional writes; split the read phase before the write batch',
+        );
+      }
+    };
+
+    const statementFirst = async (statement, ...bindings) => {
+      assertTransactionalReadAllowed();
+      return statement.bind(...bindings).first();
+    };
+
+    const statementAll = async (statement, ...bindings) => {
+      assertTransactionalReadAllowed();
+      const result = await statement.bind(...bindings).all();
+      return result?.results ?? [];
+    };
+
+    return Object.freeze({
     async ensureSchema() {
-      await db.exec(CONTROL_PLANE_SCHEMA_SQL);
+      if (schemaReady) {
+        return;
+      }
+      if (!schemaReadyPromise) {
+        schemaReadyPromise = (async () => {
+          // D1 documents exec() as a maintenance-oriented raw SQL surface; request-path schema bootstrap
+          // must execute complete prepared statements so multiline CREATE TABLE literals stay portable.
+          // Delay CREATE INDEX until after stale existing tables have converged to the current column set.
+          for (const statementSql of CONTROL_PLANE_SCHEMA_STATEMENTS.filter((statementSql) => !isControlPlaneIndexStatement(statementSql))) {
+            await statementRun(db.prepare(statementSql));
+          }
+          // Existing non-local D1 databases may predate newly added nullable/additive columns.
+          // Converge old tables in place before adding indexes that depend on newer columns.
+          await ensureAdditiveSchemaColumns(db);
+          for (const statementSql of CONTROL_PLANE_SCHEMA_STATEMENTS.filter((statementSql) => isControlPlaneIndexStatement(statementSql))) {
+            await statementRun(db.prepare(statementSql));
+          }
+          schemaReady = true;
+        })().catch((error) => {
+          schemaReadyPromise = null;
+          throw error;
+        });
+      }
+      await schemaReadyPromise;
     },
     async isSchemaReady() {
       const rows = await statementAll(
@@ -279,14 +450,30 @@ export function createD1ControlPlanePersistence(db) {
       return rows.length === REQUIRED_CONTROL_PLANE_TABLES.length;
     },
     async transaction(callback) {
-      await db.exec('BEGIN IMMEDIATE;');
+      if (typeof callback !== 'function') {
+        throw new TypeError('transaction callback must be a function');
+      }
+      if (activeBatchStatements) {
+        throw new Error(
+          'control-plane D1 transaction does not support nested or concurrent transaction() calls on the same persistence instance',
+        );
+      }
+      if (typeof db.batch !== 'function') {
+        throw new TypeError('db must expose D1-compatible batch() for transactional control-plane writes');
+      }
+
+      const nextTransactionContext = Symbol('control-plane-d1-transaction');
+      activeTransactionContext = nextTransactionContext;
+      activeBatchStatements = [];
       try {
-        const result = await callback(this);
-        await db.exec('COMMIT;');
+        const result = await callback(createPersistenceFacade(nextTransactionContext));
+        if (activeBatchStatements.length > 0) {
+          await db.batch(activeBatchStatements);
+        }
         return result;
-      } catch (error) {
-        await db.exec('ROLLBACK;');
-        throw error;
+      } finally {
+        activeBatchStatements = null;
+        activeTransactionContext = null;
       }
     },
     async upsertOperatorPolicy(record) {
@@ -997,5 +1184,8 @@ export function createD1ControlPlanePersistence(db) {
         normalizeString(appserviceId, 'appserviceId'),
       );
     },
-  });
+    });
+  };
+
+  return createPersistenceFacade();
 }

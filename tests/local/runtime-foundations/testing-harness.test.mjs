@@ -8,7 +8,9 @@ import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 
 import {
+  buildRunEnvironmentVariables,
   discoverTestFiles,
+  getReleaseGateTestFiles,
   getTestEnvironmentDefinition,
   getTestEnvironmentDirectory,
   getRequiredTestFiles,
@@ -23,6 +25,7 @@ import {
   getL1EvidenceDefinition,
   getRequiredTestImplementationFiles,
   listL1EvidenceBundleIds,
+  validateEnvironmentRunExecutionProof,
   validateEvidenceAttestationBundle,
   validateManualArtifactPayload,
   writeL1Evidence,
@@ -31,12 +34,21 @@ import {
   buildNonLocalEnvironmentPlan,
 } from '../../../packages/testing/src/nonlocal.mjs';
 import {
+  listProductionRateLimitNamespaces,
+} from '../../../packages/testing/src/cloudflare-resources.mjs';
+import {
   assertPathsDoNotExist,
   writeGovernanceEvidence,
 } from '../../../packages/spec-tools/src/governance.mjs';
 
 const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../../..');
 const execFileAsync = promisify(execFile);
+const DEFAULT_TEST_GITHUB_REPOSITORY = typeof process.env.GITHUB_REPOSITORY === 'string' && process.env.GITHUB_REPOSITORY.trim().length > 0
+  ? process.env.GITHUB_REPOSITORY.trim()
+  : 'example/matrix';
+const FOREIGN_TEST_GITHUB_REPOSITORY = DEFAULT_TEST_GITHUB_REPOSITORY === 'example/other'
+  ? 'example/matrix'
+  : 'example/other';
 const ENVIRONMENT_MANUAL_ARTIFACT_IDS = Object.freeze({
   'ci-integration': 'ci_integration_run_report',
   staging: 'staging_run_report',
@@ -51,6 +63,7 @@ function buildExpectedCloudflareResources(environmentName) {
       d1_databases: ['matrix-control-and-derived-prod'],
       r2_buckets: ['matrix-archive-prod', 'matrix-evidence-prod', 'matrix-media-prod'],
       kv_namespaces: ['matrix-edge-cache-prod'],
+      ratelimit_namespaces: listProductionRateLimitNamespaces(),
       queues: [
         'matrix-appservice-txn-job-prod',
         'matrix-export-shard-job-prod',
@@ -72,18 +85,12 @@ function buildExpectedCloudflareResources(environmentName) {
 }
 
 function buildGitHubRunId(environmentName, runTimestamp) {
-  const environmentPrefixes = {
-    'ci-integration': '1',
-    staging: '2',
-    'pre-release': '3',
-    prod: '4',
-  };
-  const prefix = environmentPrefixes[environmentName] ?? '9';
-  return `${prefix}${runTimestamp.replace(/\D/g, '')}`;
+  void environmentName;
+  return `9${runTimestamp.replace(/\D/g, '')}`;
 }
 
 function buildGitHubRunUri(environmentName, runTimestamp) {
-  return `https://github.com/example/matrix/actions/runs/${buildGitHubRunId(environmentName, runTimestamp)}`;
+  return `https://github.com/${DEFAULT_TEST_GITHUB_REPOSITORY}/actions/runs/${buildGitHubRunId(environmentName, runTimestamp)}`;
 }
 
 function buildPhase08ArtifactStoreKey(environmentName, runTimestamp, fileName) {
@@ -94,23 +101,138 @@ function buildPhase08ArtifactStoreUri(environmentName, runTimestamp, fileName) {
   return `r2://matrix-evidence-${environmentName}/${buildPhase08ArtifactStoreKey(environmentName, runTimestamp, fileName)}`;
 }
 
+function buildValidRolloutSkewProbe(runTimestamp, overrides = {}) {
+  const baselineGatewayVersionTag = 'mx-gw-d-baseline';
+  const candidateGatewayVersionTag = 'mx-gw-d-candidate';
+  return {
+    environment_name: 'pre-release',
+    probe_run_id: `rollout-${runTimestamp.toLowerCase()}`,
+    dual_version_deployment_id: 'pre-release-gateway-dual-deployment',
+    baseline_gateway_version_id: 'gateway@pre-release-v1',
+    baseline_gateway_version_tag: baselineGatewayVersionTag,
+    candidate_gateway_version_id: 'gateway@pre-release-v2',
+    candidate_gateway_version_tag: candidateGatewayVersionTag,
+    override_strategy: 'cloudflare-version-overrides',
+    observations: [
+      {
+        probe_name: 'new-worker-old-authority',
+        request_gateway_version_id: 'gateway@pre-release-v2',
+        observed_gateway_version_id: 'gateway@pre-release-v2',
+        observed_gateway_version_tag: candidateGatewayVersionTag,
+        observed_authority_version_id: 'gateway@pre-release-v1',
+        authority_kind: 'UserDO',
+        authority_key: '@baseline-user:matrix.example.test',
+        request_path: '/_matrix/client/v3/account/whoami',
+        observed_at: '2026-03-31T14:03:00.000Z',
+      },
+      {
+        probe_name: 'new-worker-old-authority',
+        request_gateway_version_id: 'gateway@pre-release-v2',
+        observed_gateway_version_id: 'gateway@pre-release-v2',
+        observed_gateway_version_tag: candidateGatewayVersionTag,
+        observed_authority_version_id: 'gateway@pre-release-v1',
+        authority_kind: 'RoomDO',
+        authority_key: '!baseline-room:matrix.example.test',
+        request_path: '/_matrix/client/v3/rooms/%21baseline-room%3Amatrix.example.test/state',
+        observed_at: '2026-03-31T14:03:01.000Z',
+      },
+      {
+        probe_name: 'old-worker-new-authority',
+        request_gateway_version_id: 'gateway@pre-release-v1',
+        observed_gateway_version_id: 'gateway@pre-release-v1',
+        observed_gateway_version_tag: baselineGatewayVersionTag,
+        observed_authority_version_id: 'gateway@pre-release-v2',
+        authority_kind: 'UserDO',
+        authority_key: '@candidate-user:matrix.example.test',
+        request_path: '/_matrix/client/v3/account/whoami',
+        observed_at: '2026-03-31T14:03:02.000Z',
+      },
+      {
+        probe_name: 'old-worker-new-authority',
+        request_gateway_version_id: 'gateway@pre-release-v1',
+        observed_gateway_version_id: 'gateway@pre-release-v1',
+        observed_gateway_version_tag: baselineGatewayVersionTag,
+        observed_authority_version_id: 'gateway@pre-release-v2',
+        authority_kind: 'RoomDO',
+        authority_key: '!candidate-room:matrix.example.test',
+        request_path: '/_matrix/client/v3/rooms/%21candidate-room%3Amatrix.example.test/state',
+        observed_at: '2026-03-31T14:03:03.000Z',
+      },
+    ],
+    assertions: {
+      new_worker_old_authority: true,
+      old_worker_new_authority: true,
+    },
+    ...overrides,
+  };
+}
+
+function buildValidPreReleaseCostObservation(runTimestamp, overrides = {}) {
+  return {
+    observation_id: `pre-release-cost-${runTimestamp.toLowerCase()}`,
+    source_environment: 'pre-release',
+    captured_at: '2026-03-31T14:04:00.000Z',
+    capture_window: {
+      start: '2026-03-31T14:00:00.000Z',
+      end: '2026-03-31T14:05:00.000Z',
+    },
+    capture_method: 'cloudflare-official-metrics',
+    source_query_uris: [
+      'https://api.cloudflare.com/client/v4/graphql#workersInvocationsAdaptive',
+      'https://developers.cloudflare.com/workers/platform/pricing',
+    ],
+    topology_kind: 'cloudflare-pre-release',
+    cloudflare_resources: buildExpectedCloudflareResources('pre-release'),
+    cost_surfaces: {
+      workers: { requests: 1000, cpu_ms: 250000 },
+      durable_objects: { requests: 400, duration_gb_s: 12 },
+      d1: { read_rows: 20000, write_rows: 1500 },
+      r2: { storage_gb_month: 3, class_a_ops: 120, class_b_ops: 400 },
+      kv: { read_ops: 500, write_ops: 40, delete_ops: 3, list_ops: 2 },
+      queues: { write_ops: 80, read_ops: 80, delete_ops: 80 },
+    },
+    model_comparison: {
+      status: 'within_expected',
+      summary: 'No bounded-workload budget drift detected.',
+      actual_total_usd: 1.2,
+      modeled_total_usd: 1.1,
+      drift_ratio: 0.09,
+    },
+    ...overrides,
+  };
+}
+
 function buildValidEnvironmentReport(environmentName, runTimestamp, overrides = {}) {
   const directory = getTestEnvironmentDefinition(environmentName).directory;
-  return {
+  const readinessSteps = [
+    { step: 'versions', ok: true, detail: { versions_count: 1 } },
+    { step: 'public_rooms', ok: true, detail: { chunk_length: 0 } },
+    { step: 'register_challenge', ok: true, detail: { session_present: true, flows_count: 1 } },
+    { step: 'register_complete', ok: true, detail: { user_id_present: true, access_token_present: true } },
+    { step: 'sync', ok: true, detail: { next_batch_present: true } },
+    { step: 'media_create', ok: true, detail: { content_uri_present: true } },
+  ];
+  if (environmentName === 'staging' || environmentName === 'pre-release') {
+    readinessSteps.push(
+      { step: 'ops_healthz', ok: true, detail: { service: 'ops-worker', status: 'ok' } },
+      { step: 'ops_rebuild_start', ok: true, detail: { job_id_present: true, job_type: 'rebuild', state: 'accepted' } },
+    );
+  }
+  const report = {
     environment_name: environmentName,
     status: 'pass',
     exit_code: 0,
     started_at: '2026-03-31T14:00:00.000Z',
     completed_at: '2026-03-31T14:05:00.000Z',
     duration_ms: 300000,
-    command: `/usr/bin/node --test /tmp/${environmentName}.test.mjs`,
+    command: null,
     test_directory: directory,
     test_file_count: 1,
     test_files: [`${directory}/remote.test.mjs`],
     expanded_test_file_count: 2,
     expanded_test_files: [
       `${directory}/remote.test.mjs`,
-      'packages/testing/src/bootstrap.mjs',
+      `${directory}/support.mjs`,
     ],
     output_sha256: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
     error_message: null,
@@ -120,9 +242,151 @@ function buildValidEnvironmentReport(environmentName, runTimestamp, overrides = 
     source_run_uri: `https://example.invalid/runs/${environmentName}/${runTimestamp}`,
     topology_kind: `cloudflare-${environmentName}`,
     cloudflare_resources: buildExpectedCloudflareResources(environmentName),
+    rollout_skew_probe: null,
+    pre_release_cost_observation: null,
+    readiness_probe: {
+      ready: true,
+      environment_name: environmentName,
+      started_at: '2026-03-31T13:59:00.000Z',
+      completed_at: '2026-03-31T13:59:30.000Z',
+      duration_ms: 30000,
+      attempt_count: 1,
+      last_error: null,
+      attempts: [
+        {
+          attempt: 1,
+          started_at: '2026-03-31T13:59:00.000Z',
+          completed_at: '2026-03-31T13:59:30.000Z',
+          duration_ms: 30000,
+          ok: true,
+          steps: readinessSteps,
+          failure: null,
+          delay_before_next_attempt_ms: null,
+        },
+      ],
+    },
+    deployment_identity_validation: {
+      before_readiness: {
+        validated_at: '2026-03-31T13:58:30.000Z',
+        workers: {
+          'jobs-worker': {
+            script_name: `matrix-jobs-worker-${environmentName}`,
+            latest_active_deployment_id: `${environmentName}-jobs-deployment`,
+            active_worker_version_ids: [`jobs@${environmentName}-v1`],
+          },
+          'ops-worker': {
+            script_name: `matrix-ops-worker-${environmentName}`,
+            latest_active_deployment_id: `${environmentName}-ops-deployment`,
+            active_worker_version_ids: [`ops@${environmentName}-v1`],
+          },
+          'gateway-worker': {
+            script_name: `matrix-gateway-worker-${environmentName}`,
+            latest_active_deployment_id: `${environmentName}-gateway-deployment`,
+            active_worker_version_ids: [`gateway@${environmentName}-v1`],
+          },
+        },
+      },
+      before_suite: {
+        validated_at: '2026-03-31T13:59:31.000Z',
+        workers: {
+          'jobs-worker': {
+            script_name: `matrix-jobs-worker-${environmentName}`,
+            latest_active_deployment_id: `${environmentName}-jobs-deployment`,
+            active_worker_version_ids: [`jobs@${environmentName}-v1`],
+          },
+          'ops-worker': {
+            script_name: `matrix-ops-worker-${environmentName}`,
+            latest_active_deployment_id: `${environmentName}-ops-deployment`,
+            active_worker_version_ids: [`ops@${environmentName}-v1`],
+          },
+          'gateway-worker': {
+            script_name: `matrix-gateway-worker-${environmentName}`,
+            latest_active_deployment_id: `${environmentName}-gateway-deployment`,
+            active_worker_version_ids: [`gateway@${environmentName}-v1`],
+          },
+        },
+      },
+    },
     run_timestamp: runTimestamp,
     ...overrides,
   };
+  report.command = Object.prototype.hasOwnProperty.call(overrides, 'command')
+    ? overrides.command
+    : `/usr/bin/node --test ${report.test_files.map((file) => path.join(repoRoot, file)).join(' ')}`;
+  return report;
+}
+
+function buildValidPreReleaseOpsReport(runTimestamp, overrides = {}) {
+  const rolloutSkewProbe = buildValidRolloutSkewProbe(runTimestamp);
+  return buildValidEnvironmentReport('pre-release', runTimestamp, {
+    test_directory: 'tests/pre-release',
+    test_file_count: 1,
+    test_files: ['tests/pre-release/test-ops-001.test.mjs'],
+    expanded_test_file_count: 1,
+    expanded_test_files: ['tests/pre-release/test-ops-001.test.mjs'],
+    rollout_skew_probe: rolloutSkewProbe,
+    deployment_identity_validation: {
+      before_readiness: {
+        validated_at: '2026-03-31T13:58:30.000Z',
+        workers: {
+          'jobs-worker': {
+            script_name: 'matrix-jobs-worker-pre-release',
+            latest_active_deployment_id: 'pre-release-jobs-deployment',
+            active_worker_version_ids: ['jobs@pre-release-v1'],
+          },
+          'ops-worker': {
+            script_name: 'matrix-ops-worker-pre-release',
+            latest_active_deployment_id: 'pre-release-ops-deployment',
+            active_worker_version_ids: ['ops@pre-release-v1'],
+          },
+          'gateway-worker': {
+            script_name: 'matrix-gateway-worker-pre-release',
+            latest_active_deployment_id: rolloutSkewProbe.dual_version_deployment_id,
+            active_worker_version_ids: [
+              rolloutSkewProbe.baseline_gateway_version_id,
+              rolloutSkewProbe.candidate_gateway_version_id,
+            ],
+          },
+        },
+      },
+      before_suite: {
+        validated_at: '2026-03-31T13:59:31.000Z',
+        workers: {
+          'jobs-worker': {
+            script_name: 'matrix-jobs-worker-pre-release',
+            latest_active_deployment_id: 'pre-release-jobs-deployment',
+            active_worker_version_ids: ['jobs@pre-release-v1'],
+          },
+          'ops-worker': {
+            script_name: 'matrix-ops-worker-pre-release',
+            latest_active_deployment_id: 'pre-release-ops-deployment',
+            active_worker_version_ids: ['ops@pre-release-v1'],
+          },
+          'gateway-worker': {
+            script_name: 'matrix-gateway-worker-pre-release',
+            latest_active_deployment_id: rolloutSkewProbe.dual_version_deployment_id,
+            active_worker_version_ids: [
+              rolloutSkewProbe.baseline_gateway_version_id,
+              rolloutSkewProbe.candidate_gateway_version_id,
+            ],
+          },
+        },
+      },
+    },
+    ...overrides,
+  });
+}
+
+function buildValidPreReleaseCostReport(runTimestamp, overrides = {}) {
+  return buildValidEnvironmentReport('pre-release', runTimestamp, {
+    test_directory: 'tests/pre-release',
+    test_file_count: 1,
+    test_files: ['tests/pre-release/test-cost-001.test.mjs'],
+    expanded_test_file_count: 1,
+    expanded_test_files: ['tests/pre-release/test-cost-001.test.mjs'],
+    pre_release_cost_observation: buildValidPreReleaseCostObservation(runTimestamp),
+    ...overrides,
+  });
 }
 
 function buildValidProdCostSnapshot(runTimestamp, overrides = {}) {
@@ -167,6 +431,7 @@ function buildValidEnvironmentAttestation(environmentName, runTimestamp, reportO
   const artifactId = ENVIRONMENT_MANUAL_ARTIFACT_IDS[environmentName];
   const baseProvenance = {
     origin_system: 'github-actions',
+    origin_repository: DEFAULT_TEST_GITHUB_REPOSITORY,
     origin_run_id: originRunId,
     origin_run_attempt: 1,
     origin_run_uri: originRunUri,
@@ -213,6 +478,7 @@ function buildValidProdCostSnapshotAttestation(runTimestamp, payloadOverrides = 
   const originRunUri = buildGitHubRunUri('prod', runTimestamp);
   const baseProvenance = {
     origin_system: 'github-actions',
+    origin_repository: DEFAULT_TEST_GITHUB_REPOSITORY,
     origin_run_id: originRunId,
     origin_run_attempt: 1,
     origin_run_uri: originRunUri,
@@ -252,6 +518,285 @@ function buildValidProdCostSnapshotAttestation(runTimestamp, payloadOverrides = 
   };
 }
 
+function buildValidProdWorkerRecordMap(overrides = {}) {
+  const base = {
+    'gateway-worker': {
+      worker_name: 'gateway-worker',
+      script_name: 'matrix-gateway-worker-prod',
+      deployment_id: 'gateway-prod-deployment-v1',
+      worker_version_id: 'gateway@prod-v1',
+      worker_version_tag: 'mx-gw-d-prod1',
+      url: 'https://matrix-gateway-worker-prod.matrixflare.workers.dev',
+    },
+    'jobs-worker': {
+      worker_name: 'jobs-worker',
+      script_name: 'matrix-jobs-worker-prod',
+      deployment_id: 'jobs-prod-deployment-v1',
+      worker_version_id: 'jobs@prod-v1',
+      worker_version_tag: 'mx-jw-d-prod1',
+      url: 'https://matrix-jobs-worker-prod.matrixflare.workers.dev',
+    },
+    'ops-worker': {
+      worker_name: 'ops-worker',
+      script_name: 'matrix-ops-worker-prod',
+      deployment_id: 'ops-prod-deployment-v1',
+      worker_version_id: 'ops@prod-v1',
+      worker_version_tag: 'mx-ow-d-prod1',
+      url: 'https://matrix-ops-worker-prod.matrixflare.workers.dev',
+    },
+  };
+  return {
+    ...base,
+    ...overrides,
+  };
+}
+
+function buildValidProdDeploymentIdentity(overrides = {}) {
+  return {
+    environment_id: 'prod',
+    deployment_ids: [
+      'jobs-prod-deployment-v1',
+      'ops-prod-deployment-v1',
+      'gateway-prod-deployment-v1',
+    ],
+    worker_version_ids: [
+      'jobs@prod-v1',
+      'ops@prod-v1',
+      'gateway@prod-v1',
+    ],
+    ...overrides,
+  };
+}
+
+function buildValidProdReadinessProbe(overrides = {}) {
+  return {
+    environment_name: 'prod',
+    ready: true,
+    started_at: '2026-03-31T14:10:00.000Z',
+    completed_at: '2026-03-31T14:10:30.000Z',
+    duration_ms: 30000,
+    attempt_count: 1,
+    last_error: null,
+    attempts: [
+      {
+        attempt: 1,
+        started_at: '2026-03-31T14:10:00.000Z',
+        completed_at: '2026-03-31T14:10:30.000Z',
+        duration_ms: 30000,
+        ok: true,
+        steps: [
+          { step: 'versions', ok: true, detail: { versions_count: 1 } },
+          { step: 'public_rooms', ok: true, detail: { chunk_length: 0 } },
+          { step: 'register_complete', ok: true, detail: { user_id_present: true, access_token_present: true } },
+          { step: 'media_create', ok: true, detail: { content_uri_present: true } },
+          { step: 'ops_healthz', ok: true, detail: { service: 'ops-worker', status: 'ok' } },
+          { step: 'ops_rebuild_start', ok: true, detail: { job_id_present: true, job_type: 'rebuild', state: 'accepted' } },
+        ],
+        failure: null,
+        delay_before_next_attempt_ms: null,
+      },
+    ],
+    ...overrides,
+  };
+}
+
+function buildValidProdRollbackHandle(overrides = {}) {
+  return {
+    workers_subdomain: 'matrixflare',
+    worker_versions: {
+      'gateway-worker': {
+        script_name: 'matrix-gateway-worker-prod',
+        previous_deployment_id: 'gateway-prod-deployment-v1',
+        previous_worker_version_id: 'gateway@prod-v1',
+        restore_version_specs: ['gateway@prod-v1@100'],
+      },
+      'jobs-worker': {
+        script_name: 'matrix-jobs-worker-prod',
+        previous_deployment_id: 'jobs-prod-deployment-v1',
+        previous_worker_version_id: 'jobs@prod-v1',
+        restore_version_specs: ['jobs@prod-v1@100'],
+      },
+      'ops-worker': {
+        script_name: 'matrix-ops-worker-prod',
+        previous_deployment_id: 'ops-prod-deployment-v1',
+        previous_worker_version_id: 'ops@prod-v1',
+        restore_version_specs: ['ops@prod-v1@100'],
+      },
+    },
+    ...overrides,
+  };
+}
+
+function buildValidProducerRunIdentity(overrides = {}) {
+  return {
+    origin_repository: DEFAULT_TEST_GITHUB_REPOSITORY,
+    origin_run_id: buildGitHubRunId('prod', '20260331T140000Z'),
+    origin_run_attempt: 1,
+    origin_run_uri: buildGitHubRunUri('prod', '20260331T140000Z'),
+    ...overrides,
+  };
+}
+
+function buildValidProdPromotionReadinessChecks(overrides = {}) {
+  return {
+    jobs_promoted: buildValidProdReadinessProbe(),
+    ops_promoted: buildValidProdReadinessProbe(),
+    ...overrides,
+  };
+}
+
+function buildValidProdReleaseCandidateManifest(runTimestamp, overrides = {}) {
+  const sharedRunId = buildGitHubRunId('prod', runTimestamp);
+  const sharedRunUri = buildGitHubRunUri('prod', runTimestamp);
+  const sourceRepository = DEFAULT_TEST_GITHUB_REPOSITORY;
+  const buildCandidateAttestation = (environmentName) => buildValidEnvironmentAttestation(
+    environmentName,
+    runTimestamp,
+    {
+      source_run_uri: sharedRunUri,
+    },
+    {
+      provenance: {
+        origin_repository: sourceRepository,
+        origin_run_id: sharedRunId,
+        origin_run_attempt: 1,
+        origin_run_uri: sharedRunUri,
+      },
+    },
+  );
+  return {
+    schema_version: 1,
+    artifact_id: 'prod_release_candidate',
+    candidate_id: `candidate-${runTimestamp.toLowerCase()}`,
+    created_at: '2026-03-31T14:07:00.000Z',
+    release_ref: 'refs/heads/phase08-nonlocal-closure',
+    release_commit_sha: '0123456789abcdef0123456789abcdef01234567',
+    requires_do_migration: false,
+    source_repository: sourceRepository,
+    source_run_uri: sharedRunUri,
+    ...buildValidProducerRunIdentity(),
+    topology_kind: 'cloudflare-prod',
+    ci_integration_attestation: buildCandidateAttestation('ci-integration'),
+    staging_attestation: buildCandidateAttestation('staging'),
+    pre_release_attestation: buildCandidateAttestation('pre-release'),
+    ...overrides,
+  };
+}
+
+function buildValidProdInstallRecord(overrides = {}) {
+  return {
+    schema_version: 1,
+    artifact_id: 'prod_install_record',
+    source_environment: 'prod',
+    install_id: 'install-prod-topology-v1',
+    installed_at: '2026-03-31T14:08:00.000Z',
+    ...buildValidProducerRunIdentity(),
+    release_commit_sha: '0123456789abcdef0123456789abcdef01234567',
+    topology_kind: 'cloudflare-prod',
+    workers_subdomain: 'matrixflare',
+    cloudflare_resources: buildExpectedCloudflareResources('prod'),
+    access: {
+      auth_domain: 'matrixflare.cloudflareaccess.com',
+      application_id: 'cf-access-app-prod',
+      application_audience: 'prod-aud',
+      application_domain: 'matrix-ops-worker-prod.matrixflare.workers.dev',
+      protected_ops_url: 'https://matrix-ops-worker-prod.matrixflare.workers.dev',
+    },
+    deployment_identity: buildValidProdDeploymentIdentity(),
+    workers: buildValidProdWorkerRecordMap(),
+    ...overrides,
+  };
+}
+
+function buildValidProdPromotionRecord(overrides = {}) {
+  return {
+    schema_version: 1,
+    artifact_id: 'prod_promotion_record',
+    source_environment: 'prod',
+    promotion_id: 'promotion-prod-v2',
+    promoted_at: '2026-03-31T14:09:00.000Z',
+    ...buildValidProducerRunIdentity({ origin_run_id: buildGitHubRunId('prod', '20260331T140900Z'), origin_run_uri: buildGitHubRunUri('prod', '20260331T140900Z') }),
+    release_commit_sha: '89abcdef0123456789abcdef0123456789abcdef',
+    promotion_mode: 'gradual',
+    source_candidate: {
+      candidate_id: 'candidate-20260331t140000z',
+      source_run_uri: buildGitHubRunUri('prod', '20260331T140000Z'),
+    },
+    previous_deployment_identity: buildValidProdDeploymentIdentity(),
+    current_deployment_identity: buildValidProdDeploymentIdentity({
+      deployment_ids: [
+        'jobs-prod-deployment-v2',
+        'ops-prod-deployment-v2',
+        'gateway-prod-deployment-v2',
+      ],
+      worker_version_ids: [
+        'jobs@prod-v2',
+        'ops@prod-v2',
+        'gateway@prod-v2',
+      ],
+    }),
+    gateway_rollout_steps: [
+      { percentage: 10, deployment_id: 'gateway-prod-rollout-10', ready: true, attempt_count: 1, last_error: null },
+      { percentage: 50, deployment_id: 'gateway-prod-rollout-50', ready: true, attempt_count: 1, last_error: null },
+      { percentage: 100, deployment_id: 'gateway-prod-rollout-100', ready: true, attempt_count: 1, last_error: null },
+    ],
+    readiness_checks: buildValidProdPromotionReadinessChecks(),
+    rollback_handle: buildValidProdRollbackHandle(),
+    ...overrides,
+  };
+}
+
+function buildValidProdRollbackRecord(overrides = {}) {
+  return {
+    schema_version: 1,
+    artifact_id: 'prod_rollback_record',
+    source_environment: 'prod',
+    rollback_id: 'rollback-prod-v1',
+    rolled_back_at: '2026-03-31T14:11:00.000Z',
+    ...buildValidProducerRunIdentity({ origin_run_id: buildGitHubRunId('prod', '20260331T141100Z'), origin_run_uri: buildGitHubRunUri('prod', '20260331T141100Z') }),
+    source_promotion_id: 'promotion-prod-v2',
+    release_commit_sha: '0123456789abcdef0123456789abcdef01234567',
+    requested_rollback_handle: buildValidProdRollbackHandle(),
+    restored_deployment_identity: buildValidProdDeploymentIdentity(),
+    worker_results: {
+      'gateway-worker': {
+        restored: true,
+        deployment_id: 'gateway-prod-deployment-v1',
+        worker_version_id: 'gateway@prod-v1',
+      },
+      'jobs-worker': {
+        restored: true,
+        deployment_id: 'jobs-prod-deployment-v1',
+        worker_version_id: 'jobs@prod-v1',
+      },
+      'ops-worker': {
+        restored: true,
+        deployment_id: 'ops-prod-deployment-v1',
+        worker_version_id: 'ops@prod-v1',
+      },
+    },
+    readiness_probe: buildValidProdReadinessProbe(),
+    ...overrides,
+  };
+}
+
+function buildSingleFileEnvironmentReportOverrides(relativeTestFile, overrides = {}) {
+  return {
+    test_files: [relativeTestFile],
+    test_file_count: 1,
+    expanded_test_files: [relativeTestFile],
+    expanded_test_file_count: 1,
+    ...overrides,
+  };
+}
+
+function assertEnvironmentBackedProofRejected(validationError) {
+  assert.match(
+    validationError ?? '',
+    /(harness is not environment-backed|attested payload invalid: environment run report must not expand local test implementations|test_files must not contain unresolved or non-literal dynamic imports|expanded_test_files must equal the repo-owned transitive closure of test_files)/,
+  );
+}
+
 function normalizeForImportPath(relativePath) {
   return relativePath.replaceAll(path.sep, '/');
 }
@@ -288,10 +833,43 @@ async function createEnvironmentBackedEvidenceFixture() {
   const fixtureRoot = await createIsolatedRepoFixture('matrix-testing-harness-env-backed-repo-');
   const sharedProofFile = 'tests/shared/all-bundles-proof.mjs';
   const environmentTestFiles = {
-    local: 'tests/local-env-backed/environment-backed.test.mjs',
-    'ci-integration': 'tests/integration-env-backed/environment-backed.test.mjs',
-    staging: 'tests/staging-env-backed/environment-backed.test.mjs',
-    'pre-release': 'tests/pre-release-env-backed/environment-backed.test.mjs',
+    local: {
+      'TEST-CS-001': 'tests/local-env-backed/environment-backed.test.mjs',
+      'TEST-CS-002': 'tests/local-env-backed/environment-backed.test.mjs',
+      'TEST-CS-003': 'tests/local-env-backed/environment-backed.test.mjs',
+      'TEST-CS-004': 'tests/local-env-backed/environment-backed.test.mjs',
+      'TEST-ROOM-001': 'tests/local-env-backed/environment-backed.test.mjs',
+      'TEST-ROOM-002': 'tests/local-env-backed/environment-backed.test.mjs',
+      'TEST-MEDIA-001': 'tests/local-env-backed/environment-backed.test.mjs',
+      'TEST-DER-001': 'tests/local-env-backed/environment-backed.test.mjs',
+      'TEST-SEC-001': 'tests/local-env-backed/environment-backed.test.mjs',
+      'TEST-OPS-001': 'tests/local-env-backed/environment-backed.test.mjs',
+      'TEST-COST-001': 'tests/local-env-backed/environment-backed.test.mjs',
+    },
+    'ci-integration': {
+      'TEST-CS-001': 'tests/integration-env-backed/test-cs-001.test.mjs',
+      'TEST-CS-004': 'tests/integration-env-backed/test-cs-004.test.mjs',
+      'TEST-ROOM-001': 'tests/integration-env-backed/test-room-001.test.mjs',
+      'TEST-ROOM-002': 'tests/integration-env-backed/test-room-002.test.mjs',
+    },
+    staging: {
+      'TEST-CS-001': 'tests/staging-env-backed/test-cs-001.test.mjs',
+      'TEST-CS-002': 'tests/staging-env-backed/test-cs-002.test.mjs',
+      'TEST-CS-003': 'tests/staging-env-backed/test-cs-003.test.mjs',
+      'TEST-CS-004': 'tests/staging-env-backed/test-cs-004.test.mjs',
+      'TEST-ROOM-001': 'tests/staging-env-backed/test-room-001.test.mjs',
+      'TEST-ROOM-002': 'tests/staging-env-backed/test-room-002.test.mjs',
+      'TEST-MEDIA-001': 'tests/staging-env-backed/test-media-001.test.mjs',
+      'TEST-DER-001': 'tests/staging-env-backed/test-der-001.test.mjs',
+      'TEST-SEC-001': 'tests/staging-env-backed/test-sec-001.test.mjs',
+    },
+    'pre-release': {
+      'TEST-MEDIA-001': 'tests/pre-release-env-backed/test-media-001.test.mjs',
+      'TEST-DER-001': 'tests/pre-release-env-backed/test-der-001.test.mjs',
+      'TEST-SEC-001': 'tests/pre-release-env-backed/test-sec-001.test.mjs',
+      'TEST-OPS-001': 'tests/pre-release-env-backed/test-ops-001.test.mjs',
+      'TEST-COST-001': 'tests/pre-release-env-backed/test-cost-001.test.mjs',
+    },
   };
 
   await Promise.all([
@@ -313,14 +891,16 @@ async function createEnvironmentBackedEvidenceFixture() {
   const environmentTestSource = [
     "import assert from 'node:assert/strict';",
     "import test from 'node:test';",
-    "import { proof } from '../shared/all-bundles-proof.mjs';",
     '',
     "test('environment-backed proof', () => {",
-    '  assert.equal(proof, true);',
+    '  assert.equal(1, 1);',
     '});',
     '',
   ].join('\n');
-  for (const testFile of Object.values(environmentTestFiles)) {
+  const writtenEnvironmentTestFiles = new Set(
+    Object.values(environmentTestFiles).flatMap((mapping) => Object.values(mapping)),
+  );
+  for (const testFile of writtenEnvironmentTestFiles) {
     await fs.writeFile(path.join(fixtureRoot, testFile), environmentTestSource);
   }
 
@@ -345,17 +925,17 @@ async function createEnvironmentBackedEvidenceFixture() {
 
   const minimalMappingBlock = [
     'const L1_TEST_IMPLEMENTATION_FILES = Object.freeze({',
-    "  'TEST-CS-001': Object.freeze({ local: Object.freeze(['tests/shared/all-bundles-proof.mjs']), 'ci-integration': Object.freeze(['tests/shared/all-bundles-proof.mjs']), staging: Object.freeze(['tests/shared/all-bundles-proof.mjs']) }),",
-    "  'TEST-CS-002': Object.freeze({ local: Object.freeze(['tests/shared/all-bundles-proof.mjs']), staging: Object.freeze(['tests/shared/all-bundles-proof.mjs']) }),",
-    "  'TEST-CS-003': Object.freeze({ local: Object.freeze(['tests/shared/all-bundles-proof.mjs']), staging: Object.freeze(['tests/shared/all-bundles-proof.mjs']) }),",
-    "  'TEST-CS-004': Object.freeze({ local: Object.freeze(['tests/shared/all-bundles-proof.mjs']), 'ci-integration': Object.freeze(['tests/shared/all-bundles-proof.mjs']), staging: Object.freeze(['tests/shared/all-bundles-proof.mjs']) }),",
-    "  'TEST-ROOM-001': Object.freeze({ local: Object.freeze(['tests/shared/all-bundles-proof.mjs']), 'ci-integration': Object.freeze(['tests/shared/all-bundles-proof.mjs']), staging: Object.freeze(['tests/shared/all-bundles-proof.mjs']) }),",
-    "  'TEST-ROOM-002': Object.freeze({ local: Object.freeze(['tests/shared/all-bundles-proof.mjs']), 'ci-integration': Object.freeze(['tests/shared/all-bundles-proof.mjs']), staging: Object.freeze(['tests/shared/all-bundles-proof.mjs']) }),",
-    "  'TEST-MEDIA-001': Object.freeze({ local: Object.freeze(['tests/shared/all-bundles-proof.mjs']), staging: Object.freeze(['tests/shared/all-bundles-proof.mjs']), 'pre-release': Object.freeze(['tests/shared/all-bundles-proof.mjs']) }),",
-    "  'TEST-DER-001': Object.freeze({ local: Object.freeze(['tests/shared/all-bundles-proof.mjs']), staging: Object.freeze(['tests/shared/all-bundles-proof.mjs']), 'pre-release': Object.freeze(['tests/shared/all-bundles-proof.mjs']) }),",
-    "  'TEST-SEC-001': Object.freeze({ local: Object.freeze(['tests/shared/all-bundles-proof.mjs']), staging: Object.freeze(['tests/shared/all-bundles-proof.mjs']), 'pre-release': Object.freeze(['tests/shared/all-bundles-proof.mjs']) }),",
-    "  'TEST-OPS-001': Object.freeze({ local: Object.freeze(['tests/shared/all-bundles-proof.mjs']), 'pre-release': Object.freeze(['tests/shared/all-bundles-proof.mjs']) }),",
-    "  'TEST-COST-001': Object.freeze({ local: Object.freeze(['tests/shared/all-bundles-proof.mjs']), 'pre-release': Object.freeze(['tests/shared/all-bundles-proof.mjs']) }),",
+    `  'TEST-CS-001': Object.freeze({ local: Object.freeze(['${sharedProofFile}']), 'ci-integration': Object.freeze(['${environmentTestFiles['ci-integration']['TEST-CS-001']}']), staging: Object.freeze(['${environmentTestFiles.staging['TEST-CS-001']}']) }),`,
+    `  'TEST-CS-002': Object.freeze({ local: Object.freeze(['${sharedProofFile}']), staging: Object.freeze(['${environmentTestFiles.staging['TEST-CS-002']}']) }),`,
+    `  'TEST-CS-003': Object.freeze({ local: Object.freeze(['${sharedProofFile}']), staging: Object.freeze(['${environmentTestFiles.staging['TEST-CS-003']}']) }),`,
+    `  'TEST-CS-004': Object.freeze({ local: Object.freeze(['${sharedProofFile}']), 'ci-integration': Object.freeze(['${environmentTestFiles['ci-integration']['TEST-CS-004']}']), staging: Object.freeze(['${environmentTestFiles.staging['TEST-CS-004']}']) }),`,
+    `  'TEST-ROOM-001': Object.freeze({ local: Object.freeze(['${sharedProofFile}']), 'ci-integration': Object.freeze(['${environmentTestFiles['ci-integration']['TEST-ROOM-001']}']), staging: Object.freeze(['${environmentTestFiles.staging['TEST-ROOM-001']}']) }),`,
+    `  'TEST-ROOM-002': Object.freeze({ local: Object.freeze(['${sharedProofFile}']), 'ci-integration': Object.freeze(['${environmentTestFiles['ci-integration']['TEST-ROOM-002']}']), staging: Object.freeze(['${environmentTestFiles.staging['TEST-ROOM-002']}']) }),`,
+    `  'TEST-MEDIA-001': Object.freeze({ local: Object.freeze(['${sharedProofFile}']), staging: Object.freeze(['${environmentTestFiles.staging['TEST-MEDIA-001']}']), 'pre-release': Object.freeze(['${environmentTestFiles['pre-release']['TEST-MEDIA-001']}']) }),`,
+    `  'TEST-DER-001': Object.freeze({ local: Object.freeze(['${sharedProofFile}']), staging: Object.freeze(['${environmentTestFiles.staging['TEST-DER-001']}']), 'pre-release': Object.freeze(['${environmentTestFiles['pre-release']['TEST-DER-001']}']) }),`,
+    `  'TEST-SEC-001': Object.freeze({ local: Object.freeze(['${sharedProofFile}']), staging: Object.freeze(['${environmentTestFiles.staging['TEST-SEC-001']}']), 'pre-release': Object.freeze(['${environmentTestFiles['pre-release']['TEST-SEC-001']}']) }),`,
+    `  'TEST-OPS-001': Object.freeze({ local: Object.freeze(['${sharedProofFile}']), 'pre-release': Object.freeze(['${environmentTestFiles['pre-release']['TEST-OPS-001']}']) }),`,
+    `  'TEST-COST-001': Object.freeze({ local: Object.freeze(['${sharedProofFile}']), 'pre-release': Object.freeze(['${environmentTestFiles['pre-release']['TEST-COST-001']}']) }),`,
     '});',
     '',
   ].join('\n');
@@ -381,17 +961,58 @@ async function createEnvironmentBackedManualArtifacts(fixtureRoot, runTimestamp,
   const manualArtifacts = {};
   for (const [environmentName, artifactId] of Object.entries(ENVIRONMENT_MANUAL_ARTIFACT_IDS)) {
     const artifactPath = path.join(externalRoot, `${environmentName}.json`);
-    const environmentTestDirectory = path.dirname(environmentTestFiles[environmentName]).replaceAll(path.sep, '/');
+    const environmentTopLevelTestFiles = [...new Set(Object.values(environmentTestFiles[environmentName]))].sort();
+    const environmentTestDirectory = path.dirname(environmentTopLevelTestFiles[0]).replaceAll(path.sep, '/');
+    const expandedTestFiles = [...environmentTopLevelTestFiles];
+    let reportOverrides = {
+      test_directory: environmentTestDirectory,
+      test_files: environmentTopLevelTestFiles,
+      test_file_count: environmentTopLevelTestFiles.length,
+      expanded_test_files: expandedTestFiles,
+      expanded_test_file_count: expandedTestFiles.length,
+      log_artifact: `https://example.invalid/logs/fixture/${runTimestamp}/${environmentName}.log`,
+    };
+    let attestationOverrides = {};
+    const coversPreReleaseOps = environmentName === 'pre-release'
+      && environmentTopLevelTestFiles.some((file) => path.basename(file).startsWith('test-ops-001'));
+    const coversPreReleaseCost = environmentName === 'pre-release'
+      && environmentTopLevelTestFiles.some((file) => path.basename(file).startsWith('test-cost-001'));
+    if (coversPreReleaseOps) {
+      const validPreReleaseOpsReport = buildValidPreReleaseOpsReport(runTimestamp, reportOverrides);
+      reportOverrides = {
+        ...validPreReleaseOpsReport,
+        source_run_uri: buildGitHubRunUri(environmentName, runTimestamp),
+        ...(coversPreReleaseCost
+          ? {
+            pre_release_cost_observation: buildValidPreReleaseCostObservation(runTimestamp),
+          }
+          : {}),
+      };
+      attestationOverrides = {
+        provenance: {
+          deployment_identity: {
+            environment_id: 'pre-release',
+            deployment_ids: [validPreReleaseOpsReport.rollout_skew_probe.dual_version_deployment_id],
+            worker_version_ids: [
+              validPreReleaseOpsReport.rollout_skew_probe.baseline_gateway_version_id,
+              validPreReleaseOpsReport.rollout_skew_probe.candidate_gateway_version_id,
+              'jobs@pre-release-v1',
+              'ops@pre-release-v1',
+            ],
+          },
+        },
+      };
+    } else if (coversPreReleaseCost) {
+      reportOverrides = {
+        ...reportOverrides,
+        pre_release_cost_observation: buildValidPreReleaseCostObservation(runTimestamp),
+      };
+    }
     await fs.writeFile(
       artifactPath,
       JSON.stringify(buildValidEnvironmentAttestation(environmentName, runTimestamp, {
-        test_directory: environmentTestDirectory,
-        test_files: [environmentTestFiles[environmentName]],
-        test_file_count: 1,
-        expanded_test_files: [environmentTestFiles[environmentName], sharedProofFile],
-        expanded_test_file_count: 2,
-        log_artifact: `https://example.invalid/logs/fixture/${runTimestamp}/${environmentName}.log`,
-      }), null, 2),
+        ...reportOverrides,
+      }, attestationOverrides), null, 2),
     );
     manualArtifacts[artifactId] = path.relative(fixtureRoot, artifactPath);
   }
@@ -439,6 +1060,30 @@ test('required test discovery fails closed when an environment layer is empty or
   await assert.rejects(
     () => getRequiredTestFiles('staging', tempRoot),
     /No staging tests found/,
+  );
+});
+
+test('release-gate test discovery excludes generic non-local bootstrap and smoke entrypoints', async () => {
+  const integrationFiles = await getReleaseGateTestFiles('ci-integration', repoRoot);
+  const stagingFiles = await getReleaseGateTestFiles('staging', repoRoot);
+  const preReleaseFiles = await getReleaseGateTestFiles('pre-release', repoRoot);
+
+  for (const files of [integrationFiles, stagingFiles, preReleaseFiles]) {
+    assert.ok(files.length > 0);
+    assert.ok(files.every((file) => !file.endsWith('bootstrap.test.mjs')));
+    assert.ok(files.every((file) => !file.endsWith('l1-mandatory.test.mjs')));
+  }
+});
+
+test('release-gate test discovery fails closed when a non-local environment only has generic smoke entrypoints', async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-testing-harness-release-gate-'));
+  await fs.mkdir(path.join(tempRoot, 'tests', 'staging'), { recursive: true });
+  await fs.writeFile(path.join(tempRoot, 'tests', 'staging', 'bootstrap.test.mjs'), 'export const bootstrap = true;\n');
+  await fs.writeFile(path.join(tempRoot, 'tests', 'staging', 'l1-mandatory.test.mjs'), 'export const smoke = true;\n');
+
+  await assert.rejects(
+    () => getReleaseGateTestFiles('staging', tempRoot),
+    /No staging release-gate tests found/,
   );
 });
 
@@ -530,8 +1175,8 @@ test('L1 evidence bundle set includes governance and canonical test implementati
   );
 });
 
-test('non-local coverage fails closed when a required environment has no canonical implementation mapping yet', () => {
-  const results = collectTestCoverageResults(
+test('non-local coverage fails closed when a required environment report does not execute the canonical implementation', async () => {
+  const results = await collectTestCoverageResults(
     getL1EvidenceDefinition('EVID-OPS-001'),
     {
       'pre-release': {
@@ -544,16 +1189,203 @@ test('non-local coverage fails closed when a required environment has no canonic
 
   assert.equal(results.length, 1);
   assert.equal(results[0].satisfied, false);
-  assert.match(results[0].mapping_error ?? '', /Missing L1 test implementation mapping/);
+  assert.equal(results[0].mapping_error, null);
+  assert.deepEqual(results[0].missing_files, ['tests/pre-release/test-ops-001.test.mjs']);
+});
+
+test('non-local coverage fails closed when a required environment mapping points at generic or shared non-local files', async () => {
+  const fixtureRoot = await createIsolatedRepoFixture('matrix-testing-harness-smoke-mapping-repo-');
+  const fixtureParent = path.dirname(fixtureRoot);
+
+  try {
+    const evidenceFile = path.join(fixtureRoot, 'packages/testing/src/evidence.mjs');
+    const evidenceSource = await fs.readFile(evidenceFile, 'utf8');
+    const mappingStart = evidenceSource.indexOf('const L1_TEST_IMPLEMENTATION_FILES = Object.freeze({');
+    const mappingEnd = evidenceSource.indexOf('const L1_EVIDENCE_DEFINITIONS =');
+    assert.notEqual(mappingStart, -1);
+    assert.notEqual(mappingEnd, -1);
+
+    const invalidCases = [
+      {
+        mappedFile: 'tests/staging/l1-mandatory.test.mjs',
+        expectedError: /generic entrypoint/,
+      },
+      {
+        mappedFile: 'tests/staging/bootstrap.test.mjs',
+        expectedError: /generic entrypoint/,
+      },
+      {
+        mappedFile: 'tests/shared/nonlocal/support.mjs',
+        expectedError: /dedicated environment directory/,
+      },
+      {
+        mappedFile: 'tests/staging/generic-shim.test.mjs',
+        expectedError: /basename is anchored by "test-cs-002"/,
+      },
+      {
+        mappedFile: 'tests/staging/test-cs-002-missing.test.mjs',
+        expectedError: /must reference existing repo-owned \.test\.mjs files/,
+      },
+    ];
+
+    for (const { mappedFile, expectedError } of invalidCases) {
+      const smokeMappingBlock = [
+        'const L1_TEST_IMPLEMENTATION_FILES = Object.freeze({',
+        `  'TEST-CS-002': Object.freeze({ staging: Object.freeze(['${mappedFile}']) }),`,
+        '});',
+        '',
+      ].join('\n');
+      await fs.writeFile(
+        evidenceFile,
+        `${evidenceSource.slice(0, mappingStart)}${smokeMappingBlock}${evidenceSource.slice(mappingEnd)}`,
+      );
+
+      const fixtureEvidenceModule = await loadFixtureEvidenceModule(fixtureRoot);
+      const results = await fixtureEvidenceModule.collectTestCoverageResults(
+        fixtureEvidenceModule.getL1EvidenceDefinition('EVID-CS-002'),
+        {
+          staging: {
+            expanded_test_files: [mappedFile],
+          },
+        },
+        fixtureRoot,
+      );
+
+      assert.equal(results.length, 1);
+      assert.equal(results[0].satisfied, false);
+      assert.match(results[0].mapping_error ?? '', expectedError);
+    }
+  } finally {
+    await fs.rm(fixtureParent, { recursive: true, force: true });
+  }
+});
+
+test('non-local coverage fails closed when a prefixed wrapper expands generic or shared non-local files', async () => {
+  const fixtureRoot = await createIsolatedRepoFixture('matrix-testing-harness-wrapper-mapping-repo-');
+  const fixtureParent = path.dirname(fixtureRoot);
+
+  try {
+    const evidenceFile = path.join(fixtureRoot, 'packages/testing/src/evidence.mjs');
+    const evidenceSource = await fs.readFile(evidenceFile, 'utf8');
+    const mappingStart = evidenceSource.indexOf('const L1_TEST_IMPLEMENTATION_FILES = Object.freeze({');
+    const mappingEnd = evidenceSource.indexOf('const L1_EVIDENCE_DEFINITIONS =');
+    assert.notEqual(mappingStart, -1);
+    assert.notEqual(mappingEnd, -1);
+
+    await fs.mkdir(path.join(fixtureRoot, 'tests', 'staging'), { recursive: true });
+    await fs.mkdir(path.join(fixtureRoot, 'tests', 'shared', 'nonlocal'), { recursive: true });
+    await fs.writeFile(path.join(fixtureRoot, 'tests', 'shared', 'nonlocal', 'support.mjs'), 'export const support = true;\n');
+
+    const invalidCases = [
+      {
+        wrapperImport: "await import('./l1-mandatory.test.mjs');\n",
+        expectedError: /dependency closure within dedicated environment directory|cannot expand generic entrypoint/,
+      },
+      {
+        wrapperImport: "await import('../shared/nonlocal/support.mjs');\n",
+        expectedError: /dependency closure within dedicated environment directory/,
+      },
+    ];
+
+    for (const { wrapperImport, expectedError } of invalidCases) {
+      await fs.writeFile(path.join(fixtureRoot, 'tests', 'staging', 'test-cs-002-wrapper.test.mjs'), wrapperImport);
+      const smokeMappingBlock = [
+        'const L1_TEST_IMPLEMENTATION_FILES = Object.freeze({',
+        "  'TEST-CS-002': Object.freeze({ staging: Object.freeze(['tests/staging/test-cs-002-wrapper.test.mjs']) }),",
+        '});',
+        '',
+      ].join('\n');
+      await fs.writeFile(
+        evidenceFile,
+        `${evidenceSource.slice(0, mappingStart)}${smokeMappingBlock}${evidenceSource.slice(mappingEnd)}`,
+      );
+
+      const fixtureEvidenceModule = await loadFixtureEvidenceModule(fixtureRoot);
+      const results = await fixtureEvidenceModule.collectTestCoverageResults(
+        fixtureEvidenceModule.getL1EvidenceDefinition('EVID-CS-002'),
+        {
+          staging: {
+            expanded_test_files: ['tests/staging/test-cs-002-wrapper.test.mjs'],
+          },
+        },
+        fixtureRoot,
+      );
+
+      assert.equal(results.length, 1);
+      assert.equal(results[0].satisfied, false);
+      assert.match(results[0].mapping_error ?? '', expectedError);
+    }
+  } finally {
+    await fs.rm(fixtureParent, { recursive: true, force: true });
+  }
+});
+
+test('non-local coverage fails closed when a canonical suite symlink escapes repo ownership', async () => {
+  const fixtureRoot = await createIsolatedRepoFixture('matrix-testing-harness-symlink-mapping-repo-');
+  const fixtureParent = path.dirname(fixtureRoot);
+
+  try {
+    const evidenceFile = path.join(fixtureRoot, 'packages/testing/src/evidence.mjs');
+    const evidenceSource = await fs.readFile(evidenceFile, 'utf8');
+    const mappingStart = evidenceSource.indexOf('const L1_TEST_IMPLEMENTATION_FILES = Object.freeze({');
+    const mappingEnd = evidenceSource.indexOf('const L1_EVIDENCE_DEFINITIONS =');
+    assert.notEqual(mappingStart, -1);
+    assert.notEqual(mappingEnd, -1);
+
+    await fs.mkdir(path.join(fixtureRoot, 'tests', 'staging'), { recursive: true });
+    const mappedFile = 'tests/staging/test-cs-002-symlink.test.mjs';
+    const externalProofFile = path.join(fixtureParent, 'external-proof.test.mjs');
+    await fs.writeFile(externalProofFile, "export const proof = true;\n");
+    await fs.symlink(externalProofFile, path.join(fixtureRoot, mappedFile));
+
+    const smokeMappingBlock = [
+      'const L1_TEST_IMPLEMENTATION_FILES = Object.freeze({',
+      `  'TEST-CS-002': Object.freeze({ staging: Object.freeze(['${mappedFile}']) }),`,
+      '});',
+      '',
+    ].join('\n');
+    await fs.writeFile(
+      evidenceFile,
+      `${evidenceSource.slice(0, mappingStart)}${smokeMappingBlock}${evidenceSource.slice(mappingEnd)}`,
+    );
+
+    const fixtureEvidenceModule = await loadFixtureEvidenceModule(fixtureRoot);
+    const results = await fixtureEvidenceModule.collectTestCoverageResults(
+      fixtureEvidenceModule.getL1EvidenceDefinition('EVID-CS-002'),
+      {
+        staging: {
+          expanded_test_files: [mappedFile],
+        },
+      },
+      fixtureRoot,
+    );
+
+    assert.equal(results.length, 1);
+    assert.equal(results[0].satisfied, false);
+    assert.match(results[0].mapping_error ?? '', /escapes repo-owned dependencies/);
+  } finally {
+    await fs.rm(fixtureParent, { recursive: true, force: true });
+  }
 });
 
 test('manual artifact payload validation requires structured non-local reports and typed prod snapshots', () => {
   const runTimestamp = '20260331T140000Z';
   const validStagingReport = buildValidEnvironmentReport('staging', runTimestamp);
+  const validPreReleaseReport = buildValidEnvironmentReport('pre-release', runTimestamp);
+  const validPreReleaseOpsReport = buildValidPreReleaseOpsReport(runTimestamp);
+  const validPreReleaseCostReport = buildValidPreReleaseCostReport(runTimestamp);
   const validProdCostSnapshot = buildValidProdCostSnapshot(runTimestamp);
 
   assert.deepEqual(
     validateManualArtifactPayload('staging_run_report', validStagingReport, { runTimestamp }),
+    {
+      valid: true,
+      error: null,
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('pre_release_run_report', validPreReleaseReport, { runTimestamp }),
     {
       valid: true,
       error: null,
@@ -622,6 +1454,33 @@ test('manual artifact payload validation requires structured non-local reports a
     {
       valid: false,
       error: 'environment run report must include test_files matching test_file_count',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('staging_run_report', {
+      ...validStagingReport,
+      command: '/usr/bin/node --test /tmp/tests/staging/not-the-real-suite.test.mjs',
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'environment run report command must enumerate the same repo-relative test_files claimed by the report',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('staging_run_report', {
+      ...validStagingReport,
+      expanded_test_file_count: 1,
+      expanded_test_files: ['tests/staging/support.mjs'],
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'environment run report expanded_test_files must include claimed test_file tests/staging/remote.test.mjs',
     },
   );
 
@@ -758,6 +1617,67 @@ test('manual artifact payload validation requires structured non-local reports a
   assert.deepEqual(
     validateManualArtifactPayload('staging_run_report', {
       ...validStagingReport,
+      readiness_probe: null,
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'environment run report must include readiness_probe',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('staging_run_report', {
+      ...validStagingReport,
+      readiness_probe: {
+        ...validStagingReport.readiness_probe,
+        attempts: [
+          {
+            ...validStagingReport.readiness_probe.attempts[0],
+            ok: false,
+            failure: {
+              step_name: 'media_create',
+              detail: {
+                status: 500,
+              },
+            },
+          },
+        ],
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'environment run report readiness_probe must include a successful final attempt',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('staging_run_report', {
+      ...validStagingReport,
+      readiness_probe: {
+        ...validStagingReport.readiness_probe,
+        attempts: [
+          {
+            ...validStagingReport.readiness_probe.attempts[0],
+            steps: validStagingReport.readiness_probe.attempts[0].steps.filter((step) => step.step !== 'ops_rebuild_start'),
+          },
+        ],
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'environment run report readiness_probe final attempt must include successful steps: ops_rebuild_start',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('staging_run_report', {
+      ...validStagingReport,
       cloudflare_resources: {
         ...validStagingReport.cloudflare_resources,
         workers: [],
@@ -817,6 +1737,177 @@ test('manual artifact payload validation requires structured non-local reports a
     {
       valid: false,
       error: 'environment run report must not expand local test implementations',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('pre_release_run_report', {
+      ...validPreReleaseReport,
+      rollout_skew_probe: buildValidRolloutSkewProbe(runTimestamp),
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'environment run report rollout_skew_probe must be null unless TEST-OPS-001 is covered',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('pre_release_run_report', {
+      ...validPreReleaseReport,
+      pre_release_cost_observation: buildValidPreReleaseCostObservation(runTimestamp),
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'environment run report pre_release_cost_observation must be null unless TEST-COST-001 is covered',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('pre_release_run_report', {
+      ...validPreReleaseOpsReport,
+      rollout_skew_probe: null,
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'environment run report must include rollout_skew_probe',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('pre_release_run_report', {
+      ...validPreReleaseOpsReport,
+      rollout_skew_probe: {
+        ...validPreReleaseOpsReport.rollout_skew_probe,
+        assertions: {
+          new_worker_old_authority: true,
+          old_worker_new_authority: false,
+        },
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'environment run report rollout_skew_probe assertions must both be true',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('pre_release_run_report', validPreReleaseOpsReport, { runTimestamp }),
+    {
+      valid: true,
+      error: null,
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('pre_release_run_report', {
+      ...validPreReleaseOpsReport,
+      rollout_skew_probe: {
+        ...validPreReleaseOpsReport.rollout_skew_probe,
+        observations: validPreReleaseOpsReport.rollout_skew_probe.observations.map((entry, index) => index === 0
+          ? {
+            ...entry,
+            observed_gateway_version_tag: `${entry.observed_gateway_version_tag}-unexpected`,
+          }
+          : entry),
+      },
+    }, { runTimestamp }),
+    {
+      valid: false,
+      error: 'environment run report rollout_skew_probe must include new-worker-old-authority/UserDO observation',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('pre_release_run_report', {
+      ...validPreReleaseOpsReport,
+      rollout_skew_probe: {
+        ...validPreReleaseOpsReport.rollout_skew_probe,
+        observations: validPreReleaseOpsReport.rollout_skew_probe.observations.map((entry) => ({
+          ...entry,
+          observed_gateway_version_id: null,
+        })),
+      },
+    }, { runTimestamp }),
+    {
+      valid: true,
+      error: null,
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('pre_release_run_report', {
+      ...validPreReleaseCostReport,
+      pre_release_cost_observation: null,
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'environment run report must include pre_release_cost_observation',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('pre_release_run_report', {
+      ...validPreReleaseCostReport,
+      pre_release_cost_observation: {
+        ...validPreReleaseCostReport.pre_release_cost_observation,
+        capture_method: 'estimated-local-model',
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'environment run report pre_release_cost_observation.capture_method must be cloudflare-official-metrics',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('pre_release_run_report', {
+      ...validPreReleaseCostReport,
+      pre_release_cost_observation: {
+        ...validPreReleaseCostReport.pre_release_cost_observation,
+        source_query_uris: ['https://example.invalid/cloudflare/pre-release/cost'],
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'environment run report pre_release_cost_observation.source_query_uris must be official Cloudflare HTTPS locators',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('pre_release_run_report', validPreReleaseCostReport, { runTimestamp }),
+    {
+      valid: true,
+      error: null,
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('staging_run_report', {
+      ...validStagingReport,
+      expanded_test_files: [
+        'tests/staging/remote.test.mjs',
+        'packages/testing/src/bootstrap.mjs',
+      ],
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'environment run report expanded_test_files must stay within tests/staging',
     },
   );
 
@@ -1084,9 +2175,163 @@ test('manual artifact payload validation requires structured non-local reports a
   );
 });
 
+test('manual artifact payload validation enforces production automation artifact contracts', () => {
+  const runTimestamp = '20260331T140000Z';
+  const validReleaseCandidate = buildValidProdReleaseCandidateManifest(runTimestamp);
+  const validInstallRecord = buildValidProdInstallRecord();
+  const validPromotionRecord = buildValidProdPromotionRecord();
+  const validRollbackRecord = buildValidProdRollbackRecord();
+
+  assert.deepEqual(
+    validateManualArtifactPayload('prod_release_candidate', validReleaseCandidate, { runTimestamp }),
+    {
+      valid: true,
+      error: null,
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('prod_release_candidate', {
+      ...validReleaseCandidate,
+      topology_kind: 'cloudflare-pre-release',
+    }, { runTimestamp }),
+    {
+      valid: false,
+      error: 'prod_release_candidate topology_kind must be "cloudflare-prod"',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('prod_install_record', validInstallRecord),
+    {
+      valid: true,
+      error: null,
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('prod_install_record', {
+      ...validInstallRecord,
+      access: {
+        ...validInstallRecord.access,
+        application_domain: '',
+      },
+    }),
+    {
+      valid: false,
+      error: 'prod_install_record access.application_domain must be non-empty',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('prod_promotion_record', validPromotionRecord),
+    {
+      valid: true,
+      error: null,
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('prod_promotion_record', {
+      ...validPromotionRecord,
+      gateway_rollout_steps: [
+        { percentage: 0, deployment_id: 'gateway-prod-rollout-0', ready: true },
+      ],
+    }),
+    {
+      valid: false,
+      error: 'prod_promotion_record gateway_rollout_steps[0].percentage must be an integer between 1 and 100',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('prod_promotion_record', {
+      ...validPromotionRecord,
+      promotion_mode: 'deploy_with_migration',
+      gateway_rollout_steps: [],
+      readiness_checks: {
+        jobs_promoted: buildValidProdReadinessProbe(),
+        ops_promoted: buildValidProdReadinessProbe(),
+        gateway_promoted: buildValidProdReadinessProbe(),
+      },
+      rollback_handle: buildValidProdRollbackHandle(),
+    }),
+    {
+      valid: false,
+      error: 'prod_promotion_record rollback_handle must be null for deploy_with_migration promotions',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('prod_promotion_record', {
+      ...validPromotionRecord,
+      rollback_handle: {
+        ...validPromotionRecord.rollback_handle,
+        worker_versions: {
+          ...validPromotionRecord.rollback_handle.worker_versions,
+          'gateway-worker': {
+            ...validPromotionRecord.rollback_handle.worker_versions['gateway-worker'],
+            restore_version_specs: [],
+          },
+        },
+      },
+    }),
+    {
+      valid: false,
+      error: 'prod_promotion_record rollback_handle.worker_versions.gateway-worker.restore_version_specs must be a non-empty string array',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('prod_rollback_record', validRollbackRecord),
+    {
+      valid: true,
+      error: null,
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('prod_rollback_record', {
+      ...validRollbackRecord,
+      readiness_probe: {
+        ...validRollbackRecord.readiness_probe,
+        attempts: [],
+      },
+    }),
+    {
+      valid: false,
+      error: 'prod_rollback_record readiness_probe.attempts must match attempt_count',
+    },
+  );
+});
+
 test('manual artifact attestation validation requires immutable provenance plus typed payloads', () => {
   const runTimestamp = '20260331T140000Z';
   const validStagingAttestation = buildValidEnvironmentAttestation('staging', runTimestamp);
+  const validPreReleaseOpsReport = buildValidPreReleaseOpsReport(runTimestamp);
+  const validPreReleaseOpsAttestation = buildValidEnvironmentAttestation(
+    'pre-release',
+    runTimestamp,
+    {
+      ...validPreReleaseOpsReport,
+      source_run_uri: buildGitHubRunUri('pre-release', runTimestamp),
+      topology_kind: 'cloudflare-pre-release',
+    },
+    {
+      provenance: {
+        deployment_identity: {
+          environment_id: 'pre-release',
+          deployment_ids: [validPreReleaseOpsReport.rollout_skew_probe.dual_version_deployment_id],
+          worker_version_ids: [
+            validPreReleaseOpsReport.rollout_skew_probe.baseline_gateway_version_id,
+            validPreReleaseOpsReport.rollout_skew_probe.candidate_gateway_version_id,
+            'jobs@pre-release-v1',
+            'ops@pre-release-v1',
+          ],
+        },
+      },
+    },
+  );
   const validProdCostAttestation = buildValidProdCostSnapshotAttestation(runTimestamp);
 
   assert.deepEqual(
@@ -1094,6 +2339,49 @@ test('manual artifact attestation validation requires immutable provenance plus 
     {
       valid: true,
       error: null,
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('pre_release_run_report', validPreReleaseOpsAttestation, { runTimestamp }),
+    {
+      valid: true,
+      error: null,
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('pre_release_run_report', {
+      ...validPreReleaseOpsAttestation,
+      payload: {
+        ...validPreReleaseOpsAttestation.payload,
+        deployment_identity_validation: null,
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'attested payload invalid: environment run report must include deployment_identity_validation when TEST-OPS-001 is covered',
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('pre_release_run_report', {
+      ...validPreReleaseOpsAttestation,
+      provenance: {
+        ...validPreReleaseOpsAttestation.provenance,
+        deployment_identity: {
+          ...validPreReleaseOpsAttestation.provenance.deployment_identity,
+          deployment_ids: ['wrong-deployment-id'],
+        },
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'attestation bundle provenance.deployment_identity.deployment_ids must include rollout_skew_probe.dual_version_deployment_id',
     },
   );
 
@@ -1120,6 +2408,49 @@ test('manual artifact attestation validation requires immutable provenance plus 
     {
       valid: false,
       error: 'attestation bundle must include RFC 3339 UTC attested_at',
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('staging_run_report', {
+      ...validStagingAttestation,
+      provenance: {
+        ...validStagingAttestation.provenance,
+        origin_repository: '',
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'attestation bundle provenance.origin_repository must be a GitHub owner/repo slug',
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('staging_run_report', {
+      ...validStagingAttestation,
+      provenance: {
+        ...validStagingAttestation.provenance,
+        origin_repository: FOREIGN_TEST_GITHUB_REPOSITORY,
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'attestation bundle provenance.origin_repository must match provenance.origin_run_uri',
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('staging_run_report', validStagingAttestation, {
+      runTimestamp,
+      expectedGitHubRepository: FOREIGN_TEST_GITHUB_REPOSITORY,
+    }),
+    {
+      valid: false,
+      error: 'attestation bundle provenance.origin_repository must match the current repository',
     },
   );
 
@@ -1382,8 +2713,8 @@ test('manual artifact attestation validation requires immutable provenance plus 
       ...validStagingAttestation,
       provenance: {
         ...validStagingAttestation.provenance,
-        artifact_store_uri: 'r2://matrix-evidence-staging/gha/220260331140000/1/pre-release/20260331T140000Z/run-bundle.tgz',
-        artifact_store_key: 'gha/220260331140000/1/pre-release/20260331T140000Z/run-bundle.tgz',
+        artifact_store_uri: `r2://matrix-evidence-staging/gha/${buildGitHubRunId('staging', runTimestamp)}/1/pre-release/${runTimestamp}/run-bundle.tgz`,
+        artifact_store_key: `gha/${buildGitHubRunId('staging', runTimestamp)}/1/pre-release/${runTimestamp}/run-bundle.tgz`,
       },
     }, {
       runTimestamp,
@@ -1399,8 +2730,8 @@ test('manual artifact attestation validation requires immutable provenance plus 
       ...validStagingAttestation,
       provenance: {
         ...validStagingAttestation.provenance,
-        artifact_store_uri: 'r2://matrix-evidence-staging/gha/220260331140000/1/staging/20260331T140001Z/run-bundle.tgz',
-        artifact_store_key: 'gha/220260331140000/1/staging/20260331T140001Z/run-bundle.tgz',
+        artifact_store_uri: `r2://matrix-evidence-staging/gha/${buildGitHubRunId('staging', runTimestamp)}/1/staging/20260331T140001Z/run-bundle.tgz`,
+        artifact_store_key: `gha/${buildGitHubRunId('staging', runTimestamp)}/1/staging/20260331T140001Z/run-bundle.tgz`,
       },
     }, {
       runTimestamp,
@@ -1487,6 +2818,76 @@ test('manual artifact attestation validation requires immutable provenance plus 
       ...validStagingAttestation,
       payload: {
         ...validStagingAttestation.payload,
+        readiness_probe: null,
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'attested payload invalid: environment run report must include readiness_probe',
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('staging_run_report', {
+      ...validStagingAttestation,
+      payload: {
+        ...validStagingAttestation.payload,
+        readiness_probe: {
+          ...validStagingAttestation.payload.readiness_probe,
+          attempts: [
+            {
+              ...validStagingAttestation.payload.readiness_probe.attempts[0],
+              ok: false,
+              failure: {
+                step_name: 'media_create',
+                detail: {
+                  status: 500,
+                },
+              },
+            },
+          ],
+        },
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'attested payload invalid: environment run report readiness_probe must include a successful final attempt',
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('staging_run_report', {
+      ...validStagingAttestation,
+      payload: {
+        ...validStagingAttestation.payload,
+        readiness_probe: {
+          ...validStagingAttestation.payload.readiness_probe,
+          attempts: [
+            {
+              ...validStagingAttestation.payload.readiness_probe.attempts[0],
+              steps: validStagingAttestation.payload.readiness_probe.attempts[0].steps.filter((step) => step.step !== 'ops_rebuild_start'),
+            },
+          ],
+        },
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'attested payload invalid: environment run report readiness_probe final attempt must include successful steps: ops_rebuild_start',
+    },
+  );
+
+  assert.deepEqual(
+    validateEvidenceAttestationBundle('staging_run_report', {
+      ...validStagingAttestation,
+      payload: {
+        ...validStagingAttestation.payload,
         expanded_test_files: [
           'tests/staging/l1-mandatory.test.mjs',
           'tests/local/client-identity/phase-04.test.mjs',
@@ -1543,30 +2944,43 @@ test('manual artifact attestation validation requires immutable provenance plus 
   );
 });
 
-test('current non-local harness readiness reports environment-backed dedicated harnesses once local imports are removed', async () => {
+test('current non-local harness readiness fails closed on default directory discovery until it is scoped to dedicated release-gate suites', async () => {
   const integrationReadiness = await assessNonLocalEnvironmentHarnessReadiness('ci-integration', repoRoot);
-  assert.equal(integrationReadiness.ready, true);
+  assert.equal(integrationReadiness.ready, false);
   assert.deepEqual(integrationReadiness.local_test_expansions, []);
+  assert.match(integrationReadiness.reason ?? '', /generic entrypoints|dedicated environment directory closure/);
 
   const stagingReadiness = await assessNonLocalEnvironmentHarnessReadiness('staging', repoRoot);
-  assert.equal(stagingReadiness.ready, true);
+  assert.equal(stagingReadiness.ready, false);
   assert.deepEqual(stagingReadiness.local_test_expansions, []);
+  assert.match(stagingReadiness.reason ?? '', /generic entrypoints|dedicated environment directory closure/);
 
   const preReleaseReadiness = await assessNonLocalEnvironmentHarnessReadiness('pre-release', repoRoot);
-  assert.equal(preReleaseReadiness.ready, true);
+  assert.equal(preReleaseReadiness.ready, false);
   assert.deepEqual(preReleaseReadiness.local_test_expansions, []);
+  assert.match(preReleaseReadiness.reason ?? '', /generic entrypoints|dedicated environment directory closure/);
+});
+
+test('non-local harness readiness can scope expansion to release-gate file selection', async () => {
+  const integrationReadiness = await assessNonLocalEnvironmentHarnessReadiness('ci-integration', repoRoot, {
+    getRequiredTestFilesImpl: getReleaseGateTestFiles,
+  });
+  assert.equal(integrationReadiness.ready, true);
+  assert.deepEqual(integrationReadiness.local_test_expansions, []);
+  assert.ok(!integrationReadiness.expanded_test_files.includes('tests/integration/bootstrap.test.mjs'));
+  assert.ok(!integrationReadiness.expanded_test_files.includes('tests/integration/l1-mandatory.test.mjs'));
+  assert.ok(!integrationReadiness.expanded_test_files.includes('tests/shared/nonlocal/support.mjs'));
 });
 
 test('non-local harness readiness does not treat exported object string literals as module imports', async () => {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-testing-harness-export-strings-'));
   await fs.mkdir(path.join(tempRoot, 'tests', 'staging'), { recursive: true });
-  await fs.mkdir(path.join(tempRoot, 'tests', 'shared'), { recursive: true });
   await fs.writeFile(
     path.join(tempRoot, 'tests', 'staging', 'export-strings.test.mjs'),
-    "import '../shared/bootstrap-like.mjs';\n",
+    "import './bootstrap-like.mjs';\n",
   );
   await fs.writeFile(
-    path.join(tempRoot, 'tests', 'shared', 'bootstrap-like.mjs'),
+    path.join(tempRoot, 'tests', 'staging', 'bootstrap-like.mjs'),
     [
       'export const TEST_ENVIRONMENTS = Object.freeze({',
       "  'ci-integration': Object.freeze({ directory: 'tests/integration' }),",
@@ -3443,12 +4857,8 @@ test('non-local harness readiness fails closed on package-import aliases that ca
     }, null, 2),
   );
   await fs.writeFile(
-    path.join(tempRoot, 'tests', 'staging', 'bootstrap.test.mjs'),
+    path.join(tempRoot, 'tests', 'staging', 'test-cs-002.test.mjs'),
     "import '#local-probe';\n",
-  );
-  await fs.writeFile(
-    path.join(tempRoot, 'tests', 'staging', 'l1-mandatory.test.mjs'),
-    'export const marker = true;\n',
   );
   await fs.writeFile(
     path.join(tempRoot, 'tests', 'local', 'probe.test.mjs'),
@@ -3458,10 +4868,10 @@ test('non-local harness readiness fails closed on package-import aliases that ca
   const readiness = await assessNonLocalEnvironmentHarnessReadiness('staging', tempRoot);
   assert.equal(readiness.ready, false);
   assert.match(readiness.reason, /non-literal dynamic imports/);
-  assert.ok(readiness.unresolved_dynamic_imports.includes('tests/staging/bootstrap.test.mjs'));
+  assert.ok(readiness.unresolved_dynamic_imports.includes('tests/staging/test-cs-002.test.mjs'));
 });
 
-test('non-local harness readiness allows node builtin imports while tracking repo-owned shared proofs', async () => {
+test('non-local harness readiness still fails closed when node builtin imports coexist with shared proofs outside the environment directory', async () => {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-testing-harness-node-builtin-'));
   await fs.mkdir(path.join(tempRoot, 'tests', 'staging'), { recursive: true });
   await fs.mkdir(path.join(tempRoot, 'tests', 'shared'), { recursive: true });
@@ -3484,10 +4894,11 @@ test('non-local harness readiness allows node builtin imports while tracking rep
   );
 
   const readiness = await assessNonLocalEnvironmentHarnessReadiness('staging', tempRoot);
-  assert.equal(readiness.ready, true);
-  assert.equal(readiness.reason, null);
+  assert.equal(readiness.ready, false);
+  assert.match(readiness.reason, /escapes dedicated environment directory closure/);
   assert.deepEqual(readiness.unresolved_dynamic_imports, []);
   assert.deepEqual(readiness.repo_boundary_escapes, []);
+  assert.deepEqual(readiness.environment_boundary_escapes, ['tests/shared/proof.mjs']);
   assert.ok(readiness.expanded_test_files.includes('tests/shared/proof.mjs'));
 });
 
@@ -3615,7 +5026,11 @@ test('manual artifact collection rejects _test-runs paths even when payload stru
   await fs.mkdir(path.dirname(reportPath), { recursive: true });
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentAttestation('pre-release', runTimestamp), null, 2),
+    JSON.stringify(buildValidEnvironmentAttestation(
+      'pre-release',
+      runTimestamp,
+      buildSingleFileEnvironmentReportOverrides('tests/pre-release/remote.test.mjs'),
+    ), null, 2),
   );
 
   const results = await collectManualArtifactResults(
@@ -3646,7 +5061,11 @@ test('manual artifact collection rejects symlinked _test-runs reports even when 
   await fs.writeFile(testFile, 'export const remote = true;\n');
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentAttestation('pre-release', runTimestamp), null, 2),
+    JSON.stringify(buildValidEnvironmentAttestation(
+      'pre-release',
+      runTimestamp,
+      buildSingleFileEnvironmentReportOverrides('tests/pre-release/remote.test.mjs'),
+    ), null, 2),
   );
   await fs.symlink(reportPath, symlinkPath);
 
@@ -3664,6 +5083,165 @@ test('manual artifact collection rejects symlinked _test-runs reports even when 
   assert.match(results[0].validation_error, /external non-local evidence/);
 });
 
+test('manual artifact collection rejects GitHub Actions attestations from another repository when the current repository is known', async () => {
+  const runTimestamp = '20260331T141605Z';
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-testing-harness-foreign-repo-'));
+  const testFile = path.join(tempRoot, 'tests', 'pre-release', 'remote.test.mjs');
+  const externalDir = path.join(tempRoot, 'external');
+  const foreignRunUri = `https://github.com/${FOREIGN_TEST_GITHUB_REPOSITORY}/actions/runs/${buildGitHubRunId('pre-release', runTimestamp)}`;
+  const reportPath = path.join(externalDir, 'pre-release.json');
+
+  await fs.mkdir(path.dirname(testFile), { recursive: true });
+  await fs.mkdir(externalDir, { recursive: true });
+  await fs.writeFile(testFile, 'export const remote = true;\n');
+  await fs.writeFile(
+    reportPath,
+    JSON.stringify(buildValidEnvironmentAttestation('pre-release', runTimestamp, {
+      source_run_uri: foreignRunUri,
+    }, {
+      provenance: {
+        origin_repository: FOREIGN_TEST_GITHUB_REPOSITORY,
+        origin_run_uri: foreignRunUri,
+        review_record_uri: foreignRunUri,
+      },
+    }), null, 2),
+  );
+
+  const results = await collectManualArtifactResults(
+    getL1EvidenceDefinition('EVID-OPS-001'),
+    tempRoot,
+    {
+      pre_release_run_report: path.relative(tempRoot, reportPath),
+    },
+    runTimestamp,
+    {
+      expectedGitHubRepository: DEFAULT_TEST_GITHUB_REPOSITORY,
+    },
+  );
+
+  assert.equal(results.length, 1);
+  assert.equal(results[0].valid, false);
+  assert.equal(results[0].validation_error, 'attestation bundle provenance.origin_repository must match the current repository');
+});
+
+test('manual artifact collection resolves the current repository from GITHUB_REPOSITORY when no explicit repository option is supplied', async () => {
+  const runTimestamp = '20260331T141607Z';
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-testing-harness-env-repo-'));
+  const testFile = path.join(tempRoot, 'tests', 'pre-release', 'remote.test.mjs');
+  const externalDir = path.join(tempRoot, 'external');
+  const foreignRunUri = `https://github.com/${FOREIGN_TEST_GITHUB_REPOSITORY}/actions/runs/${buildGitHubRunId('pre-release', runTimestamp)}`;
+  const reportPath = path.join(externalDir, 'pre-release.json');
+  const previousRepository = process.env.GITHUB_REPOSITORY;
+
+  await fs.mkdir(path.dirname(testFile), { recursive: true });
+  await fs.mkdir(externalDir, { recursive: true });
+  await fs.writeFile(testFile, 'export const remote = true;\n');
+  await fs.writeFile(
+    reportPath,
+    JSON.stringify(buildValidEnvironmentAttestation('pre-release', runTimestamp, {
+      test_directory: 'tests/pre-release',
+      test_files: ['tests/pre-release/remote.test.mjs'],
+      test_file_count: 1,
+      expanded_test_files: ['tests/pre-release/remote.test.mjs'],
+      expanded_test_file_count: 1,
+    }, {
+      provenance: {
+        origin_repository: FOREIGN_TEST_GITHUB_REPOSITORY,
+        origin_run_uri: foreignRunUri,
+        review_record_uri: foreignRunUri,
+      },
+    }), null, 2),
+  );
+
+  try {
+    process.env.GITHUB_REPOSITORY = DEFAULT_TEST_GITHUB_REPOSITORY;
+    const results = await collectManualArtifactResults(
+      getL1EvidenceDefinition('EVID-OPS-001'),
+      tempRoot,
+      {
+        pre_release_run_report: path.relative(tempRoot, reportPath),
+      },
+      runTimestamp,
+    );
+
+    assert.equal(results.length, 1);
+    assert.equal(results[0].valid, false);
+    assert.equal(results[0].validation_error, 'attestation bundle provenance.origin_repository must match the current repository');
+  } finally {
+    if (previousRepository == null) {
+      delete process.env.GITHUB_REPOSITORY;
+    } else {
+      process.env.GITHUB_REPOSITORY = previousRepository;
+    }
+  }
+});
+
+test('manual artifact collection rejects attestations that do not share one GitHub Actions run and attempt', async () => {
+  const runTimestamp = '20260331T141608Z';
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-testing-harness-same-run-'));
+  const ciTestFile = path.join(tempRoot, 'tests', 'integration', 'remote.test.mjs');
+  const stagingTestFile = path.join(tempRoot, 'tests', 'staging', 'remote.test.mjs');
+  const externalDir = path.join(tempRoot, 'external');
+  const ciPath = path.join(externalDir, 'ci-integration.json');
+  const stagingPath = path.join(externalDir, 'staging.json');
+  const mismatchedRunId = '8903120260331141608';
+  const mismatchedRunUri = `https://github.com/${DEFAULT_TEST_GITHUB_REPOSITORY}/actions/runs/${mismatchedRunId}`;
+  const mismatchedArtifactStoreKey = `gha/${mismatchedRunId}/1/staging/${runTimestamp}/run-bundle.tgz`;
+
+  await fs.mkdir(path.dirname(ciTestFile), { recursive: true });
+  await fs.mkdir(path.dirname(stagingTestFile), { recursive: true });
+  await fs.mkdir(externalDir, { recursive: true });
+  await fs.writeFile(ciTestFile, 'export const remote = true;\n');
+  await fs.writeFile(stagingTestFile, 'export const remote = true;\n');
+  await fs.writeFile(
+    ciPath,
+    JSON.stringify(buildValidEnvironmentAttestation('ci-integration', runTimestamp, {
+      test_directory: 'tests/integration',
+      test_files: ['tests/integration/remote.test.mjs'],
+      test_file_count: 1,
+      expanded_test_files: ['tests/integration/remote.test.mjs'],
+      expanded_test_file_count: 1,
+    }), null, 2),
+  );
+  await fs.writeFile(
+    stagingPath,
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
+      source_run_uri: mismatchedRunUri,
+      test_directory: 'tests/staging',
+      test_files: ['tests/staging/remote.test.mjs'],
+      test_file_count: 1,
+      expanded_test_files: ['tests/staging/remote.test.mjs'],
+      expanded_test_file_count: 1,
+    }, {
+      provenance: {
+        origin_run_id: mismatchedRunId,
+        origin_run_uri: mismatchedRunUri,
+        artifact_store_uri: `r2://matrix-evidence-staging/${mismatchedArtifactStoreKey}`,
+        artifact_store_key: mismatchedArtifactStoreKey,
+        review_record_uri: mismatchedRunUri,
+      },
+    }), null, 2),
+  );
+
+  const results = await collectManualArtifactResults(
+    getL1EvidenceDefinition('EVID-CS-001'),
+    tempRoot,
+    {
+      ci_integration_run_report: path.relative(tempRoot, ciPath),
+      staging_run_report: path.relative(tempRoot, stagingPath),
+    },
+    runTimestamp,
+    {
+      expectedGitHubRepository: DEFAULT_TEST_GITHUB_REPOSITORY,
+    },
+  );
+
+  assert.equal(results.length, 2);
+  assert.equal(results[0].valid, true);
+  assert.equal(results[1].valid, false);
+  assert.match(results[1].validation_error, /must come from GitHub Actions run/);
+});
+
 test('manual artifact collection rejects hard-linked _test-runs reports even when the provided path looks external', async () => {
   const runTimestamp = '20260331T141600Z';
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-testing-harness-manual-hardlink-'));
@@ -3678,7 +5256,11 @@ test('manual artifact collection rejects hard-linked _test-runs reports even whe
   await fs.writeFile(testFile, 'export const remote = true;\n');
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentAttestation('pre-release', runTimestamp), null, 2),
+    JSON.stringify(buildValidEnvironmentAttestation(
+      'pre-release',
+      runTimestamp,
+      buildSingleFileEnvironmentReportOverrides('tests/pre-release/remote.test.mjs'),
+    ), null, 2),
   );
   await fs.link(reportPath, linkedPath);
 
@@ -3711,7 +5293,11 @@ test('manual artifact collection rejects hard-linked _test-runs reports from oth
   await fs.writeFile(testFile, 'export const remote = true;\n');
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentAttestation('pre-release', runTimestamp), null, 2),
+    JSON.stringify(buildValidEnvironmentAttestation(
+      'pre-release',
+      runTimestamp,
+      buildSingleFileEnvironmentReportOverrides('tests/pre-release/remote.test.mjs'),
+    ), null, 2),
   );
   await fs.link(reportPath, linkedPath);
 
@@ -3743,7 +5329,11 @@ test('manual artifact collection rejects hard-linked _test-runs artifacts even w
   await fs.writeFile(testFile, 'export const remote = true;\n');
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentAttestation('pre-release', runTimestamp), null, 2),
+    JSON.stringify(buildValidEnvironmentAttestation(
+      'pre-release',
+      runTimestamp,
+      buildSingleFileEnvironmentReportOverrides('tests/pre-release/remote.test.mjs'),
+    ), null, 2),
   );
   await fs.link(reportPath, linkedPath);
 
@@ -3775,7 +5365,11 @@ test('manual artifact collection rejects prod cost snapshots from _test-runs eve
   await fs.writeFile(testFile, 'export const remote = true;\n');
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentAttestation('pre-release', runTimestamp), null, 2),
+    JSON.stringify(buildValidEnvironmentAttestation(
+      'pre-release',
+      runTimestamp,
+      buildSingleFileEnvironmentReportOverrides('tests/pre-release/remote.test.mjs'),
+    ), null, 2),
   );
   await fs.writeFile(
     prodCostSnapshotPath,
@@ -3815,7 +5409,11 @@ test('manual artifact collection rejects hard-linked prod cost snapshots from _t
   await fs.writeFile(testFile, 'export const remote = true;\n');
   await fs.writeFile(
     reportPath,
-    JSON.stringify(buildValidEnvironmentAttestation('pre-release', runTimestamp), null, 2),
+    JSON.stringify(buildValidEnvironmentAttestation(
+      'pre-release',
+      runTimestamp,
+      buildSingleFileEnvironmentReportOverrides('tests/pre-release/remote.test.mjs'),
+    ), null, 2),
   );
   await fs.writeFile(
     sharedProdCostSnapshotPath,
@@ -3861,8 +5459,8 @@ test('manual artifact collection rejects otherwise valid external reports when t
     JSON.stringify(buildValidEnvironmentAttestation('pre-release', runTimestamp, {
       test_files: ['tests/pre-release/bridge.test.mjs'],
       test_file_count: 1,
-      expanded_test_files: ['tests/pre-release/bridge.test.mjs'],
-      expanded_test_file_count: 1,
+      expanded_test_files: ['tests/local/probe.test.mjs', 'tests/pre-release/bridge.test.mjs'],
+      expanded_test_file_count: 2,
     }), null, 2),
   );
 
@@ -3878,7 +5476,7 @@ test('manual artifact collection rejects otherwise valid external reports when t
 
     assert.equal(results.length, 1);
     assert.equal(results[0].valid, false);
-    assert.match(results[0].validation_error, /harness is not environment-backed/);
+    assertEnvironmentBackedProofRejected(results[0].validation_error);
   } finally {
     await fs.rm(tempRoot, { recursive: true, force: true });
   }
@@ -3916,6 +5514,71 @@ test('manual artifact collection accepts valid external reports when the harness
   assert.equal(results[0].valid, true);
   assert.equal(results[0].environment_harness_ready, true);
   assert.equal(results[0].validation_error, null);
+});
+
+test('environment run execution proof rejects expanded_test_files that drift from the repo-owned transitive closure', async () => {
+  const runTimestamp = '20260331T141725Z';
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-testing-harness-execution-proof-drift-'));
+  const testFile = path.join(tempRoot, 'tests', 'staging', 'remote.test.mjs');
+  const supportFile = path.join(tempRoot, 'tests', 'staging', 'support.mjs');
+
+  await fs.mkdir(path.dirname(testFile), { recursive: true });
+  await fs.writeFile(testFile, "import './support.mjs';\n");
+  await fs.writeFile(supportFile, 'export const support = true;\n');
+
+  try {
+    const validation = await validateEnvironmentRunExecutionProof('staging_run_report', buildValidEnvironmentReport('staging', runTimestamp, {
+      test_files: ['tests/staging/remote.test.mjs'],
+      test_file_count: 1,
+      expanded_test_files: ['tests/staging/remote.test.mjs'],
+      expanded_test_file_count: 1,
+      command: `/usr/bin/node --test ${testFile}`,
+    }), tempRoot);
+
+    assert.deepEqual(validation, {
+      valid: false,
+      error: 'environment run report expanded_test_files must equal the repo-owned transitive closure of test_files',
+    });
+  } finally {
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('manual artifact collection rejects attestation whose execution proof drifts from the claimed expanded test closure', async () => {
+  const runTimestamp = '20260331T141725Z';
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-testing-harness-manual-drift-'));
+  const testFile = path.join(tempRoot, 'tests', 'staging', 'remote.test.mjs');
+  const supportFile = path.join(tempRoot, 'tests', 'staging', 'support.mjs');
+  const reportPath = path.join(tempRoot, 'external', 'staging.json');
+
+  await fs.mkdir(path.dirname(testFile), { recursive: true });
+  await fs.mkdir(path.dirname(reportPath), { recursive: true });
+  await fs.writeFile(testFile, "import './support.mjs';\n");
+  await fs.writeFile(supportFile, 'export const support = true;\n');
+  await fs.writeFile(
+    reportPath,
+    JSON.stringify(buildValidEnvironmentAttestation('staging', runTimestamp, {
+      test_files: ['tests/staging/remote.test.mjs'],
+      test_file_count: 1,
+      expanded_test_files: ['tests/staging/remote.test.mjs'],
+      expanded_test_file_count: 1,
+      command: `/usr/bin/node --test ${testFile}`,
+    }), null, 2),
+  );
+
+  const results = await collectManualArtifactResults(
+    getL1EvidenceDefinition('EVID-CS-002'),
+    tempRoot,
+    {
+      staging_run_report: reportPath,
+    },
+    runTimestamp,
+  );
+
+  assert.equal(results.length, 1);
+  assert.equal(results[0].valid, false);
+  assert.equal(results[0].environment_harness_ready, true);
+  assert.equal(results[0].validation_error, 'environment run report expanded_test_files must equal the repo-owned transitive closure of test_files');
 });
 
 test('manual artifact collection rejects raw run reports even when the harness is environment-backed', async () => {
@@ -4016,7 +5679,7 @@ test('manual artifact collection rejects getter-based Reflect.get object members
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects method-based Reflect.get object members that only look environment-backed on the report surface', async () => {
@@ -4058,7 +5721,7 @@ test('manual artifact collection rejects method-based Reflect.get object members
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects parenthesized reassigned getter-based Reflect.get object members that only look environment-backed on the report surface', async () => {
@@ -4100,7 +5763,7 @@ test('manual artifact collection rejects parenthesized reassigned getter-based R
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects aliased createRequire harnesses that only look environment-backed on the report surface', async () => {
@@ -4142,7 +5805,7 @@ test('manual artifact collection rejects aliased createRequire harnesses that on
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects parenthesized reassigned createRequire harnesses that only look environment-backed on the report surface', async () => {
@@ -4184,7 +5847,7 @@ test('manual artifact collection rejects parenthesized reassigned createRequire 
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects namespace-aliased createRequire harnesses that only look environment-backed on the report surface', async () => {
@@ -4226,7 +5889,7 @@ test('manual artifact collection rejects namespace-aliased createRequire harness
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects parenthesized namespace-member createRequire harnesses that only look environment-backed on the report surface', async () => {
@@ -4268,7 +5931,7 @@ test('manual artifact collection rejects parenthesized namespace-member createRe
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects optional-chained createRequire harnesses that only look environment-backed on the report surface', async () => {
@@ -4310,7 +5973,7 @@ test('manual artifact collection rejects optional-chained createRequire harnesse
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects escaped createRequire harnesses that only look environment-backed on the report surface', async () => {
@@ -4352,7 +6015,7 @@ test('manual artifact collection rejects escaped createRequire harnesses that on
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects destructuring-reassigned createRequire harnesses that only look environment-backed on the report surface', async () => {
@@ -4394,7 +6057,7 @@ test('manual artifact collection rejects destructuring-reassigned createRequire 
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects spread-backed destructuring-reassigned createRequire harnesses that only look environment-backed on the report surface', async () => {
@@ -4436,7 +6099,7 @@ test('manual artifact collection rejects spread-backed destructuring-reassigned 
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects spread-sourced destructuring-reassigned createRequire harnesses that only look environment-backed on the report surface', async () => {
@@ -4478,7 +6141,7 @@ test('manual artifact collection rejects spread-sourced destructuring-reassigned
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects expression-built spread-sourced destructuring-reassigned createRequire harnesses that only look environment-backed on the report surface', async () => {
@@ -4520,7 +6183,7 @@ test('manual artifact collection rejects expression-built spread-sourced destruc
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects spread-sourced object-member createRequire harnesses that only look environment-backed on the report surface', async () => {
@@ -4562,7 +6225,7 @@ test('manual artifact collection rejects spread-sourced object-member createRequ
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects expression-built spread-sourced object-member createRequire harnesses that only look environment-backed on the report surface', async () => {
@@ -4604,7 +6267,7 @@ test('manual artifact collection rejects expression-built spread-sourced object-
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects object-member createRequire harnesses that only look environment-backed on the report surface', async () => {
@@ -4646,7 +6309,7 @@ test('manual artifact collection rejects object-member createRequire harnesses t
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects parenthesized object-member createRequire harnesses that only look environment-backed on the report surface', async () => {
@@ -4688,7 +6351,7 @@ test('manual artifact collection rejects parenthesized object-member createRequi
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects static bracket createRequire harnesses that only look environment-backed on the report surface', async () => {
@@ -4730,7 +6393,7 @@ test('manual artifact collection rejects static bracket createRequire harnesses 
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects createRequire.call harnesses that only look environment-backed on the report surface', async () => {
@@ -4772,7 +6435,7 @@ test('manual artifact collection rejects createRequire.call harnesses that only 
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects aliased createRequire.bind harnesses that only look environment-backed on the report surface', async () => {
@@ -4814,7 +6477,7 @@ test('manual artifact collection rejects aliased createRequire.bind harnesses th
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects inline object-literal receiver createRequire harnesses built from expression spreads that only look environment-backed on the report surface', async () => {
@@ -4856,7 +6519,7 @@ test('manual artifact collection rejects inline object-literal receiver createRe
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects numeric bracket createRequire object-member harnesses that only look environment-backed on the report surface', async () => {
@@ -4898,7 +6561,7 @@ test('manual artifact collection rejects numeric bracket createRequire object-me
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects numeric bracket inline object-literal receiver createRequire harnesses that only look environment-backed on the report surface', async () => {
@@ -4940,7 +6603,7 @@ test('manual artifact collection rejects numeric bracket inline object-literal r
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects computed numeric bracket createRequire object-member harnesses that only look environment-backed on the report surface', async () => {
@@ -4982,7 +6645,7 @@ test('manual artifact collection rejects computed numeric bracket createRequire 
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects computed numeric bracket inline object-literal receiver createRequire harnesses that only look environment-backed on the report surface', async () => {
@@ -5024,7 +6687,7 @@ test('manual artifact collection rejects computed numeric bracket inline object-
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects extracted computed numeric bracket createRequire aliases that only look environment-backed on the report surface', async () => {
@@ -5066,7 +6729,7 @@ test('manual artifact collection rejects extracted computed numeric bracket crea
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects extracted inline object-literal createRequire aliases that only look environment-backed on the report surface', async () => {
@@ -5108,7 +6771,7 @@ test('manual artifact collection rejects extracted inline object-literal createR
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects non-finite computed numeric bracket createRequire object-member harnesses that only look environment-backed on the report surface', async () => {
@@ -5150,7 +6813,7 @@ test('manual artifact collection rejects non-finite computed numeric bracket cre
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects non-finite computed numeric bracket inline object-literal receiver createRequire harnesses that only look environment-backed on the report surface', async () => {
@@ -5192,7 +6855,7 @@ test('manual artifact collection rejects non-finite computed numeric bracket inl
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects extracted non-finite computed numeric bracket createRequire aliases that only look environment-backed on the report surface', async () => {
@@ -5234,7 +6897,7 @@ test('manual artifact collection rejects extracted non-finite computed numeric b
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects extracted non-finite inline object-literal createRequire aliases that only look environment-backed on the report surface', async () => {
@@ -5276,7 +6939,7 @@ test('manual artifact collection rejects extracted non-finite inline object-lite
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects aliased constructor.call harnesses that only look environment-backed on the report surface', async () => {
@@ -5318,7 +6981,7 @@ test('manual artifact collection rejects aliased constructor.call harnesses that
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects escaped constructor property aliases that only look environment-backed on the report surface', async () => {
@@ -5360,7 +7023,7 @@ test('manual artifact collection rejects escaped constructor property aliases th
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects destructuring-reassigned constructor property aliases that only look environment-backed on the report surface', async () => {
@@ -5402,7 +7065,7 @@ test('manual artifact collection rejects destructuring-reassigned constructor pr
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects computed-key destructuring-reassigned constructor aliases that only look environment-backed on the report surface', async () => {
@@ -5444,7 +7107,7 @@ test('manual artifact collection rejects computed-key destructuring-reassigned c
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects spread-sourced destructuring-reassigned constructor aliases that only look environment-backed on the report surface', async () => {
@@ -5486,7 +7149,7 @@ test('manual artifact collection rejects spread-sourced destructuring-reassigned
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects spread-sourced object-member constructor aliases that only look environment-backed on the report surface', async () => {
@@ -5528,7 +7191,7 @@ test('manual artifact collection rejects spread-sourced object-member constructo
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects object-member constructor aliases that only look environment-backed on the report surface', async () => {
@@ -5570,7 +7233,7 @@ test('manual artifact collection rejects object-member constructor aliases that 
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects parenthesized object-member constructor aliases that only look environment-backed on the report surface', async () => {
@@ -5612,7 +7275,7 @@ test('manual artifact collection rejects parenthesized object-member constructor
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects reassigned constructor.call harnesses that only look environment-backed on the report surface', async () => {
@@ -5654,7 +7317,7 @@ test('manual artifact collection rejects reassigned constructor.call harnesses t
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('manual artifact collection rejects parenthesized reassigned constructor harnesses that only look environment-backed on the report surface', async () => {
@@ -5696,7 +7359,7 @@ test('manual artifact collection rejects parenthesized reassigned constructor ha
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
   assert.equal(results[0].environment_harness_ready, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('non-local harness readiness is recomputed after files change and manual artifact validation reuses the fresh result', async () => {
@@ -5741,7 +7404,7 @@ test('non-local harness readiness is recomputed after files change and manual ar
 
   assert.equal(results.length, 1);
   assert.equal(results[0].valid, false);
-  assert.match(results[0].validation_error, /harness is not environment-backed/);
+  assertEnvironmentBackedProofRejected(results[0].validation_error);
 });
 
 test('writeL1Evidence keeps end-to-end bundle gating fail-closed without manual artifacts and passes once environment-backed artifacts exist', async () => {
@@ -5788,6 +7451,10 @@ test('writeL1Evidence keeps end-to-end bundle gating fail-closed without manual 
     const passManualArtifacts = JSON.parse(
       await fs.readFile(path.join(passCs001Root, 'artifacts', 'manual-artifacts.json'), 'utf8'),
     );
+    const passEnvironmentResults = JSON.parse(
+      await fs.readFile(path.join(passCs001Root, 'artifacts', 'environment-results.json'), 'utf8'),
+    );
+    const passSummary = await fs.readFile(path.join(passCs001Root, 'summary.md'), 'utf8');
     const stagingArtifact = passManualArtifacts.find((artifact) => artifact.artifact_id === 'staging_run_report');
     assert.equal(stagingArtifact?.attestation_origin_run_attempt, 1);
     assert.equal(stagingArtifact?.attestation_origin_run_uri, buildGitHubRunUri('staging', passTimestamp));
@@ -5795,6 +7462,11 @@ test('writeL1Evidence keeps end-to-end bundle gating fail-closed without manual 
     assert.equal(stagingArtifact?.attestation_artifact_sha256, 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789');
     assert.equal(stagingArtifact?.attestation_deployment_identity?.environment_id, 'staging');
     assert.equal(stagingArtifact?.attestation_provenance?.review_record_uri, buildGitHubRunUri('staging', passTimestamp));
+    const stagingEnvironmentResult = passEnvironmentResults.required_results.find((entry) => entry.environment_name === 'staging');
+    assert.equal(stagingEnvironmentResult?.readiness_probe?.ready, true);
+    assert.equal(stagingEnvironmentResult?.readiness_probe?.attempt_count, 1);
+    assert.equal(stagingEnvironmentResult?.deployment_identity_validation?.before_suite?.workers?.['gateway-worker']?.script_name, 'matrix-gateway-worker-staging');
+    assert.match(passSummary, /readiness: ready=true, attempts=1/);
   } finally {
     await fs.rm(fixtureParent, { recursive: true, force: true });
   }
@@ -5867,6 +7539,85 @@ test('concurrent governance evidence writes fail closed on the same run timestam
   } finally {
     await fs.rm(fixtureParent, { recursive: true, force: true });
   }
+});
+
+test('staging security suite fails closed when the non-local environment is selected without a remote harness', async () => {
+  const supportModule = await import(`${pathToFileURL(path.join(repoRoot, 'tests/staging/support.mjs')).href}?cacheBust=${Date.now()}-${Math.random()}`);
+  const savedEnvironment = {
+    MATRIX_TEST_ENVIRONMENT: process.env.MATRIX_TEST_ENVIRONMENT,
+    MATRIX_REMOTE_BASE_URL: process.env.MATRIX_REMOTE_BASE_URL,
+    MATRIX_REMOTE_SERVER_NAME: process.env.MATRIX_REMOTE_SERVER_NAME,
+    MATRIX_REMOTE_OPS_BASE_URL: process.env.MATRIX_REMOTE_OPS_BASE_URL,
+    MATRIX_AGGREGATE_LOCAL_NONLOCAL_SKIP: process.env.MATRIX_AGGREGATE_LOCAL_NONLOCAL_SKIP,
+  };
+  try {
+    process.env.MATRIX_TEST_ENVIRONMENT = 'staging';
+    delete process.env.MATRIX_REMOTE_BASE_URL;
+    delete process.env.MATRIX_REMOTE_SERVER_NAME;
+    delete process.env.MATRIX_REMOTE_OPS_BASE_URL;
+    delete process.env.MATRIX_AGGREGATE_LOCAL_NONLOCAL_SKIP;
+
+    assert.throws(
+      () => supportModule.requireRemoteHarnessContext({ skip() {} }, 'staging'),
+      /Remote staging harness requires MATRIX_REMOTE_BASE_URL/,
+    );
+  } finally {
+    for (const [key, value] of Object.entries(savedEnvironment)) {
+      if (value == null) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+  }
+});
+
+test('staging security suite skips cleanly during aggregate local runs when no remote harness is configured', async () => {
+  const supportModule = await import(`${pathToFileURL(path.join(repoRoot, 'tests/staging/support.mjs')).href}?cacheBust=${Date.now()}-${Math.random()}`);
+  const savedEnvironment = {
+    MATRIX_TEST_ENVIRONMENT: process.env.MATRIX_TEST_ENVIRONMENT,
+    MATRIX_REMOTE_BASE_URL: process.env.MATRIX_REMOTE_BASE_URL,
+    MATRIX_REMOTE_SERVER_NAME: process.env.MATRIX_REMOTE_SERVER_NAME,
+    MATRIX_REMOTE_OPS_BASE_URL: process.env.MATRIX_REMOTE_OPS_BASE_URL,
+    MATRIX_AGGREGATE_LOCAL_NONLOCAL_SKIP: process.env.MATRIX_AGGREGATE_LOCAL_NONLOCAL_SKIP,
+  };
+  const skipCalls = [];
+
+  try {
+    process.env.MATRIX_TEST_ENVIRONMENT = 'staging';
+    delete process.env.MATRIX_REMOTE_BASE_URL;
+    delete process.env.MATRIX_REMOTE_SERVER_NAME;
+    delete process.env.MATRIX_REMOTE_OPS_BASE_URL;
+    process.env.MATRIX_AGGREGATE_LOCAL_NONLOCAL_SKIP = 'true';
+
+    const harness = supportModule.requireRemoteHarnessContext({
+      skip(message) {
+        skipCalls.push(message);
+      },
+    }, 'staging');
+
+    assert.equal(harness, null);
+    assert.deepEqual(skipCalls, [
+      'Remote staging harness requires MATRIX_REMOTE_BASE_URL and MATRIX_REMOTE_SERVER_NAME',
+    ]);
+  } finally {
+    for (const [key, value] of Object.entries(savedEnvironment)) {
+      if (value == null) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+  }
+});
+
+test('explicit non-local run environment overrides an ambient aggregate-local skip flag back to fail-closed', () => {
+  const runEnv = buildRunEnvironmentVariables({
+    MATRIX_AGGREGATE_LOCAL_NONLOCAL_SKIP: 'true',
+  }, 'staging');
+
+  assert.equal(runEnv.MATRIX_TEST_ENVIRONMENT, 'staging');
+  assert.equal(runEnv.MATRIX_AGGREGATE_LOCAL_NONLOCAL_SKIP, 'false');
 });
 
 test('CLI failure paths surface immutability errors and exit with code 1', async () => {
@@ -5946,6 +7697,10 @@ test('CLI evidence-l1 forwards attestation paths into the evidence writer', asyn
       manualArtifacts.prod_cost_snapshot,
     ], {
       cwd: fixtureRoot,
+      env: {
+        ...process.env,
+        GITHUB_REPOSITORY: DEFAULT_TEST_GITHUB_REPOSITORY,
+      },
     });
 
     assert.match(stdout, /Wrote L1 evidence bundles/);

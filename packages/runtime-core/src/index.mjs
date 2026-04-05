@@ -2,6 +2,7 @@ export {
   classifyGatewayRequest,
   createMatrixRateLimitResponse,
   enforceGatewayAbuseGuard,
+  GATEWAY_RATE_LIMIT_BINDING_DEFINITIONS,
   enforceSemanticQuota,
   resolveAbusePolicy,
 } from './abuse-guard.mjs';
@@ -47,6 +48,7 @@ export {
   DEFAULT_MEDIA_ORPHAN_RETENTION_MS,
   DEFAULT_MEDIA_PENDING_UPLOAD_TTL_MS,
   DEFAULT_MEDIA_THUMBNAIL_VARIANTS,
+  MEDIA_WRITE_BACKOFF_TTL_SECONDS,
   MAX_MEDIA_FETCH_TIMEOUT_MS,
   buildMediaConfig,
   buildMxcUri,
@@ -63,6 +65,7 @@ export {
   readReadableStreamWithDigest,
   resolveThumbnailAnimationPreference,
   teeBodyStreamWithDigest,
+  uploadStreamToR2MultipartWithDigest,
 } from './media-domain.mjs';
 export {
   buildNormalizedRequestObject,
@@ -125,6 +128,12 @@ export {
   loadWorkerRuntimeConfig,
   resolveWorkerResourceBindingNames,
 } from './runtime-manifest.mjs';
+export {
+  VERSION_METADATA_BINDING_NAME,
+  readRuntimeVersionMetadata,
+  resolveRuntimeWorkerVersionId,
+  resolveRuntimeWorkerVersionTag,
+} from './version-metadata.mjs';
 export {
   incrementMetric,
   instrumentEnvironmentBindings,

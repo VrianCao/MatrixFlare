@@ -7,7 +7,12 @@ import {
   ROOM_DO_SCHEMA_VERSION,
   createRoomDurableObjectPersistence,
 } from './room-persistence.mjs';
-import { normalizeInteger, normalizeString, withSqliteTransaction } from './persistence-common.mjs';
+import {
+  bindSqlStorageTransactionSync,
+  normalizeInteger,
+  normalizeString,
+  withSqliteTransaction,
+} from './persistence-common.mjs';
 import {
   DEFAULT_ROOM_VERSION,
   buildRoomStateTupleKey,
@@ -25,6 +30,7 @@ import {
   observeMetric,
 } from './telemetry.mjs';
 import { loadWorkerRuntimeConfig } from './runtime-manifest.mjs';
+import { resolveRuntimeWorkerVersionId } from './version-metadata.mjs';
 import { enforceSemanticQuota } from './abuse-guard.mjs';
 import {
   DEFAULT_ACCESS_TOKEN_TTL_MS,
@@ -54,6 +60,7 @@ import {
   buildPushRulesView,
   computePushRulePriorityIndex,
   createStoredFilterEnvelope,
+  evaluatePushRuleNotification,
   filterEventList,
   getNextPushRulePriorityIndex,
   getSyncFilterFlags,
@@ -78,6 +85,11 @@ import {
   DEFAULT_MEDIA_PENDING_UPLOAD_TTL_MS,
   buildMxcUri,
 } from './media-domain.mjs';
+import {
+  buildEncryptedBackupSegmentObjectKey,
+  normalizeEncryptedBackupSegmentMetadata,
+  putR2JsonObject,
+} from './object-keyspace.mjs';
 import { enqueueDerivedWork, RUNTIME_JOB_SCHEMA_VERSION } from './runtime-jobs.mjs';
 
 function jsonResponse(payload, status = 200) {
@@ -209,6 +221,392 @@ function mergePhase04Meta(principal, patch) {
       ...existing,
       ...patch,
     },
+  };
+}
+
+function readPhase05Meta(principal) {
+  const candidate = principal?.record?.phase05;
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+    return {};
+  }
+  return candidate;
+}
+
+function mergePhase05Meta(principal, patch) {
+  const existing = readPhase05Meta(principal);
+  return {
+    ...(principal?.record ?? {}),
+    phase05: {
+      ...existing,
+      ...patch,
+    },
+  };
+}
+
+function isObjectRecord(value) {
+  return value != null && typeof value === 'object' && !Array.isArray(value);
+}
+
+const CROSS_SIGNING_DEVICE_ID = '__cross_signing__';
+const DEVICE_KEYS_ROW_ID = 'device_keys';
+const CROSS_SIGNING_KEY_IDS = Object.freeze({
+  master: 'master_key',
+  self_signing: 'self_signing_key',
+  user_signing: 'user_signing_key',
+});
+const ROOM_KEY_BACKUP_ALGORITHM = 'm.megolm_backup.v1.curve25519-aes-sha2';
+
+function buildDeviceView(device) {
+  const response = {
+    device_id: device.device_id,
+    display_name: device.display_name ?? null,
+  };
+  if (device.last_seen_ip) {
+    response.last_seen_ip = device.last_seen_ip;
+  }
+  const lastSeenTs = device.last_seen_at ? Date.parse(device.last_seen_at) : Number.NaN;
+  if (Number.isFinite(lastSeenTs)) {
+    response.last_seen_ts = lastSeenTs;
+  }
+  return response;
+}
+
+function buildDeviceStatePayload({
+  changed_user_ids = [],
+  left_user_ids = [],
+} = {}) {
+  const changed = [...new Set(changed_user_ids.filter((value) => typeof value === 'string' && value.length > 0))];
+  const left = [...new Set(left_user_ids.filter((value) => typeof value === 'string' && value.length > 0))];
+  return {
+    changed_user_ids: changed,
+    left_user_ids: left,
+  };
+}
+
+function appendDeviceStateDeltaWithinTransaction(userDo, userId, now, payload) {
+  const normalizedPayload = buildDeviceStatePayload(payload);
+  return userDo.persistence.appendUserStreamWithinTransaction({
+    user_id: userId,
+    stream_kind: 'device_state',
+    created_at: now,
+    payload: normalizedPayload,
+  });
+}
+
+function listActiveDevices(persistence) {
+  return persistence.devices.list().filter((device) => !device.deleted_at);
+}
+
+function computeOneTimeKeyCounts(persistence, deviceId) {
+  const counts = {};
+  for (const row of persistence.oneTimeKeys.list()) {
+    if (row.device_id !== deviceId || row.claimed_at) {
+      continue;
+    }
+    counts[row.algorithm] = (counts[row.algorithm] ?? 0) + 1;
+  }
+  return counts;
+}
+
+function computeUnusedFallbackKeyTypes(persistence, deviceId) {
+  const algorithms = new Set();
+  for (const row of persistence.fallbackKeys.list()) {
+    if (row.device_id === deviceId && !row.used_at) {
+      algorithms.add(row.algorithm);
+    }
+  }
+  return [...algorithms].sort();
+}
+
+function normalizeKeyUploadMap(input, label) {
+  if (!isObjectRecord(input)) {
+    return [];
+  }
+  return Object.entries(input).reduce((accumulator, [rawKey, rawValue]) => {
+    const normalizedKey = normalizeString(rawKey, `${label}.key`);
+    const separatorIndex = normalizedKey.indexOf(':');
+    if (separatorIndex <= 0 || separatorIndex === normalizedKey.length - 1) {
+      throw new TypeError(`${label}.${normalizedKey} must use the algorithm:key_id form`);
+    }
+    const algorithm = normalizedKey.slice(0, separatorIndex);
+    const keyId = normalizedKey.slice(separatorIndex + 1);
+    accumulator.push({
+      algorithm,
+      key_id: keyId,
+      record_json: structuredClone(rawValue),
+    });
+    return accumulator;
+  }, []);
+}
+
+function getDeviceKeysRow(persistence, deviceId) {
+  return persistence.deviceKeys.get({
+    device_id: deviceId,
+    key_id: DEVICE_KEYS_ROW_ID,
+  });
+}
+
+function getCrossSigningRow(persistence, keyId) {
+  return persistence.deviceKeys.get({
+    device_id: CROSS_SIGNING_DEVICE_ID,
+    key_id: keyId,
+  });
+}
+
+function buildKeysQuerySnapshot(persistence, userId, deviceIds = null) {
+  const requestedDeviceIds = deviceIds == null ? null : new Set(deviceIds);
+  const activeDevices = listActiveDevices(persistence);
+  const deviceKeys = {};
+  for (const device of activeDevices) {
+    if (requestedDeviceIds && !requestedDeviceIds.has(device.device_id)) {
+      continue;
+    }
+    const row = getDeviceKeysRow(persistence, device.device_id);
+    if (!row || !isObjectRecord(row.record)) {
+      continue;
+    }
+    const payload = structuredClone(row.record);
+    const unsigned = isObjectRecord(payload.unsigned) ? structuredClone(payload.unsigned) : {};
+    if (device.display_name) {
+      unsigned.device_display_name = device.display_name;
+    }
+    payload.unsigned = unsigned;
+    if (!deviceKeys[userId]) {
+      deviceKeys[userId] = {};
+    }
+    deviceKeys[userId][device.device_id] = payload;
+  }
+
+  const masterRow = getCrossSigningRow(persistence, CROSS_SIGNING_KEY_IDS.master);
+  const selfSigningRow = getCrossSigningRow(persistence, CROSS_SIGNING_KEY_IDS.self_signing);
+  const userSigningRow = getCrossSigningRow(persistence, CROSS_SIGNING_KEY_IDS.user_signing);
+
+  return {
+    device_keys: deviceKeys,
+    master_keys: masterRow?.record ? { [userId]: structuredClone(masterRow.record) } : {},
+    self_signing_keys: selfSigningRow?.record ? { [userId]: structuredClone(selfSigningRow.record) } : {},
+    user_signing_keys: userSigningRow?.record ? { [userId]: structuredClone(userSigningRow.record) } : {},
+  };
+}
+
+function cloneSignedObjectWithoutSignatures(record) {
+  if (!isObjectRecord(record)) {
+    return null;
+  }
+  const cloned = structuredClone(record);
+  delete cloned.signatures;
+  // Matrix signed JSON excludes unsigned additions such as device_display_name.
+  delete cloned.unsigned;
+  return cloned;
+}
+
+function extractCrossSigningPublicKey(record) {
+  if (!isObjectRecord(record?.keys)) {
+    throw new TypeError('cross-signing key must include keys');
+  }
+  const entries = Object.entries(record.keys);
+  if (entries.length !== 1) {
+    throw new TypeError('cross-signing key must contain exactly one public key');
+  }
+  const [keyId, keyValue] = entries[0];
+  const normalizedKeyId = normalizeString(keyId, 'cross_signing_key.keys.key_id');
+  const normalizedKeyValue = normalizeString(keyValue, 'cross_signing_key.keys.value');
+  const separatorIndex = normalizedKeyId.indexOf(':');
+  if (separatorIndex <= 0 || separatorIndex === normalizedKeyId.length - 1) {
+    throw new TypeError('cross-signing key id must use the algorithm:public_key form');
+  }
+  return {
+    key_id: normalizedKeyId,
+    public_key: normalizedKeyId.slice(separatorIndex + 1),
+    key_value: normalizedKeyValue,
+  };
+}
+
+function normalizeCrossSigningKeyRecord(record, {
+  expectedUserId,
+  expectedUsage,
+  label,
+} = {}) {
+  if (!isObjectRecord(record)) {
+    throw new TypeError(`${label} must be a JSON object`);
+  }
+  if (record.user_id !== expectedUserId) {
+    throw new TypeError(`${label}.user_id must match the authenticated user`);
+  }
+  if (!Array.isArray(record.usage) || record.usage.length !== 1 || record.usage[0] !== expectedUsage) {
+    throw new TypeError(`${label}.usage must be [\"${expectedUsage}\"]`);
+  }
+  extractCrossSigningPublicKey(record);
+  if (record.signatures != null && !isObjectRecord(record.signatures)) {
+    throw new TypeError(`${label}.signatures must be an object when present`);
+  }
+  return structuredClone(record);
+}
+
+function findCrossSigningRowByPublicKey(persistence, publicKey) {
+  const normalizedPublicKey = normalizeString(publicKey, 'publicKey');
+  for (const keyId of Object.values(CROSS_SIGNING_KEY_IDS)) {
+    const row = getCrossSigningRow(persistence, keyId);
+    if (!row?.record) {
+      continue;
+    }
+    try {
+      if (extractCrossSigningPublicKey(row.record).public_key === normalizedPublicKey) {
+        return row;
+      }
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
+function mergeSignatureMaps(existingSignatures, nextSignatures) {
+  const merged = isObjectRecord(existingSignatures) ? structuredClone(existingSignatures) : {};
+  for (const [userId, signatureMap] of Object.entries(isObjectRecord(nextSignatures) ? nextSignatures : {})) {
+    if (!isObjectRecord(signatureMap)) {
+      continue;
+    }
+    merged[userId] = {
+      ...(isObjectRecord(merged[userId]) ? merged[userId] : {}),
+      ...structuredClone(signatureMap),
+    };
+  }
+  return merged;
+}
+
+function normalizeRoomKeyBackupAlgorithm(value) {
+  const algorithm = normalizeString(value, 'algorithm');
+  if (algorithm !== ROOM_KEY_BACKUP_ALGORITHM) {
+    throw new TypeError(`algorithm must be ${ROOM_KEY_BACKUP_ALGORITHM}`);
+  }
+  return algorithm;
+}
+
+function readRoomKeyBackupRecord(manifest) {
+  const record = isObjectRecord(manifest?.record) ? manifest.record : {};
+  return {
+    segments: isObjectRecord(record.segments) ? structuredClone(record.segments) : {},
+    pending_writes: isObjectRecord(record.pending_writes) ? structuredClone(record.pending_writes) : {},
+  };
+}
+
+function buildRoomKeyBackupSegmentKey(roomId, sessionId) {
+  return `${encodeURIComponent(normalizeString(roomId, 'roomId'))}/${encodeURIComponent(normalizeString(sessionId, 'sessionId'))}`;
+}
+
+function buildRoomKeyBackupObjectKey(userId, backupVersion, roomId, sessionId, contentHash) {
+  return buildEncryptedBackupSegmentObjectKey({
+    userId,
+    backupVersion,
+    segmentId: `${buildRoomKeyBackupSegmentKey(roomId, sessionId)}/${normalizeString(contentHash, 'contentHash')}`,
+  });
+}
+
+function computeRoomKeyBackupManifestStats(record) {
+  const segmentEntries = Object.values(record.segments ?? {}).filter((entry) => isObjectRecord(entry));
+  const byteCount = segmentEntries.reduce((total, entry) => {
+    return total + (Number.isInteger(entry.byte_size) && entry.byte_size >= 0 ? entry.byte_size : 0);
+  }, 0);
+  return {
+    chunk_count: segmentEntries.length,
+    byte_count: byteCount,
+  };
+}
+
+function computeRoomKeyBackupManifestEtag(manifest, record) {
+  return canonicalJsonHash({
+    backup_version: manifest.backup_version,
+    algorithm: manifest.algorithm ?? null,
+    auth_data: manifest.auth_data ?? null,
+    segments: Object.keys(record.segments ?? {}).sort().reduce((accumulator, key) => {
+      const entry = record.segments[key];
+      accumulator[key] = {
+        content_hash: entry.content_hash,
+        object_key: entry.object_key,
+      };
+      return accumulator;
+    }, {}),
+  });
+}
+
+function buildRoomKeyBackupManifestView(manifest) {
+  return {
+    algorithm: manifest.algorithm ?? null,
+    auth_data: structuredClone(manifest.auth_data ?? {}),
+    count: Number.isInteger(manifest.chunk_count) ? manifest.chunk_count : 0,
+    etag: manifest.etag ?? null,
+    version: manifest.backup_version,
+  };
+}
+
+function normalizeRoomKeyBackupEntries(input, {
+  roomId = null,
+  sessionId = null,
+} = {}) {
+  if (sessionId != null) {
+    return [{
+      room_id: normalizeString(roomId, 'roomId'),
+      session_id: normalizeString(sessionId, 'sessionId'),
+      session_data: structuredClone(input),
+    }];
+  }
+  if (roomId != null) {
+    const body = isObjectRecord(input) ? input : {};
+    const sessions = isObjectRecord(body.sessions) ? body.sessions : null;
+    if (!sessions) {
+      throw new TypeError('sessions must be present');
+    }
+    return Object.entries(sessions).map(([currentSessionId, sessionData]) => ({
+      room_id: normalizeString(roomId, 'roomId'),
+      session_id: normalizeString(currentSessionId, 'sessionId'),
+      session_data: structuredClone(sessionData),
+    }));
+  }
+  const body = isObjectRecord(input) ? input : {};
+  const rooms = isObjectRecord(body.rooms) ? body.rooms : null;
+  if (!rooms) {
+    throw new TypeError('rooms must be present');
+  }
+  const entries = [];
+  for (const [currentRoomId, roomRecord] of Object.entries(rooms)) {
+    if (!isObjectRecord(roomRecord?.sessions)) {
+      throw new TypeError(`rooms.${currentRoomId}.sessions must be present`);
+    }
+    for (const [currentSessionId, sessionData] of Object.entries(roomRecord.sessions)) {
+      entries.push({
+        room_id: normalizeString(currentRoomId, 'roomId'),
+        session_id: normalizeString(currentSessionId, 'sessionId'),
+        session_data: structuredClone(sessionData),
+      });
+    }
+  }
+  return entries;
+}
+
+function buildRoomKeyBackupResponsePayload(entries, {
+  roomId = null,
+  sessionId = null,
+} = {}) {
+  if (sessionId != null) {
+    return entries[0]?.session_data ?? null;
+  }
+  if (roomId != null) {
+    return {
+      sessions: entries.reduce((accumulator, entry) => {
+        accumulator[entry.session_id] = structuredClone(entry.session_data);
+        return accumulator;
+      }, {}),
+    };
+  }
+  return {
+    rooms: entries.reduce((accumulator, entry) => {
+      if (!accumulator[entry.room_id]) {
+        accumulator[entry.room_id] = { sessions: {} };
+      }
+      accumulator[entry.room_id].sessions[entry.session_id] = structuredClone(entry.session_data);
+      return accumulator;
+    }, {}),
   };
 }
 
@@ -447,7 +845,7 @@ const MEDIA_CLEANUP_RETRY_MS = 60_000;
 
 async function ensureShardRegistrySchema(env) {
   const db = env?.MATRIX_CONTROL_D1;
-  if (!db || typeof db.prepare !== 'function' || typeof db.exec !== 'function') {
+  if (!db || typeof db.prepare !== 'function') {
     throw createInternalErrorEnvelope({
       code: 'internal',
       message: 'Missing MATRIX_CONTROL_D1 binding for shard registry barrier',
@@ -455,7 +853,22 @@ async function ensureShardRegistrySchema(env) {
     });
   }
   if (!env.__SHARD_REGISTRY_SCHEMA_READY__) {
-    env.__SHARD_REGISTRY_SCHEMA_READY__ = db.exec(SHARD_REGISTRY_SCHEMA_SQL);
+    // D1 prepared statements are the stable request-path API; `exec()` is documented as a less-safe
+    // maintenance/one-shot surface and local runtimes can diverge on its return-shape semantics.
+    const prepared = db.prepare(SHARD_REGISTRY_SCHEMA_SQL);
+    const runnable = typeof prepared?.run === 'function'
+      ? prepared
+      : typeof prepared?.bind === 'function'
+        ? prepared.bind()
+        : null;
+    if (!runnable || typeof runnable.run !== 'function') {
+      throw createInternalErrorEnvelope({
+        code: 'internal',
+        message: 'MATRIX_CONTROL_D1 prepare() must return a runnable prepared statement',
+        retryable: false,
+      });
+    }
+    env.__SHARD_REGISTRY_SCHEMA_READY__ = runnable.run();
   }
   await env.__SHARD_REGISTRY_SCHEMA_READY__;
   return db;
@@ -741,8 +1154,103 @@ function normalizeRoomFanoutDelta(delta = {}) {
   };
 }
 
+function normalizeRoomNotificationEvent(candidate = {}) {
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+    return null;
+  }
+  if (typeof candidate.type !== 'string' || candidate.type.length === 0) {
+    return null;
+  }
+  if (candidate.state_key != null && typeof candidate.state_key !== 'string') {
+    throw new TypeError('candidate.state_key must be a string when present');
+  }
+  return {
+    room_id: candidate.room_id == null ? null : normalizeString(candidate.room_id, 'candidate.room_id'),
+    event_id: candidate.event_id == null ? null : normalizeString(candidate.event_id, 'candidate.event_id'),
+    sender: candidate.sender == null ? null : normalizeString(candidate.sender, 'candidate.sender'),
+    type: normalizeString(candidate.type, 'candidate.type'),
+    state_key: candidate.state_key ?? null,
+    content: candidate.content && typeof candidate.content === 'object' && !Array.isArray(candidate.content)
+      ? structuredClone(candidate.content)
+      : {},
+    room_member_count: Number.isInteger(candidate.room_member_count) && candidate.room_member_count >= 0
+      ? candidate.room_member_count
+      : null,
+    sender_notification_permission_room: candidate.sender_notification_permission_room === true,
+  };
+}
+
+function readLatestRoomNotificationState(userPersistence, roomId) {
+  const latest = userPersistence.userStream.list()
+    .filter((entry) => entry.stream_kind === 'room_fanout' && entry.room_id === roomId)
+    .sort((left, right) => right.stream_pos - left.stream_pos)[0] ?? null;
+  return {
+    notification_count: Number.isInteger(latest?.payload?.notification_count) && latest.payload.notification_count >= 0
+      ? latest.payload.notification_count
+      : 0,
+    highlight_count: Number.isInteger(latest?.payload?.highlight_count) && latest.payload.highlight_count >= 0
+      ? latest.payload.highlight_count
+      : 0,
+    unread_thread_notifications: latest?.payload?.unread_thread_notifications
+      && typeof latest.payload.unread_thread_notifications === 'object'
+      && !Array.isArray(latest.payload.unread_thread_notifications)
+      ? structuredClone(latest.payload.unread_thread_notifications)
+      : null,
+  };
+}
+
+function resolveRoomFanoutNotificationState(userPersistence, principal, delta, notificationEvent) {
+  if (delta.membership_bucket !== 'join') {
+    return {
+      notification_count: null,
+      highlight_count: null,
+      unread_thread_notifications: null,
+    };
+  }
+  if (
+    Number.isInteger(delta.notification_count)
+    || Number.isInteger(delta.highlight_count)
+    || delta.unread_thread_notifications != null
+  ) {
+    return {
+      notification_count: delta.notification_count,
+      highlight_count: delta.highlight_count,
+      unread_thread_notifications: delta.unread_thread_notifications,
+    };
+  }
+  const previous = readLatestRoomNotificationState(userPersistence, delta.room_id);
+  if (notificationEvent == null) {
+    return previous;
+  }
+  const evaluation = evaluatePushRuleNotification(
+    principal.user_id,
+    userPersistence.pushRules.list(),
+    notificationEvent,
+    {
+      room_id: delta.room_id,
+      room_member_count: notificationEvent.room_member_count,
+      sender_notification_permission_room: notificationEvent.sender_notification_permission_room,
+    },
+  );
+  if (!evaluation.notify) {
+    return previous;
+  }
+  return {
+    notification_count: previous.notification_count + 1,
+    highlight_count: previous.highlight_count + (evaluation.highlight ? 1 : 0),
+    unread_thread_notifications: previous.unread_thread_notifications,
+  };
+}
+
 function buildRoomFanoutDedupeKey(delta) {
   return `${delta.room_id}|${delta.room_pos}|${delta.user_id}`;
+}
+
+function decodeRoomCursorOrNull(cursor) {
+  if (typeof cursor !== 'string' || cursor.length === 0) {
+    return null;
+  }
+  return decodeRoomCursor(cursor);
 }
 
 function parseSnapshotRoomPos(snapshot) {
@@ -864,10 +1372,6 @@ function buildRoomSyncSummaryFromSnapshot(roomDo, snapshotId) {
 
 function cloneJson(value) {
   return value == null ? value : structuredClone(value);
-}
-
-function isObjectRecord(value) {
-  return value != null && typeof value === 'object' && !Array.isArray(value);
 }
 
 function createRoomInternalError(code, message, { retryable = false, details = null } = {}) {
@@ -1024,6 +1528,23 @@ function getRequiredEventPowerLevel(roomDo, roomVersion, stateMap, candidateEven
     return powerLevels.events[candidateEvent.type];
   }
   return Number.isInteger(powerLevels.events_default) ? powerLevels.events_default : 0;
+}
+
+function getRequiredNotificationPowerLevel(roomDo, stateMap, key) {
+  const powerLevels = getCurrentPowerLevelsContent(roomDo, stateMap);
+  const notifications = isObjectRecord(powerLevels.notifications) ? powerLevels.notifications : {};
+  if (Number.isInteger(notifications[key])) {
+    return notifications[key];
+  }
+  return 50;
+}
+
+function hasSenderNotificationPermission(roomDo, roomVersion, stateMap, senderUserId, key) {
+  if (typeof senderUserId !== 'string' || senderUserId.length === 0) {
+    return false;
+  }
+  return getUserPowerLevel(roomDo, roomVersion, stateMap, senderUserId)
+    >= getRequiredNotificationPowerLevel(roomDo, stateMap, key);
 }
 
 function getJoinRule(roomDo, stateMap) {
@@ -1452,10 +1973,34 @@ function mapInternalCodeToMatrixError(error) {
   };
 }
 
-export class BaseDurableObject {
+// Cloudflare DO method-call RPC only works when the target class inherits the runtime DurableObject base.
+let DurableObjectRuntimeBase = typeof globalThis.DurableObject === 'function'
+  ? globalThis.DurableObject
+  : null;
+if (typeof DurableObjectRuntimeBase !== 'function') {
+  try {
+    const cloudflareWorkersModule = await import('cloudflare:workers');
+    if (typeof cloudflareWorkersModule?.DurableObject === 'function') {
+      DurableObjectRuntimeBase = cloudflareWorkersModule.DurableObject;
+    }
+  } catch {
+    // Node test environments do not expose the Workers runtime module.
+  }
+}
+if (typeof DurableObjectRuntimeBase !== 'function') {
+  DurableObjectRuntimeBase = class DurableObjectFallback {
+    constructor(ctx, env) {
+      this.ctx = ctx;
+      this.env = env;
+    }
+  };
+}
+
+export class BaseDurableObject extends DurableObjectRuntimeBase {
   constructor(ctx, env, options) {
-    this.ctx = ctx;
-    this.env = env;
+    super(ctx, env);
+    this.ctx ??= ctx;
+    this.env ??= env;
     this.options = options;
   }
 
@@ -1477,7 +2022,7 @@ export class BaseDurableObject {
   createRequestContext(request, routeFamily = `${this.options.routeFamilyPrefix}.fetch`) {
     return createRequestContext({
       workerName: this.options.owningWorkerName,
-      workerVersion: this.config.text.WORKER_VERSION_ID,
+      workerVersion: resolveRuntimeWorkerVersionId(this.env, this.config.text.WORKER_VERSION_ID),
       request,
       routeFamily,
     });
@@ -1486,9 +2031,20 @@ export class BaseDurableObject {
   createAsyncTaskContext(routeFamily) {
     return createAsyncTaskContext({
       workerName: this.options.owningWorkerName,
-      workerVersion: this.config.text.WORKER_VERSION_ID,
+      workerVersion: resolveRuntimeWorkerVersionId(this.env, this.config.text.WORKER_VERSION_ID),
       routeFamily,
     });
+  }
+
+  async inspectRuntimeIdentity() {
+    await this.ensureCurrentness();
+    return {
+      ok: true,
+      authority_kind: this.options.className,
+      worker_version_id: resolveRuntimeWorkerVersionId(this.env, this.config.text.WORKER_VERSION_ID),
+      deployment_id: this.config.text.DEPLOYMENT_ID,
+      environment_name: this.config.environmentName,
+    };
   }
 
   createNotImplementedEnvelope(methodName, details = null) {
@@ -1522,9 +2078,13 @@ export class BaseDurableObject {
   }
 
   requireSqlStorage() {
-    const sql = this.ctx?.storage?.sql;
+    const storage = this.ctx?.storage;
+    const sql = storage?.sql;
     if (!sql || typeof sql.exec !== 'function') {
       throw new TypeError(`${this.options.className} requires SQLite-backed Durable Object storage`);
+    }
+    if (typeof storage?.transactionSync === 'function') {
+      bindSqlStorageTransactionSync(sql, storage.transactionSync.bind(storage));
     }
     return sql;
   }
@@ -1766,6 +2326,8 @@ export class UserDO extends BaseDurableObject {
     const roomFanoutDeltas = [];
     const roomEphemeralDeltas = [];
     const changedGlobalAccountTypes = new Set();
+    const deviceListsChanged = new Set();
+    const deviceListsLeft = new Set();
     let includePushRules = isInitial;
     let includePresence = isInitial;
 
@@ -1782,6 +2344,17 @@ export class UserDO extends BaseDurableObject {
         roomFanoutDeltas.push(entry.payload);
       } else if (entry.stream_kind === 'room_ephemeral') {
         roomEphemeralDeltas.push(entry.payload);
+      } else if (entry.stream_kind === 'device_state') {
+        for (const changedUserId of entry.payload?.changed_user_ids ?? []) {
+          if (typeof changedUserId === 'string' && changedUserId.length > 0) {
+            deviceListsChanged.add(changedUserId);
+          }
+        }
+        for (const leftUserId of entry.payload?.left_user_ids ?? []) {
+          if (typeof leftUserId === 'string' && leftUserId.length > 0) {
+            deviceListsLeft.add(leftUserId);
+          }
+        }
       }
     }
 
@@ -1823,6 +2396,8 @@ export class UserDO extends BaseDurableObject {
       .listToDeviceForDevice(session.device_id, { after_stream_pos: sincePos, limit: 10_000 })
       .filter((entry) => entry.stream_pos <= upperBound)
       .map((entry) => buildToDeviceEvent(entry));
+    const deviceOneTimeKeyCount = computeOneTimeKeyCounts(this.persistence, session.device_id);
+    const deviceUnusedFallbackKeyTypes = computeUnusedFallbackKeyTypes(this.persistence, session.device_id);
 
     const nextBatch = issueSyncToken({
       user_id: userId,
@@ -1846,6 +2421,10 @@ export class UserDO extends BaseDurableObject {
         account_data_events: filterEventList(accountDataEvents, filterDefinition.account_data),
         presence_events: filterEventList(presenceEvents, filterDefinition.presence),
         to_device_events: filterEventList(toDeviceEvents, filterDefinition.to_device),
+        device_lists_changed: [...deviceListsChanged],
+        device_lists_left: [...deviceListsLeft],
+        device_one_time_keys_count: deviceOneTimeKeyCount,
+        device_unused_fallback_key_types: deviceUnusedFallbackKeyTypes,
         room_deltas: roomFanoutDeltas,
         room_account_data_deltas: roomAccountDeltas,
         room_ephemeral_deltas: roomEphemeralDeltas,
@@ -1865,6 +2444,7 @@ export class UserDO extends BaseDurableObject {
     const [request = {}] = arguments;
     const principal = this.persistence.userPrincipal.get();
     const delta = normalizeRoomFanoutDelta(request);
+    const notificationEvent = normalizeRoomNotificationEvent(request.notification_event);
     if (!principal || principal.user_id !== delta.user_id) {
       return {
         ok: false,
@@ -1917,24 +2497,29 @@ export class UserDO extends BaseDurableObject {
     }
 
     const now = request?.now ?? new Date().toISOString();
+    const notificationState = resolveRoomFanoutNotificationState(this.persistence, principal, delta, notificationEvent);
+    const effectiveDelta = {
+      ...delta,
+      ...notificationState,
+    };
     let wakePos = 0;
     const sql = this.requireSqlStorage();
     withSqliteTransaction(sql, () => {
       const streamEntry = this.persistence.appendUserStreamWithinTransaction({
         user_id: principal.user_id,
         stream_kind: 'room_fanout',
-        room_id: delta.room_id,
-        event_id: delta.event_id,
+        room_id: effectiveDelta.room_id,
+        event_id: effectiveDelta.event_id,
         dedupe_key: dedupeKey,
         created_at: now,
-        payload: delta,
+        payload: effectiveDelta,
       });
       wakePos = streamEntry.stream_pos;
       this.persistence.userPrincipal.put(principalRowToPutRecord(principal, {
         record: mergeRoomSyncMembershipRecord(principal, {
-          room_id: delta.room_id,
-          membership_bucket: delta.membership_bucket,
-          room_pos: delta.room_pos,
+          room_id: effectiveDelta.room_id,
+          membership_bucket: effectiveDelta.membership_bucket,
+          room_pos: effectiveDelta.room_pos,
           updated_at: now,
         }),
       }));
@@ -2160,6 +2745,1311 @@ export class UserDO extends BaseDurableObject {
     }
     return createSuccessResult({
       entries: listRoomSyncMembershipEntries(principal),
+    });
+  }
+
+  async listDevices() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const [request = {}] = arguments;
+    const userId = normalizeString(request?.user_id, 'request.user_id');
+    const principal = this.persistence.userPrincipal.get();
+    if (!principal || principal.user_id !== userId) {
+      return createMatrixError(404, 'M_NOT_FOUND', 'User does not exist');
+    }
+    return createSuccessResult({
+      response: {
+        devices: listActiveDevices(this.persistence).map((device) => buildDeviceView(device)),
+      },
+    });
+  }
+
+  async getDevice() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const [request = {}] = arguments;
+    const userId = normalizeString(request?.user_id, 'request.user_id');
+    const deviceId = normalizeString(request?.device_id, 'request.device_id');
+    const principal = this.persistence.userPrincipal.get();
+    if (!principal || principal.user_id !== userId) {
+      return createMatrixError(404, 'M_NOT_FOUND', 'User does not exist');
+    }
+    const device = this.persistence.devices.get({ device_id: deviceId });
+    if (!device || device.deleted_at) {
+      return createMatrixError(404, 'M_NOT_FOUND', 'Device does not exist');
+    }
+    return createSuccessResult({
+      response: buildDeviceView(device),
+    });
+  }
+
+  async updateDevice() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const [request = {}] = arguments;
+    const userId = normalizeString(request?.user_id, 'request.user_id');
+    const deviceId = normalizeString(request?.device_id, 'request.device_id');
+    const now = request?.now ?? new Date().toISOString();
+    const displayName = request?.display_name == null
+      ? null
+      : normalizeString(request.display_name, 'request.display_name', { allowNull: true });
+    const principal = this.persistence.userPrincipal.get();
+    if (!principal || principal.user_id !== userId) {
+      return createMatrixError(404, 'M_NOT_FOUND', 'User does not exist');
+    }
+    const existingDevice = this.persistence.devices.get({ device_id: deviceId });
+    if (!existingDevice || existingDevice.deleted_at) {
+      return createMatrixError(404, 'M_NOT_FOUND', 'Device does not exist');
+    }
+    this.persistence.devices.put(deviceRowToPutRecord(existingDevice, {
+      display_name: displayName ?? existingDevice.display_name ?? null,
+      updated_at: now,
+    }));
+    return createSuccessResult({
+      response: {},
+    });
+  }
+
+  async resolvePhase05DeviceDeleteReplay() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const [request = {}] = arguments;
+    const userId = request?.user_id ?? null;
+    const requestFingerprint = request?.request_fingerprint ?? null;
+    const uiaNonce = request?.uia_nonce ?? null;
+    const accessTokenHash = request?.access_token_hash == null
+      ? null
+      : normalizeString(request.access_token_hash, 'request.access_token_hash');
+    if (typeof userId !== 'string' || userId.length === 0) {
+      return createMatrixError(400, 'M_BAD_JSON', 'user_id must be present');
+    }
+    if (typeof requestFingerprint !== 'string' || requestFingerprint.length === 0) {
+      return createMatrixError(400, 'M_BAD_JSON', 'request_fingerprint must be present');
+    }
+    if (typeof uiaNonce !== 'string' || uiaNonce.length === 0) {
+      return createMatrixError(400, 'M_BAD_JSON', 'uia_nonce must be present');
+    }
+    const principal = this.persistence.userPrincipal.get();
+    if (!principal || principal.user_id !== userId) {
+      return createSuccessResult({ handled: false });
+    }
+    const phase05 = readPhase05Meta(principal);
+    const previousDelete = phase05.device_delete ?? null;
+    if (previousDelete?.uia_nonce !== uiaNonce) {
+      return createSuccessResult({ handled: false });
+    }
+    if (accessTokenHash != null && previousDelete?.access_token_hash != null && previousDelete.access_token_hash !== accessTokenHash) {
+      return createSuccessResult({ handled: false });
+    }
+    if (previousDelete.request_fingerprint === requestFingerprint) {
+      return createSuccessResult({
+        handled: true,
+        response: {},
+      });
+    }
+    return createMatrixError(409, 'M_CONFLICT', 'This UIA session was already used for a different device deletion');
+  }
+
+  async deleteDevices() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const [request = {}] = arguments;
+    const userId = request?.user_id ?? null;
+    const requestFingerprint = request?.request_fingerprint ?? null;
+    const uiaNonce = request?.uia_nonce ?? null;
+    const accessTokenHash = request?.access_token_hash == null
+      ? null
+      : normalizeString(request.access_token_hash, 'request.access_token_hash', { allowNull: true });
+    const now = request?.now ?? new Date().toISOString();
+    const deviceIds = Array.isArray(request?.device_ids)
+      ? [...new Set(request.device_ids.map((value) => normalizeString(value, 'request.device_ids[]')))]
+      : null;
+    if (typeof userId !== 'string' || userId.length === 0) {
+      return createMatrixError(400, 'M_BAD_JSON', 'user_id must be present');
+    }
+    if (!deviceIds || deviceIds.length === 0) {
+      return createMatrixError(400, 'M_MISSING_PARAM', 'device_ids must be present');
+    }
+    if (typeof requestFingerprint !== 'string' || requestFingerprint.length === 0) {
+      return createMatrixError(400, 'M_BAD_JSON', 'request_fingerprint must be present');
+    }
+    if (typeof uiaNonce !== 'string' || uiaNonce.length === 0) {
+      return createMatrixError(400, 'M_BAD_JSON', 'uia_nonce must be present');
+    }
+    let wakePos = 0;
+    const sql = this.requireSqlStorage();
+    const result = withSqliteTransaction(sql, () => {
+      const principal = this.persistence.userPrincipal.get();
+      if (!principal || principal.user_id !== userId) {
+        return createMatrixError(404, 'M_NOT_FOUND', 'User does not exist');
+      }
+      const phase05 = readPhase05Meta(principal);
+      const previousDelete = phase05.device_delete ?? null;
+      if (previousDelete?.uia_nonce === uiaNonce) {
+        if (previousDelete.request_fingerprint === requestFingerprint) {
+          return createSuccessResult({ response: {} });
+        }
+        return createMatrixError(409, 'M_CONFLICT', 'This UIA session was already used for a different device deletion');
+      }
+
+      let mutatedDeviceState = false;
+      for (const deviceId of deviceIds) {
+        const device = this.persistence.devices.get({ device_id: deviceId });
+        if (device && !device.deleted_at) {
+          this.persistence.devices.put(deviceRowToPutRecord(device, {
+            deleted_at: now,
+            updated_at: now,
+          }));
+          mutatedDeviceState = true;
+        }
+        for (const session of this.persistence.sessions.list().filter((row) => row.device_id === deviceId)) {
+          if (session.revoked_at) {
+            continue;
+          }
+          this.persistence.sessions.put(sessionRowToPutRecord(session, {
+            revoked_at: now,
+            updated_at: now,
+          }));
+        }
+        for (const row of this.persistence.deviceKeys.list().filter((candidate) => candidate.device_id === deviceId)) {
+          this.persistence.deviceKeys.delete({
+            device_id: row.device_id,
+            key_id: row.key_id,
+          });
+          mutatedDeviceState = true;
+        }
+        for (const row of this.persistence.oneTimeKeys.list().filter((candidate) => candidate.device_id === deviceId)) {
+          this.persistence.oneTimeKeys.delete({
+            device_id: row.device_id,
+            algorithm: row.algorithm,
+            key_id: row.key_id,
+          });
+        }
+        for (const row of this.persistence.fallbackKeys.list().filter((candidate) => candidate.device_id === deviceId)) {
+          this.persistence.fallbackKeys.delete({
+            device_id: row.device_id,
+            algorithm: row.algorithm,
+            key_id: row.key_id,
+          });
+        }
+        for (const row of this.persistence.toDeviceQueue.list().filter((candidate) => candidate.target_device_id === deviceId)) {
+          this.persistence.toDeviceQueue.delete({
+            target_device_id: row.target_device_id,
+            stream_pos: row.stream_pos,
+          });
+        }
+      }
+      if (mutatedDeviceState) {
+        wakePos = appendDeviceStateDeltaWithinTransaction(this, userId, now, {
+          changed_user_ids: [userId],
+        }).stream_pos;
+      }
+      this.persistence.userPrincipal.put(principalRowToPutRecord(principal, {
+        record: mergePhase05Meta(principal, {
+          device_delete: {
+            uia_nonce: uiaNonce,
+            request_fingerprint: requestFingerprint,
+            access_token_hash: accessTokenHash,
+            completed_at: now,
+            device_ids: structuredClone(deviceIds),
+          },
+        }),
+      }));
+      return createSuccessResult({ response: {} });
+    });
+    if (result.ok && wakePos > 0) {
+      wakeSyncWaiters(this.env, {
+        user_id: userId,
+        user_stream_pos: wakePos,
+      });
+    }
+    return result;
+  }
+
+  async uploadKeys() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const [request = {}] = arguments;
+    const userId = normalizeString(request?.user_id, 'request.user_id');
+    const deviceId = normalizeString(request?.device_id, 'request.device_id');
+    const now = request?.now ?? new Date().toISOString();
+    const principal = this.persistence.userPrincipal.get();
+    if (!principal || principal.user_id !== userId) {
+      return createMatrixError(404, 'M_NOT_FOUND', 'User does not exist');
+    }
+    const device = this.persistence.devices.get({ device_id: deviceId });
+    if (!device || device.deleted_at) {
+      return createMatrixError(404, 'M_NOT_FOUND', 'Device does not exist');
+    }
+
+    const deviceKeys = request?.device_keys == null ? null : structuredClone(request.device_keys);
+    if (deviceKeys != null) {
+      if (!isObjectRecord(deviceKeys)) {
+        return createMatrixError(400, 'M_BAD_JSON', 'device_keys must be a JSON object');
+      }
+      if (deviceKeys.user_id !== userId || deviceKeys.device_id !== deviceId) {
+        return createMatrixError(400, 'M_INVALID_PARAM', 'device_keys must match the authenticated user and device');
+      }
+    }
+    let oneTimeKeys;
+    let fallbackKeys;
+    try {
+      oneTimeKeys = normalizeKeyUploadMap(request?.one_time_keys, 'request.one_time_keys');
+      fallbackKeys = normalizeKeyUploadMap(request?.fallback_keys, 'request.fallback_keys');
+    } catch (error) {
+      return createMatrixError(400, 'M_INVALID_PARAM', error.message);
+    }
+
+    let wakePos = 0;
+    const sql = this.requireSqlStorage();
+    withSqliteTransaction(sql, () => {
+      let deviceListChanged = false;
+      let deviceStateChanged = false;
+      if (deviceKeys != null) {
+        this.persistence.deviceKeys.put({
+          device_id: deviceId,
+          key_id: DEVICE_KEYS_ROW_ID,
+          key_type: 'device_key',
+          version: now,
+          updated_at: now,
+          record_json: deviceKeys,
+        });
+        deviceListChanged = true;
+        deviceStateChanged = true;
+      }
+      for (const row of oneTimeKeys) {
+        this.persistence.oneTimeKeys.put({
+          device_id: deviceId,
+          algorithm: row.algorithm,
+          key_id: row.key_id,
+          published_at: now,
+          claimed_at: null,
+          claim_context_json: null,
+          record_json: row.record_json,
+        });
+        deviceStateChanged = true;
+      }
+      for (const row of fallbackKeys) {
+        for (const existing of this.persistence.fallbackKeys.list().filter((candidate) => {
+          return candidate.device_id === deviceId && candidate.algorithm === row.algorithm;
+        })) {
+          this.persistence.fallbackKeys.delete({
+            device_id: existing.device_id,
+            algorithm: existing.algorithm,
+            key_id: existing.key_id,
+          });
+        }
+        this.persistence.fallbackKeys.put({
+          device_id: deviceId,
+          algorithm: row.algorithm,
+          key_id: row.key_id,
+          published_at: now,
+          used_at: null,
+          record_json: row.record_json,
+        });
+        deviceStateChanged = true;
+      }
+      if (deviceStateChanged) {
+        wakePos = appendDeviceStateDeltaWithinTransaction(this, userId, now, {
+          changed_user_ids: deviceListChanged ? [userId] : [],
+        }).stream_pos;
+      }
+    });
+    if (wakePos > 0) {
+      wakeSyncWaiters(this.env, {
+        user_id: userId,
+        user_stream_pos: wakePos,
+      });
+    }
+    return createSuccessResult({
+      response: {
+        one_time_key_counts: computeOneTimeKeyCounts(this.persistence, deviceId),
+      },
+    });
+  }
+
+  async queryDeviceKeys() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const [request = {}] = arguments;
+    const userId = normalizeString(request?.user_id, 'request.user_id');
+    const principal = this.persistence.userPrincipal.get();
+    if (!principal || principal.user_id !== userId) {
+      return createSuccessResult({
+        response: {
+          device_keys: {},
+          master_keys: {},
+          self_signing_keys: {},
+          user_signing_keys: {},
+        },
+      });
+    }
+    if (request?.device_ids != null && !Array.isArray(request.device_ids)) {
+      return createMatrixError(400, 'M_BAD_JSON', 'device_ids must be an array');
+    }
+    let deviceIds;
+    try {
+      deviceIds = request?.device_ids == null
+        ? null
+        : (
+          request.device_ids.length === 0
+            ? null
+            : [...new Set(request.device_ids.map((value) => normalizeString(value, 'request.device_ids[]')))]
+        );
+    } catch (error) {
+      return createMatrixError(400, 'M_INVALID_PARAM', error.message);
+    }
+    const response = buildKeysQuerySnapshot(this.persistence, userId, deviceIds);
+    if (request?.requester_user_id != null && request.requester_user_id !== userId) {
+      response.user_signing_keys = {};
+    }
+    return createSuccessResult({ response });
+  }
+
+  async resolvePhase05CrossSigningReplay() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const [request = {}] = arguments;
+    const userId = request?.user_id ?? null;
+    const requestFingerprint = request?.request_fingerprint ?? null;
+    const uiaNonce = request?.uia_nonce ?? null;
+    if (typeof userId !== 'string' || userId.length === 0) {
+      return createMatrixError(400, 'M_BAD_JSON', 'user_id must be present');
+    }
+    if (typeof requestFingerprint !== 'string' || requestFingerprint.length === 0) {
+      return createMatrixError(400, 'M_BAD_JSON', 'request_fingerprint must be present');
+    }
+    if (typeof uiaNonce !== 'string' || uiaNonce.length === 0) {
+      return createMatrixError(400, 'M_BAD_JSON', 'uia_nonce must be present');
+    }
+    const principal = this.persistence.userPrincipal.get();
+    if (!principal || principal.user_id !== userId) {
+      return createSuccessResult({ handled: false });
+    }
+    const phase05 = readPhase05Meta(principal);
+    const previousUpload = phase05.cross_signing_upload ?? null;
+    if (previousUpload?.uia_nonce !== uiaNonce) {
+      return createSuccessResult({ handled: false });
+    }
+    if (previousUpload.request_fingerprint === requestFingerprint) {
+      return createSuccessResult({
+        handled: true,
+        response: {},
+      });
+    }
+    return createMatrixError(409, 'M_CONFLICT', 'This UIA session was already used for a different cross-signing upload');
+  }
+
+  async uploadCrossSigningKeys() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const [request = {}] = arguments;
+    const userId = normalizeString(request?.user_id, 'request.user_id');
+    const now = request?.now ?? new Date().toISOString();
+    const requestFingerprint = request?.request_fingerprint ?? null;
+    const uiaNonce = request?.uia_nonce ?? null;
+    let masterKey;
+    let selfSigningKey;
+    let userSigningKey;
+    try {
+      masterKey = request?.master_key == null
+        ? null
+        : normalizeCrossSigningKeyRecord(request.master_key, {
+          expectedUserId: userId,
+          expectedUsage: 'master',
+          label: 'request.master_key',
+        });
+      selfSigningKey = request?.self_signing_key == null
+        ? null
+        : normalizeCrossSigningKeyRecord(request.self_signing_key, {
+          expectedUserId: userId,
+          expectedUsage: 'self_signing',
+          label: 'request.self_signing_key',
+        });
+      userSigningKey = request?.user_signing_key == null
+        ? null
+        : normalizeCrossSigningKeyRecord(request.user_signing_key, {
+          expectedUserId: userId,
+          expectedUsage: 'user_signing',
+          label: 'request.user_signing_key',
+        });
+    } catch (error) {
+      return createMatrixError(400, 'M_INVALID_PARAM', error.message);
+    }
+    if (!masterKey && !selfSigningKey && !userSigningKey) {
+      return createMatrixError(400, 'M_MISSING_PARAM', 'At least one cross-signing key must be present');
+    }
+
+    const principal = this.persistence.userPrincipal.get();
+    if (!principal || principal.user_id !== userId) {
+      return createMatrixError(404, 'M_NOT_FOUND', 'User does not exist');
+    }
+    const currentMaster = getCrossSigningRow(this.persistence, CROSS_SIGNING_KEY_IDS.master);
+    if (!currentMaster && !masterKey) {
+      return createMatrixError(400, 'M_MISSING_PARAM', 'master_key must be present when no master key is stored');
+    }
+
+    const activeDeviceIds = new Set(listActiveDevices(this.persistence).map((device) => device.device_id));
+    for (const candidate of [masterKey, selfSigningKey, userSigningKey].filter(Boolean)) {
+      const publicKey = extractCrossSigningPublicKey(candidate).public_key;
+      if (activeDeviceIds.has(publicKey)) {
+        return createMatrixError(403, 'M_FORBIDDEN', 'Key ID in use');
+      }
+    }
+
+    let wakePos = 0;
+    const sql = this.requireSqlStorage();
+    const result = withSqliteTransaction(sql, () => {
+      const currentPrincipal = this.persistence.userPrincipal.get();
+      if (!currentPrincipal || currentPrincipal.user_id !== userId) {
+        return createMatrixError(404, 'M_NOT_FOUND', 'User does not exist');
+      }
+      if (uiaNonce != null) {
+        if (typeof requestFingerprint !== 'string' || requestFingerprint.length === 0) {
+          return createMatrixError(400, 'M_BAD_JSON', 'request_fingerprint must be present');
+        }
+        const phase05 = readPhase05Meta(currentPrincipal);
+        const previousUpload = phase05.cross_signing_upload ?? null;
+        if (previousUpload?.uia_nonce === uiaNonce) {
+          if (previousUpload.request_fingerprint === requestFingerprint) {
+            return createSuccessResult({ response: {} });
+          }
+          return createMatrixError(409, 'M_CONFLICT', 'This UIA session was already used for a different cross-signing upload');
+        }
+      }
+
+      let changed = false;
+      const rowsToUpsert = [
+        [CROSS_SIGNING_KEY_IDS.master, masterKey],
+        [CROSS_SIGNING_KEY_IDS.self_signing, selfSigningKey],
+        [CROSS_SIGNING_KEY_IDS.user_signing, userSigningKey],
+      ];
+      for (const [keyId, record] of rowsToUpsert) {
+        if (!record) {
+          continue;
+        }
+        const existing = getCrossSigningRow(this.persistence, keyId);
+        if (!existing || canonicalJsonHash(existing.record ?? null) !== canonicalJsonHash(record)) {
+          changed = true;
+        }
+        this.persistence.deviceKeys.put({
+          device_id: CROSS_SIGNING_DEVICE_ID,
+          key_id: keyId,
+          key_type: 'cross_signing',
+          version: now,
+          updated_at: now,
+          record_json: record,
+        });
+      }
+      if (changed) {
+        wakePos = appendDeviceStateDeltaWithinTransaction(this, userId, now, {
+          changed_user_ids: [userId],
+        }).stream_pos;
+      }
+      if (uiaNonce != null) {
+        this.persistence.userPrincipal.put(principalRowToPutRecord(currentPrincipal, {
+          record: mergePhase05Meta(currentPrincipal, {
+            cross_signing_upload: {
+              uia_nonce: uiaNonce,
+              request_fingerprint: requestFingerprint,
+              completed_at: now,
+            },
+          }),
+        }));
+      }
+      return createSuccessResult({ response: {} });
+    });
+    if (result.ok && wakePos > 0) {
+      wakeSyncWaiters(this.env, {
+        user_id: userId,
+        user_stream_pos: wakePos,
+      });
+    }
+    return result;
+  }
+
+  async uploadCrossSigningSignatures() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const [request = {}] = arguments;
+    const userId = normalizeString(request?.user_id, 'request.user_id');
+    const now = request?.now ?? new Date().toISOString();
+    const signedObjects = isObjectRecord(request?.signed_objects) ? request.signed_objects : null;
+    if (!signedObjects) {
+      return createMatrixError(400, 'M_BAD_JSON', 'signed_objects must be a JSON object');
+    }
+    const principal = this.persistence.userPrincipal.get();
+    if (!principal || principal.user_id !== userId) {
+      return createMatrixError(404, 'M_NOT_FOUND', 'User does not exist');
+    }
+
+    let wakePos = 0;
+    const sql = this.requireSqlStorage();
+    const result = withSqliteTransaction(sql, () => {
+      const failures = {};
+      let changed = false;
+      for (const [keyLocator, signedObject] of Object.entries(signedObjects)) {
+        let normalizedLocator;
+        try {
+          normalizedLocator = normalizeString(keyLocator, 'request.signed_objects.key');
+        } catch (error) {
+          failures[userId] = {
+            ...(failures[userId] ?? {}),
+            [typeof keyLocator === 'string' ? keyLocator : String(keyLocator)]: {
+              errcode: 'M_INVALID_PARAM',
+              error: error.message,
+            },
+          };
+          continue;
+        }
+        if (!isObjectRecord(signedObject) || !isObjectRecord(signedObject.signatures)) {
+          failures[userId] = {
+            ...(failures[userId] ?? {}),
+            [normalizedLocator]: {
+              errcode: 'M_INVALID_SIGNATURE',
+              error: 'Signed object must include signatures',
+            },
+          };
+          continue;
+        }
+
+        const existingDeviceRow = this.persistence.deviceKeys.get({
+          device_id: normalizedLocator,
+          key_id: DEVICE_KEYS_ROW_ID,
+        });
+        const existingRow = existingDeviceRow ?? findCrossSigningRowByPublicKey(this.persistence, normalizedLocator);
+        if (!existingRow?.record) {
+          failures[userId] = {
+            ...(failures[userId] ?? {}),
+            [normalizedLocator]: {
+              errcode: 'M_NOT_FOUND',
+              error: 'Signed key does not exist',
+            },
+          };
+          continue;
+        }
+        if (canonicalJsonHash(cloneSignedObjectWithoutSignatures(existingRow.record)) !== canonicalJsonHash(cloneSignedObjectWithoutSignatures(signedObject))) {
+          failures[userId] = {
+            ...(failures[userId] ?? {}),
+            [normalizedLocator]: {
+              errcode: 'M_INVALID_SIGNATURE',
+              error: 'Signed object does not match the stored key',
+            },
+          };
+          continue;
+        }
+
+        const nextRecord = structuredClone(existingRow.record);
+        nextRecord.signatures = mergeSignatureMaps(existingRow.record?.signatures, signedObject.signatures);
+        if (canonicalJsonHash(existingRow.record ?? null) === canonicalJsonHash(nextRecord)) {
+          continue;
+        }
+        changed = true;
+        this.persistence.deviceKeys.put({
+          device_id: existingRow.device_id,
+          key_id: existingRow.key_id,
+          key_type: existingRow.key_type,
+          version: now,
+          updated_at: now,
+          record_json: nextRecord,
+        });
+      }
+      if (changed) {
+        wakePos = appendDeviceStateDeltaWithinTransaction(this, userId, now, {
+          changed_user_ids: [userId],
+        }).stream_pos;
+      }
+      return createSuccessResult({
+        response: {
+          failures,
+        },
+      });
+    });
+    if (result.ok && wakePos > 0) {
+      wakeSyncWaiters(this.env, {
+        user_id: userId,
+        user_stream_pos: wakePos,
+      });
+    }
+    return result;
+  }
+
+  async claimOneTimeKeys() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const [request = {}] = arguments;
+    const userId = normalizeString(request?.user_id, 'request.user_id');
+    const now = request?.now ?? new Date().toISOString();
+    const deviceRequests = isObjectRecord(request?.device_requests) ? request.device_requests : {};
+    let normalizedRequests;
+    try {
+      normalizedRequests = Object.entries(deviceRequests).map(([deviceId, rawAlgorithm]) => ({
+        device_id: normalizeString(deviceId, 'request.device_requests.device_id'),
+        algorithm: normalizeString(rawAlgorithm, 'request.device_requests.algorithm'),
+      }));
+    } catch (error) {
+      return createMatrixError(400, 'M_INVALID_PARAM', error.message);
+    }
+    const principal = this.persistence.userPrincipal.get();
+    if (!principal || principal.user_id !== userId) {
+      return createSuccessResult({
+        response: {
+          one_time_keys: {},
+        },
+      });
+    }
+    const claimedByDevice = {};
+    let wakePos = 0;
+    const sql = this.requireSqlStorage();
+    withSqliteTransaction(sql, () => {
+      let deviceStateChanged = false;
+      for (const { device_id: normalizedDeviceId, algorithm } of normalizedRequests) {
+        const availableKey = this.persistence.oneTimeKeys.list()
+          .filter((row) => row.device_id === normalizedDeviceId && row.algorithm === algorithm && !row.claimed_at)
+          .sort((left, right) => left.published_at.localeCompare(right.published_at))[0] ?? null;
+        if (availableKey) {
+          const claimedRow = this.persistence.claimOneTimeKeyWithinTransaction({
+            device_id: normalizedDeviceId,
+            algorithm,
+            key_id: availableKey.key_id,
+            claimed_at: now,
+            claim_context: {
+              requester_user_id: request?.requester_user_id ?? null,
+            },
+          });
+          if (claimedRow) {
+            if (!claimedByDevice[normalizedDeviceId]) {
+              claimedByDevice[normalizedDeviceId] = {};
+            }
+            claimedByDevice[normalizedDeviceId][`${algorithm}:${claimedRow.key_id}`] = structuredClone(claimedRow.record ?? {});
+            deviceStateChanged = true;
+          }
+          continue;
+        }
+
+        const fallbackRow = this.persistence.fallbackKeys.list()
+          .filter((row) => row.device_id === normalizedDeviceId && row.algorithm === algorithm)
+          .sort((left, right) => right.published_at.localeCompare(left.published_at))[0] ?? null;
+        if (!fallbackRow) {
+          continue;
+        }
+        if (!fallbackRow.used_at) {
+          this.persistence.fallbackKeys.put({
+            device_id: fallbackRow.device_id,
+            algorithm: fallbackRow.algorithm,
+            key_id: fallbackRow.key_id,
+            published_at: fallbackRow.published_at,
+            used_at: now,
+            record_json: fallbackRow.record ?? {},
+          });
+          deviceStateChanged = true;
+        }
+        if (!claimedByDevice[normalizedDeviceId]) {
+          claimedByDevice[normalizedDeviceId] = {};
+        }
+        claimedByDevice[normalizedDeviceId][`${algorithm}:${fallbackRow.key_id}`] = structuredClone(fallbackRow.record ?? {});
+      }
+      if (deviceStateChanged) {
+        wakePos = appendDeviceStateDeltaWithinTransaction(this, userId, now, {}).stream_pos;
+      }
+    });
+    if (wakePos > 0) {
+      wakeSyncWaiters(this.env, {
+        user_id: userId,
+        user_stream_pos: wakePos,
+      });
+    }
+    return createSuccessResult({
+      response: {
+        one_time_keys: Object.keys(claimedByDevice).length === 0
+          ? {}
+          : {
+            [userId]: claimedByDevice,
+          },
+      },
+    });
+  }
+
+  async createRoomKeyBackupVersion() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const [request = {}] = arguments;
+    const userId = normalizeString(request?.user_id, 'request.user_id');
+    const now = request?.now ?? new Date().toISOString();
+    let algorithm;
+    try {
+      algorithm = normalizeRoomKeyBackupAlgorithm(request?.algorithm);
+    } catch (error) {
+      return createMatrixError(400, 'M_INVALID_PARAM', error.message);
+    }
+    const authData = isObjectRecord(request?.auth_data) ? structuredClone(request.auth_data) : {};
+    const principal = this.persistence.userPrincipal.get();
+    if (!principal || principal.user_id !== userId) {
+      return createMatrixError(404, 'M_NOT_FOUND', 'User does not exist');
+    }
+    const sql = this.requireSqlStorage();
+    const backupVersion = withSqliteTransaction(sql, () => {
+      const existingVersions = this.persistence.roomKeyBackupManifests.list();
+      const numericVersions = existingVersions
+        .map((row) => Number.parseInt(row.backup_version, 10))
+        .filter((value) => Number.isInteger(value));
+      const nextVersion = String((numericVersions.length === 0 ? 0 : Math.max(...numericVersions)) + 1);
+      for (const row of existingVersions) {
+        if (row.backup_state === 'ready') {
+          this.persistence.roomKeyBackupManifests.put({
+            backup_version: row.backup_version,
+            algorithm: row.algorithm,
+            etag: row.etag,
+            backup_state: 'archived',
+            chunk_count: row.chunk_count,
+            byte_count: row.byte_count,
+            created_at: row.created_at,
+            updated_at: now,
+            auth_data_json: row.auth_data ?? {},
+            record_json: row.record ?? {},
+          });
+        }
+      }
+      const record = {
+        segments: {},
+        pending_writes: {},
+      };
+      const row = {
+        backup_version: nextVersion,
+        algorithm,
+        etag: null,
+        backup_state: 'ready',
+        chunk_count: 0,
+        byte_count: 0,
+        created_at: now,
+        updated_at: now,
+        auth_data_json: authData,
+        record_json: record,
+      };
+      row.etag = computeRoomKeyBackupManifestEtag({
+        backup_version: nextVersion,
+        algorithm,
+        auth_data: authData,
+      }, record);
+      this.persistence.roomKeyBackupManifests.put(row);
+      return nextVersion;
+    });
+    return createSuccessResult({
+      response: {
+        version: backupVersion,
+      },
+    });
+  }
+
+  async getCurrentRoomKeyBackupVersion() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const [request = {}] = arguments;
+    const userId = normalizeString(request?.user_id, 'request.user_id');
+    const principal = this.persistence.userPrincipal.get();
+    if (!principal || principal.user_id !== userId) {
+      return createMatrixError(404, 'M_NOT_FOUND', 'User does not exist');
+    }
+    const current = this.persistence.roomKeyBackupManifests.list()
+      .filter((row) => row.backup_state === 'ready')
+      .sort((left, right) => right.updated_at.localeCompare(left.updated_at))[0] ?? null;
+    if (!current) {
+      return createMatrixError(404, 'M_NOT_FOUND', 'No current backup version exists');
+    }
+    return createSuccessResult({
+      response: buildRoomKeyBackupManifestView(current),
+    });
+  }
+
+  async getRoomKeyBackupVersion() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const [request = {}] = arguments;
+    const userId = normalizeString(request?.user_id, 'request.user_id');
+    const backupVersion = normalizeString(request?.backup_version, 'request.backup_version');
+    const principal = this.persistence.userPrincipal.get();
+    if (!principal || principal.user_id !== userId) {
+      return createMatrixError(404, 'M_NOT_FOUND', 'User does not exist');
+    }
+    const manifest = this.persistence.roomKeyBackupManifests.get({ backup_version: backupVersion });
+    if (!manifest || manifest.backup_state === 'deleted') {
+      return createMatrixError(404, 'M_NOT_FOUND', 'Backup version does not exist');
+    }
+    return createSuccessResult({
+      response: buildRoomKeyBackupManifestView(manifest),
+    });
+  }
+
+  async updateRoomKeyBackupVersion() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const [request = {}] = arguments;
+    const userId = normalizeString(request?.user_id, 'request.user_id');
+    const backupVersion = normalizeString(request?.backup_version, 'request.backup_version');
+    const now = request?.now ?? new Date().toISOString();
+    let algorithm;
+    try {
+      algorithm = normalizeRoomKeyBackupAlgorithm(request?.algorithm);
+    } catch (error) {
+      return createMatrixError(400, 'M_INVALID_PARAM', error.message);
+    }
+    const authData = isObjectRecord(request?.auth_data) ? structuredClone(request.auth_data) : {};
+    const principal = this.persistence.userPrincipal.get();
+    if (!principal || principal.user_id !== userId) {
+      return createMatrixError(404, 'M_NOT_FOUND', 'User does not exist');
+    }
+    const sql = this.requireSqlStorage();
+    const result = withSqliteTransaction(sql, () => {
+      const manifest = this.persistence.roomKeyBackupManifests.get({ backup_version: backupVersion });
+      if (!manifest || manifest.backup_state === 'deleted') {
+        return createMatrixError(404, 'M_NOT_FOUND', 'Backup version does not exist');
+      }
+      if (manifest.algorithm && manifest.algorithm !== algorithm) {
+        return createMatrixError(400, 'M_INVALID_PARAM', 'algorithm must match the existing backup version');
+      }
+      const record = readRoomKeyBackupRecord(manifest);
+      this.persistence.roomKeyBackupManifests.put({
+        backup_version: manifest.backup_version,
+        algorithm,
+        etag: computeRoomKeyBackupManifestEtag({
+          backup_version: manifest.backup_version,
+          algorithm,
+          auth_data: authData,
+        }, record),
+        backup_state: manifest.backup_state,
+        chunk_count: manifest.chunk_count,
+        byte_count: manifest.byte_count,
+        created_at: manifest.created_at,
+        updated_at: now,
+        auth_data_json: authData,
+        record_json: record,
+      });
+      return createSuccessResult({ response: {} });
+    });
+    return result;
+  }
+
+  async deleteRoomKeyBackupVersion() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const [request = {}] = arguments;
+    const userId = normalizeString(request?.user_id, 'request.user_id');
+    const backupVersion = normalizeString(request?.backup_version, 'request.backup_version');
+    const now = request?.now ?? new Date().toISOString();
+    const principal = this.persistence.userPrincipal.get();
+    if (!principal || principal.user_id !== userId) {
+      return createMatrixError(404, 'M_NOT_FOUND', 'User does not exist');
+    }
+    const archiveBucket = this.env.MATRIX_ARCHIVE_BUCKET;
+    if (!archiveBucket || typeof archiveBucket.delete !== 'function') {
+      return {
+        ok: false,
+        error: createInternalErrorEnvelope({
+          code: 'backpressure',
+          message: 'Missing MATRIX_ARCHIVE_BUCKET binding',
+          retryable: false,
+        }),
+      };
+    }
+    const sql = this.requireSqlStorage();
+    const deleteResult = withSqliteTransaction(sql, () => {
+      const manifest = this.persistence.roomKeyBackupManifests.get({ backup_version: backupVersion });
+      if (!manifest) {
+        return createMatrixError(404, 'M_NOT_FOUND', 'Backup version does not exist');
+      }
+      if (manifest.backup_state === 'deleted') {
+        return createSuccessResult({
+          object_keys: [],
+        });
+      }
+      const record = readRoomKeyBackupRecord(manifest);
+      const pendingKeys = Object.values(record.pending_writes).map((entry) => entry.object_key).filter(Boolean);
+      const segmentKeys = Object.values(record.segments).map((entry) => entry.object_key).filter(Boolean);
+      this.persistence.roomKeyBackupManifests.put({
+        backup_version: manifest.backup_version,
+        algorithm: manifest.algorithm,
+        etag: manifest.etag,
+        backup_state: 'deleted',
+        chunk_count: 0,
+        byte_count: 0,
+        created_at: manifest.created_at,
+        updated_at: now,
+        auth_data_json: manifest.auth_data ?? {},
+        record_json: {
+          segments: {},
+          pending_writes: {},
+        },
+      });
+      return createSuccessResult({
+        object_keys: [...new Set([...pendingKeys, ...segmentKeys])],
+      });
+    });
+    if (!deleteResult.ok) {
+      return deleteResult;
+    }
+    for (const objectKey of deleteResult.object_keys) {
+      await archiveBucket.delete(objectKey);
+    }
+    return createSuccessResult({
+      response: {},
+    });
+  }
+
+  async putRoomKeyBackupData() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const [request = {}] = arguments;
+    const userId = normalizeString(request?.user_id, 'request.user_id');
+    const backupVersion = normalizeString(request?.backup_version, 'request.backup_version');
+    const now = request?.now ?? new Date().toISOString();
+    const principal = this.persistence.userPrincipal.get();
+    if (!principal || principal.user_id !== userId) {
+      return createMatrixError(404, 'M_NOT_FOUND', 'User does not exist');
+    }
+    const archiveBucket = this.env.MATRIX_ARCHIVE_BUCKET;
+    if (!archiveBucket || typeof archiveBucket.put !== 'function') {
+      return {
+        ok: false,
+        error: createInternalErrorEnvelope({
+          code: 'backpressure',
+          message: 'Missing MATRIX_ARCHIVE_BUCKET binding',
+          retryable: false,
+        }),
+      };
+    }
+    let entries;
+    try {
+      entries = normalizeRoomKeyBackupEntries(request?.backup_data, {
+        roomId: request?.room_id ?? null,
+        sessionId: request?.session_id ?? null,
+      });
+    } catch (error) {
+      return createMatrixError(400, 'M_BAD_JSON', error.message);
+    }
+
+    const sql = this.requireSqlStorage();
+    let writePlan = null;
+    const planResult = withSqliteTransaction(sql, () => {
+      const manifest = this.persistence.roomKeyBackupManifests.get({ backup_version: backupVersion });
+      if (!manifest || manifest.backup_state === 'deleted') {
+        return createMatrixError(404, 'M_NOT_FOUND', 'Backup version does not exist');
+      }
+      const record = readRoomKeyBackupRecord(manifest);
+      const plannedSegments = entries.map((entry) => {
+        const contentHash = canonicalJsonHash(entry.session_data);
+        const objectKey = buildRoomKeyBackupObjectKey(userId, backupVersion, entry.room_id, entry.session_id, contentHash);
+        const segmentKey = buildRoomKeyBackupSegmentKey(entry.room_id, entry.session_id);
+        record.pending_writes[segmentKey] = {
+          room_id: entry.room_id,
+          session_id: entry.session_id,
+          object_key: objectKey,
+          content_hash: contentHash,
+          requested_at: now,
+        };
+        return {
+          ...entry,
+          segment_key: segmentKey,
+          object_key: objectKey,
+          content_hash: contentHash,
+          byte_size: Buffer.byteLength(JSON.stringify(entry.session_data), 'utf8'),
+        };
+      });
+      this.persistence.roomKeyBackupManifests.put({
+        backup_version: manifest.backup_version,
+        algorithm: manifest.algorithm,
+        etag: manifest.etag,
+        backup_state: manifest.backup_state,
+        chunk_count: manifest.chunk_count,
+        byte_count: manifest.byte_count,
+        created_at: manifest.created_at,
+        updated_at: now,
+        auth_data_json: manifest.auth_data ?? {},
+        record_json: record,
+      });
+      writePlan = {
+        manifest,
+        segments: plannedSegments,
+      };
+      return createSuccessResult({ response: {} });
+    });
+    if (!planResult.ok) {
+      return planResult;
+    }
+
+    const writtenSegments = [];
+    try {
+      for (const segment of writePlan.segments) {
+        const existed = typeof archiveBucket.head === 'function'
+          ? Boolean(await archiveBucket.head(segment.object_key))
+          : Boolean(await archiveBucket.get(segment.object_key));
+        await putR2JsonObject(archiveBucket, segment.object_key, segment.session_data, {
+          metadata: normalizeEncryptedBackupSegmentMetadata({
+            user_id: userId,
+            backup_version: backupVersion,
+            segment_id: segment.segment_key,
+            content_hash: segment.content_hash,
+          }),
+        });
+        writtenSegments.push({
+          ...segment,
+          existed,
+        });
+      }
+    } catch (error) {
+      for (const segment of writtenSegments.filter((entry) => !entry.existed)) {
+        await archiveBucket.delete(segment.object_key);
+      }
+      withSqliteTransaction(sql, () => {
+        const manifest = this.persistence.roomKeyBackupManifests.get({ backup_version: backupVersion });
+        if (!manifest || manifest.backup_state === 'deleted') {
+          return;
+        }
+        const record = readRoomKeyBackupRecord(manifest);
+        for (const segment of writePlan.segments) {
+          delete record.pending_writes[segment.segment_key];
+        }
+        this.persistence.roomKeyBackupManifests.put({
+          backup_version: manifest.backup_version,
+          algorithm: manifest.algorithm,
+          etag: manifest.etag,
+          backup_state: manifest.backup_state,
+          chunk_count: manifest.chunk_count,
+          byte_count: manifest.byte_count,
+          created_at: manifest.created_at,
+          updated_at: now,
+          auth_data_json: manifest.auth_data ?? {},
+          record_json: record,
+        });
+      });
+      return {
+        ok: false,
+        error: createInternalErrorEnvelope({
+          code: 'backpressure',
+          message: error.message ?? 'Room key backup object write failed',
+          retryable: false,
+        }),
+      };
+    }
+
+    const finalizeResult = withSqliteTransaction(sql, () => {
+      const manifest = this.persistence.roomKeyBackupManifests.get({ backup_version: backupVersion });
+      if (!manifest || manifest.backup_state === 'deleted') {
+        return createMatrixError(404, 'M_NOT_FOUND', 'Backup version does not exist');
+      }
+      const record = readRoomKeyBackupRecord(manifest);
+      const replacedObjectKeys = [];
+      for (const segment of writePlan.segments) {
+        const existing = record.segments[segment.segment_key] ?? null;
+        if (existing?.object_key && existing.object_key !== segment.object_key) {
+          replacedObjectKeys.push(existing.object_key);
+        }
+        record.segments[segment.segment_key] = {
+          room_id: segment.room_id,
+          session_id: segment.session_id,
+          object_key: segment.object_key,
+          content_hash: segment.content_hash,
+          byte_size: segment.byte_size,
+          updated_at: now,
+        };
+        delete record.pending_writes[segment.segment_key];
+      }
+      const stats = computeRoomKeyBackupManifestStats(record);
+      const updatedManifest = {
+        backup_version: manifest.backup_version,
+        algorithm: manifest.algorithm,
+        etag: null,
+        backup_state: manifest.backup_state,
+        chunk_count: stats.chunk_count,
+        byte_count: stats.byte_count,
+        created_at: manifest.created_at,
+        updated_at: now,
+        auth_data_json: manifest.auth_data ?? {},
+        record_json: record,
+      };
+      updatedManifest.etag = computeRoomKeyBackupManifestEtag({
+        backup_version: updatedManifest.backup_version,
+        algorithm: updatedManifest.algorithm,
+        auth_data: updatedManifest.auth_data_json,
+      }, record);
+      this.persistence.roomKeyBackupManifests.put(updatedManifest);
+      return createSuccessResult({
+        response: {
+          count: updatedManifest.chunk_count,
+          etag: updatedManifest.etag,
+          _replaced_object_keys: [...new Set(replacedObjectKeys)],
+        },
+      });
+    });
+    if (!finalizeResult.ok) {
+      return finalizeResult;
+    }
+    for (const objectKey of finalizeResult.response._replaced_object_keys ?? []) {
+      await archiveBucket.delete(objectKey);
+    }
+    return createSuccessResult({
+      response: {
+        count: finalizeResult.response.count,
+        etag: finalizeResult.response.etag,
+      },
+    });
+  }
+
+  async getRoomKeyBackupData() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const [request = {}] = arguments;
+    const userId = normalizeString(request?.user_id, 'request.user_id');
+    const backupVersion = normalizeString(request?.backup_version, 'request.backup_version');
+    const roomId = request?.room_id == null ? null : normalizeString(request.room_id, 'request.room_id');
+    const sessionId = request?.session_id == null ? null : normalizeString(request.session_id, 'request.session_id');
+    const principal = this.persistence.userPrincipal.get();
+    if (!principal || principal.user_id !== userId) {
+      return createMatrixError(404, 'M_NOT_FOUND', 'User does not exist');
+    }
+    const archiveBucket = this.env.MATRIX_ARCHIVE_BUCKET;
+    if (!archiveBucket || typeof archiveBucket.get !== 'function') {
+      return {
+        ok: false,
+        error: createInternalErrorEnvelope({
+          code: 'backpressure',
+          message: 'Missing MATRIX_ARCHIVE_BUCKET binding',
+          retryable: false,
+        }),
+      };
+    }
+    const manifest = this.persistence.roomKeyBackupManifests.get({ backup_version: backupVersion });
+    if (!manifest || manifest.backup_state === 'deleted') {
+      return createMatrixError(404, 'M_NOT_FOUND', 'Backup version does not exist');
+    }
+    const record = readRoomKeyBackupRecord(manifest);
+    const selectedEntries = Object.values(record.segments).filter((entry) => {
+      if (roomId != null && entry.room_id !== roomId) {
+        return false;
+      }
+      if (sessionId != null && entry.session_id !== sessionId) {
+        return false;
+      }
+      return true;
+    });
+    if (sessionId != null && selectedEntries.length === 0) {
+      return createMatrixError(404, 'M_NOT_FOUND', 'Backup key does not exist');
+    }
+    const hydratedEntries = [];
+    for (const entry of selectedEntries) {
+      const object = await archiveBucket.get(entry.object_key);
+      if (!object) {
+        continue;
+      }
+      hydratedEntries.push({
+        room_id: entry.room_id,
+        session_id: entry.session_id,
+        session_data: typeof object.json === 'function'
+          ? await object.json()
+          : JSON.parse(await object.text()),
+      });
+    }
+    if (sessionId != null && hydratedEntries.length === 0) {
+      return createMatrixError(404, 'M_NOT_FOUND', 'Backup key does not exist');
+    }
+    return createSuccessResult({
+      response: buildRoomKeyBackupResponsePayload(hydratedEntries, {
+        roomId,
+        sessionId,
+      }),
+    });
+  }
+
+  async deleteRoomKeyBackupData() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const [request = {}] = arguments;
+    const userId = normalizeString(request?.user_id, 'request.user_id');
+    const backupVersion = normalizeString(request?.backup_version, 'request.backup_version');
+    const roomId = request?.room_id == null ? null : normalizeString(request.room_id, 'request.room_id');
+    const sessionId = request?.session_id == null ? null : normalizeString(request.session_id, 'request.session_id');
+    const now = request?.now ?? new Date().toISOString();
+    const principal = this.persistence.userPrincipal.get();
+    if (!principal || principal.user_id !== userId) {
+      return createMatrixError(404, 'M_NOT_FOUND', 'User does not exist');
+    }
+    const archiveBucket = this.env.MATRIX_ARCHIVE_BUCKET;
+    if (!archiveBucket || typeof archiveBucket.delete !== 'function') {
+      return {
+        ok: false,
+        error: createInternalErrorEnvelope({
+          code: 'backpressure',
+          message: 'Missing MATRIX_ARCHIVE_BUCKET binding',
+          retryable: false,
+        }),
+      };
+    }
+    const sql = this.requireSqlStorage();
+    const deleteResult = withSqliteTransaction(sql, () => {
+      const manifest = this.persistence.roomKeyBackupManifests.get({ backup_version: backupVersion });
+      if (!manifest || manifest.backup_state === 'deleted') {
+        return createMatrixError(404, 'M_NOT_FOUND', 'Backup version does not exist');
+      }
+      const record = readRoomKeyBackupRecord(manifest);
+      const objectKeys = [];
+      for (const [segmentKey, entry] of Object.entries(record.segments)) {
+        if (roomId != null && entry.room_id !== roomId) {
+          continue;
+        }
+        if (sessionId != null && entry.session_id !== sessionId) {
+          continue;
+        }
+        if (entry.object_key) {
+          objectKeys.push(entry.object_key);
+        }
+        delete record.segments[segmentKey];
+      }
+      for (const [segmentKey, entry] of Object.entries(record.pending_writes)) {
+        if (roomId != null && entry.room_id !== roomId) {
+          continue;
+        }
+        if (sessionId != null && entry.session_id !== sessionId) {
+          continue;
+        }
+        if (entry.object_key) {
+          objectKeys.push(entry.object_key);
+        }
+        delete record.pending_writes[segmentKey];
+      }
+      const stats = computeRoomKeyBackupManifestStats(record);
+      const updatedManifest = {
+        backup_version: manifest.backup_version,
+        algorithm: manifest.algorithm,
+        etag: null,
+        backup_state: manifest.backup_state,
+        chunk_count: stats.chunk_count,
+        byte_count: stats.byte_count,
+        created_at: manifest.created_at,
+        updated_at: now,
+        auth_data_json: manifest.auth_data ?? {},
+        record_json: record,
+      };
+      updatedManifest.etag = computeRoomKeyBackupManifestEtag({
+        backup_version: updatedManifest.backup_version,
+        algorithm: updatedManifest.algorithm,
+        auth_data: updatedManifest.auth_data_json,
+      }, record);
+      this.persistence.roomKeyBackupManifests.put(updatedManifest);
+      return createSuccessResult({
+        object_keys: [...new Set(objectKeys)],
+      });
+    });
+    if (!deleteResult.ok) {
+      return deleteResult;
+    }
+    for (const objectKey of deleteResult.object_keys) {
+      await archiveBucket.delete(objectKey);
+    }
+    const manifest = this.persistence.roomKeyBackupManifests.get({ backup_version: backupVersion });
+    return createSuccessResult({
+      response: {
+        count: manifest?.chunk_count ?? 0,
+        etag: manifest?.etag ?? null,
+      },
     });
   }
 
@@ -5363,8 +7253,11 @@ export class RoomDO extends BaseDurableObject {
     snapshotId,
   }) {
     const roomId = this.persistence.getRuntimeState()?.room_id ?? committedEvent.room_id ?? null;
+    const roomVersion = this.persistence.getRuntimeState()?.room_version ?? DEFAULT_ROOM_VERSION;
     const stateKey = stateKeyForEvent(committedEvent);
+    const stateMap = getRoomStateMapForSnapshot(this.persistence, snapshotId);
     const summary = buildRoomSyncSummary(this.persistence);
+    const roomMentionRequested = committedEvent?.content?.['m.mentions']?.room === true;
     const currentSnapshotEventIds = snapshotId
       ? this.persistence.stateEntries.list()
         .filter((row) => row.snapshot_id === snapshotId)
@@ -5396,9 +7289,27 @@ export class RoomDO extends BaseDurableObject {
         timeline_event_ids: [],
         state_event_ids: [],
         limited: false,
-        prev_batch: roomPos > 1 ? encodeRoomCursor(roomPos - 1) : null,
-        notification_count: 0,
-        highlight_count: 0,
+        prev_batch: roomPos > 1 ? encodeRoomCursor(roomPos) : null,
+        notification_event: {
+          room_id: roomId,
+          event_id: committedEvent.event_id,
+          sender: committedEvent.sender ?? null,
+          type: committedEvent.type,
+          state_key: committedEvent.state_key ?? null,
+          content: committedEvent.content && typeof committedEvent.content === 'object' && !Array.isArray(committedEvent.content)
+            ? structuredClone(committedEvent.content)
+            : {},
+          room_member_count: summary.joined_member_count ?? null,
+          sender_notification_permission_room: roomMentionRequested
+            ? hasSenderNotificationPermission(
+              this,
+              roomVersion,
+              stateMap,
+              committedEvent.sender ?? null,
+              'room',
+            )
+            : false,
+        },
         summary,
       };
       if (membershipBucket === 'join' || membershipBucket === 'leave') {
@@ -6217,10 +8128,10 @@ export class RoomDO extends BaseDurableObject {
     const timelineEventIds = uniqueStringArray(request?.timeline_event_ids);
     const stateEventIds = uniqueStringArray(request?.state_event_ids);
     const loadProjectedEvents = (eventIds) => {
-      const events = [];
+      const entries = [];
       for (const eventId of eventIds) {
         try {
-          events.push(this.loadVisibleRoomEventById(eventId, { maxRoomPos: visibilityRoomPos }).event);
+          entries.push(this.loadVisibleRoomEventById(eventId, { maxRoomPos: visibilityRoomPos }));
         } catch (error) {
           if (error?.code === 'event_not_found') {
             continue;
@@ -6233,7 +8144,7 @@ export class RoomDO extends BaseDurableObject {
       }
       return {
         ok: true,
-        events,
+        entries,
       };
     };
     const timelineEventsResult = loadProjectedEvents(timelineEventIds);
@@ -6244,8 +8155,21 @@ export class RoomDO extends BaseDurableObject {
     if (!deltaStateEventsResult.ok) {
       return deltaStateEventsResult;
     }
-    const timelineEvents = timelineEventsResult.events;
-    const deltaStateEvents = deltaStateEventsResult.events;
+    const timelineLimit = Number.isInteger(filterFlags.timeline_limit) && filterFlags.timeline_limit >= 1
+      ? filterFlags.timeline_limit
+      : null;
+    const fullTimelineEntries = timelineEventsResult.entries;
+    const limitedTimelineEntries = timelineLimit != null && fullTimelineEntries.length > timelineLimit
+      ? fullTimelineEntries.slice(-timelineLimit)
+      : fullTimelineEntries;
+    const timelineEvents = limitedTimelineEntries.map((entry) => entry.event);
+    const deltaStateEvents = deltaStateEventsResult.entries.map((entry) => entry.event);
+    const filteredByTimelineLimit = timelineLimit != null && fullTimelineEntries.length > timelineLimit;
+    const limitedPrevBatch = filteredByTimelineLimit && limitedTimelineEntries.length > 0
+      ? (limitedTimelineEntries[0].metadata.room_pos > 1
+        ? encodeRoomCursor(limitedTimelineEntries[0].metadata.room_pos)
+        : null)
+      : null;
 
     let currentStateEvents = [];
     try {
@@ -6269,8 +8193,8 @@ export class RoomDO extends BaseDurableObject {
     const projection = {
       room_id: roomId,
       membership_bucket: membershipBucket,
-      limited: request?.limited === true,
-      prev_batch: typeof request?.prev_batch === 'string' && request.prev_batch.length > 0 ? request.prev_batch : null,
+      limited: request?.limited === true || filteredByTimelineLimit,
+      prev_batch: limitedPrevBatch ?? (typeof request?.prev_batch === 'string' && request.prev_batch.length > 0 ? request.prev_batch : null),
       timeline_events: timelineEvents,
       state_events: request?.full_state === true ? currentStateEvents : deltaStateEvents,
       state_after_events: request?.use_state_after === true ? currentStateEvents : null,

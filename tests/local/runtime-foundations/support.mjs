@@ -1,5 +1,9 @@
 import { DatabaseSync } from 'node:sqlite';
 
+import { readCloudflareKnownLengthStreamMetadata } from '../../../packages/runtime-core/src/media-domain.mjs';
+
+const R2_MULTIPART_MIN_PART_BYTES = 5 * 1024 * 1024;
+
 function detectStatementType(sql) {
   const trimmed = sql.trim().replace(/^\uFEFF/, '');
   const match = /^([A-Za-z]+)/.exec(trimmed);
@@ -56,6 +60,21 @@ export function createFakeSqlStorage() {
 
 export function createFakeD1Database() {
   const database = new DatabaseSync(':memory:');
+  const executePreparedStatement = (sql, bindings) => {
+    const statement = database.prepare(sql);
+    const statementType = detectStatementType(sql);
+    if (['SELECT', 'PRAGMA', 'WITH'].includes(statementType)) {
+      return {
+        success: true,
+        results: statement.all(...bindings),
+      };
+    }
+    statement.run(...bindings);
+    return {
+      success: true,
+      results: [],
+    };
+  };
   return {
     exec(sql) {
       database.exec(sql);
@@ -66,6 +85,9 @@ export function createFakeD1Database() {
       return {
         bind(...bindings) {
           return {
+            __sql: sql,
+            __bindings: bindings,
+            __batchExecute: () => executePreparedStatement(sql, bindings),
             run: async () => {
               statement.run(...bindings);
               return { success: true };
@@ -78,6 +100,23 @@ export function createFakeD1Database() {
         },
       };
     },
+    batch(statements) {
+      database.exec('BEGIN');
+      try {
+        const results = [];
+        for (const statement of statements) {
+          if (!statement || typeof statement.__batchExecute !== 'function') {
+            throw new TypeError('batch() requires prepared statements returned by bind()');
+          }
+          results.push(statement.__batchExecute());
+        }
+        database.exec('COMMIT');
+        return Promise.resolve(results);
+      } catch (error) {
+        database.exec('ROLLBACK');
+        return Promise.reject(error);
+      }
+    },
     close() {
       database.close();
     },
@@ -87,10 +126,21 @@ export function createFakeD1Database() {
 export class FakeR2Bucket {
   constructor() {
     this.objects = new Map();
+    this.multipartUploads = new Map();
+    this.nextMultipartUploadId = 1;
   }
 
   async put(key, value, options = {}) {
+    const streamMetadata = typeof value?.getReader === 'function'
+      ? readCloudflareKnownLengthStreamMetadata(value)
+      : null;
+    if (typeof value?.getReader === 'function' && !Number.isInteger(streamMetadata?.byte_length)) {
+      throw new Error('Provided readable stream must declare an exact known byte length');
+    }
     const body = await readInputToBuffer(value);
+    if (Number.isInteger(streamMetadata?.byte_length) && body.byteLength !== streamMetadata.byte_length) {
+      throw new Error(`Provided readable stream declared ${streamMetadata.byte_length} bytes but produced ${body.byteLength}`);
+    }
     this.objects.set(key, {
       body,
       options,
@@ -102,8 +152,9 @@ export class FakeR2Bucket {
     if (!entry) {
       return null;
     }
+    const streamBody = createReadableStreamFromBuffer(entry.body);
     return {
-      body: entry.body,
+      body: streamBody,
       size: entry.body.byteLength,
       etag: `"${key}"`,
       key,
@@ -158,6 +209,101 @@ export class FakeR2Bucket {
       delimitedPrefixes: [],
     };
   }
+
+  async createMultipartUpload(key, options = {}) {
+    const uploadId = `multipart-${this.nextMultipartUploadId++}`;
+    this.multipartUploads.set(uploadId, {
+      key,
+      options,
+      parts: new Map(),
+    });
+    return new FakeR2MultipartUpload(this, uploadId);
+  }
+}
+
+class FakeR2MultipartUpload {
+  constructor(bucket, uploadId) {
+    this.bucket = bucket;
+    this.uploadId = uploadId;
+  }
+
+  async uploadPart(partNumber, value) {
+    const state = this.#state();
+    const body = await readInputToBuffer(value);
+    const normalizedPartNumber = Number(partNumber);
+    const etag = `"${this.uploadId}:${normalizedPartNumber}"`;
+    state.parts.set(normalizedPartNumber, {
+      partNumber: normalizedPartNumber,
+      etag,
+      body,
+    });
+    return {
+      partNumber: normalizedPartNumber,
+      etag,
+    };
+  }
+
+  async complete(uploadedParts) {
+    const state = this.#state();
+    const normalizedParts = Array.isArray(uploadedParts)
+      ? uploadedParts
+      : [...state.parts.values()]
+        .sort((left, right) => left.partNumber - right.partNumber)
+        .map(({ partNumber, etag }) => ({ partNumber, etag }));
+    const resolvedParts = normalizedParts.map((part, index) => {
+      const normalizedPartNumber = Number(part?.partNumber);
+      if (!Number.isInteger(normalizedPartNumber) || normalizedPartNumber < 1) {
+        throw new Error(`Multipart upload part number ${String(part?.partNumber)} is invalid`);
+      }
+      const previousPartNumber = index === 0 ? null : Number(normalizedParts[index - 1]?.partNumber);
+      if (previousPartNumber != null && normalizedPartNumber <= previousPartNumber) {
+        throw new Error('Multipart upload parts must be strictly increasing and unique');
+      }
+      const storedPart = state.parts.get(normalizedPartNumber);
+      if (!storedPart || storedPart.etag !== part?.etag) {
+        throw new Error(`Missing multipart upload part ${normalizedPartNumber}`);
+      }
+      if (index < normalizedParts.length - 1 && storedPart.body.byteLength < R2_MULTIPART_MIN_PART_BYTES) {
+        throw new Error(`Multipart upload part ${normalizedPartNumber} must be at least ${R2_MULTIPART_MIN_PART_BYTES} bytes`);
+      }
+      return storedPart;
+    });
+    this.bucket.objects.set(state.key, {
+      body: Buffer.concat(resolvedParts.map((part) => part.body)),
+      options: state.options,
+    });
+    this.bucket.multipartUploads.delete(this.uploadId);
+    return {
+      key: state.key,
+      etag: `"${state.key}"`,
+    };
+  }
+
+  async abort() {
+    this.bucket.multipartUploads.delete(this.uploadId);
+  }
+
+  #state() {
+    const state = this.bucket.multipartUploads.get(this.uploadId);
+    if (!state) {
+      throw new Error(`Unknown multipart upload ${this.uploadId}`);
+    }
+    return state;
+  }
+}
+
+function createReadableStreamFromBuffer(buffer) {
+  let sent = false;
+  return new ReadableStream({
+    pull(controller) {
+      if (sent) {
+        controller.close();
+        return;
+      }
+      sent = true;
+      controller.enqueue(Buffer.from(buffer));
+    },
+  });
 }
 
 async function readInputToBuffer(value) {
@@ -231,6 +377,11 @@ export class FakeKvNamespace {
   }
 
   async put(key, value, options = {}) {
+    if (options.expirationTtl != null) {
+      if (!Number.isInteger(options.expirationTtl) || options.expirationTtl < 60) {
+        throw new Error(`400 Invalid expiration_ttl of ${options.expirationTtl}. Expiration TTL must be at least 60.`);
+      }
+    }
     this.entries.set(key, {
       value,
       metadata: options.metadata ?? null,

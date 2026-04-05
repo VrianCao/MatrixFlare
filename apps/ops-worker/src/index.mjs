@@ -5,6 +5,7 @@ import {
   ensureDeploymentRecord,
   instrumentEnvironmentBindings,
   loadWorkerRuntimeConfig,
+  resolveRuntimeWorkerVersionId,
   startRequestMetrics,
 } from '../../../packages/runtime-core/src/index.mjs';
 
@@ -17,9 +18,10 @@ const fetch = async (request, env) => {
     workerName: 'ops-worker',
     config,
   });
+  const observedWorkerVersionId = resolveRuntimeWorkerVersionId(env, config.text.WORKER_VERSION_ID);
   const requestMetrics = startRequestMetrics(env, {
     workerName: 'ops-worker',
-    workerVersion: config.text.WORKER_VERSION_ID,
+    workerVersion: observedWorkerVersionId,
     routeFamily: 'ops-control-plane',
   });
   try {

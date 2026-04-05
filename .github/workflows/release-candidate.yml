@@ -1,0 +1,176 @@
+name: Release Candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: GitHub Actions non-local run id with reviewed ci/staging/pre-release attestations
+        required: true
+        type: string
+      release_ref:
+        description: Git ref/tag/sha that must match the source run head sha
+        required: true
+        type: string
+      requires_do_migration:
+        description: Whether the production promote must use migration-safe all-at-once deploy
+        required: true
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+permissions:
+  actions: read
+  contents: read
+  id-token: write
+
+concurrency:
+  group: release-candidate
+  cancel-in-progress: false
+
+jobs:
+  release-candidate:
+    runs-on: ubuntu-latest
+    environment: prod
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Define candidate paths
+        id: paths
+        shell: bash
+        run: |
+          run_timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+          workspace_root=".tmp/github/release-candidate"
+          state_root="${workspace_root}/state"
+          download_root="${workspace_root}/downloaded"
+          artifact_root="${workspace_root}/artifacts"
+          manifest_key="gha/${{ github.run_id }}/${{ github.run_attempt }}/prod/${run_timestamp}/prod-release-candidate.json"
+          artifact_name="prod-release-candidate-${run_timestamp}-${{ github.run_id }}-${{ github.run_attempt }}"
+          raw_state_artifact_name="prod-release-candidate-raw-state-${run_timestamp}-${{ github.run_id }}-${{ github.run_attempt }}"
+          echo "run_timestamp=${run_timestamp}" >> "$GITHUB_OUTPUT"
+          echo "workspace_root=${workspace_root}" >> "$GITHUB_OUTPUT"
+          echo "state_root=${state_root}" >> "$GITHUB_OUTPUT"
+          echo "download_root=${download_root}" >> "$GITHUB_OUTPUT"
+          echo "artifact_root=${artifact_root}" >> "$GITHUB_OUTPUT"
+          echo "manifest=${artifact_root}/prod-release-candidate.json" >> "$GITHUB_OUTPUT"
+          echo "manifest_key=${manifest_key}" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=${artifact_name}" >> "$GITHUB_OUTPUT"
+          echo "raw_state_artifact_name=${raw_state_artifact_name}" >> "$GITHUB_OUTPUT"
+          mkdir -p "$workspace_root" "$state_root" "$download_root" "$artifact_root"
+          printf '{"run_timestamp":"%s","workflow":"release-candidate"}\n' "$run_timestamp" > "${state_root}/raw-state-metadata.json"
+
+      - name: Resolve source run metadata
+        id: source_run
+        continue-on-error: true
+        uses: actions/github-script@v7
+        env:
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        with:
+          script: |
+            const { data } = await github.rest.actions.getWorkflowRun({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: Number(process.env.SOURCE_RUN_ID),
+            });
+            core.setOutput('head_sha', data.head_sha);
+            core.setOutput('run_attempt', String(data.run_attempt));
+            core.setOutput('workflow_path', data.path);
+            core.setOutput('html_url', data.html_url);
+
+      - name: Require reviewed non-local run match
+        id: require_source_match
+        if: steps.source_run.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          test "${{ steps.source_run.outputs.workflow_path }}" = ".github/workflows/nonlocal-phase08.yml"
+          test "$(git rev-parse HEAD)" = "${{ steps.source_run.outputs.head_sha }}"
+
+      - name: Download reviewed attestation artifacts
+        id: download_reviewed_attestations
+        if: steps.source_run.outcome == 'success' && steps.require_source_match.outcome == 'success'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+          pattern: phase08-*-attestation-*-${{ inputs.source_run_id }}-${{ steps.source_run.outputs.run_attempt }}
+          merge-multiple: true
+          path: ${{ steps.paths.outputs.download_root }}
+
+      - name: Write reviewed release candidate manifest
+        id: write_candidate
+        if: steps.download_reviewed_attestations.outcome == 'success'
+        continue-on-error: true
+        run: |
+          node packages/testing/src/cli.mjs prod-candidate-write \
+            --output "${{ steps.paths.outputs.manifest }}" \
+            --release-ref "${{ inputs.release_ref }}" \
+            --release-commit-sha "${{ steps.source_run.outputs.head_sha }}" \
+            --requires-do-migration "${{ inputs.requires_do_migration }}" \
+            --ci-integration-attestation "${{ steps.paths.outputs.download_root }}/ci-integration-attestation.json" \
+            --staging-attestation "${{ steps.paths.outputs.download_root }}/staging-attestation.json" \
+            --pre-release-attestation "${{ steps.paths.outputs.download_root }}/pre-release-attestation.json"
+
+      - name: Upload release-candidate raw state artifact
+        if: always() && steps.paths.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.paths.outputs.raw_state_artifact_name }}
+          path: |
+            ${{ steps.paths.outputs.state_root }}
+            ${{ steps.paths.outputs.download_root }}
+            ${{ steps.paths.outputs.artifact_root }}
+          if-no-files-found: error
+
+      - name: Upload release candidate artifact
+        if: steps.write_candidate.outcome == 'success'
+        id: upload_record
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.paths.outputs.artifact_name }}
+          path: ${{ steps.paths.outputs.manifest }}
+          if-no-files-found: error
+
+      - name: Upload release candidate to R2
+        if: steps.write_candidate.outcome == 'success'
+        id: upload_r2
+        run: |
+          node packages/testing/src/cli.mjs nonlocal-upload-r2 \
+            --bucket "matrix-evidence-prod" \
+            --key "${{ steps.paths.outputs.manifest_key }}" \
+            --file "${{ steps.paths.outputs.manifest }}" \
+            --content-type "application/json; charset=utf-8" \
+            --output "${{ steps.paths.outputs.state_root }}/manifest-upload.json"
+
+      - name: Enforce release-candidate fail-closed outcome after raw artifact preservation
+        if: always()
+        shell: bash
+        run: |
+          if [ "${{ steps.source_run.outcome }}" != "success" ]; then
+            echo "Resolving source run metadata failed after raw state preservation." >&2
+            exit 1
+          fi
+          if [ "${{ steps.require_source_match.outcome }}" != "success" ]; then
+            echo "Reviewed source run/head match failed after raw state preservation." >&2
+            exit 1
+          fi
+          if [ "${{ steps.download_reviewed_attestations.outcome }}" != "success" ]; then
+            echo "Downloading reviewed attestation artifacts failed after raw state preservation." >&2
+            exit 1
+          fi
+          if [ "${{ steps.write_candidate.outcome }}" != "success" ]; then
+            echo "Writing reviewed release candidate manifest failed after raw state preservation." >&2
+            exit 1
+          fi

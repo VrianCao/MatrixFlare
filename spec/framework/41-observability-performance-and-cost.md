@@ -148,6 +148,14 @@
 * 若为冷归档采用 R2 Infrequent Access，成本模型必须额外纳入 retrieval fee、`30` 天 minimum storage duration 与“无 included quota”的事实；默认 Included Quotas Matrix 只适用于 R2 Standard。引用：`CF-R2-005`。
 * 当 deployment 启用 Cloudflare traces 或 OTel export 时，成本模型必须分别暴露 `trace_span_count`、`exported_log_event_count` 与 `persist_enabled`，并在 `OQ-0002` 关闭前禁止默认把 trace spans 自动并入 Workers Logs quota。引用：`CF-WKR-017`,`CF-WKR-018`。
 
+### 6.4 Pre-release Cost Proof Contract
+
+* `TEST-COST-001` 的 pre-release half 不得再把 canonical file existence、local telemetry shim、或仅来自 `tests/local/*` 的 JSON 当作“actual cost proof”。
+* pre-release cost proof 必须先执行一个 bounded workload，再对同一 pre-release environment 和同一 bounded workload window 查询 official Cloudflare metrics/billing surfaces，并将结果归一化为 [26-wire-schema-catalog.md](/root/Matrix/spec/framework/26-wire-schema-catalog.md) 中的 `PreReleaseCostObservation`。
+* `PreReleaseCostObservation.cost_surfaces` 必须至少覆盖 `workers`,`durable_objects`,`d1`,`r2`,`kv`,`queues` 六个主要成本面；若启用 traces/OTel，还必须按 `OQ-0002` 的约束单独记录 `telemetry_export`，不得把 trace spans 默认并入 logs。
+* `PreReleaseCostObservation.model_comparison` 必须显式输出 `status`,`summary`,`actual_total_usd`,`modeled_total_usd`,`drift_ratio`；若任一官方 surface、时间窗口或 usage-model 前提缺失，则必须 fail-closed，而不是用估算值补洞。
+* `PreReleaseCostObservation` 只证明 pre-release bounded workload 的实际指标与模型比较；它不替代 production monthly `ProdCostSnapshotAttestation`，也不能关闭 `OQ-0002`。
+
 ## 7. Primary Load Drivers
 
 * 在线设备数

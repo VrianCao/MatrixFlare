@@ -15,10 +15,18 @@ import {
   writeGovernanceEvidence,
 } from '../../spec-tools/src/governance.mjs';
 import {
+  normalizeRolloutSkewProbeResponse,
+} from '../../control-plane/src/index.mjs';
+import {
+  getReleaseGateTestFiles,
   getRequiredTestFiles,
   getTestEnvironmentDefinition,
   getTestEnvironmentDirectory,
 } from './bootstrap.mjs';
+import {
+  listEnvironmentRateLimitNamespaces,
+  listProductionRateLimitNamespaces,
+} from './cloudflare-resources.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -45,6 +53,7 @@ const NON_LOCAL_ENVIRONMENT_ARTIFACT_REQUIREMENTS = Object.freeze({
 });
 
 const ATTESTATION_SCHEMA_VERSION = 1;
+const GIT_COMMIT_SHA_RE = /^[a-f0-9]{40}$/;
 
 const MANUAL_ARTIFACT_ATTESTATION_REQUIREMENTS = Object.freeze({
   ci_integration_run_report: Object.freeze({
@@ -72,6 +81,7 @@ const MANUAL_ARTIFACT_ATTESTATION_REQUIREMENTS = Object.freeze({
 const SHA256_HEX_RE = /^[a-f0-9]{64}$/;
 const WELL_FORMED_URN_RE = /^urn:[a-z0-9][a-z0-9-]{0,31}:.+/i;
 const RUN_TIMESTAMP_RE = /^\d{8}T\d{6}Z$/;
+const GIT_SHA_RE = /^[a-f0-9]{40}$/;
 const L1_SHARED_TEST_RUN_ROOT = 'evidence/common/_test-runs';
 const CLOUDFLARE_RESOURCE_NAMES = Object.freeze([
   'workers',
@@ -79,6 +89,7 @@ const CLOUDFLARE_RESOURCE_NAMES = Object.freeze([
   'd1_databases',
   'r2_buckets',
   'kv_namespaces',
+  'ratelimit_namespaces',
   'queues',
 ]);
 const EXPECTED_CLOUDFLARE_QUEUE_BASE_NAMES = Object.freeze([
@@ -100,46 +111,135 @@ const EXPECTED_WORKER_BASE_NAMES = Object.freeze([
   'jobs-worker',
   'ops-worker',
 ]);
+const PRE_RELEASE_TEST_FILE_PREFIXES = Object.freeze({
+  ops: 'test-ops-001',
+  cost: 'test-cost-001',
+});
+const PRE_RELEASE_COST_SURFACES = Object.freeze([
+  'workers',
+  'durable_objects',
+  'd1',
+  'r2',
+  'kv',
+  'queues',
+]);
+const RELEASE_CANDIDATE_ENVIRONMENTS = Object.freeze([
+  'ci-integration',
+  'staging',
+  'pre-release',
+]);
+const PRODUCTION_AUTOMATION_ARTIFACT_IDS = Object.freeze([
+  'release_candidate_manifest',
+  'prod_install_record',
+  'prod_promotion_record',
+  'prod_rollback_record',
+]);
+const PRODUCTION_READINESS_REQUIRED_STEPS = Object.freeze([
+  'versions',
+  'public_rooms',
+  'register_complete',
+  'media_create',
+  'ops_healthz',
+  'ops_rebuild_start',
+]);
+
+function parseGitHubRepositoryFromRemoteUrl(remoteUrl) {
+  if (typeof remoteUrl !== 'string' || remoteUrl.trim().length === 0) {
+    return null;
+  }
+  const normalized = remoteUrl.trim();
+  const patterns = [
+    /^https:\/\/github\.com\/([^/]+\/[^/]+?)(?:\.git)?$/u,
+    /^git@github\.com:([^/]+\/[^/]+?)(?:\.git)?$/u,
+    /^ssh:\/\/git@github\.com\/([^/]+\/[^/]+?)(?:\.git)?$/u,
+  ];
+  for (const pattern of patterns) {
+    const match = pattern.exec(normalized);
+    if (match) {
+      return match[1];
+    }
+  }
+  return null;
+}
+
+async function resolveExpectedGitHubRepositoryForRepoRoot(repoRoot, expectedGitHubRepository = null) {
+  if (typeof expectedGitHubRepository === 'string' && expectedGitHubRepository.trim().length > 0) {
+    return expectedGitHubRepository.trim();
+  }
+  const envRepository = typeof process.env.GITHUB_REPOSITORY === 'string'
+    ? process.env.GITHUB_REPOSITORY.trim()
+    : '';
+  if (envRepository.length > 0) {
+    return envRepository;
+  }
+  try {
+    const { stdout } = await execFileAsync('git', ['remote', 'get-url', 'origin'], { cwd: repoRoot });
+    return parseGitHubRepositoryFromRemoteUrl(stdout) ?? null;
+  } catch {
+    return null;
+  }
+}
 
 const L1_TEST_IMPLEMENTATION_FILES = Object.freeze({
   'TEST-CS-001': Object.freeze({
     local: Object.freeze(['tests/local/client-identity/phase-04.test.mjs']),
+    'ci-integration': Object.freeze(['tests/integration/test-cs-001.test.mjs']),
+    staging: Object.freeze(['tests/staging/test-cs-001.test.mjs']),
   }),
   'TEST-CS-002': Object.freeze({
     local: Object.freeze(['tests/local/client-identity/phase-05.test.mjs']),
+    staging: Object.freeze(['tests/staging/test-cs-002.test.mjs']),
   }),
   'TEST-CS-003': Object.freeze({
-    local: Object.freeze(['tests/local/client-identity/phase-05.test.mjs']),
+    local: Object.freeze([
+      'tests/local/client-identity/phase-05.test.mjs',
+      'tests/local/client-identity/phase-05a.test.mjs',
+    ]),
+    staging: Object.freeze(['tests/staging/test-cs-003.test.mjs']),
   }),
   'TEST-CS-004': Object.freeze({
     local: Object.freeze(['tests/local/client-identity/phase-04.test.mjs']),
+    'ci-integration': Object.freeze(['tests/integration/test-cs-004.test.mjs']),
+    staging: Object.freeze(['tests/staging/test-cs-004.test.mjs']),
   }),
   'TEST-ROOM-001': Object.freeze({
     local: Object.freeze(['tests/local/client-identity/phase-06.test.mjs']),
+    'ci-integration': Object.freeze(['tests/integration/test-room-001.test.mjs']),
+    staging: Object.freeze(['tests/staging/test-room-001.test.mjs']),
   }),
   'TEST-ROOM-002': Object.freeze({
     local: Object.freeze(['tests/local/client-identity/phase-06.test.mjs']),
+    'ci-integration': Object.freeze(['tests/integration/test-room-002.test.mjs']),
+    staging: Object.freeze(['tests/staging/test-room-002.test.mjs']),
   }),
   'TEST-MEDIA-001': Object.freeze({
     local: Object.freeze(['tests/local/client-identity/phase-07.test.mjs']),
+    staging: Object.freeze(['tests/staging/test-media-001.test.mjs']),
+    'pre-release': Object.freeze(['tests/pre-release/test-media-001.test.mjs']),
   }),
   'TEST-DER-001': Object.freeze({
     local: Object.freeze(['tests/local/client-identity/phase-07.test.mjs']),
+    staging: Object.freeze(['tests/staging/test-der-001.test.mjs']),
+    'pre-release': Object.freeze(['tests/pre-release/test-der-001.test.mjs']),
   }),
   'TEST-SEC-001': Object.freeze({
     local: Object.freeze([
       'tests/local/client-identity/phase-04.test.mjs',
       'tests/local/runtime-foundations/phase-08-runtime-controls.test.mjs',
     ]),
+    staging: Object.freeze(['tests/staging/test-sec-001.test.mjs']),
+    'pre-release': Object.freeze(['tests/pre-release/test-sec-001.test.mjs']),
   }),
   'TEST-OPS-001': Object.freeze({
     local: Object.freeze([
       'tests/local/runtime-foundations/phase-08-runtime-controls.test.mjs',
       'tests/local/control-plane/phase-08-ops.test.mjs',
     ]),
+    'pre-release': Object.freeze(['tests/pre-release/test-ops-001.test.mjs']),
   }),
   'TEST-COST-001': Object.freeze({
     local: Object.freeze(['tests/local/runtime-foundations/phase-08-runtime-controls.test.mjs']),
+    'pre-release': Object.freeze(['tests/pre-release/test-cost-001.test.mjs']),
   }),
 });
 
@@ -172,7 +272,7 @@ const L1_EVIDENCE_DEFINITIONS = Object.freeze([
     generation_method: 'devices/E2EE transport attested staging report',
     required_environments: ['staging'],
     declared_source_ids: ['MX-CS-013', 'MX-CS-014'],
-    pass_criteria: 'Devices, to-device transport, and one-time key at-most-once behavior must pass in staging.',
+    pass_criteria: 'Device CRUD/delete UIA, to-device transport, one-time key at-most-once, cross-signing upload/signature handling, /sync device_lists increments, /sync device_one_time_keys_count and device_unused_fallback_key_types truth, and backup metadata/object handling must pass in staging.',
   }),
   Object.freeze({
     id: 'EVID-CS-004',
@@ -287,7 +387,56 @@ export function getRequiredTestImplementationFiles(testId, environmentName = 'lo
   if (!Array.isArray(files) || files.length === 0) {
     throw new RangeError(`Missing L1 test implementation mapping for "${testId}" in environment "${environmentName}"`);
   }
+  validateRequiredTestImplementationFiles(testId, environmentName, files);
   return [...files];
+}
+
+function validateRequiredTestImplementationFiles(testId, environmentName, files) {
+  if (environmentName === 'local') {
+    return;
+  }
+  const environmentDirectory = normalizeRepoRelativePath(getTestEnvironmentDefinition(environmentName).directory);
+  if (environmentDirectory == null) {
+    throw new RangeError(`Unknown non-local test environment directory for "${environmentName}"`);
+  }
+  const normalizedFiles = files.map((file) => normalizeRepoRelativePath(file));
+  const invalidDirectoryFile = normalizedFiles.find((file) => file == null || !pathUsesPrefix(file, environmentDirectory));
+  if (invalidDirectoryFile != null) {
+    throw new RangeError(
+      `Non-local L1 test implementation mapping for "${testId}" in environment "${environmentName}" must stay within dedicated environment directory "${environmentDirectory}"`,
+    );
+  }
+  const invalidNonTestFile = normalizedFiles.find((file) => !file.endsWith('.test.mjs'));
+  if (invalidNonTestFile != null) {
+    throw new RangeError(
+      `Non-local L1 test implementation mapping for "${testId}" in environment "${environmentName}" must use dedicated .test.mjs files`,
+    );
+  }
+  const invalidGenericEntrypoint = normalizedFiles.find((file) => {
+    const basename = path.posix.basename(file);
+    return basename === 'bootstrap.test.mjs' || basename === 'l1-mandatory.test.mjs';
+  });
+  if (invalidGenericEntrypoint != null) {
+    throw new RangeError(
+      `Non-local L1 test implementation mapping for "${testId}" in environment "${environmentName}" cannot point at generic entrypoint "${invalidGenericEntrypoint}"`,
+    );
+  }
+  const invalidDedicatedSuiteName = normalizedFiles.find((file) => !matchesDedicatedNonLocalTestImplementationFileName(testId, file));
+  if (invalidDedicatedSuiteName != null) {
+    throw new RangeError(
+      `Non-local L1 test implementation mapping for "${testId}" in environment "${environmentName}" must use dedicated .test.mjs files whose basename is anchored by "${testId.toLowerCase()}"`,
+    );
+  }
+}
+
+function matchesDedicatedNonLocalTestImplementationFileName(testId, file) {
+  const basename = path.posix.basename(file);
+  const escapedTestId = escapeRegularExpression(String(testId).trim().toLowerCase());
+  return new RegExp(`^${escapedTestId}(?:[.-][a-z0-9-]+)?\\.test\\.mjs$`, 'u').test(basename);
+}
+
+function escapeRegularExpression(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function listL1EnvironmentImplementationFiles(environmentName = 'local') {
@@ -365,6 +514,21 @@ function sortUniqueStringArray(value) {
 function buildExpectedCloudflareResources(environmentName, {
   includeArtifactBucket = true,
 } = {}) {
+  if (environmentName === 'prod') {
+    return Object.freeze({
+      workers: Object.freeze(EXPECTED_WORKER_BASE_NAMES.map((workerName) => `matrix-${workerName}-prod`).sort()),
+      durable_objects: EXPECTED_DURABLE_OBJECT_NAMES,
+      d1_databases: Object.freeze(['matrix-control-and-derived-prod']),
+      r2_buckets: Object.freeze(sortUniqueStringArray([
+        'matrix-media-prod',
+        'matrix-archive-prod',
+        ...(includeArtifactBucket ? ['matrix-evidence-prod'] : []),
+      ])),
+      kv_namespaces: Object.freeze(['matrix-edge-cache-prod']),
+      ratelimit_namespaces: listProductionRateLimitNamespaces(),
+      queues: Object.freeze(EXPECTED_CLOUDFLARE_QUEUE_BASE_NAMES.map((queueName) => `${queueName}-prod`).sort()),
+    });
+  }
   return Object.freeze({
     workers: Object.freeze(EXPECTED_WORKER_BASE_NAMES.map((workerName) => `matrix-${workerName}-${environmentName}`).sort()),
     durable_objects: EXPECTED_DURABLE_OBJECT_NAMES,
@@ -375,6 +539,7 @@ function buildExpectedCloudflareResources(environmentName, {
       ...(includeArtifactBucket ? [`matrix-evidence-${environmentName}`] : []),
     ])),
     kv_namespaces: Object.freeze([`matrix-edge-cache-${environmentName}`]),
+    ratelimit_namespaces: listEnvironmentRateLimitNamespaces(environmentName),
     queues: Object.freeze(EXPECTED_CLOUDFLARE_QUEUE_BASE_NAMES.map((queueName) => `${queueName}-${environmentName}`).sort()),
   });
 }
@@ -417,6 +582,1387 @@ function validateExpectedCloudflareResources(payloadLabel, environmentName, reso
 
 function isNonNegativeNumber(value) {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+}
+
+function isGitCommitSha(value) {
+  return isNonEmptyString(value) && GIT_SHA_RE.test(value);
+}
+
+function validateGitHubRepositorySlug(label, value) {
+  if (!isNonEmptyString(value) || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(value)) {
+    return {
+      valid: false,
+      error: `${label} must be a GitHub owner/repo slug`,
+    };
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validateGitHubRunUri(label, value, {
+  expectedRepository = null,
+} = {}) {
+  if (!isGitHubActionsRunUri(value)) {
+    return {
+      valid: false,
+      error: `${label} must be a GitHub Actions run URL`,
+    };
+  }
+  if (expectedRepository != null && extractGitHubActionsRunRepository(value) !== expectedRepository) {
+    return {
+      valid: false,
+      error: `${label} must match ${expectedRepository}`,
+    };
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validateProducerRunIdentity(payloadLabel, payload) {
+  const repositoryValidation = validateGitHubRepositorySlug(`${payloadLabel} origin_repository`, payload.origin_repository);
+  if (!repositoryValidation.valid) {
+    return repositoryValidation;
+  }
+  if (!isNonEmptyString(payload.origin_run_id)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} origin_run_id must be non-empty`,
+    };
+  }
+  if (!Number.isInteger(payload.origin_run_attempt) || payload.origin_run_attempt <= 0) {
+    return {
+      valid: false,
+      error: `${payloadLabel} origin_run_attempt must be a positive integer`,
+    };
+  }
+  const runUriValidation = validateGitHubRunUri(`${payloadLabel} origin_run_uri`, payload.origin_run_uri, {
+    expectedRepository: payload.origin_repository,
+  });
+  if (!runUriValidation.valid) {
+    return runUriValidation;
+  }
+  if (extractGitHubActionsRunId(payload.origin_run_uri) !== payload.origin_run_id) {
+    return {
+      valid: false,
+      error: `${payloadLabel} origin_run_uri must match origin_run_id`,
+    };
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validateDeploymentIdentityLike(label, deploymentIdentity, {
+  expectedEnvironment = null,
+} = {}) {
+  if (!isPlainObject(deploymentIdentity)) {
+    return {
+      valid: false,
+      error: `${label} must be an object`,
+    };
+  }
+  if (!isNonEmptyString(deploymentIdentity.environment_id)) {
+    return {
+      valid: false,
+      error: `${label}.environment_id must be non-empty`,
+    };
+  }
+  if (expectedEnvironment != null && deploymentIdentity.environment_id !== expectedEnvironment) {
+    return {
+      valid: false,
+      error: `${label}.environment_id must be ${expectedEnvironment}`,
+    };
+  }
+  if (!isNonEmptyStringArray(deploymentIdentity.deployment_ids)) {
+    return {
+      valid: false,
+      error: `${label}.deployment_ids must be a non-empty string array`,
+    };
+  }
+  if (!isNonEmptyStringArray(deploymentIdentity.worker_version_ids)) {
+    return {
+      valid: false,
+      error: `${label}.worker_version_ids must be a non-empty string array`,
+    };
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validateProductionAccessMetadata(label, access) {
+  if (!isPlainObject(access)) {
+    return {
+      valid: false,
+      error: `${label} must be an object`,
+    };
+  }
+  for (const fieldName of ['auth_domain', 'application_id', 'application_audience', 'application_domain', 'protected_ops_url']) {
+    if (!isNonEmptyString(access[fieldName])) {
+      return {
+        valid: false,
+        error: `${label}.${fieldName} must be non-empty`,
+      };
+    }
+  }
+  if (!isAbsoluteExternalUri(access.protected_ops_url)) {
+    return {
+      valid: false,
+      error: `${label}.protected_ops_url must be an absolute external URI`,
+    };
+  }
+  if (new URL(access.protected_ops_url).host !== access.application_domain) {
+    return {
+      valid: false,
+      error: `${label}.application_domain must match ${label}.protected_ops_url host`,
+    };
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validateProductionPlanSnapshot(label, plan) {
+  if (!isPlainObject(plan)) {
+    return {
+      valid: false,
+      error: `${label} must be an object`,
+    };
+  }
+  if (plan.environment_name !== 'prod') {
+    return {
+      valid: false,
+      error: `${label}.environment_name must be prod`,
+    };
+  }
+  if (!isPlainObject(plan.worker_scripts) || !isPlainObject(plan.worker_urls)) {
+    return {
+      valid: false,
+      error: `${label} must include worker_scripts and worker_urls`,
+    };
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validateProductionResourceSnapshot(label, resources) {
+  if (!isPlainObject(resources)) {
+    return {
+      valid: false,
+      error: `${label} must be an object`,
+    };
+  }
+  if (!isNonEmptyString(resources?.d1_database?.id) || !isNonEmptyString(resources?.d1_database?.name)) {
+    return {
+      valid: false,
+      error: `${label}.d1_database must include id and name`,
+    };
+  }
+  if (!isNonEmptyString(resources?.kv_namespace?.id) || !isNonEmptyString(resources?.kv_namespace?.title)) {
+    return {
+      valid: false,
+      error: `${label}.kv_namespace must include id and title`,
+    };
+  }
+  if (
+    !isPlainObject(resources?.r2_buckets)
+    || !isNonEmptyString(resources.r2_buckets.media?.name)
+    || !isNonEmptyString(resources.r2_buckets.archive?.name)
+    || !isNonEmptyString(resources.r2_buckets.evidence?.name)
+  ) {
+    return {
+      valid: false,
+      error: `${label}.r2_buckets must include media/archive/evidence names`,
+    };
+  }
+  if (!Array.isArray(resources.queues) || resources.queues.length === 0) {
+    return {
+      valid: false,
+      error: `${label}.queues must be a non-empty array`,
+    };
+  }
+  const invalidQueue = resources.queues.find((queue) => !isPlainObject(queue) || !isNonEmptyString(queue.id) || !isNonEmptyString(queue.name));
+  if (invalidQueue != null) {
+    return {
+      valid: false,
+      error: `${label}.queues must include id and name for every queue`,
+    };
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validateProductionWorkerSummaryMap(label, workers, {
+  deploymentIdentity = null,
+} = {}) {
+  if (!isPlainObject(workers)) {
+    return {
+      valid: false,
+      error: `${label} must be an object`,
+    };
+  }
+  const declaredDeploymentIds = new Set(deploymentIdentity?.deployment_ids ?? []);
+  const declaredVersionIds = new Set(deploymentIdentity?.worker_version_ids ?? []);
+  for (const workerName of EXPECTED_WORKER_BASE_NAMES) {
+    const worker = workers[workerName];
+    if (!isPlainObject(worker)) {
+      return {
+        valid: false,
+        error: `${label}.${workerName} must be an object`,
+      };
+    }
+    for (const fieldName of ['script_name', 'deployment_id', 'worker_version_id', 'url']) {
+      if (!isNonEmptyString(worker[fieldName])) {
+        return {
+          valid: false,
+          error: `${label}.${workerName}.${fieldName} must be non-empty`,
+        };
+      }
+    }
+    if (!isAbsoluteExternalUri(worker.url)) {
+      return {
+        valid: false,
+        error: `${label}.${workerName}.url must be an absolute external URI`,
+      };
+    }
+    if (deploymentIdentity != null) {
+      if (!declaredDeploymentIds.has(worker.deployment_id)) {
+        return {
+          valid: false,
+          error: `${label}.${workerName}.deployment_id must be present in deployment_identity`,
+        };
+      }
+      if (!declaredVersionIds.has(worker.worker_version_id)) {
+        return {
+          valid: false,
+          error: `${label}.${workerName}.worker_version_id must be present in deployment_identity`,
+        };
+      }
+    }
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validateProductionReadinessProbe(label, readinessProbe) {
+  if (!isPlainObject(readinessProbe)) {
+    return {
+      valid: false,
+      error: `${label} must be an object`,
+    };
+  }
+  if (readinessProbe.environment_name !== 'prod') {
+    return {
+      valid: false,
+      error: `${label}.environment_name must be prod`,
+    };
+  }
+  if (typeof readinessProbe.ready !== 'boolean') {
+    return {
+      valid: false,
+      error: `${label}.ready must be boolean`,
+    };
+  }
+  if (!isRfc3339UtcTimestamp(readinessProbe.started_at) || !isRfc3339UtcTimestamp(readinessProbe.completed_at)) {
+    return {
+      valid: false,
+      error: `${label} must include RFC 3339 UTC started_at and completed_at timestamps`,
+    };
+  }
+  if (!isNonNegativeInteger(readinessProbe.duration_ms)) {
+    return {
+      valid: false,
+      error: `${label}.duration_ms must be a non-negative integer`,
+    };
+  }
+  if (!isNonNegativeInteger(readinessProbe.attempt_count) || readinessProbe.attempt_count === 0) {
+    return {
+      valid: false,
+      error: `${label}.attempt_count must be a positive integer`,
+    };
+  }
+  if (!Array.isArray(readinessProbe.attempts) || readinessProbe.attempts.length !== readinessProbe.attempt_count) {
+    return {
+      valid: false,
+      error: `${label}.attempts must match attempt_count`,
+    };
+  }
+  const invalidAttempt = readinessProbe.attempts.find((attempt, index) => (
+    !isPlainObject(attempt)
+    || attempt.attempt !== index + 1
+    || !isRfc3339UtcTimestamp(attempt.started_at)
+    || !isRfc3339UtcTimestamp(attempt.completed_at)
+    || !isNonNegativeInteger(attempt.duration_ms)
+    || typeof attempt.ok !== 'boolean'
+    || !Array.isArray(attempt.steps)
+    || attempt.steps.length === 0
+    || attempt.steps.some((step) => !isPlainObject(step) || !isNonEmptyString(step.step) || typeof step.ok !== 'boolean' || !('detail' in step))
+    || (attempt.delay_before_next_attempt_ms !== null && !isNonNegativeInteger(attempt.delay_before_next_attempt_ms))
+    || (attempt.ok ? attempt.failure !== null : !isPlainObject(attempt.failure))
+  ));
+  if (invalidAttempt != null) {
+    return {
+      valid: false,
+      error: `${label}.attempts must include structured steps and failures`,
+    };
+  }
+  const finalAttempt = readinessProbe.attempts.at(-1);
+  if (readinessProbe.ready !== finalAttempt.ok) {
+    return {
+      valid: false,
+      error: `${label}.ready must match the final attempt result`,
+    };
+  }
+  if (readinessProbe.ready) {
+    const successfulFinalStepNames = new Set(
+      finalAttempt.steps.filter((step) => step.ok === true).map((step) => step.step),
+    );
+    const missingSteps = PRODUCTION_READINESS_REQUIRED_STEPS.filter((stepName) => !successfulFinalStepNames.has(stepName));
+    if (missingSteps.length > 0) {
+      return {
+        valid: false,
+        error: `${label} successful final attempt must include steps: ${missingSteps.join(', ')}`,
+      };
+    }
+    if (readinessProbe.last_error !== null) {
+      return {
+        valid: false,
+        error: `${label}.last_error must be null when ready`,
+      };
+    }
+  } else if (!isNonEmptyString(readinessProbe.last_error)) {
+    return {
+      valid: false,
+      error: `${label}.last_error must be non-empty when ready is false`,
+    };
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validateReleaseCandidateSource(label, sourceCandidate) {
+  if (!isPlainObject(sourceCandidate)) {
+    return {
+      valid: false,
+      error: `${label} must be an object`,
+    };
+  }
+  if (!isNonEmptyString(sourceCandidate.candidate_id)) {
+    return {
+      valid: false,
+      error: `${label}.candidate_id must be non-empty`,
+    };
+  }
+  const runUriValidation = validateGitHubRunUri(`${label}.source_run_uri`, sourceCandidate.source_run_uri);
+  if (!runUriValidation.valid) {
+    return runUriValidation;
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validateProductionRollbackHandle(label, rollbackHandle) {
+  if (!isPlainObject(rollbackHandle)) {
+    return {
+      valid: false,
+      error: `${label} must be an object`,
+    };
+  }
+  if (!isNonEmptyString(rollbackHandle.workers_subdomain)) {
+    return {
+      valid: false,
+      error: `${label}.workers_subdomain must be non-empty`,
+    };
+  }
+  if (!isPlainObject(rollbackHandle.worker_versions)) {
+    return {
+      valid: false,
+      error: `${label}.worker_versions must be an object`,
+    };
+  }
+  for (const workerName of EXPECTED_WORKER_BASE_NAMES) {
+    const worker = rollbackHandle.worker_versions[workerName];
+    if (!isPlainObject(worker)) {
+      return {
+        valid: false,
+        error: `${label}.worker_versions.${workerName} must be an object`,
+      };
+    }
+    for (const fieldName of ['script_name', 'previous_deployment_id', 'previous_worker_version_id']) {
+      if (!isNonEmptyString(worker[fieldName])) {
+        return {
+          valid: false,
+          error: `${label}.worker_versions.${workerName}.${fieldName} must be non-empty`,
+        };
+      }
+    }
+    if (!isNonEmptyStringArray(worker.restore_version_specs)) {
+      return {
+        valid: false,
+        error: `${label}.worker_versions.${workerName}.restore_version_specs must be a non-empty string array`,
+      };
+    }
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validateProductionPromotionReadinessChecks(label, promotionMode, readinessChecks) {
+  if (!isPlainObject(readinessChecks)) {
+    return {
+      valid: false,
+      error: `${label} must be an object`,
+    };
+  }
+  const requiredFields = promotionMode === 'deploy_with_migration'
+    ? ['jobs_promoted', 'ops_promoted', 'gateway_promoted']
+    : ['jobs_promoted', 'ops_promoted'];
+  for (const fieldName of requiredFields) {
+    const validation = validateProductionReadinessProbe(`${label}.${fieldName}`, readinessChecks[fieldName]);
+    if (!validation.valid) {
+      return validation;
+    }
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validateProdReleaseCommitSha(payloadLabel, releaseCommitSha) {
+  if (!isNonEmptyString(releaseCommitSha) || !GIT_COMMIT_SHA_RE.test(releaseCommitSha)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} release_commit_sha must be a 40-character lowercase git sha`,
+    };
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validateEvidenceDeploymentIdentity(payloadLabel, identity, {
+  expectedEnvironmentName = 'prod',
+  deploymentFieldName = 'deployment_identity',
+} = {}) {
+  if (!isPlainObject(identity)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} must include ${deploymentFieldName}`,
+    };
+  }
+  if (identity.environment_id !== expectedEnvironmentName) {
+    return {
+      valid: false,
+      error: `${payloadLabel} ${deploymentFieldName}.environment_id must be ${expectedEnvironmentName}`,
+    };
+  }
+  if (!isNonEmptyStringArray(identity.deployment_ids)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} ${deploymentFieldName}.deployment_ids must be a non-empty string array`,
+    };
+  }
+  if (!isNonEmptyStringArray(identity.worker_version_ids)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} ${deploymentFieldName}.worker_version_ids must be a non-empty string array`,
+    };
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validateExpectedWorkerRecordMap(payloadLabel, workers, expectedEnvironmentName, {
+  expectedWorkersSubdomain = null,
+} = {}) {
+  if (!isPlainObject(workers)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} must include workers`,
+    };
+  }
+  for (const workerName of EXPECTED_WORKER_BASE_NAMES) {
+    const worker = workers[workerName];
+    const expectedScriptName = `matrix-${workerName}-${expectedEnvironmentName}`;
+    if (!isPlainObject(worker)) {
+      return {
+        valid: false,
+        error: `${payloadLabel} workers.${workerName} must be an object`,
+      };
+    }
+    if (worker.worker_name !== workerName) {
+      return {
+        valid: false,
+        error: `${payloadLabel} workers.${workerName}.worker_name must equal ${workerName}`,
+      };
+    }
+    if (worker.script_name !== expectedScriptName) {
+      return {
+        valid: false,
+        error: `${payloadLabel} workers.${workerName}.script_name must equal ${expectedScriptName}`,
+      };
+    }
+    if (!isNonEmptyString(worker.deployment_id)) {
+      return {
+        valid: false,
+        error: `${payloadLabel} workers.${workerName}.deployment_id must be non-empty`,
+      };
+    }
+    if (!isNonEmptyString(worker.worker_version_id)) {
+      return {
+        valid: false,
+        error: `${payloadLabel} workers.${workerName}.worker_version_id must be non-empty`,
+      };
+    }
+    if (!isAbsoluteExternalUri(worker.url)) {
+      return {
+        valid: false,
+        error: `${payloadLabel} workers.${workerName}.url must be an absolute external URI`,
+      };
+    }
+    if (expectedWorkersSubdomain != null) {
+      const expectedHost = `${expectedScriptName}.${expectedWorkersSubdomain}.workers.dev`;
+      if (new URL(worker.url).hostname !== expectedHost) {
+        return {
+          valid: false,
+          error: `${payloadLabel} workers.${workerName}.url must match ${expectedHost}`,
+        };
+      }
+    }
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validateReleaseCandidateManifestPayload(payload, {
+  runTimestamp = null,
+} = {}) {
+  const payloadLabel = 'prod_release_candidate';
+  if (payload.artifact_id !== 'prod_release_candidate') {
+    return {
+      valid: false,
+      error: `${payloadLabel} artifact_id must be "prod_release_candidate"`,
+    };
+  }
+  if (payload.schema_version !== 1) {
+    return {
+      valid: false,
+      error: `${payloadLabel} schema_version must be 1`,
+    };
+  }
+  if (!isNonEmptyString(payload.candidate_id)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} candidate_id must be non-empty`,
+    };
+  }
+  if (!isRfc3339UtcTimestamp(payload.created_at)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} created_at must be an RFC 3339 UTC timestamp`,
+    };
+  }
+  if (!isNonEmptyString(payload.release_ref)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} release_ref must be non-empty`,
+    };
+  }
+  const releaseCommitValidation = validateProdReleaseCommitSha(payloadLabel, payload.release_commit_sha);
+  if (!releaseCommitValidation.valid) {
+    return releaseCommitValidation;
+  }
+  if (typeof payload.requires_do_migration !== 'boolean') {
+    return {
+      valid: false,
+      error: `${payloadLabel} requires_do_migration must be boolean`,
+    };
+  }
+  if (!isNonEmptyString(payload.source_repository) || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(payload.source_repository)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} source_repository must be a GitHub owner/repo slug`,
+    };
+  }
+  if (!isGitHubActionsRunUri(payload.source_run_uri)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} source_run_uri must be a GitHub Actions run URL`,
+    };
+  }
+  if (extractGitHubActionsRunRepository(payload.source_run_uri) !== payload.source_repository) {
+    return {
+      valid: false,
+      error: `${payloadLabel} source_repository must match source_run_uri`,
+    };
+  }
+  const originRunValidation = validateProducerRunIdentity(payloadLabel, payload);
+  if (!originRunValidation.valid) {
+    return originRunValidation;
+  }
+  if (payload.topology_kind !== 'cloudflare-prod') {
+    return {
+      valid: false,
+      error: `${payloadLabel} topology_kind must be "cloudflare-prod"`,
+    };
+  }
+  const nestedAttestations = [
+    ['ci_integration_run_report', 'ci_integration_attestation', 'ci-integration'],
+    ['staging_run_report', 'staging_attestation', 'staging'],
+    ['pre_release_run_report', 'pre_release_attestation', 'pre-release'],
+  ];
+  let observedRunTimestamp = null;
+  for (const [artifactId, fieldName, expectedEnvironmentName] of nestedAttestations) {
+    const attestation = payload[fieldName];
+    const validation = validateEvidenceAttestationBundle(artifactId, attestation, {
+      expectedGitHubRepository: payload.source_repository,
+    });
+    if (!validation.valid) {
+      return {
+        valid: false,
+        error: `${payloadLabel} ${fieldName} invalid: ${validation.error}`,
+      };
+    }
+    if (attestation.source_environment !== expectedEnvironmentName) {
+      return {
+        valid: false,
+        error: `${payloadLabel} ${fieldName}.source_environment must be ${expectedEnvironmentName}`,
+      };
+    }
+    if (attestation.provenance.origin_run_uri !== payload.source_run_uri) {
+      return {
+        valid: false,
+        error: `${payloadLabel} ${fieldName} provenance.origin_run_uri must equal source_run_uri`,
+      };
+    }
+    observedRunTimestamp ??= attestation.run_timestamp;
+    if (attestation.run_timestamp !== observedRunTimestamp) {
+      return {
+        valid: false,
+        error: `${payloadLabel} environment attestations must share the same run_timestamp`,
+      };
+    }
+  }
+  if (runTimestamp != null && observedRunTimestamp !== runTimestamp) {
+    return {
+      valid: false,
+      error: `${payloadLabel} environment attestations must have run_timestamp ${runTimestamp}`,
+    };
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validateProdInstallRecordPayload(payload) {
+  const payloadLabel = 'prod_install_record';
+  if (payload.artifact_id !== 'prod_install_record') {
+    return {
+      valid: false,
+      error: `${payloadLabel} artifact_id must be "prod_install_record"`,
+    };
+  }
+  if (payload.schema_version !== 1) {
+    return {
+      valid: false,
+      error: `${payloadLabel} schema_version must be 1`,
+    };
+  }
+  if (payload.source_environment !== 'prod') {
+    return {
+      valid: false,
+      error: `${payloadLabel} source_environment must be "prod"`,
+    };
+  }
+  if (!isNonEmptyString(payload.install_id)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} install_id must be non-empty`,
+    };
+  }
+  if (!isRfc3339UtcTimestamp(payload.installed_at)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} installed_at must be an RFC 3339 UTC timestamp`,
+    };
+  }
+  const releaseCommitValidation = validateProdReleaseCommitSha(payloadLabel, payload.release_commit_sha);
+  if (!releaseCommitValidation.valid) {
+    return releaseCommitValidation;
+  }
+  const originRunValidation = validateProducerRunIdentity(payloadLabel, payload);
+  if (!originRunValidation.valid) {
+    return originRunValidation;
+  }
+  if (payload.topology_kind !== 'cloudflare-prod') {
+    return {
+      valid: false,
+      error: `${payloadLabel} topology_kind must be "cloudflare-prod"`,
+    };
+  }
+  if (!isNonEmptyString(payload.workers_subdomain)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} workers_subdomain must be non-empty`,
+    };
+  }
+  const resourceValidation = validateExpectedCloudflareResources(payloadLabel, 'prod', payload.cloudflare_resources);
+  if (!resourceValidation.valid) {
+    return resourceValidation;
+  }
+  const accessValidation = validateProductionAccessMetadata(`${payloadLabel} access`, payload.access);
+  if (!accessValidation.valid) {
+    return accessValidation;
+  }
+  const deploymentValidation = validateEvidenceDeploymentIdentity(payloadLabel, payload.deployment_identity);
+  if (!deploymentValidation.valid) {
+    return deploymentValidation;
+  }
+  return validateExpectedWorkerRecordMap(payloadLabel, payload.workers, 'prod', {
+    expectedWorkersSubdomain: payload.workers_subdomain,
+  });
+}
+
+function validateProdPromotionRecordPayload(payload) {
+  const payloadLabel = 'prod_promotion_record';
+  if (payload.artifact_id !== 'prod_promotion_record') {
+    return {
+      valid: false,
+      error: `${payloadLabel} artifact_id must be "prod_promotion_record"`,
+    };
+  }
+  if (payload.schema_version !== 1) {
+    return {
+      valid: false,
+      error: `${payloadLabel} schema_version must be 1`,
+    };
+  }
+  if (payload.source_environment !== 'prod') {
+    return {
+      valid: false,
+      error: `${payloadLabel} source_environment must be "prod"`,
+    };
+  }
+  if (!isNonEmptyString(payload.promotion_id)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} promotion_id must be non-empty`,
+    };
+  }
+  if (!isRfc3339UtcTimestamp(payload.promoted_at)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} promoted_at must be an RFC 3339 UTC timestamp`,
+    };
+  }
+  const releaseCommitValidation = validateProdReleaseCommitSha(payloadLabel, payload.release_commit_sha);
+  if (!releaseCommitValidation.valid) {
+    return releaseCommitValidation;
+  }
+  const originRunValidation = validateProducerRunIdentity(payloadLabel, payload);
+  if (!originRunValidation.valid) {
+    return originRunValidation;
+  }
+  if (payload.promotion_mode !== 'gradual' && payload.promotion_mode !== 'deploy_with_migration') {
+    return {
+      valid: false,
+      error: `${payloadLabel} promotion_mode must be "gradual" or "deploy_with_migration"`,
+    };
+  }
+  if (!isPlainObject(payload.source_candidate) || !isNonEmptyString(payload.source_candidate.candidate_id)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} source_candidate.candidate_id must be non-empty`,
+    };
+  }
+  if (!isGitHubActionsRunUri(payload.source_candidate.source_run_uri)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} source_candidate.source_run_uri must be a GitHub Actions run URL`,
+    };
+  }
+  const previousValidation = validateEvidenceDeploymentIdentity(payloadLabel, payload.previous_deployment_identity, {
+    deploymentFieldName: 'previous_deployment_identity',
+  });
+  if (!previousValidation.valid) {
+    return previousValidation;
+  }
+  const currentValidation = validateEvidenceDeploymentIdentity(payloadLabel, payload.current_deployment_identity, {
+    deploymentFieldName: 'current_deployment_identity',
+  });
+  if (!currentValidation.valid) {
+    return currentValidation;
+  }
+  if (!Array.isArray(payload.gateway_rollout_steps)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} gateway_rollout_steps must be an array`,
+    };
+  }
+  if (payload.promotion_mode === 'gradual' && payload.gateway_rollout_steps.length === 0) {
+    return {
+      valid: false,
+      error: `${payloadLabel} gateway_rollout_steps must be non-empty for gradual promotion`,
+    };
+  }
+  if (payload.promotion_mode === 'deploy_with_migration' && payload.gateway_rollout_steps.length !== 0) {
+    return {
+      valid: false,
+      error: `${payloadLabel} gateway_rollout_steps must be empty for deploy_with_migration promotions`,
+    };
+  }
+  for (const [index, step] of payload.gateway_rollout_steps.entries()) {
+    if (!isPlainObject(step)) {
+      return {
+        valid: false,
+        error: `${payloadLabel} gateway_rollout_steps[${index}] must be an object`,
+      };
+    }
+    if (!isNonNegativeInteger(step.percentage) || step.percentage === 0 || step.percentage > 100) {
+      return {
+        valid: false,
+        error: `${payloadLabel} gateway_rollout_steps[${index}].percentage must be an integer between 1 and 100`,
+      };
+    }
+    if (!isNonEmptyString(step.deployment_id)) {
+      return {
+        valid: false,
+        error: `${payloadLabel} gateway_rollout_steps[${index}].deployment_id must be non-empty`,
+      };
+    }
+    if (typeof step.ready !== 'boolean') {
+      return {
+        valid: false,
+        error: `${payloadLabel} gateway_rollout_steps[${index}].ready must be boolean`,
+      };
+    }
+    if (!isNonNegativeInteger(step.attempt_count) || step.attempt_count === 0) {
+      return {
+        valid: false,
+        error: `${payloadLabel} gateway_rollout_steps[${index}].attempt_count must be a positive integer`,
+      };
+    }
+    if (step.last_error !== null && !isNonEmptyString(step.last_error)) {
+      return {
+        valid: false,
+        error: `${payloadLabel} gateway_rollout_steps[${index}].last_error must be null or a non-empty string`,
+      };
+    }
+  }
+  const readinessChecksValidation = validateProductionPromotionReadinessChecks(
+    `${payloadLabel} readiness_checks`,
+    payload.promotion_mode,
+    payload.readiness_checks,
+  );
+  if (!readinessChecksValidation.valid) {
+    return readinessChecksValidation;
+  }
+  if (payload.promotion_mode === 'gradual') {
+    if (!isPlainObject(payload.rollback_handle)) {
+      return {
+        valid: false,
+        error: `${payloadLabel} rollback_handle must be present for gradual promotion`,
+      };
+    }
+    return validateProductionRollbackHandle(`${payloadLabel} rollback_handle`, payload.rollback_handle);
+  }
+  if (payload.rollback_handle != null) {
+    return {
+      valid: false,
+      error: `${payloadLabel} rollback_handle must be null for deploy_with_migration promotions`,
+    };
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validateProdRollbackRecordPayload(payload) {
+  const payloadLabel = 'prod_rollback_record';
+  if (payload.artifact_id !== 'prod_rollback_record') {
+    return {
+      valid: false,
+      error: `${payloadLabel} artifact_id must be "prod_rollback_record"`,
+    };
+  }
+  if (payload.schema_version !== 1) {
+    return {
+      valid: false,
+      error: `${payloadLabel} schema_version must be 1`,
+    };
+  }
+  if (payload.source_environment !== 'prod') {
+    return {
+      valid: false,
+      error: `${payloadLabel} source_environment must be "prod"`,
+    };
+  }
+  if (!isNonEmptyString(payload.rollback_id)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} rollback_id must be non-empty`,
+    };
+  }
+  if (!isRfc3339UtcTimestamp(payload.rolled_back_at)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} rolled_back_at must be an RFC 3339 UTC timestamp`,
+    };
+  }
+  if (!isNonEmptyString(payload.source_promotion_id)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} source_promotion_id must be non-empty`,
+    };
+  }
+  const releaseCommitValidation = validateProdReleaseCommitSha(payloadLabel, payload.release_commit_sha);
+  if (!releaseCommitValidation.valid) {
+    return releaseCommitValidation;
+  }
+  const originRunValidation = validateProducerRunIdentity(payloadLabel, payload);
+  if (!originRunValidation.valid) {
+    return originRunValidation;
+  }
+  const rollbackHandleValidation = validateProductionRollbackHandle(`${payloadLabel} requested_rollback_handle`, payload.requested_rollback_handle);
+  if (!rollbackHandleValidation.valid) {
+    return rollbackHandleValidation;
+  }
+  const deploymentValidation = validateEvidenceDeploymentIdentity(payloadLabel, payload.restored_deployment_identity, {
+    deploymentFieldName: 'restored_deployment_identity',
+  });
+  if (!deploymentValidation.valid) {
+    return deploymentValidation;
+  }
+  if (!isPlainObject(payload.worker_results)) {
+    return {
+      valid: false,
+      error: `${payloadLabel} worker_results must be an object`,
+    };
+  }
+  for (const workerName of EXPECTED_WORKER_BASE_NAMES) {
+    const result = payload.worker_results[workerName];
+    if (!isPlainObject(result)) {
+      return {
+        valid: false,
+        error: `${payloadLabel} worker_results.${workerName} must be an object`,
+      };
+    }
+    if (typeof result.restored !== 'boolean') {
+      return {
+        valid: false,
+        error: `${payloadLabel} worker_results.${workerName}.restored must be boolean`,
+      };
+    }
+    if (!isNonEmptyString(result.deployment_id)) {
+      return {
+        valid: false,
+        error: `${payloadLabel} worker_results.${workerName}.deployment_id must be non-empty`,
+      };
+    }
+    if (!isNonEmptyString(result.worker_version_id)) {
+      return {
+        valid: false,
+        error: `${payloadLabel} worker_results.${workerName}.worker_version_id must be non-empty`,
+      };
+    }
+  }
+  return validateProductionReadinessProbe(`${payloadLabel} readiness_probe`, payload.readiness_probe);
+}
+
+function listReportCoverageFiles(payload) {
+  const combined = [];
+  for (const candidate of [payload?.test_files, payload?.expanded_test_files]) {
+    if (!Array.isArray(candidate)) {
+      continue;
+    }
+    for (const entry of candidate) {
+      if (typeof entry === 'string' && entry.length > 0) {
+        combined.push(entry);
+      }
+    }
+  }
+  return [...new Set(combined)];
+}
+
+function reportCoversCanonicalTestPrefix(payload, prefix) {
+  return listReportCoverageFiles(payload).some((candidate) => {
+    const basename = path.basename(candidate).toLowerCase();
+    return basename.startsWith(prefix) && basename.endsWith('.test.mjs');
+  });
+}
+
+export function validateRolloutSkewProbeSemantics(reportLabel, normalized, {
+  expectedEnvironmentName = 'pre-release',
+  expectedProbeRunId = null,
+  expectedDualVersionDeploymentId = null,
+  expectedBaselineGatewayVersionId = null,
+  expectedBaselineGatewayVersionTag = null,
+  expectedCandidateGatewayVersionId = null,
+  expectedCandidateGatewayVersionTag = null,
+} = {}) {
+  if (normalized.environment_name !== expectedEnvironmentName) {
+    return {
+      valid: false,
+      error: `${reportLabel}.environment_name must be ${expectedEnvironmentName}`,
+    };
+  }
+  if (expectedProbeRunId != null && normalized.probe_run_id !== expectedProbeRunId) {
+    return {
+      valid: false,
+      error: `${reportLabel}.probe_run_id must match rollout state`,
+    };
+  }
+  if (expectedDualVersionDeploymentId != null && normalized.dual_version_deployment_id !== expectedDualVersionDeploymentId) {
+    return {
+      valid: false,
+      error: `${reportLabel}.dual_version_deployment_id must match rollout state`,
+    };
+  }
+  if (expectedBaselineGatewayVersionId != null && normalized.baseline_gateway_version_id !== expectedBaselineGatewayVersionId) {
+    return {
+      valid: false,
+      error: `${reportLabel}.baseline_gateway_version_id must match rollout state`,
+    };
+  }
+  if (expectedBaselineGatewayVersionTag != null && normalized.baseline_gateway_version_tag !== expectedBaselineGatewayVersionTag) {
+    return {
+      valid: false,
+      error: `${reportLabel}.baseline_gateway_version_tag must match rollout state`,
+    };
+  }
+  if (expectedCandidateGatewayVersionId != null && normalized.candidate_gateway_version_id !== expectedCandidateGatewayVersionId) {
+    return {
+      valid: false,
+      error: `${reportLabel}.candidate_gateway_version_id must match rollout state`,
+    };
+  }
+  if (expectedCandidateGatewayVersionTag != null && normalized.candidate_gateway_version_tag !== expectedCandidateGatewayVersionTag) {
+    return {
+      valid: false,
+      error: `${reportLabel}.candidate_gateway_version_tag must match rollout state`,
+    };
+  }
+  const requiredObservations = [
+    {
+      probe_name: 'new-worker-old-authority',
+      authority_kind: 'UserDO',
+      expected_gateway_version_id: normalized.candidate_gateway_version_id,
+      expected_gateway_version_tag: normalized.candidate_gateway_version_tag,
+      expected_authority_version_id: normalized.baseline_gateway_version_id,
+    },
+    {
+      probe_name: 'new-worker-old-authority',
+      authority_kind: 'RoomDO',
+      expected_gateway_version_id: normalized.candidate_gateway_version_id,
+      expected_gateway_version_tag: normalized.candidate_gateway_version_tag,
+      expected_authority_version_id: normalized.baseline_gateway_version_id,
+    },
+    {
+      probe_name: 'old-worker-new-authority',
+      authority_kind: 'UserDO',
+      expected_gateway_version_id: normalized.baseline_gateway_version_id,
+      expected_gateway_version_tag: normalized.baseline_gateway_version_tag,
+      expected_authority_version_id: normalized.candidate_gateway_version_id,
+    },
+    {
+      probe_name: 'old-worker-new-authority',
+      authority_kind: 'RoomDO',
+      expected_gateway_version_id: normalized.baseline_gateway_version_id,
+      expected_gateway_version_tag: normalized.baseline_gateway_version_tag,
+      expected_authority_version_id: normalized.candidate_gateway_version_id,
+    },
+  ];
+  for (const requirement of requiredObservations) {
+    const matchesObservedGatewayIdentity = (entry) => {
+      if (entry.observed_gateway_version_id === requirement.expected_gateway_version_id) {
+        return entry.observed_gateway_version_tag == null
+          || entry.observed_gateway_version_tag === requirement.expected_gateway_version_tag;
+      }
+      return (
+        entry.observed_gateway_version_id == null
+        && entry.observed_gateway_version_tag === requirement.expected_gateway_version_tag
+      );
+    };
+    const matched = normalized.observations.some((entry) => (
+      entry.probe_name === requirement.probe_name
+      && entry.authority_kind === requirement.authority_kind
+      && entry.request_gateway_version_id === requirement.expected_gateway_version_id
+      && entry.observed_authority_version_id === requirement.expected_authority_version_id
+      && matchesObservedGatewayIdentity(entry)
+    ));
+    if (!matched) {
+      return {
+        valid: false,
+        error: `${reportLabel} must include ${requirement.probe_name}/${requirement.authority_kind} observation`,
+      };
+    }
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validatePreReleaseRolloutSkewProbe(reportLabel, value, expected = {}) {
+  if (value == null) {
+    return {
+      valid: false,
+      error: `${reportLabel} must include rollout_skew_probe`,
+    };
+  }
+  let normalized;
+  try {
+    normalized = normalizeRolloutSkewProbeResponse(value);
+  } catch (error) {
+    return {
+      valid: false,
+      error: `${reportLabel} rollout_skew_probe is invalid: ${error.message}`,
+    };
+  }
+  if (normalized.environment_name !== 'pre-release') {
+    return {
+      valid: false,
+      error: `${reportLabel} rollout_skew_probe.environment_name must be pre-release`,
+    };
+  }
+  if (normalized.assertions.new_worker_old_authority !== true || normalized.assertions.old_worker_new_authority !== true) {
+    return {
+      valid: false,
+      error: `${reportLabel} rollout_skew_probe assertions must both be true`,
+    };
+  }
+  const semanticValidation = validateRolloutSkewProbeSemantics(
+    `${reportLabel} rollout_skew_probe`,
+    normalized,
+    expected,
+  );
+  if (!semanticValidation.valid) {
+    return semanticValidation;
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validatePreReleaseRolloutDeploymentAudit(reportLabel, rolloutSkewProbe, deploymentIdentityValidation) {
+  if (!isPlainObject(deploymentIdentityValidation)) {
+    return {
+      valid: false,
+      error: `${reportLabel} must include deployment_identity_validation when TEST-OPS-001 is covered`,
+    };
+  }
+  for (const phase of ['before_readiness', 'before_suite']) {
+    const phaseRecord = deploymentIdentityValidation[phase];
+    if (!isPlainObject(phaseRecord)) {
+      return {
+        valid: false,
+        error: `${reportLabel} deployment_identity_validation.${phase} must be an object when TEST-OPS-001 is covered`,
+      };
+    }
+    const gatewayWorker = phaseRecord?.workers?.['gateway-worker'];
+    if (!isPlainObject(gatewayWorker)) {
+      return {
+        valid: false,
+        error: `${reportLabel} deployment_identity_validation.${phase}.workers.gateway-worker must be present when TEST-OPS-001 is covered`,
+      };
+    }
+    if (!isNonEmptyString(gatewayWorker.latest_active_deployment_id)) {
+      return {
+        valid: false,
+        error: `${reportLabel} deployment_identity_validation.${phase}.workers.gateway-worker.latest_active_deployment_id must be non-empty`,
+      };
+    }
+    if (!isNonEmptyStringArray(gatewayWorker.active_worker_version_ids)) {
+      return {
+        valid: false,
+        error: `${reportLabel} deployment_identity_validation.${phase}.workers.gateway-worker.active_worker_version_ids must be a non-empty string array`,
+      };
+    }
+    if (gatewayWorker.latest_active_deployment_id !== rolloutSkewProbe.dual_version_deployment_id) {
+      return {
+        valid: false,
+        error: `${reportLabel} deployment_identity_validation.${phase}.workers.gateway-worker.latest_active_deployment_id must match rollout_skew_probe.dual_version_deployment_id`,
+      };
+    }
+    if (!gatewayWorker.active_worker_version_ids.includes(rolloutSkewProbe.baseline_gateway_version_id)) {
+      return {
+        valid: false,
+        error: `${reportLabel} deployment_identity_validation.${phase}.workers.gateway-worker.active_worker_version_ids must include rollout_skew_probe.baseline_gateway_version_id`,
+      };
+    }
+    if (!gatewayWorker.active_worker_version_ids.includes(rolloutSkewProbe.candidate_gateway_version_id)) {
+      return {
+        valid: false,
+        error: `${reportLabel} deployment_identity_validation.${phase}.workers.gateway-worker.active_worker_version_ids must include rollout_skew_probe.candidate_gateway_version_id`,
+      };
+    }
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validatePreReleaseRolloutProvenance(reportLabel, rolloutSkewProbe, deploymentIdentity) {
+  if (!isPlainObject(deploymentIdentity)) {
+    return {
+      valid: false,
+      error: `${reportLabel} provenance.deployment_identity must be an object when TEST-OPS-001 is covered`,
+    };
+  }
+  if (!isNonEmptyStringArray(deploymentIdentity.deployment_ids) || !deploymentIdentity.deployment_ids.includes(rolloutSkewProbe.dual_version_deployment_id)) {
+    return {
+      valid: false,
+      error: `${reportLabel} provenance.deployment_identity.deployment_ids must include rollout_skew_probe.dual_version_deployment_id`,
+    };
+  }
+  if (!isNonEmptyStringArray(deploymentIdentity.worker_version_ids)) {
+    return {
+      valid: false,
+      error: `${reportLabel} provenance.deployment_identity.worker_version_ids must be a non-empty string array when TEST-OPS-001 is covered`,
+    };
+  }
+  if (!deploymentIdentity.worker_version_ids.includes(rolloutSkewProbe.baseline_gateway_version_id)) {
+    return {
+      valid: false,
+      error: `${reportLabel} provenance.deployment_identity.worker_version_ids must include rollout_skew_probe.baseline_gateway_version_id`,
+    };
+  }
+  if (!deploymentIdentity.worker_version_ids.includes(rolloutSkewProbe.candidate_gateway_version_id)) {
+    return {
+      valid: false,
+      error: `${reportLabel} provenance.deployment_identity.worker_version_ids must include rollout_skew_probe.candidate_gateway_version_id`,
+    };
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validatePreReleaseCostObservation(reportLabel, value, {
+  expectedEnvironmentName = 'pre-release',
+} = {}) {
+  if (value == null) {
+    return {
+      valid: false,
+      error: `${reportLabel} must include pre_release_cost_observation`,
+    };
+  }
+  if (!isPlainObject(value)) {
+    return {
+      valid: false,
+      error: `${reportLabel} pre_release_cost_observation must be an object`,
+    };
+  }
+  if (!isNonEmptyString(value.observation_id)) {
+    return {
+      valid: false,
+      error: `${reportLabel} pre_release_cost_observation.observation_id must be non-empty`,
+    };
+  }
+  if (value.source_environment !== expectedEnvironmentName) {
+    return {
+      valid: false,
+      error: `${reportLabel} pre_release_cost_observation.source_environment must be ${expectedEnvironmentName}`,
+    };
+  }
+  if (!isRfc3339UtcTimestamp(value.captured_at)) {
+    return {
+      valid: false,
+      error: `${reportLabel} pre_release_cost_observation.captured_at must be RFC 3339 UTC`,
+    };
+  }
+  if (!isPlainObject(value.capture_window) || !isRfc3339UtcTimestamp(value.capture_window.start) || !isRfc3339UtcTimestamp(value.capture_window.end)) {
+    return {
+      valid: false,
+      error: `${reportLabel} pre_release_cost_observation.capture_window must contain RFC 3339 UTC start/end`,
+    };
+  }
+  if (Date.parse(value.capture_window.start) > Date.parse(value.capture_window.end)) {
+    return {
+      valid: false,
+      error: `${reportLabel} pre_release_cost_observation.capture_window.start must be <= end`,
+    };
+  }
+  if (value.capture_method !== 'cloudflare-official-metrics') {
+    return {
+      valid: false,
+      error: `${reportLabel} pre_release_cost_observation.capture_method must be cloudflare-official-metrics`,
+    };
+  }
+  if (!isNonEmptyStringArray(value.source_query_uris) || value.source_query_uris.some((entry) => !isOfficialCloudflareLocator(entry))) {
+    return {
+      valid: false,
+      error: `${reportLabel} pre_release_cost_observation.source_query_uris must be official Cloudflare HTTPS locators`,
+    };
+  }
+  if (!isNonEmptyString(value.topology_kind) || value.topology_kind === 'local') {
+    return {
+      valid: false,
+      error: `${reportLabel} pre_release_cost_observation.topology_kind must be non-local`,
+    };
+  }
+  const resourceValidation = validateExpectedCloudflareResources(
+    `${reportLabel} pre_release_cost_observation`,
+    expectedEnvironmentName,
+    value.cloudflare_resources,
+  );
+  if (!resourceValidation.valid) {
+    return resourceValidation;
+  }
+  if (!isPlainObject(value.cost_surfaces) || PRE_RELEASE_COST_SURFACES.some((surface) => !isPlainObject(value.cost_surfaces[surface]))) {
+    return {
+      valid: false,
+      error: `${reportLabel} pre_release_cost_observation.cost_surfaces must include workers,durable_objects,d1,r2,kv,queues`,
+    };
+  }
+  if (
+    !isPlainObject(value.model_comparison)
+    || !isNonEmptyString(value.model_comparison.status)
+    || !isNonEmptyString(value.model_comparison.summary)
+    || !isNonNegativeNumber(value.model_comparison.actual_total_usd)
+    || !isNonNegativeNumber(value.model_comparison.modeled_total_usd)
+    || typeof value.model_comparison.drift_ratio !== 'number'
+    || !Number.isFinite(value.model_comparison.drift_ratio)
+  ) {
+    return {
+      valid: false,
+      error: `${reportLabel} pre_release_cost_observation.model_comparison is invalid`,
+    };
+  }
+  return {
+    valid: true,
+    error: null,
+  };
 }
 
 function isDisallowedLocalHostname(hostname) {
@@ -482,6 +2028,22 @@ function isAbsoluteExternalUri(value) {
   }
 }
 
+function isOfficialCloudflareLocator(value) {
+  if (!isAbsoluteExternalUri(value)) {
+    return false;
+  }
+  try {
+    const parsed = new URL(value);
+    const hostname = parsed.hostname.toLowerCase();
+    return (
+      parsed.protocol === 'https:'
+      && (hostname === 'cloudflare.com' || hostname.endsWith('.cloudflare.com'))
+    );
+  } catch {
+    return false;
+  }
+}
+
 function isGitHubActionsRunUri(value) {
   if (!isAbsoluteExternalUri(value)) {
     return false;
@@ -494,6 +2056,28 @@ function isGitHubActionsRunUri(value) {
     return /^\/[^/]+\/[^/]+\/actions\/runs\/\d+\/?$/.test(parsed.pathname);
   } catch {
     return false;
+  }
+}
+
+function extractGitHubActionsRunRepository(value) {
+  if (!isGitHubActionsRunUri(value)) {
+    return null;
+  }
+  try {
+    const parsed = new URL(value);
+    const [, owner, repository, actionsLiteral, runsLiteral, runId] = parsed.pathname.split('/');
+    if (
+      !isNonEmptyString(owner)
+      || !isNonEmptyString(repository)
+      || actionsLiteral !== 'actions'
+      || runsLiteral !== 'runs'
+      || !isNonEmptyString(runId)
+    ) {
+      return null;
+    }
+    return `${owner}/${repository}`;
+  } catch {
+    return null;
   }
 }
 
@@ -608,11 +2192,156 @@ function pathUsesPrefix(relativePath, prefix) {
   return normalizedRelativePath === normalizedPrefix || normalizedRelativePath.startsWith(`${normalizedPrefix}/`);
 }
 
+function sortUniqueStrings(values) {
+  return [...new Set(values)].sort();
+}
+
+function haveSameSortedStrings(left, right) {
+  if (left.length !== right.length) {
+    return false;
+  }
+  return left.every((value, index) => value === right[index]);
+}
+
+function splitShellStyleCommand(command) {
+  if (!isNonEmptyString(command)) {
+    return null;
+  }
+  const tokens = [];
+  let current = '';
+  let quote = null;
+  let escaping = false;
+  for (const character of command) {
+    if (escaping) {
+      current += character;
+      escaping = false;
+      continue;
+    }
+    if (quote === '\'') {
+      if (character === '\'') {
+        quote = null;
+      } else {
+        current += character;
+      }
+      continue;
+    }
+    if (quote === '"') {
+      if (character === '"') {
+        quote = null;
+      } else if (character === '\\') {
+        escaping = true;
+      } else {
+        current += character;
+      }
+      continue;
+    }
+    if (character === '\'' || character === '"') {
+      quote = character;
+      continue;
+    }
+    if (character === '\\') {
+      escaping = true;
+      continue;
+    }
+    if (/\s/.test(character)) {
+      if (current.length > 0) {
+        tokens.push(current);
+        current = '';
+      }
+      continue;
+    }
+    current += character;
+  }
+  if (escaping || quote != null) {
+    return null;
+  }
+  if (current.length > 0) {
+    tokens.push(current);
+  }
+  return tokens.length > 0 ? tokens : null;
+}
+
+function normalizeCommandTokenToRepoRelativePath(token) {
+  if (!isNonEmptyString(token)) {
+    return null;
+  }
+  let normalizedToken = String(token).trim();
+  if (normalizedToken.startsWith('file://')) {
+    try {
+      normalizedToken = fileURLToPath(normalizedToken);
+    } catch {
+      return null;
+    }
+  }
+  const repoRelative = normalizeRepoRelativePath(normalizedToken);
+  if (repoRelative != null) {
+    return repoRelative;
+  }
+  const commandPath = normalizedToken.replaceAll('\\', '/');
+  const match = commandPath.match(/(?:^|\/)(tests\/.+)$/);
+  return match == null ? null : normalizeRepoRelativePath(match[1]);
+}
+
+function extractCommandClaimedTestFiles(command) {
+  const tokens = splitShellStyleCommand(command);
+  if (tokens == null) {
+    return {
+      valid: false,
+      error: 'environment run report command must be a parseable shell-style string',
+      files: [],
+    };
+  }
+  const claimedFiles = sortUniqueStrings(tokens
+    .filter((token) => !token.startsWith('-'))
+    .map((token) => normalizeCommandTokenToRepoRelativePath(token))
+    .filter((token) => token != null && token.endsWith('.test.mjs')));
+  if (claimedFiles.length === 0) {
+    return {
+      valid: false,
+      error: 'environment run report command must enumerate repo-relative .test.mjs files',
+      files: [],
+    };
+  }
+  return {
+    valid: true,
+    error: null,
+    files: claimedFiles,
+  };
+}
+
+function validateEnvironmentRunCommandClaims(command, normalizedTestFiles) {
+  const commandFilesResult = extractCommandClaimedTestFiles(command);
+  if (!commandFilesResult.valid) {
+    return commandFilesResult;
+  }
+  const normalizedClaimedFiles = sortUniqueStrings(normalizedTestFiles);
+  if (!haveSameSortedStrings(commandFilesResult.files, normalizedClaimedFiles)) {
+    return {
+      valid: false,
+      error: 'environment run report command must enumerate the same repo-relative test_files claimed by the report',
+      files: commandFilesResult.files,
+    };
+  }
+  return {
+    valid: true,
+    error: null,
+    files: commandFilesResult.files,
+  };
+}
+
 function pathIsWithinRoot(targetPath, rootPath) {
   const absoluteTargetPath = path.resolve(targetPath);
   const absoluteRootPath = path.resolve(rootPath);
   const relative = path.relative(absoluteRootPath, absoluteTargetPath);
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function describeRepoBoundaryEscapePath(candidatePath, repoRoot) {
+  const absoluteCandidatePath = path.resolve(candidatePath);
+  if (pathIsWithinRoot(absoluteCandidatePath, repoRoot)) {
+    return normalizePathForMarkdown(path.relative(repoRoot, absoluteCandidatePath));
+  }
+  return normalizePathForMarkdown(absoluteCandidatePath);
 }
 
 function isIdentifierBoundaryCharacter(value) {
@@ -3118,6 +4847,132 @@ function requiresExternalManualArtifactEvidence(artifactId) {
   return resolveEnvironmentNameForArtifactId(artifactId) != null || artifactId === 'prod_cost_snapshot';
 }
 
+function listRequiredReadinessProbeStepNames(expectedEnvironmentName) {
+  const requiredSteps = [
+    'versions',
+    'public_rooms',
+    'register_challenge',
+    'register_complete',
+    'sync',
+    'media_create',
+  ];
+  if (expectedEnvironmentName === 'staging' || expectedEnvironmentName === 'pre-release') {
+    requiredSteps.push('ops_healthz', 'ops_rebuild_start');
+  }
+  return requiredSteps;
+}
+
+function validateEnvironmentRunReadinessProbe(reportLabel, readinessProbe, expectedEnvironmentName) {
+  if (!isPlainObject(readinessProbe)) {
+    return {
+      valid: false,
+      error: `${reportLabel} must include readiness_probe`,
+    };
+  }
+  if (readinessProbe.environment_name !== expectedEnvironmentName) {
+    return {
+      valid: false,
+      error: `${reportLabel} readiness_probe.environment_name must be ${expectedEnvironmentName}`,
+    };
+  }
+  if (readinessProbe.ready !== true) {
+    return {
+      valid: false,
+      error: `${reportLabel} readiness_probe.ready must be true`,
+    };
+  }
+  if (!isRfc3339UtcTimestamp(readinessProbe.started_at) || !isRfc3339UtcTimestamp(readinessProbe.completed_at)) {
+    return {
+      valid: false,
+      error: `${reportLabel} readiness_probe must include RFC 3339 UTC started_at and completed_at timestamps`,
+    };
+  }
+  if (!isNonNegativeInteger(readinessProbe.duration_ms)) {
+    return {
+      valid: false,
+      error: `${reportLabel} readiness_probe must include a non-negative duration_ms`,
+    };
+  }
+  if (!isNonNegativeInteger(readinessProbe.attempt_count) || readinessProbe.attempt_count === 0) {
+    return {
+      valid: false,
+      error: `${reportLabel} readiness_probe must include a positive attempt_count`,
+    };
+  }
+  if (!Array.isArray(readinessProbe.attempts) || readinessProbe.attempts.length !== readinessProbe.attempt_count) {
+    return {
+      valid: false,
+      error: `${reportLabel} readiness_probe must include attempts matching attempt_count`,
+    };
+  }
+  const invalidAttempt = readinessProbe.attempts.find((attempt, index) => {
+    if (!isPlainObject(attempt)) {
+      return true;
+    }
+    if (attempt.attempt !== index + 1) {
+      return true;
+    }
+    if (!isRfc3339UtcTimestamp(attempt.started_at) || !isRfc3339UtcTimestamp(attempt.completed_at)) {
+      return true;
+    }
+    if (!isNonNegativeInteger(attempt.duration_ms)) {
+      return true;
+    }
+    if (typeof attempt.ok !== 'boolean') {
+      return true;
+    }
+    if (!Array.isArray(attempt.steps) || attempt.steps.length === 0) {
+      return true;
+    }
+    if (attempt.steps.some((step) => !isPlainObject(step) || !isNonEmptyString(step.step) || typeof step.ok !== 'boolean' || !('detail' in step))) {
+      return true;
+    }
+    if (attempt.delay_before_next_attempt_ms !== null && !isNonNegativeInteger(attempt.delay_before_next_attempt_ms)) {
+      return true;
+    }
+    if (attempt.ok) {
+      return attempt.failure !== null;
+    }
+    return !isPlainObject(attempt.failure) || !isNonEmptyString(attempt.failure.step_name) || !isPlainObject(attempt.failure.detail);
+  });
+  if (invalidAttempt) {
+    return {
+      valid: false,
+      error: `${reportLabel} readiness_probe must include structured attempts and steps`,
+    };
+  }
+  if (!readinessProbe.attempts.some((attempt) => attempt.ok === true) || readinessProbe.attempts.at(-1)?.ok !== true) {
+    return {
+      valid: false,
+      error: `${reportLabel} readiness_probe must include a successful final attempt`,
+    };
+  }
+  const finalAttempt = readinessProbe.attempts.at(-1);
+  const successfulFinalStepNames = new Set(
+    finalAttempt.steps
+      .filter((step) => step.ok === true)
+      .map((step) => step.step),
+  );
+  const missingRequiredSteps = listRequiredReadinessProbeStepNames(expectedEnvironmentName)
+    .filter((stepName) => !successfulFinalStepNames.has(stepName));
+  if (missingRequiredSteps.length > 0) {
+    return {
+      valid: false,
+      error: `${reportLabel} readiness_probe final attempt must include successful steps: ${missingRequiredSteps.join(', ')}`,
+    };
+  }
+  if (readinessProbe.last_error !== null) {
+    return {
+      valid: false,
+      error: `${reportLabel} readiness_probe.last_error must be null for a passing report`,
+    };
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
 export function validateManualArtifactPayload(artifactId, payload, {
   runTimestamp = null,
 } = {}) {
@@ -3185,10 +5040,23 @@ export function validateManualArtifactPayload(artifactId, payload, {
         error: 'environment run report must include test_files matching test_file_count',
       };
     }
+    if (sortUniqueStrings(normalizedTestFiles).length !== normalizedTestFiles.length) {
+      return {
+        valid: false,
+        error: 'environment run report test_files must not repeat paths',
+      };
+    }
     if (!normalizedTestFiles.every((file) => pathUsesPrefix(file, environmentDefinition.directory))) {
       return {
         valid: false,
         error: `environment run report test_files must stay within ${environmentDefinition.directory}`,
+      };
+    }
+    const commandValidation = validateEnvironmentRunCommandClaims(payload.command, normalizedTestFiles);
+    if (!commandValidation.valid) {
+      return {
+        valid: false,
+        error: commandValidation.error,
       };
     }
     if (!isNonNegativeInteger(payload.expanded_test_file_count) || payload.expanded_test_file_count === 0) {
@@ -3203,10 +5071,39 @@ export function validateManualArtifactPayload(artifactId, payload, {
         error: 'environment run report must include expanded_test_files matching expanded_test_file_count',
       };
     }
+    if (sortUniqueStrings(normalizedExpandedTestFiles).length !== normalizedExpandedTestFiles.length) {
+      return {
+        valid: false,
+        error: 'environment run report expanded_test_files must not repeat paths',
+      };
+    }
     if (normalizedExpandedTestFiles.some((file) => pathUsesPrefix(file, 'tests/local'))) {
       return {
         valid: false,
         error: 'environment run report must not expand local test implementations',
+      };
+    }
+    if (!normalizedExpandedTestFiles.every((file) => pathUsesPrefix(file, environmentDefinition.directory))) {
+      return {
+        valid: false,
+        error: `environment run report expanded_test_files must stay within ${environmentDefinition.directory}`,
+      };
+    }
+    const genericExpandedEntrypoint = normalizedExpandedTestFiles.find((file) => {
+      const basename = path.posix.basename(file);
+      return basename === 'bootstrap.test.mjs' || basename === 'l1-mandatory.test.mjs';
+    });
+    if (genericExpandedEntrypoint != null) {
+      return {
+        valid: false,
+        error: `environment run report expanded_test_files must not include generic entrypoint ${genericExpandedEntrypoint}`,
+      };
+    }
+    const missingClaimedTestFile = normalizedTestFiles.find((file) => !normalizedExpandedTestFiles.includes(file));
+    if (missingClaimedTestFile != null) {
+      return {
+        valid: false,
+        error: `environment run report expanded_test_files must include claimed test_file ${missingClaimedTestFile}`,
       };
     }
     if (!isRfc3339UtcTimestamp(payload.started_at) || !isRfc3339UtcTimestamp(payload.completed_at)) {
@@ -3270,6 +5167,68 @@ export function validateManualArtifactPayload(artifactId, payload, {
     );
     if (!resourceValidation.valid) {
       return resourceValidation;
+    }
+    const readinessProbeValidation = validateEnvironmentRunReadinessProbe(
+      'environment run report',
+      payload.readiness_probe,
+      expectedEnvironmentName,
+    );
+    if (!readinessProbeValidation.valid) {
+      return readinessProbeValidation;
+    }
+    const coversPreReleaseOps = expectedEnvironmentName === 'pre-release'
+      && reportCoversCanonicalTestPrefix(payload, PRE_RELEASE_TEST_FILE_PREFIXES.ops);
+    const coversPreReleaseCost = expectedEnvironmentName === 'pre-release'
+      && reportCoversCanonicalTestPrefix(payload, PRE_RELEASE_TEST_FILE_PREFIXES.cost);
+    if (expectedEnvironmentName === 'pre-release' && !coversPreReleaseOps && payload.rollout_skew_probe != null) {
+      return {
+        valid: false,
+        error: 'environment run report rollout_skew_probe must be null unless TEST-OPS-001 is covered',
+      };
+    }
+    if (expectedEnvironmentName === 'pre-release' && !coversPreReleaseCost && payload.pre_release_cost_observation != null) {
+      return {
+        valid: false,
+        error: 'environment run report pre_release_cost_observation must be null unless TEST-COST-001 is covered',
+      };
+    }
+    if (expectedEnvironmentName !== 'pre-release' && payload.rollout_skew_probe != null) {
+      return {
+        valid: false,
+        error: 'environment run report rollout_skew_probe must be null outside pre-release',
+      };
+    }
+    if (expectedEnvironmentName !== 'pre-release' && payload.pre_release_cost_observation != null) {
+      return {
+        valid: false,
+        error: 'environment run report pre_release_cost_observation must be null outside pre-release',
+      };
+    }
+    if (coversPreReleaseOps) {
+      const rolloutValidation = validatePreReleaseRolloutSkewProbe(
+        'environment run report',
+        payload.rollout_skew_probe,
+      );
+      if (!rolloutValidation.valid) {
+        return rolloutValidation;
+      }
+      const deploymentAuditValidation = validatePreReleaseRolloutDeploymentAudit(
+        'environment run report',
+        payload.rollout_skew_probe,
+        payload.deployment_identity_validation,
+      );
+      if (!deploymentAuditValidation.valid) {
+        return deploymentAuditValidation;
+      }
+    }
+    if (coversPreReleaseCost) {
+      const costObservationValidation = validatePreReleaseCostObservation(
+        'environment run report',
+        payload.pre_release_cost_observation,
+      );
+      if (!costObservationValidation.valid) {
+        return costObservationValidation;
+      }
     }
     return {
       valid: true,
@@ -3433,6 +5392,81 @@ export function validateManualArtifactPayload(artifactId, payload, {
     }
   }
 
+  if (artifactId === 'prod_release_candidate') {
+    return validateReleaseCandidateManifestPayload(payload, { runTimestamp });
+  }
+
+  if (artifactId === 'prod_install_record') {
+    return validateProdInstallRecordPayload(payload);
+  }
+
+  if (artifactId === 'prod_promotion_record') {
+    return validateProdPromotionRecordPayload(payload);
+  }
+
+  if (artifactId === 'prod_rollback_record') {
+    return validateProdRollbackRecordPayload(payload);
+  }
+
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+export async function validateEnvironmentRunExecutionProof(artifactId, payload, repoRoot = process.cwd()) {
+  const expectedEnvironmentName = resolveEnvironmentNameForArtifactId(artifactId);
+  if (expectedEnvironmentName == null) {
+    return {
+      valid: true,
+      error: null,
+    };
+  }
+  const normalizedTestFiles = Array.isArray(payload?.test_files)
+    ? payload.test_files.map((entry) => normalizeRepoRelativePath(entry))
+    : null;
+  const normalizedExpandedTestFiles = Array.isArray(payload?.expanded_test_files)
+    ? payload.expanded_test_files.map((entry) => normalizeRepoRelativePath(entry))
+    : null;
+  if (
+    normalizedTestFiles == null
+    || normalizedExpandedTestFiles == null
+    || normalizedTestFiles.some((entry) => entry == null)
+    || normalizedExpandedTestFiles.some((entry) => entry == null)
+  ) {
+    return {
+      valid: false,
+      error: 'environment run report must include normalized repo-relative test_files and expanded_test_files before execution-proof validation',
+    };
+  }
+  const absoluteTestFiles = normalizedTestFiles.map((file) => path.join(repoRoot, file));
+  const expansionResult = await expandEnvironmentTestFiles(absoluteTestFiles, repoRoot);
+  if (expansionResult.missing_files.length > 0) {
+    return {
+      valid: false,
+      error: 'environment run report test_files must reference existing repo-owned files',
+    };
+  }
+  if (expansionResult.repo_boundary_escapes.length > 0) {
+    return {
+      valid: false,
+      error: 'environment run report test_files must keep repo-owned dependency closure within the repository boundary',
+    };
+  }
+  if (expansionResult.unresolved_dynamic_imports.length > 0) {
+    return {
+      valid: false,
+      error: 'environment run report test_files must not contain unresolved or non-literal dynamic imports',
+    };
+  }
+  const expectedExpandedTestFiles = sortUniqueStrings(expansionResult.expanded_test_files);
+  const claimedExpandedTestFiles = sortUniqueStrings(normalizedExpandedTestFiles);
+  if (!haveSameSortedStrings(expectedExpandedTestFiles, claimedExpandedTestFiles)) {
+    return {
+      valid: false,
+      error: 'environment run report expanded_test_files must equal the repo-owned transitive closure of test_files',
+    };
+  }
   return {
     valid: true,
     error: null,
@@ -3441,6 +5475,7 @@ export function validateManualArtifactPayload(artifactId, payload, {
 
 export function validateEvidenceAttestationBundle(artifactId, payload, {
   runTimestamp = null,
+  expectedGitHubRepository = null,
 } = {}) {
   if (!isPlainObject(payload)) {
     return {
@@ -3520,16 +5555,34 @@ export function validateEvidenceAttestationBundle(artifactId, payload, {
       error: 'attestation bundle provenance.origin_run_attempt must be a positive integer',
     };
   }
+  if (!isNonEmptyString(provenance.origin_repository) || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(provenance.origin_repository)) {
+    return {
+      valid: false,
+      error: 'attestation bundle provenance.origin_repository must be a GitHub owner/repo slug',
+    };
+  }
   if (!isGitHubActionsRunUri(provenance.origin_run_uri)) {
     return {
       valid: false,
       error: 'attestation bundle provenance.origin_run_uri must be a GitHub Actions run URL',
     };
   }
+  if (provenance.origin_repository !== extractGitHubActionsRunRepository(provenance.origin_run_uri)) {
+    return {
+      valid: false,
+      error: 'attestation bundle provenance.origin_repository must match provenance.origin_run_uri',
+    };
+  }
   if (provenance.origin_run_id !== extractGitHubActionsRunId(provenance.origin_run_uri)) {
     return {
       valid: false,
       error: 'attestation bundle provenance.origin_run_id must match provenance.origin_run_uri',
+    };
+  }
+  if (isNonEmptyString(expectedGitHubRepository) && provenance.origin_repository !== expectedGitHubRepository) {
+    return {
+      valid: false,
+      error: 'attestation bundle provenance.origin_repository must match the current repository',
     };
   }
   const artifactStoreLocator = parseR2ObjectLocator(provenance.artifact_store_uri);
@@ -3673,6 +5726,19 @@ export function validateEvidenceAttestationBundle(artifactId, payload, {
       error: 'attestation bundle payload source_run_uri must equal provenance.origin_run_uri',
     };
   }
+  if (
+    artifactId === 'pre_release_run_report'
+    && reportCoversCanonicalTestPrefix(payload.payload, PRE_RELEASE_TEST_FILE_PREFIXES.ops)
+  ) {
+    const rolloutProvenanceValidation = validatePreReleaseRolloutProvenance(
+      'attestation bundle',
+      payload.payload.rollout_skew_probe,
+      provenance.deployment_identity,
+    );
+    if (!rolloutProvenanceValidation.valid) {
+      return rolloutProvenanceValidation;
+    }
+  }
 
   return {
     valid: true,
@@ -3685,7 +5751,8 @@ async function collectTransitiveTestFiles(entryFile, repoRoot, visited = new Set
   if (ownedEntryFile == null) {
     return {
       files: [],
-      repo_boundary_escapes: [],
+      missing_files: [],
+      repo_boundary_escapes: [describeRepoBoundaryEscapePath(entryFile, repoRoot)],
       unresolved_dynamic_imports: [],
     };
   }
@@ -3694,6 +5761,7 @@ async function collectTransitiveTestFiles(entryFile, repoRoot, visited = new Set
   if (visited.has(normalizedEntryFile)) {
     return {
       files: [],
+      missing_files: [],
       repo_boundary_escapes: [],
       unresolved_dynamic_imports: [],
     };
@@ -3706,12 +5774,14 @@ async function collectTransitiveTestFiles(entryFile, repoRoot, visited = new Set
   } catch {
     return {
       files: [normalizedEntryFile],
+      missing_files: [normalizedEntryFile],
       repo_boundary_escapes: [],
       unresolved_dynamic_imports: [],
     };
   }
 
   const transitiveFiles = new Set([normalizedEntryFile]);
+  const missingFiles = [];
   const repoBoundaryEscapes = [];
   const unresolvedDynamicImports = [];
   const dependencyScan = collectRelativeModuleDependencies(sourceText);
@@ -3732,6 +5802,9 @@ async function collectTransitiveTestFiles(entryFile, repoRoot, visited = new Set
     for (const nestedFile of nestedResult.files) {
       transitiveFiles.add(nestedFile);
     }
+    for (const missingFile of nestedResult.missing_files) {
+      missingFiles.push(missingFile);
+    }
     for (const repoBoundaryEscape of nestedResult.repo_boundary_escapes) {
       repoBoundaryEscapes.push(repoBoundaryEscape);
     }
@@ -3741,6 +5814,7 @@ async function collectTransitiveTestFiles(entryFile, repoRoot, visited = new Set
   }
   return {
     files: [...transitiveFiles].sort(),
+    missing_files: [...new Set(missingFiles)].sort(),
     repo_boundary_escapes: [...new Set(repoBoundaryEscapes)].sort(),
     unresolved_dynamic_imports: [...new Set(unresolvedDynamicImports)].sort(),
   };
@@ -3748,6 +5822,7 @@ async function collectTransitiveTestFiles(entryFile, repoRoot, visited = new Set
 
 async function expandEnvironmentTestFiles(files, repoRoot) {
   const expanded = new Set();
+  const missingFiles = new Set();
   const repoBoundaryEscapes = new Set();
   const unresolvedDynamicImports = new Set();
   for (const file of files) {
@@ -3758,6 +5833,9 @@ async function expandEnvironmentTestFiles(files, repoRoot) {
     for (const expandedFile of expansionResult.files) {
       expanded.add(expandedFile);
     }
+    for (const missingFile of expansionResult.missing_files) {
+      missingFiles.add(missingFile);
+    }
     for (const repoBoundaryEscape of expansionResult.repo_boundary_escapes) {
       repoBoundaryEscapes.add(repoBoundaryEscape);
     }
@@ -3767,9 +5845,43 @@ async function expandEnvironmentTestFiles(files, repoRoot) {
   }
   return {
     expanded_test_files: [...expanded].sort(),
+    missing_files: [...missingFiles].sort(),
     repo_boundary_escapes: [...repoBoundaryEscapes].sort(),
     unresolved_dynamic_imports: [...unresolvedDynamicImports].sort(),
   };
+}
+
+async function validateNonLocalRequiredTestImplementationClosure(testId, environmentName, requiredFiles, repoRoot) {
+  if (environmentName === 'local') {
+    return null;
+  }
+  const environmentDirectory = normalizeRepoRelativePath(getTestEnvironmentDefinition(environmentName).directory);
+  if (environmentDirectory == null) {
+    return `Unknown non-local test environment directory for "${environmentName}"`;
+  }
+  const absoluteRequiredFiles = requiredFiles.map((file) => (path.isAbsolute(file) ? file : path.join(repoRoot, file)));
+  const expansionResult = await expandEnvironmentTestFiles(absoluteRequiredFiles, repoRoot);
+  if (expansionResult.missing_files.length > 0) {
+    return `Non-local L1 test implementation mapping for "${testId}" in environment "${environmentName}" must reference existing repo-owned .test.mjs files`;
+  }
+  if (expansionResult.repo_boundary_escapes.length > 0) {
+    return `Non-local L1 test implementation mapping for "${testId}" in environment "${environmentName}" escapes repo-owned dependencies`;
+  }
+  if (expansionResult.unresolved_dynamic_imports.length > 0) {
+    return `Non-local L1 test implementation mapping for "${testId}" in environment "${environmentName}" contains unresolved or non-literal dynamic imports`;
+  }
+  const escapedDependency = expansionResult.expanded_test_files.find((file) => !pathUsesPrefix(file, environmentDirectory));
+  if (escapedDependency != null) {
+    return `Non-local L1 test implementation mapping for "${testId}" in environment "${environmentName}" must keep its repo-owned dependency closure within dedicated environment directory "${environmentDirectory}"`;
+  }
+  const genericDependency = expansionResult.expanded_test_files.find((file) => {
+    const basename = path.posix.basename(file);
+    return basename === 'bootstrap.test.mjs' || basename === 'l1-mandatory.test.mjs';
+  });
+  if (genericDependency != null) {
+    return `Non-local L1 test implementation mapping for "${testId}" in environment "${environmentName}" cannot expand generic entrypoint "${genericDependency}"`;
+  }
+  return null;
 }
 
 function buildL1EvidenceOutputPaths(repoRoot, runTimestamp) {
@@ -3782,10 +5894,17 @@ function buildL1EvidenceOutputPaths(repoRoot, runTimestamp) {
   ];
 }
 
-export async function assessNonLocalEnvironmentHarnessReadiness(environmentName, repoRoot = process.cwd()) {
+export async function assessNonLocalEnvironmentHarnessReadiness(
+  environmentName,
+  repoRoot = process.cwd(),
+  {
+    getRequiredTestFilesImpl = getRequiredTestFiles,
+  } = {},
+) {
   let result;
   try {
-    const testFiles = await getRequiredTestFiles(environmentName, repoRoot);
+    const environmentDirectory = normalizeRepoRelativePath(getTestEnvironmentDefinition(environmentName).directory);
+    const testFiles = await getRequiredTestFilesImpl(environmentName, repoRoot);
     const relativeTestFiles = testFiles.map((file) => normalizePathForMarkdown(path.relative(repoRoot, file)));
     const {
       expanded_test_files: expandedTestFiles,
@@ -3793,7 +5912,16 @@ export async function assessNonLocalEnvironmentHarnessReadiness(environmentName,
       unresolved_dynamic_imports: unresolvedDynamicImports,
     } = await expandEnvironmentTestFiles(testFiles, repoRoot);
     const localTestExpansions = expandedTestFiles.filter((file) => pathUsesPrefix(file, 'tests/local'));
+    const environmentBoundaryEscapes = environmentDirectory == null
+      ? []
+      : expandedTestFiles.filter((file) => !pathUsesPrefix(file, environmentDirectory));
+    const genericEntrypoints = expandedTestFiles.filter((file) => {
+      const basename = path.posix.basename(file);
+      return basename === 'bootstrap.test.mjs' || basename === 'l1-mandatory.test.mjs';
+    });
     result = localTestExpansions.length === 0
+      && environmentBoundaryEscapes.length === 0
+      && genericEntrypoints.length === 0
       && unresolvedDynamicImports.length === 0
       && repoBoundaryEscapes.length === 0
       ? {
@@ -3802,6 +5930,8 @@ export async function assessNonLocalEnvironmentHarnessReadiness(environmentName,
           test_files: relativeTestFiles,
           expanded_test_files: expandedTestFiles,
           local_test_expansions: [],
+          environment_boundary_escapes: [],
+          generic_entrypoints: [],
           repo_boundary_escapes: [],
           unresolved_dynamic_imports: [],
         }
@@ -3812,9 +5942,35 @@ export async function assessNonLocalEnvironmentHarnessReadiness(environmentName,
           test_files: relativeTestFiles,
           expanded_test_files: expandedTestFiles,
           local_test_expansions: localTestExpansions,
+          environment_boundary_escapes: environmentBoundaryEscapes,
+          generic_entrypoints: genericEntrypoints,
           repo_boundary_escapes: repoBoundaryEscapes,
           unresolved_dynamic_imports: unresolvedDynamicImports,
         }
+        : environmentBoundaryEscapes.length > 0
+          ? {
+            ready: false,
+            reason: `${environmentName} harness escapes dedicated environment directory closure`,
+            test_files: relativeTestFiles,
+            expanded_test_files: expandedTestFiles,
+            local_test_expansions: [],
+            environment_boundary_escapes: environmentBoundaryEscapes,
+            generic_entrypoints: genericEntrypoints,
+            repo_boundary_escapes: repoBoundaryEscapes,
+            unresolved_dynamic_imports: unresolvedDynamicImports,
+          }
+        : genericEntrypoints.length > 0
+          ? {
+            ready: false,
+            reason: `${environmentName} harness expands generic entrypoints`,
+            test_files: relativeTestFiles,
+            expanded_test_files: expandedTestFiles,
+            local_test_expansions: [],
+            environment_boundary_escapes: environmentBoundaryEscapes,
+            generic_entrypoints: genericEntrypoints,
+            repo_boundary_escapes: repoBoundaryEscapes,
+            unresolved_dynamic_imports: unresolvedDynamicImports,
+          }
         : repoBoundaryEscapes.length > 0
           ? {
               ready: false,
@@ -3822,6 +5978,8 @@ export async function assessNonLocalEnvironmentHarnessReadiness(environmentName,
               test_files: relativeTestFiles,
               expanded_test_files: expandedTestFiles,
               local_test_expansions: [],
+              environment_boundary_escapes: environmentBoundaryEscapes,
+              generic_entrypoints: genericEntrypoints,
               repo_boundary_escapes: repoBoundaryEscapes,
               unresolved_dynamic_imports: unresolvedDynamicImports,
             }
@@ -3831,6 +5989,8 @@ export async function assessNonLocalEnvironmentHarnessReadiness(environmentName,
             test_files: relativeTestFiles,
             expanded_test_files: expandedTestFiles,
             local_test_expansions: [],
+            environment_boundary_escapes: environmentBoundaryEscapes,
+            generic_entrypoints: genericEntrypoints,
             repo_boundary_escapes: repoBoundaryEscapes,
             unresolved_dynamic_imports: unresolvedDynamicImports,
           };
@@ -3841,6 +6001,8 @@ export async function assessNonLocalEnvironmentHarnessReadiness(environmentName,
       test_files: [],
       expanded_test_files: [],
       local_test_expansions: [],
+      environment_boundary_escapes: [],
+      generic_entrypoints: [],
       repo_boundary_escapes: [],
       unresolved_dynamic_imports: [],
     };
@@ -4034,16 +6196,24 @@ function buildApplicableSourceIds(definition, expandedSourceIds) {
   return expandedSourceIds.filter((sourceId) => !excluded.has(sourceId));
 }
 
-export async function collectManualArtifactResults(definition, repoRoot, manualArtifacts = {}, runTimestamp) {
+export async function collectManualArtifactResults(definition, repoRoot, manualArtifacts = {}, runTimestamp, {
+  expectedGitHubRepository = null,
+} = {}) {
   const requiredManualArtifacts = buildRequiredManualArtifactDefinitions(definition);
-  return Promise.all(requiredManualArtifacts.map(async (artifactRequirement) => {
+  const resolvedExpectedGitHubRepository = await resolveExpectedGitHubRepositoryForRepoRoot(
+    repoRoot,
+    expectedGitHubRepository,
+  );
+  const results = await Promise.all(requiredManualArtifacts.map(async (artifactRequirement) => {
     const resolvedPath = normalizeOptionalArtifactPath(repoRoot, manualArtifacts[artifactRequirement.artifact_id]);
     const providedPath = resolvedPath == null ? null : normalizePathForMarkdown(path.relative(repoRoot, resolvedPath));
     const expectedEnvironmentName = resolveEnvironmentNameForArtifactId(artifactRequirement.artifact_id);
     const requiresExternalEvidence = requiresExternalManualArtifactEvidence(artifactRequirement.artifact_id);
     const harnessReadiness = expectedEnvironmentName == null
       ? null
-      : await assessNonLocalEnvironmentHarnessReadiness(expectedEnvironmentName, repoRoot);
+      : await assessNonLocalEnvironmentHarnessReadiness(expectedEnvironmentName, repoRoot, {
+        getRequiredTestFilesImpl: getReleaseGateTestFiles,
+      });
     let exists = false;
     let sha256 = null;
     let valid = false;
@@ -4083,28 +6253,24 @@ export async function collectManualArtifactResults(definition, repoRoot, manualA
         }
         const validation = validateEvidenceAttestationBundle(artifactRequirement.artifact_id, parsedPayload, {
           runTimestamp,
+          expectedGitHubRepository: resolvedExpectedGitHubRepository,
         });
         valid = validation.valid;
         validation_error = validation.error;
-        if (valid) {
-          attestation_kind = parsedPayload.attestation_kind ?? null;
-          attestation_origin_system = parsedPayload.provenance?.origin_system ?? null;
-          attestation_origin_run_id = parsedPayload.provenance?.origin_run_id ?? null;
-          attestation_origin_run_attempt = parsedPayload.provenance?.origin_run_attempt ?? null;
-          attestation_origin_run_uri = parsedPayload.provenance?.origin_run_uri ?? null;
-          attestation_artifact_store_uri = parsedPayload.provenance?.artifact_store_uri ?? null;
-          attestation_artifact_store_key = parsedPayload.provenance?.artifact_store_key ?? null;
-          attestation_artifact_sha256 = parsedPayload.provenance?.artifact_sha256 ?? null;
-          attestation_review_record_uri = parsedPayload.provenance?.review_record_uri ?? null;
-          attestation_topology_kind = parsedPayload.provenance?.topology_kind ?? null;
-          attestation_deployment_identity = parsedPayload.provenance?.deployment_identity ?? null;
-        }
         attestation_provenance = isPlainObject(parsedPayload?.provenance)
           ? parsedPayload.provenance
           : null;
-        attested_payload = valid && isPlainObject(parsedPayload?.payload)
-          ? parsedPayload.payload
-          : null;
+        if (valid && expectedEnvironmentName != null && isPlainObject(parsedPayload?.payload)) {
+          const executionProofValidation = await validateEnvironmentRunExecutionProof(
+            artifactRequirement.artifact_id,
+            parsedPayload.payload,
+            repoRoot,
+          );
+          if (!executionProofValidation.valid) {
+            valid = false;
+            validation_error = executionProofValidation.error;
+          }
+        }
         if (requiresExternalEvidence) {
           sharedRunArtifactAlias = await isAliasOfSharedRunArtifact(
             resolvedPath,
@@ -4126,6 +6292,24 @@ export async function collectManualArtifactResults(definition, repoRoot, manualA
         if (valid && expectedEnvironmentName != null && harnessReadiness?.ready === false) {
           valid = false;
           validation_error = `${expectedEnvironmentName} harness is not environment-backed: ${harnessReadiness.reason}`;
+        }
+        if (valid) {
+          attestation_kind = parsedPayload.attestation_kind ?? null;
+          attestation_origin_system = parsedPayload.provenance?.origin_system ?? null;
+          attestation_origin_run_id = parsedPayload.provenance?.origin_run_id ?? null;
+          attestation_origin_run_attempt = parsedPayload.provenance?.origin_run_attempt ?? null;
+          attestation_origin_run_uri = parsedPayload.provenance?.origin_run_uri ?? null;
+          attestation_artifact_store_uri = parsedPayload.provenance?.artifact_store_uri ?? null;
+          attestation_artifact_store_key = parsedPayload.provenance?.artifact_store_key ?? null;
+          attestation_artifact_sha256 = parsedPayload.provenance?.artifact_sha256 ?? null;
+          attestation_review_record_uri = parsedPayload.provenance?.review_record_uri ?? null;
+          attestation_topology_kind = parsedPayload.provenance?.topology_kind ?? null;
+          attestation_deployment_identity = parsedPayload.provenance?.deployment_identity ?? null;
+          attested_payload = isPlainObject(parsedPayload?.payload)
+            ? parsedPayload.payload
+            : null;
+        } else {
+          attested_payload = null;
         }
       } catch (error) {
         if (error && error.code === 'ENOENT') {
@@ -4162,6 +6346,30 @@ export async function collectManualArtifactResults(definition, repoRoot, manualA
       environment_harness_reason: harnessReadiness?.reason ?? null,
     };
   }));
+  const referenceArtifact = results.find((artifact) => (
+    artifact.valid
+    && isNonEmptyString(artifact.attestation_origin_run_id)
+    && Number.isInteger(artifact.attestation_origin_run_attempt)
+  )) ?? null;
+  if (referenceArtifact == null) {
+    return results;
+  }
+  return results.map((artifact) => {
+    if (!artifact.valid) {
+      return artifact;
+    }
+    if (
+      artifact.attestation_origin_run_id === referenceArtifact.attestation_origin_run_id
+      && artifact.attestation_origin_run_attempt === referenceArtifact.attestation_origin_run_attempt
+    ) {
+      return artifact;
+    }
+    return {
+      ...artifact,
+      valid: false,
+      validation_error: `${artifact.artifact_id} must come from GitHub Actions run ${referenceArtifact.attestation_origin_run_id} attempt ${referenceArtifact.attestation_origin_run_attempt}, matching the other manual artifacts for this evidence run`,
+    };
+  });
 }
 
 function buildAttestedEnvironmentRunSource(artifactResult) {
@@ -4191,6 +6399,10 @@ function buildAttestedEnvironmentRunSource(artifactResult) {
     source_run_uri: payload.source_run_uri,
     topology_kind: payload.topology_kind,
     cloudflare_resources: payload.cloudflare_resources,
+    readiness_probe: payload.readiness_probe,
+    rollout_skew_probe: payload.rollout_skew_probe ?? null,
+    pre_release_cost_observation: payload.pre_release_cost_observation ?? null,
+    deployment_identity_validation: payload.deployment_identity_validation ?? null,
     attestation_path: artifactResult.provided_path,
     attestation_origin_run_id: artifactResult.attestation_origin_run_id,
     attestation_origin_run_attempt: artifactResult.attestation_origin_run_attempt,
@@ -4237,11 +6449,12 @@ function resolveEnvironmentRunSource(environmentName, environmentRuns, manualArt
   return buildAttestedEnvironmentRunSource(artifact);
 }
 
-export function collectTestCoverageResults(definition, environmentRuns) {
-  return definition.required_environments.flatMap((environmentName) => {
+export async function collectTestCoverageResults(definition, environmentRuns, repoRoot = process.cwd()) {
+  const results = [];
+  for (const environmentName of definition.required_environments) {
     const environmentRun = environmentRuns[environmentName] ?? null;
     const executedFiles = new Set(environmentRun?.expanded_test_files ?? []);
-    return definition.test_ids.map((testId) => {
+    for (const testId of definition.test_ids) {
       let requiredFiles;
       let mapping_error = null;
       try {
@@ -4250,9 +6463,17 @@ export function collectTestCoverageResults(definition, environmentRuns) {
         requiredFiles = [];
         mapping_error = error instanceof Error ? error.message : String(error);
       }
+      if (mapping_error == null) {
+        mapping_error = await validateNonLocalRequiredTestImplementationClosure(
+          testId,
+          environmentName,
+          requiredFiles,
+          repoRoot,
+        );
+      }
       const matchedFiles = requiredFiles.filter((file) => executedFiles.has(file));
       const missingFiles = requiredFiles.filter((file) => !executedFiles.has(file));
-      return {
+      results.push({
         environment_name: environmentName,
         test_id: testId,
         required_files: requiredFiles,
@@ -4260,9 +6481,10 @@ export function collectTestCoverageResults(definition, environmentRuns) {
         missing_files: missingFiles,
         mapping_error,
         satisfied: mapping_error == null && missingFiles.length === 0,
-      };
-    });
-  });
+      });
+    }
+  }
+  return results;
 }
 
 function createMissingEnvironmentRunSource(environmentName, reason) {
@@ -4316,6 +6538,10 @@ function serializeEnvironmentRunSource(environmentRun, evidenceRoot) {
       source_run_uri: environmentRun.source_run_uri,
       topology_kind: environmentRun.topology_kind,
       cloudflare_resources: environmentRun.cloudflare_resources,
+      readiness_probe: environmentRun.readiness_probe ?? null,
+      rollout_skew_probe: environmentRun.rollout_skew_probe ?? null,
+      pre_release_cost_observation: environmentRun.pre_release_cost_observation ?? null,
+      deployment_identity_validation: environmentRun.deployment_identity_validation ?? null,
       artifact_store_uri: environmentRun.attestation_artifact_store_uri,
       artifact_store_key: environmentRun.attestation_artifact_store_key,
       artifact_sha256: environmentRun.attestation_artifact_sha256,
@@ -4339,12 +6565,15 @@ async function writeEvidenceBundle(repoRoot, {
   sharedRunRoot,
   environmentRuns,
   manualArtifacts,
+  expectedGitHubRepository,
 }) {
   const evidenceRoot = path.join(repoRoot, `evidence/${definition.scope}/${definition.id}/${runTimestamp}`);
   const artifactsDir = path.join(evidenceRoot, 'artifacts');
   const expandedSourceIds = expandDeclaredSourceIds(definition.declared_source_ids, analysis);
   const applicableSourceIds = buildApplicableSourceIds(definition, expandedSourceIds);
-  const manualArtifactResults = await collectManualArtifactResults(definition, repoRoot, manualArtifacts, runTimestamp);
+  const manualArtifactResults = await collectManualArtifactResults(definition, repoRoot, manualArtifacts, runTimestamp, {
+    expectedGitHubRepository,
+  });
   const coverageEnvironmentRuns = {};
   if (environmentRuns.local) {
     coverageEnvironmentRuns.local = buildLocalEnvironmentRunSource(environmentRuns.local);
@@ -4362,7 +6591,7 @@ async function writeEvidenceBundle(repoRoot, {
     && !definition.required_environments.includes('local')
     ? [coverageEnvironmentRuns.local]
     : [];
-  const testCoverageResults = collectTestCoverageResults(definition, coverageEnvironmentRuns);
+  const testCoverageResults = await collectTestCoverageResults(definition, coverageEnvironmentRuns, repoRoot);
   const localEnvironmentRun = coverageEnvironmentRuns.local ?? null;
   const status = analysis.valid
     && localEnvironmentRun?.exit_code === 0
@@ -4455,6 +6684,12 @@ async function writeEvidenceBundle(repoRoot, {
     } else if (environmentRun.source_kind === 'attestation') {
       summaryLines.push(`  attestation: \`${environmentRun.attestation_path}\``);
       summaryLines.push(`  provenance: origin_run_uri=\`${environmentRun.attestation_origin_run_uri}\`, artifact_store_uri=\`${environmentRun.attestation_artifact_store_uri}\`, review_record_uri=\`${environmentRun.attestation_review_record_uri}\``);
+      if (isPlainObject(environmentRun.readiness_probe)) {
+        summaryLines.push(`  readiness: ready=${String(environmentRun.readiness_probe.ready)}, attempts=${environmentRun.readiness_probe.attempt_count}, completed_at=\`${environmentRun.readiness_probe.completed_at}\``);
+      }
+      if (isPlainObject(environmentRun.deployment_identity_validation)) {
+        summaryLines.push(`  deployment_identity_validation: before_readiness=${environmentRun.deployment_identity_validation.before_readiness == null ? 'absent' : 'present'}, before_suite=${environmentRun.deployment_identity_validation.before_suite == null ? 'absent' : 'present'}`);
+      }
     } else {
       summaryLines.push(`  reason: ${environmentRun.missing_reason ?? 'missing environment evidence'}`);
     }
@@ -4525,6 +6760,10 @@ export async function writeL1Evidence(repoRoot = process.cwd(), options = {}) {
     label: `L1 evidence output paths for run ${runTimestamp}`,
   });
   const governanceBundle = await writeGovernanceEvidence(repoRoot, { timestamp: runTimestamp });
+  const expectedGitHubRepository = await resolveExpectedGitHubRepositoryForRepoRoot(
+    repoRoot,
+    options.expectedGitHubRepository ?? null,
+  );
 
   await fs.mkdir(sharedRunRoot, { recursive: true });
 
@@ -4551,6 +6790,7 @@ export async function writeL1Evidence(repoRoot = process.cwd(), options = {}) {
       sharedRunRoot,
       environmentRuns,
       manualArtifacts: options.manualArtifacts ?? {},
+      expectedGitHubRepository,
     }));
   }
 

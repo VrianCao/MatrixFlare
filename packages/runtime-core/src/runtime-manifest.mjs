@@ -1,5 +1,8 @@
+import { GATEWAY_RATE_LIMIT_BINDING_DEFINITIONS } from './abuse-guard.mjs';
+import { VERSION_METADATA_BINDING_NAME } from './version-metadata.mjs';
+
 const COMPATIBILITY_DATE = '2026-03-26';
-const COMPATIBILITY_FLAGS = Object.freeze([
+const DEFAULT_COMPATIBILITY_FLAGS = Object.freeze([
   'nodejs_compat',
   'nodejs_compat_do_not_populate_process_env',
 ]);
@@ -62,6 +65,8 @@ const DEFAULT_RESOURCE_BINDING_NAMES = Object.freeze({
 const WORKER_RUNTIME_MANIFEST = Object.freeze({
   'gateway-worker': Object.freeze({
     compatibilityDate: COMPATIBILITY_DATE,
+    compatibilityFlags: DEFAULT_COMPATIBILITY_FLAGS,
+    versionMetadataBinding: VERSION_METADATA_BINDING_NAME,
     vars: Object.freeze({
       ...SHARED_TEXT_BINDINGS,
       MATRIX_PUBLIC_BASE_URL: { type: 'string', required: true },
@@ -129,10 +134,22 @@ const WORKER_RUNTIME_MANIFEST = Object.freeze({
       kv: Object.freeze([
         { binding: 'MATRIX_EDGE_CACHE', id: '00000000000000000000000000000001' },
       ]),
+      ratelimits: Object.freeze(
+        Object.values(GATEWAY_RATE_LIMIT_BINDING_DEFINITIONS).map((definition) => ({
+          binding: definition.binding_name,
+          namespaceId: definition.default_namespace_id,
+          simple: Object.freeze({
+            limit: definition.limit,
+            period: definition.period_seconds,
+          }),
+        })),
+      ),
     }),
   }),
   'jobs-worker': Object.freeze({
     compatibilityDate: COMPATIBILITY_DATE,
+    compatibilityFlags: DEFAULT_COMPATIBILITY_FLAGS,
+    versionMetadataBinding: VERSION_METADATA_BINDING_NAME,
     vars: Object.freeze({
       ...SHARED_TEXT_BINDINGS,
       MANAGEMENT_API_BASE_URL: { type: 'string', required: true },
@@ -158,6 +175,8 @@ const WORKER_RUNTIME_MANIFEST = Object.freeze({
       services: Object.freeze([]),
       queues: Object.freeze({
         producers: Object.freeze([
+          { binding: 'SEARCH_INDEX_QUEUE', queue: 'matrix-search-index-job' },
+          { binding: 'MEDIA_THUMBNAIL_QUEUE', queue: 'matrix-media-thumbnail-job' },
           { binding: 'REBUILD_SHARD_QUEUE', queue: 'matrix-rebuild-shard-job' },
           { binding: 'EXPORT_SHARD_QUEUE', queue: 'matrix-export-shard-job' },
           { binding: 'RESTORE_SHARD_QUEUE', queue: 'matrix-restore-shard-job' },
@@ -187,18 +206,29 @@ const WORKER_RUNTIME_MANIFEST = Object.freeze({
       kv: Object.freeze([
         { binding: 'MATRIX_EDGE_CACHE', id: '00000000000000000000000000000001' },
       ]),
+      ratelimits: Object.freeze([]),
     }),
   }),
   'ops-worker': Object.freeze({
     compatibilityDate: COMPATIBILITY_DATE,
+    compatibilityFlags: Object.freeze([
+      ...DEFAULT_COMPATIBILITY_FLAGS,
+      'global_fetch_strictly_public',
+    ]),
+    versionMetadataBinding: VERSION_METADATA_BINDING_NAME,
     vars: Object.freeze({
       ...SHARED_TEXT_BINDINGS,
+      MATRIX_PUBLIC_BASE_URL: { type: 'string', required: true },
       MANAGEMENT_API_BASE_URL: { type: 'string', required: true },
+      GATEWAY_WORKER_SCRIPT_NAME: { type: 'string', required: true },
       ACCESS_TEAM_DOMAIN: { type: 'string', required: true },
       ACCESS_AUDIENCE: { type: 'string', required: true },
+      CLOUDFLARE_ACCOUNT_ID: { type: 'string', required: false, default: '' },
+      CLOUDFLARE_RESOURCE_IDS_JSON: { type: 'string', required: false, default: '' },
     }),
     secrets: Object.freeze({
       export_bundle_key_ring: 'EXPORT_BUNDLE_KEY_RING',
+      cloudflare_observability_api_token: 'CLOUDFLARE_OBSERVABILITY_API_TOKEN',
     }),
     featureGates: Object.freeze([
       'appservice_api',
@@ -227,6 +257,7 @@ const WORKER_RUNTIME_MANIFEST = Object.freeze({
         { binding: 'MATRIX_ARCHIVE_BUCKET', bucketName: 'matrix-archive' },
       ]),
       kv: Object.freeze([]),
+      ratelimits: Object.freeze([]),
     }),
   }),
 });
@@ -352,6 +383,7 @@ export function loadWorkerRuntimeConfig(workerName, env = {}) {
   return Object.freeze({
     workerName,
     compatibilityDate: manifest.compatibilityDate,
+    compatibilityFlags: Object.freeze([...manifest.compatibilityFlags]),
     bindings: manifest.bindings,
     text: Object.freeze(text),
     environmentName: text.ENVIRONMENT_NAME,
@@ -407,7 +439,7 @@ export function createWranglerConfigSnapshot(workerName) {
     name: `matrix-${workerName}`,
     main: 'src/index.mjs',
     compatibility_date: manifest.compatibilityDate,
-    compatibility_flags: [...COMPATIBILITY_FLAGS],
+    compatibility_flags: [...manifest.compatibilityFlags],
     vars: {},
   };
 
@@ -437,6 +469,12 @@ export function createWranglerConfigSnapshot(workerName) {
       tag: migration.tag,
       new_sqlite_classes: [...migration.newSqliteClasses],
     }));
+  }
+
+  if (typeof manifest.versionMetadataBinding === 'string' && manifest.versionMetadataBinding.length > 0) {
+    config.version_metadata = {
+      binding: manifest.versionMetadataBinding,
+    };
   }
 
   if (manifest.bindings.services.length > 0) {
@@ -481,6 +519,17 @@ export function createWranglerConfigSnapshot(workerName) {
     config.kv_namespaces = manifest.bindings.kv.map((binding) => ({
       binding: binding.binding,
       id: binding.id,
+    }));
+  }
+
+  if (manifest.bindings.ratelimits.length > 0) {
+    config.ratelimits = manifest.bindings.ratelimits.map((binding) => ({
+      name: binding.binding,
+      namespace_id: binding.namespaceId,
+      simple: {
+        limit: binding.simple.limit,
+        period: binding.simple.period,
+      },
     }));
   }
 

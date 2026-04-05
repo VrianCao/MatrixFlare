@@ -38,6 +38,8 @@ import {
   putWellKnownCacheEntry,
 } from '../../../packages/runtime-core/src/index.mjs';
 import { createD1ControlPlanePersistence } from '../../../packages/control-plane/src/index.mjs';
+import { markCloudflareKnownLengthStream } from '../../../packages/runtime-core/src/media-domain.mjs';
+import { R2_MULTIPART_MIN_PART_BYTES } from '../../../packages/runtime-core/src/media-domain.mjs';
 import {
   FakeKvNamespace,
   FakeR2Bucket,
@@ -339,6 +341,28 @@ test('UserDO persistence lands DATA-USER-001 through DATA-USER-017 and exposes s
   const schemaState = await userDo.ensureSchema();
   assert.equal(schemaState.schema_version, USER_DO_SCHEMA_VERSION);
   storage.close();
+});
+
+test('FakeR2 multipart completion rejects out-of-order and duplicate uploaded parts', async () => {
+  const bucket = new FakeR2Bucket();
+  const multipart = await bucket.createMultipartUpload('phase08/multipart-ordering');
+  const first = await multipart.uploadPart(1, Buffer.alloc(R2_MULTIPART_MIN_PART_BYTES, 'a'));
+  const second = await multipart.uploadPart(2, Buffer.alloc(R2_MULTIPART_MIN_PART_BYTES, 'b'));
+
+  await assert.rejects(
+    multipart.complete([second, first]),
+    /strictly increasing and unique/,
+  );
+
+  await assert.rejects(
+    multipart.complete([first, first]),
+    /strictly increasing and unique/,
+  );
+
+  await assert.rejects(
+    multipart.complete([{ partNumber: 0, etag: first.etag }]),
+    /part number 0 is invalid/,
+  );
 });
 
 test('RoomDO persistence lands DATA-ROOM-001 through DATA-ROOM-012 with query indices and outbox helpers', async () => {
@@ -837,6 +861,453 @@ test('derived D1 persistence lands DATA-D1-001 through DATA-D1-004 and composes 
     now: '2026-03-30T03:00:06.000Z',
   })).length, 1);
   d1.close();
+});
+
+test('derived D1 schema bootstrap avoids exec() so non-local publicRooms does not fail on newline-delimited D1 exec semantics', async () => {
+  const d1 = createFakeD1Database();
+  let execCalls = 0;
+  d1.exec = async () => {
+    execCalls += 1;
+    throw new Error('D1_EXEC_ERROR: Error in line 1: CREATE TABLE IF NOT EXISTS derived_schema_state (: incomplete input: SQLITE_ERROR');
+  };
+
+  const derived = createD1DerivedDataPersistence(d1);
+  await derived.ensureSchema('2026-04-01T15:00:00.000Z');
+
+  assert.equal(execCalls, 0);
+  assert.equal(await derived.isSchemaReady(), true);
+  const schemaState = await derived.getSchemaState();
+  assert.equal(schemaState.schema_version, DERIVED_DATA_SCHEMA_VERSION);
+  d1.close();
+});
+
+test('derived D1 schema bootstrap memoizes once-per-isolate after the first successful ensureSchema()', async () => {
+  const d1 = createFakeD1Database();
+  const originalPrepare = d1.prepare.bind(d1);
+  let prepareCalls = 0;
+  d1.prepare = (sql) => {
+    prepareCalls += 1;
+    return originalPrepare(sql);
+  };
+
+  const derived = createD1DerivedDataPersistence(d1);
+  await derived.ensureSchema('2026-04-01T15:00:00.000Z');
+  const firstPrepareCount = prepareCalls;
+  assert.ok(firstPrepareCount > 0);
+
+  await derived.ensureSchema('2026-04-01T15:00:01.000Z');
+  assert.equal(prepareCalls, firstPrepareCount);
+  d1.close();
+});
+
+test('derived D1 schema bootstrap coalesces concurrent ensureSchema() calls into a single schema install', async () => {
+  const d1 = createFakeD1Database();
+  const originalPrepare = d1.prepare.bind(d1);
+  let prepareCalls = 0;
+  d1.prepare = (sql) => {
+    prepareCalls += 1;
+    return originalPrepare(sql);
+  };
+
+  const derived = createD1DerivedDataPersistence(d1);
+  await Promise.all([
+    derived.ensureSchema('2026-04-01T15:00:00.000Z'),
+    derived.ensureSchema('2026-04-01T15:00:01.000Z'),
+    derived.ensureSchema('2026-04-01T15:00:02.000Z'),
+  ]);
+  const firstPrepareCount = prepareCalls;
+  assert.ok(firstPrepareCount > 0);
+
+  await derived.ensureSchema('2026-04-01T15:00:03.000Z');
+  assert.equal(prepareCalls, firstPrepareCount);
+  d1.close();
+});
+
+test('control-plane D1 schema bootstrap avoids exec() so non-local publicRooms does not fail on newline-delimited D1 exec semantics', async () => {
+  const d1 = createFakeD1Database();
+  let execCalls = 0;
+  d1.exec = async () => {
+    execCalls += 1;
+    throw new Error('D1_EXEC_ERROR: Error in line 1: CREATE TABLE IF NOT EXISTS operator_authz_policies (: incomplete input: SQLITE_ERROR');
+  };
+
+  const controlPlane = createD1ControlPlanePersistence(d1);
+  await controlPlane.ensureSchema();
+
+  assert.equal(execCalls, 0);
+  assert.equal(await controlPlane.isSchemaReady(), true);
+  await controlPlane.upsertOperatorPolicy({
+    principal_id: 'ops-alice',
+    principal_type: 'human',
+    access_issuer: 'https://matrix.cloudflareaccess.com',
+    access_audience: 'aud',
+    access_subject_binding: { mode: 'sub' },
+    access_subject_value: 'alice-subject',
+    allowed_scopes: ['ops.read'],
+    target_scope_constraints: { global: true },
+    expires_at: null,
+    disabled_at: null,
+    require_reason: false,
+    require_ticket: false,
+    created_at: '2026-04-01T15:00:00.000Z',
+    updated_at: '2026-04-01T15:00:00.000Z',
+  });
+  const activePolicies = await controlPlane.listActiveOperatorPolicies({
+    issuer: 'https://matrix.cloudflareaccess.com',
+    audience: 'aud',
+    now: '2026-04-01T15:00:01.000Z',
+  });
+  assert.equal(activePolicies.length, 1);
+  d1.close();
+});
+
+test('control-plane D1 transaction avoids raw BEGIN/COMMIT SQL on managed D1 bindings', async () => {
+  const d1 = createFakeD1Database();
+  const originalExec = d1.exec.bind(d1);
+  const executedSql = [];
+  d1.exec = async (sql) => {
+    executedSql.push(sql);
+    if (/^\s*(BEGIN|COMMIT|ROLLBACK)\b/i.test(sql)) {
+      throw new Error('D1_EXEC_ERROR: raw transaction SQL is not allowed on managed D1 bindings');
+    }
+    return originalExec(sql);
+  };
+
+  const controlPlane = createD1ControlPlanePersistence(d1);
+  await controlPlane.ensureSchema();
+  await controlPlane.transaction(async (tx) => {
+    await tx.upsertOperatorPolicy({
+      principal_id: 'ops-managed-d1',
+      principal_type: 'human',
+      access_issuer: 'https://matrix.cloudflareaccess.com',
+      access_audience: 'aud-managed',
+      access_subject_binding: { mode: 'sub' },
+      access_subject_value: 'managed-subject',
+      allowed_scopes: ['ops.read'],
+      target_scope_constraints: { global: true },
+      expires_at: null,
+      disabled_at: null,
+      require_reason: false,
+      require_ticket: false,
+      created_at: '2026-04-02T19:00:00.000Z',
+      updated_at: '2026-04-02T19:00:00.000Z',
+    });
+  });
+
+  const activePolicies = await controlPlane.listActiveOperatorPolicies({
+    issuer: 'https://matrix.cloudflareaccess.com',
+    audience: 'aud-managed',
+    now: '2026-04-02T19:00:01.000Z',
+  });
+  assert.equal(activePolicies.length, 1);
+  assert.equal(
+    executedSql.some((sql) => /^\s*(BEGIN|COMMIT|ROLLBACK)\b/i.test(sql)),
+    false,
+  );
+  d1.close();
+});
+
+test('control-plane D1 transaction rolls back the entire batch when one grouped write fails', async () => {
+  const d1 = createFakeD1Database();
+  const controlPlane = createD1ControlPlanePersistence(d1);
+  await controlPlane.ensureSchema();
+
+  await assert.rejects(
+    controlPlane.transaction(async (tx) => {
+      const event = {
+        event_id: 'audit-rollback-test',
+        event_type: 'rebuild.accepted',
+        occurred_at: '2026-04-02T19:10:00.000Z',
+        operator_principal_id: 'ops-managed-d1',
+        auth_mechanism: 'access-jwt',
+        scope: {
+          scope_kind: 'global',
+          scope_id: null,
+        },
+        request_id: 'req-managed-d1',
+        idempotency_key: 'idem-managed-d1',
+        request_fingerprint: 'fingerprint-managed-d1',
+        job_id: 'job-managed-d1',
+        causation_id: 'job-managed-d1',
+        result_code: 'accepted',
+        affected_objects: [{ kind: 'job', id: 'job-managed-d1' }],
+        details: {
+          action: 'accepted',
+        },
+      };
+      await tx.insertAuditEvent(event);
+      await tx.insertAuditEvent(event);
+    }),
+    /UNIQUE|constraint/i,
+  );
+
+  const exported = await controlPlane.exportControlPlaneSnapshot();
+  assert.equal(exported.tables.audit_events.length, 0);
+  d1.close();
+});
+
+test('control-plane D1 transaction rejects nested transaction() calls instead of merging them into the same batch', async () => {
+  const d1 = createFakeD1Database();
+  const controlPlane = createD1ControlPlanePersistence(d1);
+  await controlPlane.ensureSchema();
+
+  await assert.rejects(
+    controlPlane.transaction(async (tx) => {
+      await tx.transaction(async (inner) => {
+        await inner.insertAuditEvent({
+          event_id: 'audit-nested-test',
+          event_type: 'rebuild.accepted',
+          occurred_at: '2026-04-02T20:30:00.000Z',
+          operator_principal_id: 'ops-managed-d1',
+          auth_mechanism: 'access-jwt',
+          scope: {
+            scope_kind: 'global',
+            scope_id: null,
+          },
+          request_id: 'req-nested',
+          idempotency_key: 'idem-nested',
+          request_fingerprint: 'fingerprint-nested',
+          job_id: 'job-nested',
+          causation_id: 'job-nested',
+          result_code: 'accepted',
+          affected_objects: [{ kind: 'job', id: 'job-nested' }],
+          details: {
+            action: 'accepted',
+          },
+        });
+      });
+    }),
+    /nested or concurrent transaction\(\) calls/i,
+  );
+
+  const exported = await controlPlane.exportControlPlaneSnapshot();
+  assert.equal(exported.tables.audit_events.length, 0);
+  d1.close();
+});
+
+test('control-plane D1 transaction rejects concurrent transaction() calls instead of sharing the active batch', async () => {
+  const d1 = createFakeD1Database();
+  const controlPlane = createD1ControlPlanePersistence(d1);
+  await controlPlane.ensureSchema();
+
+  let releaseOuterTransaction = null;
+  const outerBlocked = new Promise((resolve) => {
+    releaseOuterTransaction = resolve;
+  });
+  const outerPromise = controlPlane.transaction(async (tx) => {
+    await tx.insertAuditEvent({
+      event_id: 'audit-concurrent-outer',
+      event_type: 'rebuild.accepted',
+      occurred_at: '2026-04-02T20:31:00.000Z',
+      operator_principal_id: 'ops-managed-d1',
+      auth_mechanism: 'access-jwt',
+      scope: {
+        scope_kind: 'global',
+        scope_id: null,
+      },
+      request_id: 'req-concurrent-outer',
+      idempotency_key: 'idem-concurrent-outer',
+      request_fingerprint: 'fingerprint-concurrent-outer',
+      job_id: 'job-concurrent-outer',
+      causation_id: 'job-concurrent-outer',
+      result_code: 'accepted',
+      affected_objects: [{ kind: 'job', id: 'job-concurrent-outer' }],
+      details: {
+        action: 'accepted',
+      },
+    });
+    await outerBlocked;
+  });
+
+  await assert.rejects(
+    controlPlane.transaction(async (tx) => {
+      await tx.insertAuditEvent({
+        event_id: 'audit-concurrent-inner',
+        event_type: 'rebuild.accepted',
+        occurred_at: '2026-04-02T20:31:01.000Z',
+        operator_principal_id: 'ops-managed-d1',
+        auth_mechanism: 'access-jwt',
+        scope: {
+          scope_kind: 'global',
+          scope_id: null,
+        },
+        request_id: 'req-concurrent-inner',
+        idempotency_key: 'idem-concurrent-inner',
+        request_fingerprint: 'fingerprint-concurrent-inner',
+        job_id: 'job-concurrent-inner',
+        causation_id: 'job-concurrent-inner',
+        result_code: 'accepted',
+        affected_objects: [{ kind: 'job', id: 'job-concurrent-inner' }],
+        details: {
+          action: 'accepted',
+        },
+      });
+    }),
+    /nested or concurrent transaction\(\) calls/i,
+  );
+
+  releaseOuterTransaction();
+  await outerPromise;
+
+  const exported = await controlPlane.exportControlPlaneSnapshot();
+  assert.equal(exported.tables.audit_events.length, 1);
+  assert.equal(exported.tables.audit_events[0].event_id, 'audit-concurrent-outer');
+  d1.close();
+});
+
+test('control-plane D1 transaction rejects direct writes outside the active transaction on the same persistence instance', async () => {
+  const d1 = createFakeD1Database();
+  const controlPlane = createD1ControlPlanePersistence(d1);
+  await controlPlane.ensureSchema();
+
+  let releaseOuterTransaction = null;
+  const outerBlocked = new Promise((resolve) => {
+    releaseOuterTransaction = resolve;
+  });
+  const outerPromise = controlPlane.transaction(async (tx) => {
+    await tx.insertAuditEvent({
+      event_id: 'audit-direct-write-outer',
+      event_type: 'rebuild.accepted',
+      occurred_at: '2026-04-02T20:32:00.000Z',
+      operator_principal_id: 'ops-managed-d1',
+      auth_mechanism: 'access-jwt',
+      scope: {
+        scope_kind: 'global',
+        scope_id: null,
+      },
+      request_id: 'req-direct-write-outer',
+      idempotency_key: 'idem-direct-write-outer',
+      request_fingerprint: 'fingerprint-direct-write-outer',
+      job_id: 'job-direct-write-outer',
+      causation_id: 'job-direct-write-outer',
+      result_code: 'accepted',
+      affected_objects: [{ kind: 'job', id: 'job-direct-write-outer' }],
+      details: {
+        action: 'accepted',
+      },
+    });
+    await outerBlocked;
+  });
+
+  await assert.rejects(
+    controlPlane.insertAuditEvent({
+      event_id: 'audit-direct-write-inner',
+      event_type: 'rebuild.accepted',
+      occurred_at: '2026-04-02T20:32:01.000Z',
+      operator_principal_id: 'ops-managed-d1',
+      auth_mechanism: 'access-jwt',
+      scope: {
+        scope_kind: 'global',
+        scope_id: null,
+      },
+      request_id: 'req-direct-write-inner',
+      idempotency_key: 'idem-direct-write-inner',
+      request_fingerprint: 'fingerprint-direct-write-inner',
+      job_id: 'job-direct-write-inner',
+      causation_id: 'job-direct-write-inner',
+      result_code: 'accepted',
+      affected_objects: [{ kind: 'job', id: 'job-direct-write-inner' }],
+      details: {
+        action: 'accepted',
+      },
+    }),
+    /outside the active transaction/i,
+  );
+
+  releaseOuterTransaction();
+  await outerPromise;
+
+  const exported = await controlPlane.exportControlPlaneSnapshot();
+  assert.equal(exported.tables.audit_events.length, 1);
+  assert.equal(exported.tables.audit_events[0].event_id, 'audit-direct-write-outer');
+  d1.close();
+});
+
+test('control-plane D1 schema bootstrap memoizes once-per-isolate after the first successful ensureSchema()', async () => {
+  const d1 = createFakeD1Database();
+  const originalPrepare = d1.prepare.bind(d1);
+  let prepareCalls = 0;
+  d1.prepare = (sql) => {
+    prepareCalls += 1;
+    return originalPrepare(sql);
+  };
+
+  const controlPlane = createD1ControlPlanePersistence(d1);
+  await controlPlane.ensureSchema();
+  const firstPrepareCount = prepareCalls;
+  assert.ok(firstPrepareCount > 0);
+
+  await controlPlane.ensureSchema();
+  assert.equal(prepareCalls, firstPrepareCount);
+  d1.close();
+});
+
+test('control-plane D1 schema bootstrap coalesces concurrent ensureSchema() calls into a single schema install', async () => {
+  const d1 = createFakeD1Database();
+  const originalPrepare = d1.prepare.bind(d1);
+  let prepareCalls = 0;
+  d1.prepare = (sql) => {
+    prepareCalls += 1;
+    return originalPrepare(sql);
+  };
+
+  const controlPlane = createD1ControlPlanePersistence(d1);
+  await Promise.all([
+    controlPlane.ensureSchema(),
+    controlPlane.ensureSchema(),
+    controlPlane.ensureSchema(),
+  ]);
+  const firstPrepareCount = prepareCalls;
+  assert.ok(firstPrepareCount > 0);
+
+  await controlPlane.ensureSchema();
+  assert.equal(prepareCalls, firstPrepareCount);
+  d1.close();
+});
+
+test('FakeR2Bucket fail-closes generic readable streams unless they model Cloudflare known-length bodies', async () => {
+  const bucket = new FakeR2Bucket();
+  const encoder = new TextEncoder();
+
+  await assert.rejects(
+    bucket.put('generic-stream', new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode('generic-stream'));
+        controller.close();
+      },
+    })),
+    /exact known byte length/u,
+  );
+
+  await bucket.put('marked-stream', markCloudflareKnownLengthStream(new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode('known-length-stream'));
+      controller.close();
+    },
+  }), 'fixed-length-stream', {
+    knownByteLength: Buffer.byteLength('known-length-stream'),
+  }));
+
+  const stored = await bucket.get('marked-stream');
+  assert.ok(stored);
+  assert.equal(typeof stored.body?.getReader, 'function');
+  assert.equal(await stored.text(), 'known-length-stream');
+  assert.equal(
+    Buffer.from(await stored.arrayBuffer()).toString('utf8'),
+    'known-length-stream',
+  );
+
+  await assert.rejects(
+    bucket.put('mismatched-stream', markCloudflareKnownLengthStream(new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode('size-mismatch'));
+        controller.close();
+      },
+    }), 'fixed-length-stream', {
+      knownByteLength: Buffer.byteLength('size-mismatch') + 1,
+    })),
+    /declared 14 bytes but produced 13/u,
+  );
 });
 
 test('R2 and KV keyspace builders plus wrappers cover DATA-R2-001 through DATA-R2-006 and DATA-KV-001 through DATA-KV-002', async () => {

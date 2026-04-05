@@ -6,6 +6,9 @@
     "nodejs_compat",
     "nodejs_compat_do_not_populate_process_env"
   ],
+  "version_metadata": {
+    "binding": "CF_VERSION_METADATA"
+  },
   "vars": {
     "ENVIRONMENT_NAME": "environment_name-placeholder",
     "MATRIX_SERVER_NAME": "matrix_server_name-placeholder",
@@ -120,6 +123,64 @@
     {
       "binding": "MATRIX_EDGE_CACHE",
       "id": "00000000000000000000000000000001"
+    }
+  ],
+  "ratelimits": [
+    {
+      "name": "GATEWAY_PUBLIC_ENTRY_RATE_LIMITER",
+      "namespace_id": "84081001",
+      "simple": {
+        "limit": 120,
+        "period": 60
+      }
+    },
+    {
+      "name": "GATEWAY_REGISTER_RATE_LIMITER",
+      "namespace_id": "84081002",
+      "simple": {
+        "limit": 24,
+        "period": 60
+      }
+    },
+    {
+      "name": "GATEWAY_LOGIN_RATE_LIMITER",
+      "namespace_id": "84081003",
+      "simple": {
+        "limit": 60,
+        "period": 60
+      }
+    },
+    {
+      "name": "GATEWAY_REFRESH_RATE_LIMITER",
+      "namespace_id": "84081004",
+      "simple": {
+        "limit": 120,
+        "period": 60
+      }
+    },
+    {
+      "name": "GATEWAY_MEDIA_RATE_LIMITER",
+      "namespace_id": "84081005",
+      "simple": {
+        "limit": 180,
+        "period": 60
+      }
+    },
+    {
+      "name": "GATEWAY_SEARCH_RATE_LIMITER",
+      "namespace_id": "84081006",
+      "simple": {
+        "limit": 60,
+        "period": 60
+      }
+    },
+    {
+      "name": "GATEWAY_ROOM_WRITE_RATE_LIMITER",
+      "namespace_id": "84081007",
+      "simple": {
+        "limit": 240,
+        "period": 60
+      }
     }
   ]
 }

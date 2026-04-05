@@ -16,83 +16,101 @@ const REQUIRED_DERIVED_TABLES = Object.freeze([
   'media_catalog_entries',
 ]);
 
-export const DERIVED_DATA_SCHEMA_SQL = `
-CREATE TABLE IF NOT EXISTS derived_schema_state (
-  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-  schema_version INTEGER NOT NULL,
-  updated_at TEXT NOT NULL
-);
+const DERIVED_DATA_SCHEMA_STATEMENTS = Object.freeze([
+  `
+  CREATE TABLE IF NOT EXISTS derived_schema_state (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    schema_version INTEGER NOT NULL,
+    updated_at TEXT NOT NULL
+  )
+  `,
+  `
+  CREATE TABLE IF NOT EXISTS search_index_rows (
+    event_id TEXT PRIMARY KEY,
+    room_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    origin_server_ts INTEGER NOT NULL,
+    sender_user_id TEXT,
+    search_vector_text TEXT NOT NULL,
+    visibility_scope TEXT,
+    updated_at TEXT NOT NULL,
+    record_json TEXT
+  )
+  `,
+  `
+  CREATE INDEX IF NOT EXISTS idx_search_index_rows_room_id
+    ON search_index_rows (room_id, origin_server_ts, event_id)
+  `,
+  `
+  CREATE TABLE IF NOT EXISTS user_directory_entries (
+    user_id TEXT PRIMARY KEY,
+    displayname TEXT,
+    avatar_url TEXT,
+    profile_version INTEGER,
+    directory_visibility TEXT NOT NULL,
+    discovery_flags_json TEXT,
+    updated_at TEXT NOT NULL,
+    record_json TEXT
+  )
+  `,
+  `
+  CREATE INDEX IF NOT EXISTS idx_user_directory_entries_visibility
+    ON user_directory_entries (directory_visibility, displayname, user_id)
+  `,
+  `
+  CREATE TABLE IF NOT EXISTS public_room_directory_entries (
+    room_id TEXT PRIMARY KEY,
+    canonical_alias TEXT,
+    name TEXT,
+    topic TEXT,
+    avatar_url TEXT,
+    join_rules TEXT,
+    history_visibility TEXT,
+    world_readable INTEGER NOT NULL DEFAULT 0,
+    guest_can_join INTEGER NOT NULL DEFAULT 0,
+    joined_members INTEGER NOT NULL DEFAULT 0,
+    room_serial INTEGER NOT NULL,
+    visibility_watermark INTEGER NOT NULL,
+    is_public INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    record_json TEXT
+  )
+  `,
+  `
+  CREATE INDEX IF NOT EXISTS idx_public_room_directory_entries_visibility
+    ON public_room_directory_entries (is_public, joined_members DESC, room_id)
+  `,
+  `
+  CREATE INDEX IF NOT EXISTS idx_public_room_directory_entries_watermark
+    ON public_room_directory_entries (visibility_watermark, room_id)
+  `,
+  `
+  CREATE TABLE IF NOT EXISTS media_catalog_entries (
+    mxc_uri TEXT PRIMARY KEY,
+    origin_kind TEXT NOT NULL,
+    origin_server_name TEXT,
+    media_id TEXT NOT NULL,
+    content_type TEXT,
+    byte_size INTEGER,
+    content_hash TEXT,
+    legacy_unauth_access_flag INTEGER NOT NULL DEFAULT 0,
+    source_object_key TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    record_json TEXT
+  )
+  `,
+  `
+  CREATE INDEX IF NOT EXISTS idx_media_catalog_entries_origin
+    ON media_catalog_entries (origin_kind, origin_server_name, media_id)
+  `,
+].map((statement) => statement.trim()));
 
-CREATE TABLE IF NOT EXISTS search_index_rows (
-  event_id TEXT PRIMARY KEY,
-  room_id TEXT NOT NULL,
-  event_type TEXT NOT NULL,
-  origin_server_ts INTEGER NOT NULL,
-  sender_user_id TEXT,
-  search_vector_text TEXT NOT NULL,
-  visibility_scope TEXT,
-  updated_at TEXT NOT NULL,
-  record_json TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_search_index_rows_room_id
-  ON search_index_rows (room_id, origin_server_ts, event_id);
-
-CREATE TABLE IF NOT EXISTS user_directory_entries (
-  user_id TEXT PRIMARY KEY,
-  displayname TEXT,
-  avatar_url TEXT,
-  profile_version INTEGER,
-  directory_visibility TEXT NOT NULL,
-  discovery_flags_json TEXT,
-  updated_at TEXT NOT NULL,
-  record_json TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_user_directory_entries_visibility
-  ON user_directory_entries (directory_visibility, displayname, user_id);
-
-CREATE TABLE IF NOT EXISTS public_room_directory_entries (
-  room_id TEXT PRIMARY KEY,
-  canonical_alias TEXT,
-  name TEXT,
-  topic TEXT,
-  avatar_url TEXT,
-  join_rules TEXT,
-  history_visibility TEXT,
-  world_readable INTEGER NOT NULL DEFAULT 0,
-  guest_can_join INTEGER NOT NULL DEFAULT 0,
-  joined_members INTEGER NOT NULL DEFAULT 0,
-  room_serial INTEGER NOT NULL,
-  visibility_watermark INTEGER NOT NULL,
-  is_public INTEGER NOT NULL DEFAULT 0,
-  updated_at TEXT NOT NULL,
-  record_json TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_public_room_directory_entries_visibility
-  ON public_room_directory_entries (is_public, joined_members DESC, room_id);
-CREATE INDEX IF NOT EXISTS idx_public_room_directory_entries_watermark
-  ON public_room_directory_entries (visibility_watermark, room_id);
-
-CREATE TABLE IF NOT EXISTS media_catalog_entries (
-  mxc_uri TEXT PRIMARY KEY,
-  origin_kind TEXT NOT NULL,
-  origin_server_name TEXT,
-  media_id TEXT NOT NULL,
-  content_type TEXT,
-  byte_size INTEGER,
-  content_hash TEXT,
-  legacy_unauth_access_flag INTEGER NOT NULL DEFAULT 0,
-  source_object_key TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  record_json TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_media_catalog_entries_origin
-  ON media_catalog_entries (origin_kind, origin_server_name, media_id);
-`;
+export const DERIVED_DATA_SCHEMA_SQL = `${DERIVED_DATA_SCHEMA_STATEMENTS.join(';\n\n')};\n`;
 
 function requireD1Database(db) {
-  if (!db || typeof db.prepare !== 'function' || typeof db.exec !== 'function') {
-    throw new TypeError('db must expose D1-compatible prepare() and exec() methods');
+  if (!db || typeof db.prepare !== 'function') {
+    throw new TypeError('db must expose a D1-compatible prepare() method');
   }
   return db;
 }
@@ -203,6 +221,8 @@ async function tableExists(db, tableName) {
 
 export function createD1DerivedDataPersistence(database) {
   const db = requireD1Database(database);
+  let schemaReady = false;
+  let schemaReadyPromise = null;
   const searchIndex = createD1TableAccess(db, {
     tableName: 'search_index_rows',
     keyColumns: ['event_id'],
@@ -281,22 +301,38 @@ export function createD1DerivedDataPersistence(database) {
   return Object.freeze({
     schemaVersion: DERIVED_DATA_SCHEMA_VERSION,
     async ensureSchema(now = new Date().toISOString()) {
-      await db.exec(DERIVED_DATA_SCHEMA_SQL);
-      await statementRun(
-        db.prepare(`
-          INSERT INTO ${DERIVED_SCHEMA_STATE_TABLE} (singleton, schema_version, updated_at)
-          VALUES (?, ?, ?)
-          ON CONFLICT(singleton) DO UPDATE SET
-            schema_version = CASE
-              WHEN ${DERIVED_SCHEMA_STATE_TABLE}.schema_version > excluded.schema_version THEN ${DERIVED_SCHEMA_STATE_TABLE}.schema_version
-              ELSE excluded.schema_version
-            END,
-            updated_at = excluded.updated_at
-        `),
-        1,
-        DERIVED_DATA_SCHEMA_VERSION,
-        normalizeString(now, 'now'),
-      );
+      if (schemaReady) {
+        return;
+      }
+      if (!schemaReadyPromise) {
+        schemaReadyPromise = (async () => {
+          // Cloudflare D1 documents `exec()` as a newline-delimited maintenance surface; request-path schema
+          // bootstrap must run discrete prepared statements so multiline CREATE statements stay portable.
+          for (const statementSql of DERIVED_DATA_SCHEMA_STATEMENTS) {
+            await statementRun(db.prepare(statementSql));
+          }
+          await statementRun(
+            db.prepare(`
+              INSERT INTO ${DERIVED_SCHEMA_STATE_TABLE} (singleton, schema_version, updated_at)
+              VALUES (?, ?, ?)
+              ON CONFLICT(singleton) DO UPDATE SET
+                schema_version = CASE
+                  WHEN ${DERIVED_SCHEMA_STATE_TABLE}.schema_version > excluded.schema_version THEN ${DERIVED_SCHEMA_STATE_TABLE}.schema_version
+                  ELSE excluded.schema_version
+                END,
+                updated_at = excluded.updated_at
+            `),
+            1,
+            DERIVED_DATA_SCHEMA_VERSION,
+            normalizeString(now, 'now'),
+          );
+          schemaReady = true;
+        })().catch((error) => {
+          schemaReadyPromise = null;
+          throw error;
+        });
+      }
+      await schemaReadyPromise;
     },
     async isSchemaReady() {
       for (const tableName of REQUIRED_DERIVED_TABLES) {

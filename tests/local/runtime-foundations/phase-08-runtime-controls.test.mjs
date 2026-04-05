@@ -1,11 +1,14 @@
+import { Buffer } from 'node:buffer';
 import assert from 'node:assert/strict';
 import process from 'node:process';
 import test from 'node:test';
 
 import {
   classifyGatewayRequest,
+  createD1DerivedDataPersistence,
   enforceGatewayAbuseGuard,
   ensureDeploymentRecord,
+  GATEWAY_RATE_LIMIT_BINDING_DEFINITIONS,
   INTERNAL_RUNTIME_DERIVED_WORK_PATH,
   instrumentEnvironmentBindings,
   loadWorkerRuntimeConfig,
@@ -88,11 +91,33 @@ async function putJson(rig, accessToken, pathname, json = {}) {
   });
 }
 
+async function expectMatrixError(response, status, errcode) {
+  assert.equal(response.status, status);
+  const body = await response.json();
+  assert.equal(body.errcode, errcode);
+  return body;
+}
+
+function createStubRateLimitBinding(limit) {
+  const hits = new Map();
+  return {
+    async limit({ key }) {
+      const next = (hits.get(key) ?? 0) + 1;
+      hits.set(key, next);
+      return {
+        success: next <= limit,
+      };
+    },
+  };
+}
+
 test('Phase 08 gateway abuse guard classifies L1 surfaces and enforces IP limits', async () => {
   const env = {
     ABUSE_GUARD_POLICY_JSON: JSON.stringify({
       gateway_public_entry: { limit: 1, window_ms: 60_000 },
+      gateway_register: { limit: 1, window_ms: 60_000 },
       gateway_login: { limit: 1, window_ms: 60_000 },
+      gateway_refresh: { limit: 1, window_ms: 60_000 },
       gateway_search: { limit: 1, window_ms: 60_000 },
       gateway_media: { limit: 1, window_ms: 60_000 },
       gateway_room_write: { limit: 1, window_ms: 60_000 },
@@ -113,7 +138,8 @@ test('Phase 08 gateway abuse guard classifies L1 surfaces and enforces IP limits
   ];
 
   for (const [method, pathname, routeFamily, policyId] of cases) {
-    env.__MATRIX_GATEWAY_ABUSE_GUARD__ = new Map();
+    const bindingDefinition = GATEWAY_RATE_LIMIT_BINDING_DEFINITIONS[policyId];
+    env[bindingDefinition.binding_name] = createStubRateLimitBinding(1);
     const classification = classifyGatewayRequest(method, pathname);
     assert.equal(classification.route_family, routeFamily);
     assert.equal(classification.gateway_policy_id, policyId);
@@ -124,14 +150,69 @@ test('Phase 08 gateway abuse guard classifies L1 surfaces and enforces IP limits
         'cf-connecting-ip': '198.51.100.10',
       },
     });
-    assert.equal(enforceGatewayAbuseGuard(request, env, classification), null);
-    const limited = enforceGatewayAbuseGuard(request, env, classification);
+    assert.equal(await enforceGatewayAbuseGuard(request, env, classification), null);
+    const limited = await enforceGatewayAbuseGuard(request, env, classification);
     assert.ok(limited instanceof Response);
     assert.equal(limited.status, 429);
     const body = await limited.json();
     assert.equal(body.errcode, 'M_LIMIT_EXCEEDED');
     assert.ok(body.error.includes(routeFamily));
   }
+});
+
+test('Phase 08 gateway abuse guard shares the same search limiter across authenticated search and anonymous publicRooms', async () => {
+  const env = {
+    [GATEWAY_RATE_LIMIT_BINDING_DEFINITIONS.gateway_search.binding_name]: createStubRateLimitBinding(1),
+  };
+  const searchRequest = new Request('https://matrix.example.test/_matrix/client/v3/search', {
+    method: 'POST',
+    headers: {
+      'cf-connecting-ip': '198.51.100.25',
+    },
+  });
+  const publicRoomsRequest = new Request('https://matrix.example.test/_matrix/client/v3/publicRooms?limit=1', {
+    method: 'GET',
+    headers: {
+      'cf-connecting-ip': '198.51.100.25',
+    },
+  });
+
+  assert.equal(await enforceGatewayAbuseGuard(searchRequest, env), null);
+  const limited = await enforceGatewayAbuseGuard(publicRoomsRequest, env);
+  assert.ok(limited instanceof Response);
+  assert.equal(limited.status, 429);
+  const body = await limited.json();
+  assert.equal(body.errcode, 'M_LIMIT_EXCEEDED');
+});
+
+test('Phase 08 gateway abuse guard fails closed in non-local environments when a required Workers rate-limit binding is missing', async () => {
+  const request = new Request('https://matrix.example.test/_matrix/client/v3/publicRooms?limit=1', {
+    method: 'GET',
+    headers: {
+      'cf-connecting-ip': '198.51.100.40',
+    },
+  });
+  await assert.rejects(
+    enforceGatewayAbuseGuard(request, {
+      ENVIRONMENT_NAME: 'staging',
+    }),
+    /Missing required Workers rate-limit binding GATEWAY_SEARCH_RATE_LIMITER/,
+  );
+});
+
+test('Phase 08 gateway abuse guard fails closed for unexpected environment names when a required Workers rate-limit binding is missing', async () => {
+  const request = new Request('https://matrix.example.test/_matrix/client/v3/publicRooms?limit=1', {
+    method: 'GET',
+    headers: {
+      'cf-connecting-ip': '198.51.100.41',
+    },
+  });
+  await assert.rejects(
+    enforceGatewayAbuseGuard(request, {
+      ENVIRONMENT_NAME: 'staging-typo',
+    }),
+    /Missing required Workers rate-limit binding GATEWAY_SEARCH_RATE_LIMITER/,
+  );
 });
 
 test('Phase 08 gateway telemetry does not crash when process.cpuUsage is unavailable in Workers runtime', async (t) => {
@@ -363,7 +444,342 @@ test('Phase 08 telemetry records deployment, binding, derived-lag, and cost attr
   assert.ok(gatewayRecord);
   assert.equal(gatewayRecord.startup_time_ms, 12);
   assert.equal(gatewayRecord.deployment_composition.length, 2);
+  assert.ok(gatewayRecord.compatibility_flags.includes('nodejs_compat'));
   assert.equal(gatewayRecord.feature_gates.otel_persist, true);
+});
+
+test('Phase 08 D1 telemetry wrapper preserves the full D1PreparedStatement surface after bind()', async () => {
+  class FakePreparedStatement {
+    constructor(sql, values = []) {
+      this.sql = sql;
+      this.values = values;
+      this.extra_marker = 'prepared-surface';
+    }
+
+    bind(...values) {
+      return new FakePreparedStatement(this.sql, values);
+    }
+
+    async run() {
+      return {
+        success: true,
+        meta: {
+          duration: 1,
+          rows_read: 0,
+          rows_written: 0,
+        },
+        results: [{ sql: this.sql, values: this.values }],
+      };
+    }
+
+    async first() {
+      return {
+        sql: this.sql,
+        first: this.values[0] ?? null,
+      };
+    }
+
+    async all() {
+      return {
+        success: true,
+        meta: {
+          duration: 1,
+          rows_read: 1,
+          rows_written: 0,
+        },
+        results: [{ values: this.values }],
+      };
+    }
+
+    async raw(options = {}) {
+      return options.columnNames
+        ? [['value'], [this.values[0] ?? null]]
+        : [[this.values[0] ?? null]];
+    }
+  }
+
+  const env = {
+    MATRIX_CONTROL_D1: {
+      prepare(sql) {
+        return new FakePreparedStatement(sql);
+      },
+    },
+    MATRIX_MEDIA_BUCKET: null,
+    MATRIX_ARCHIVE_BUCKET: null,
+    MATRIX_EDGE_CACHE: null,
+    SEARCH_INDEX_QUEUE: null,
+    MEDIA_THUMBNAIL_QUEUE: null,
+    APPSERVICE_TXN_QUEUE: null,
+    REBUILD_SHARD_QUEUE: null,
+    EXPORT_SHARD_QUEUE: null,
+    RESTORE_SHARD_QUEUE: null,
+    REPAIR_SHARD_QUEUE: null,
+  };
+
+  instrumentEnvironmentBindings(env);
+  const rebound = env.MATRIX_CONTROL_D1.prepare('SELECT ?').bind(1).bind(2);
+
+  assert.equal(typeof rebound.bind, 'function');
+  assert.equal(typeof rebound.run, 'function');
+  assert.equal(typeof rebound.first, 'function');
+  assert.equal(typeof rebound.all, 'function');
+  assert.equal(typeof rebound.raw, 'function');
+  assert.equal(rebound.extra_marker, 'prepared-surface');
+
+  const rawResult = await rebound.raw({ columnNames: true });
+  assert.deepEqual(rawResult, [['value'], [2]]);
+  const runResult = await rebound.run();
+  assert.equal(runResult.meta.duration, 1);
+
+  const snapshot = snapshotTelemetry(env);
+  assertMetric(snapshot, 'd1.query.count', (dimensions) => dimensions.method === 'raw');
+  assertMetric(snapshot, 'd1.query.count', (dimensions) => dimensions.method === 'run');
+});
+
+test('Phase 08 shard registry bootstrap avoids D1 exec() so register stays alive when exec return-shape is broken', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const originalD1 = rig.env.MATRIX_CONTROL_D1;
+  rig.env.MATRIX_CONTROL_D1 = {
+    ...originalD1,
+    async exec() {
+      throw new Error('Cannot read properties of undefined (reading \'duration\')');
+    },
+    prepare(sql) {
+      return originalD1.prepare(sql);
+    },
+  };
+
+  const alice = await registerUser(rig, { username: 'phase08-d1-exec-broken-alice' });
+  assert.equal(alice.user_id, '@phase08-d1-exec-broken-alice:matrix.example.test');
+});
+
+test('Phase 08 anonymous publicRooms fast path does not touch control-plane shard scans when derived candidates are empty', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const originalPrepare = rig.env.MATRIX_CONTROL_D1.prepare.bind(rig.env.MATRIX_CONTROL_D1);
+  const forbiddenSql = [];
+  rig.env.MATRIX_CONTROL_D1.prepare = (sql) => {
+    if (/operator_authz_policies|audit_events|request_dedupe_projection|jobs|job_checkpoints|replay_manifests|repair_decisions|shard_registry|registry_snapshots|appservice_configs/.test(sql)) {
+      forbiddenSql.push(sql);
+      throw new Error('publicRooms fast path must not touch control-plane D1 when derived candidates are empty');
+    }
+    return originalPrepare(sql);
+  };
+
+  const response = await rig.gatewayFetch('/_matrix/client/v3/publicRooms?limit=1');
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), {
+    chunk: [],
+    total_room_count_estimate: 0,
+  });
+  assert.deepEqual(forbiddenSql, []);
+});
+
+test('Phase 08 anonymous publicRooms fast path does not leak stale private-room counts through total_room_count_estimate', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, { username: 'phase08-publicrooms-stale-count-alice' });
+  const publicRoomResponse = await postJson(rig, alice.access_token, '/_matrix/client/v3/createRoom', {
+    visibility: 'public',
+    name: 'Phase 08 Public Room',
+    room_alias_name: 'phase08-public-room',
+  });
+  assert.equal(publicRoomResponse.status, 200);
+  const publicRoom = await publicRoomResponse.json();
+  const privateRoomResponse = await postJson(rig, alice.access_token, '/_matrix/client/v3/createRoom', {
+    visibility: 'private',
+    name: 'Phase 08 Private Room',
+    room_alias_name: 'phase08-private-room',
+  });
+  assert.equal(privateRoomResponse.status, 200);
+  const privateRoom = await privateRoomResponse.json();
+
+  await rig.drainJobsQueues();
+  const derived = createD1DerivedDataPersistence(rig.d1);
+  await derived.ensureSchema();
+  const privateTruth = await rig.getRoomDo(privateRoom.room_id).getPublicRoomDirectoryEntry({
+    room_id: privateRoom.room_id,
+  });
+  await derived.publicRoomDirectory.put({
+    ...privateTruth.entry,
+    canonical_alias: `#phase08-private-room:${rig.env.MATRIX_SERVER_NAME}`,
+    join_rules: 'public',
+    history_visibility: 'world_readable',
+    world_readable: true,
+    guest_can_join: true,
+    joined_members: 999,
+    is_public: true,
+    updated_at: new Date().toISOString(),
+    record_json: {
+      stale_visibility_injected: true,
+    },
+  });
+
+  const response = await rig.gatewayFetch('/_matrix/client/v3/publicRooms?limit=10');
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), {
+    chunk: [
+      {
+        room_id: publicRoom.room_id,
+        name: 'Phase 08 Public Room',
+        canonical_alias: `#phase08-public-room:${rig.env.MATRIX_SERVER_NAME}`,
+        num_joined_members: 1,
+        world_readable: false,
+        guest_can_join: false,
+        join_rule: 'invite',
+      },
+    ],
+    total_room_count_estimate: 1,
+  });
+});
+
+test('Phase 08 anonymous publicRooms pagination stays stable when stale private derived rows are interleaved between visible rooms', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, { username: 'phase08-publicrooms-pagination-alice' });
+  const publicRooms = [];
+  for (const [aliasSuffix, name] of [
+    ['alpha', 'Phase 08 Public Alpha'],
+    ['beta', 'Phase 08 Public Beta'],
+    ['gamma', 'Phase 08 Public Gamma'],
+  ]) {
+    const response = await postJson(rig, alice.access_token, '/_matrix/client/v3/createRoom', {
+      visibility: 'public',
+      name,
+      room_alias_name: `phase08-pagination-${aliasSuffix}`,
+    });
+    assert.equal(response.status, 200);
+    publicRooms.push(await response.json());
+  }
+  const privateRoomResponse = await postJson(rig, alice.access_token, '/_matrix/client/v3/createRoom', {
+    visibility: 'private',
+    name: 'Phase 08 Private Interleaved',
+    room_alias_name: 'phase08-pagination-private',
+  });
+  assert.equal(privateRoomResponse.status, 200);
+  const privateRoom = await privateRoomResponse.json();
+
+  await rig.drainJobsQueues();
+  const derived = createD1DerivedDataPersistence(rig.d1);
+  await derived.ensureSchema();
+
+  for (const [joinedMembers, room] of [
+    [30, publicRooms[0]],
+    [20, publicRooms[1]],
+    [10, publicRooms[2]],
+  ]) {
+    const truth = await rig.getRoomDo(room.room_id).getPublicRoomDirectoryEntry({
+      room_id: room.room_id,
+    });
+    await derived.publicRoomDirectory.put({
+      ...truth.entry,
+      joined_members: joinedMembers,
+      updated_at: new Date().toISOString(),
+      record_json: {
+        pagination_order_injected: true,
+      },
+    });
+  }
+
+  const privateTruth = await rig.getRoomDo(privateRoom.room_id).getPublicRoomDirectoryEntry({
+    room_id: privateRoom.room_id,
+  });
+  await derived.publicRoomDirectory.put({
+    ...privateTruth.entry,
+    canonical_alias: `#phase08-pagination-private:${rig.env.MATRIX_SERVER_NAME}`,
+    join_rules: 'public',
+    history_visibility: 'world_readable',
+    world_readable: true,
+    guest_can_join: true,
+    joined_members: 25,
+    is_public: true,
+    updated_at: new Date().toISOString(),
+    record_json: {
+      stale_visibility_injected: true,
+      pagination_order_injected: true,
+    },
+  });
+
+  const pageOneResponse = await rig.gatewayFetch('/_matrix/client/v3/publicRooms?limit=2');
+  assert.equal(pageOneResponse.status, 200);
+  const pageOne = await pageOneResponse.json();
+  assert.deepEqual(
+    pageOne.chunk.map((entry) => entry.room_id),
+    [publicRooms[0].room_id, publicRooms[1].room_id],
+  );
+  assert.equal(pageOne.total_room_count_estimate, 3);
+  assert.equal(typeof pageOne.next_batch, 'string');
+  const decodedNextBatch = JSON.parse(Buffer.from(pageOne.next_batch, 'base64url').toString('utf8'));
+  assert.deepEqual(decodedNextBatch, {
+    cursor_version: 2,
+    visible_offset: 2,
+  });
+
+  const pageTwoResponse = await rig.gatewayFetch(
+    `/_matrix/client/v3/publicRooms?limit=2&since=${encodeURIComponent(pageOne.next_batch)}`,
+  );
+  assert.equal(pageTwoResponse.status, 200);
+  const pageTwo = await pageTwoResponse.json();
+  assert.deepEqual(
+    pageTwo.chunk.map((entry) => entry.room_id),
+    [publicRooms[2].room_id],
+  );
+  assert.equal(pageTwo.total_room_count_estimate, 3);
+  assert.equal(typeof pageTwo.prev_batch, 'string');
+
+  const previousPageResponse = await rig.gatewayFetch(
+    `/_matrix/client/v3/publicRooms?limit=2&since=${encodeURIComponent(pageTwo.prev_batch)}`,
+  );
+  assert.equal(previousPageResponse.status, 200);
+  const previousPage = await previousPageResponse.json();
+  assert.deepEqual(
+    previousPage.chunk.map((entry) => entry.room_id),
+    [publicRooms[0].room_id, publicRooms[1].room_id],
+  );
+
+  const legacyCursor = Buffer.from(JSON.stringify({ offset: 2 }), 'utf8').toString('base64url');
+  const legacyPageTwoResponse = await rig.gatewayFetch(
+    `/_matrix/client/v3/publicRooms?limit=2&since=${encodeURIComponent(legacyCursor)}`,
+  );
+  assert.equal(legacyPageTwoResponse.status, 200);
+  const legacyPageTwo = await legacyPageTwoResponse.json();
+  assert.deepEqual(
+    legacyPageTwo.chunk.map((entry) => entry.room_id),
+    [publicRooms[2].room_id],
+  );
+});
+
+test('Phase 08 anonymous publicRooms rejects malformed visible and legacy cursor offsets', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const malformedVisibleCursor = Buffer.from(JSON.stringify({
+    cursor_version: 2,
+    visible_offset: '1junk',
+  }), 'utf8').toString('base64url');
+  await expectMatrixError(
+    await rig.gatewayFetch(
+      `/_matrix/client/v3/publicRooms?limit=2&since=${encodeURIComponent(malformedVisibleCursor)}`,
+    ),
+    400,
+    'M_INVALID_PARAM',
+  );
+
+  const malformedLegacyCursor = Buffer.from(JSON.stringify({
+    offset: '2junk',
+  }), 'utf8').toString('base64url');
+  await expectMatrixError(
+    await rig.gatewayFetch(
+      `/_matrix/client/v3/publicRooms?limit=2&since=${encodeURIComponent(malformedLegacyCursor)}`,
+    ),
+    400,
+    'M_INVALID_PARAM',
+  );
 });
 
 test('Phase 08 request contracts stay functional under worker and authority version skew', async (t) => {

@@ -235,9 +235,6 @@ export async function verifyAccessJwt({
   if (verification.payload.nbf != null && (!Number.isFinite(verification.payload.nbf) || verification.payload.nbf > currentEpochSeconds)) {
     throw createAccessJwtAuthError('Access JWT nbf is missing or not yet valid');
   }
-  if (typeof verification.payload.sub !== 'string' || verification.payload.sub.trim().length === 0) {
-    throw createAccessJwtAuthError('Access JWT sub must be a non-empty string');
-  }
   return Object.freeze({
     header: verification.header,
     claims: verification.payload,

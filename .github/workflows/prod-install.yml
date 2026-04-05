@@ -1,0 +1,125 @@
+name: Prod Install
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_ref:
+        description: Git ref/tag/sha to install into production
+        required: true
+        type: string
+      workers_subdomain:
+        description: Optional account workers.dev subdomain override
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: prod-install
+  cancel-in-progress: false
+
+jobs:
+  prod-install:
+    runs-on: ubuntu-latest
+    environment: prod
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_OBSERVABILITY_API_TOKEN: ${{ secrets.CLOUDFLARE_OBSERVABILITY_API_TOKEN }}
+      MATRIX_PROD_SECRET_SEED: ${{ secrets.MATRIX_PROD_SECRET_SEED }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Require production secrets
+        shell: bash
+        run: |
+          test -n "$CLOUDFLARE_ACCOUNT_ID"
+          test -n "$CLOUDFLARE_API_TOKEN"
+          test -n "$MATRIX_PROD_SECRET_SEED"
+
+      - name: Define install paths
+        id: paths
+        shell: bash
+        run: |
+          run_timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+          workspace_root=".tmp/github/prod-install"
+          release_commit_sha="$(git rev-parse HEAD)"
+          state_root="${workspace_root}/state"
+          artifact_root="${workspace_root}/artifacts"
+          record_key="gha/${{ github.run_id }}/${{ github.run_attempt }}/prod/${run_timestamp}/prod-install-record.json"
+          artifact_name="prod-install-record-${run_timestamp}-${{ github.run_id }}-${{ github.run_attempt }}"
+          raw_state_artifact_name="prod-install-raw-state-${run_timestamp}-${{ github.run_id }}-${{ github.run_attempt }}"
+          echo "run_timestamp=${run_timestamp}" >> "$GITHUB_OUTPUT"
+          echo "workspace_root=${workspace_root}" >> "$GITHUB_OUTPUT"
+          echo "release_commit_sha=${release_commit_sha}" >> "$GITHUB_OUTPUT"
+          echo "state_root=${state_root}" >> "$GITHUB_OUTPUT"
+          echo "artifact_root=${artifact_root}" >> "$GITHUB_OUTPUT"
+          echo "record=${artifact_root}/prod-install-record.json" >> "$GITHUB_OUTPUT"
+          echo "record_key=${record_key}" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=${artifact_name}" >> "$GITHUB_OUTPUT"
+          echo "raw_state_artifact_name=${raw_state_artifact_name}" >> "$GITHUB_OUTPUT"
+          mkdir -p "$workspace_root" "$state_root" "$artifact_root"
+          printf '{"run_timestamp":"%s","workflow":"prod-install"}\n' "$run_timestamp" > "${state_root}/raw-state-metadata.json"
+
+      - name: Install production topology
+        id: install_topology
+        continue-on-error: true
+        run: |
+          args=(
+            node packages/testing/src/cli.mjs prod-install
+            --working-root "${{ steps.paths.outputs.state_root }}/install"
+            --output "${{ steps.paths.outputs.record }}"
+            --release-commit-sha "${{ steps.paths.outputs.release_commit_sha }}"
+            --install-id "gha-prod-install-${{ steps.paths.outputs.run_timestamp }}-${{ github.run_id }}-${{ github.run_attempt }}"
+          )
+          if [ -n "${{ inputs.workers_subdomain }}" ]; then
+            args+=(--workers-subdomain "${{ inputs.workers_subdomain }}")
+          fi
+          "${args[@]}"
+
+      - name: Upload prod-install raw state artifact
+        if: always() && steps.paths.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.paths.outputs.raw_state_artifact_name }}
+          path: |
+            ${{ steps.paths.outputs.state_root }}
+            ${{ steps.paths.outputs.artifact_root }}
+          if-no-files-found: error
+
+      - name: Upload install record artifact
+        if: steps.install_topology.outcome == 'success'
+        id: upload_record
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.paths.outputs.artifact_name }}
+          path: ${{ steps.paths.outputs.record }}
+          if-no-files-found: error
+
+      - name: Upload install record to R2
+        if: steps.install_topology.outcome == 'success'
+        id: upload_r2
+        run: |
+          node packages/testing/src/cli.mjs nonlocal-upload-r2 \
+            --bucket "matrix-evidence-prod" \
+            --key "${{ steps.paths.outputs.record_key }}" \
+            --file "${{ steps.paths.outputs.record }}" \
+            --content-type "application/json; charset=utf-8" \
+            --output "${{ steps.paths.outputs.state_root }}/record-upload.json"
+
+      - name: Enforce prod-install fail-closed outcome after raw artifact preservation
+        if: always()
+        shell: bash
+        run: |
+          if [ "${{ steps.install_topology.outcome }}" != "success" ]; then
+            echo "Install production topology failed after raw state preservation." >&2
+            exit 1
+          fi

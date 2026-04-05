@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
+import { promisify } from 'node:util';
 
 import {
+  buildRunEnvironmentVariables,
   getTestEnvironmentDirectory,
   getRequiredTestFiles,
   listTestEnvironmentNames,
@@ -13,13 +15,24 @@ import {
 } from './bootstrap.mjs';
 import { writeL1Evidence } from './evidence.mjs';
 import {
+  buildProductionEnvironmentPlan,
   buildNonLocalEnvironmentPlan,
   buildNonProductionSecretBundle,
+  captureProdCostSnapshot,
   createEnvironmentWranglerConfig,
+  downloadImmutableArtifactFromR2,
   deployNonLocalEnvironment,
+  installProductionTopology,
+  promoteProductionEnvironment,
+  rollbackProductionEnvironment,
+  writeReleaseCandidateManifest,
   ensureNonLocalEnvironmentResources,
+  prepareNonLocalOpsAccessSession,
+  restorePreReleaseGatewayRollout,
   runEnvironmentBackedSuite,
+  startPreReleaseGatewayRollout,
   uploadImmutableArtifactToR2,
+  writeProdCostSnapshotProvenance,
   writeEnvironmentRunProvenance,
   writeEnvironmentRunAttestation,
   writeEnvironmentWranglerConfig,
@@ -33,7 +46,43 @@ const EVIDENCE_L1_MANUAL_ARTIFACT_FLAGS = Object.freeze({
   '--prod-cost-attestation': 'prod_cost_snapshot',
 });
 
-async function runEnvironment(environmentName) {
+const execFileAsync = promisify(execFile);
+
+function parseGitHubRepositoryFromRemoteUrl(remoteUrl) {
+  if (typeof remoteUrl !== 'string' || remoteUrl.trim().length === 0) {
+    return null;
+  }
+  const normalized = remoteUrl.trim();
+  const patterns = [
+    /^https:\/\/github\.com\/([^/]+\/[^/]+?)(?:\.git)?$/u,
+    /^git@github\.com:([^/]+\/[^/]+?)(?:\.git)?$/u,
+    /^ssh:\/\/git@github\.com\/([^/]+\/[^/]+?)(?:\.git)?$/u,
+  ];
+  for (const pattern of patterns) {
+    const match = pattern.exec(normalized);
+    if (match) {
+      return match[1];
+    }
+  }
+  return null;
+}
+
+async function resolveExpectedGitHubRepository(repoRoot) {
+  const envRepository = typeof process.env.GITHUB_REPOSITORY === 'string'
+    ? process.env.GITHUB_REPOSITORY.trim()
+    : '';
+  if (envRepository.length > 0) {
+    return envRepository;
+  }
+  try {
+    const { stdout } = await execFileAsync('git', ['remote', 'get-url', 'origin'], { cwd: repoRoot });
+    return parseGitHubRepositoryFromRemoteUrl(stdout) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function runEnvironment(environmentName, options = {}) {
   const repoRoot = process.cwd();
   let files;
   try {
@@ -47,10 +96,9 @@ async function runEnvironment(environmentName) {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, ['--test', ...files], {
       cwd: repoRoot,
-      env: {
-        ...process.env,
-        MATRIX_TEST_ENVIRONMENT: environmentName,
-      },
+      env: buildRunEnvironmentVariables(process.env, environmentName, {
+        allowMissingRemoteHarness: options.allowMissingRemoteHarness === true,
+      }),
       stdio: 'inherit',
     });
 
@@ -126,13 +174,35 @@ function requireOption(options, optionName) {
   return value;
 }
 
+function parseBooleanOption(options, optionName, {
+  defaultValue = false,
+} = {}) {
+  const value = options[optionName];
+  if (value == null) {
+    return defaultValue;
+  }
+  if (value === true) {
+    return true;
+  }
+  const normalized = String(value).trim().toLowerCase();
+  if (normalized === 'true') {
+    return true;
+  }
+  if (normalized === 'false') {
+    return false;
+  }
+  throw new RangeError(`--${optionName} must be true or false`);
+}
+
 async function main() {
   const requestedEnvironment = process.argv[2] ?? 'local';
   if (requestedEnvironment === 'evidence-l1') {
     const { timestamp, manualArtifacts } = parseEvidenceL1Options(process.argv);
+    const expectedGitHubRepository = await resolveExpectedGitHubRepository(process.cwd());
     const result = await writeL1Evidence(process.cwd(), {
       timestamp,
       manualArtifacts,
+      expectedGitHubRepository,
     });
     console.log(`Wrote L1 evidence bundles for run ${result.run_timestamp}`);
     console.log(`Shared test-run artifacts: ${path.relative(process.cwd(), result.shared_run_root)}`);
@@ -147,6 +217,14 @@ async function main() {
   if (requestedEnvironment === 'nonlocal-plan') {
     const options = parseKeyValueOptions(process.argv);
     const plan = buildNonLocalEnvironmentPlan(requireOption(options, 'environment'), {
+      workersSubdomain: typeof options['workers-subdomain'] === 'string' ? options['workers-subdomain'] : null,
+    });
+    process.stdout.write(`${JSON.stringify(plan, null, 2)}\n`);
+    return;
+  }
+  if (requestedEnvironment === 'prod-plan') {
+    const options = parseKeyValueOptions(process.argv);
+    const plan = buildProductionEnvironmentPlan({
       workersSubdomain: typeof options['workers-subdomain'] === 'string' ? options['workers-subdomain'] : null,
     });
     process.stdout.write(`${JSON.stringify(plan, null, 2)}\n`);
@@ -186,6 +264,12 @@ async function main() {
       activeDeploymentComposition: typeof options['active-deployment-composition'] === 'string'
         ? JSON.parse(options['active-deployment-composition'])
         : [],
+      access: typeof options['access-auth-domain'] === 'string' && typeof options['access-audience'] === 'string'
+        ? {
+          auth_domain: options['access-auth-domain'],
+          application_audience: options['access-audience'],
+        }
+        : null,
     });
     process.stdout.write(`${JSON.stringify({
       worker_name: result.worker_name,
@@ -233,9 +317,139 @@ async function main() {
     }, null, 2)}\n`);
     return;
   }
+  if (requestedEnvironment === 'prod-install') {
+    const options = parseKeyValueOptions(process.argv);
+    const result = await installProductionTopology({
+      repoRoot: process.cwd(),
+      releaseCommitSha: typeof options['release-commit-sha'] === 'string' ? options['release-commit-sha'] : process.env.GITHUB_SHA,
+      workingRoot: typeof options['working-root'] === 'string'
+        ? path.resolve(process.cwd(), options['working-root'])
+        : path.resolve(process.cwd(), '.tmp', 'prod', 'install'),
+      outputPath: typeof options.output === 'string' ? path.resolve(process.cwd(), options.output) : null,
+      preferredWorkersSubdomain: typeof options['workers-subdomain'] === 'string' ? options['workers-subdomain'] : null,
+      installId: typeof options['install-id'] === 'string' ? options['install-id'] : null,
+      deploymentId: typeof options['deployment-id'] === 'string' ? options['deployment-id'] : null,
+      accountId: typeof options['account-id'] === 'string' ? options['account-id'] : null,
+      apiToken: typeof options['api-token'] === 'string' ? options['api-token'] : null,
+      productionSecretSeed: typeof options['secret-seed'] === 'string' ? options['secret-seed'] : null,
+    });
+    process.stdout.write(`${JSON.stringify({
+      output_path: typeof options.output === 'string' ? options.output : null,
+      install_id: result.record.install_id,
+      deployment_identity: result.record.deployment_identity,
+      readiness_probe_ready: result.readiness_probe.ready,
+      readiness_probe_attempt_count: result.readiness_probe.attempt_count,
+    }, null, 2)}\n`);
+    return;
+  }
+  if (requestedEnvironment === 'nonlocal-prepare-ops-access') {
+    const options = parseKeyValueOptions(process.argv);
+    const provisionedEnvironment = await readJsonFile(path.resolve(process.cwd(), requireOption(options, 'provisioning')));
+    const deploymentSummary = await readJsonFile(path.resolve(process.cwd(), requireOption(options, 'deployment')));
+    const result = await prepareNonLocalOpsAccessSession(requireOption(options, 'environment'), {
+      repoRoot: process.cwd(),
+      provisionedEnvironment,
+      deploymentSummary,
+      workingRoot: typeof options['working-root'] === 'string'
+        ? path.resolve(process.cwd(), options['working-root'])
+        : null,
+      outputPath: typeof options.output === 'string' ? path.resolve(process.cwd(), options.output) : null,
+      accountId: typeof options['account-id'] === 'string' ? options['account-id'] : null,
+      apiToken: typeof options['api-token'] === 'string' ? options['api-token'] : null,
+    });
+    process.stdout.write(`${JSON.stringify({
+      environment_name: result.environment_name,
+      output_path: typeof options.output === 'string' ? options.output : null,
+      policy_id: result.access.policy_id,
+      service_token_id: result.access.service_token_id,
+      service_token_client_id: result.access.service_token_client_id,
+    }, null, 2)}\n`);
+    return;
+  }
+  if (requestedEnvironment === 'prod-candidate-write') {
+    const options = parseKeyValueOptions(process.argv);
+    const ciIntegrationAttestation = await readJsonFile(path.resolve(process.cwd(), requireOption(options, 'ci-integration-attestation')));
+    const stagingAttestation = await readJsonFile(path.resolve(process.cwd(), requireOption(options, 'staging-attestation')));
+    const preReleaseAttestation = await readJsonFile(path.resolve(process.cwd(), requireOption(options, 'pre-release-attestation')));
+    const result = await writeReleaseCandidateManifest(
+      path.resolve(process.cwd(), requireOption(options, 'output')),
+      {
+        releaseRef: requireOption(options, 'release-ref'),
+        releaseCommitSha: typeof options['release-commit-sha'] === 'string'
+          ? options['release-commit-sha']
+          : process.env.GITHUB_SHA,
+        requiresDoMigration: parseBooleanOption(options, 'requires-do-migration', {
+          defaultValue: false,
+        }),
+        candidateId: typeof options['candidate-id'] === 'string' ? options['candidate-id'] : null,
+        sourceRepository: ciIntegrationAttestation?.provenance?.origin_repository,
+        sourceRunUri: ciIntegrationAttestation?.provenance?.origin_run_uri,
+        ciIntegrationAttestation,
+        stagingAttestation,
+        preReleaseAttestation,
+      },
+    );
+    process.stdout.write(`${JSON.stringify({
+      output_path: path.relative(process.cwd(), result.output_path),
+      candidate_id: result.manifest.candidate_id,
+      release_commit_sha: result.manifest.release_commit_sha,
+      source_run_uri: result.manifest.source_run_uri,
+    }, null, 2)}\n`);
+    return;
+  }
+  if (requestedEnvironment === 'nonlocal-rollout-start') {
+    const options = parseKeyValueOptions(process.argv);
+    const provisionedEnvironment = await readJsonFile(path.resolve(process.cwd(), requireOption(options, 'provisioning')));
+    const deploymentSummary = await readJsonFile(path.resolve(process.cwd(), requireOption(options, 'deployment')));
+    const result = await startPreReleaseGatewayRollout(requireOption(options, 'environment'), {
+      repoRoot: process.cwd(),
+      provisionedEnvironment,
+      deploymentSummary,
+      workingRoot: typeof options['working-root'] === 'string'
+        ? path.resolve(process.cwd(), options['working-root'])
+        : null,
+      outputPath: typeof options.output === 'string' ? path.resolve(process.cwd(), options.output) : null,
+      deploymentId: typeof options['deployment-id'] === 'string' ? options['deployment-id'] : null,
+      accountId: typeof options['account-id'] === 'string' ? options['account-id'] : null,
+      apiToken: typeof options['api-token'] === 'string' ? options['api-token'] : null,
+    });
+    process.stdout.write(`${JSON.stringify({
+      environment_name: result.environment_name,
+      output_path: typeof options.output === 'string' ? options.output : null,
+      baseline_gateway_version_id: result.baseline_gateway_version_id,
+      baseline_gateway_version_tag: result.baseline_gateway_version_tag,
+      candidate_gateway_version_id: result.candidate_gateway_version_id,
+      candidate_gateway_version_tag: result.candidate_gateway_version_tag,
+      dual_version_deployment_id: result.dual_version_deployment_id,
+    }, null, 2)}\n`);
+    return;
+  }
+  if (requestedEnvironment === 'nonlocal-rollout-restore') {
+    const options = parseKeyValueOptions(process.argv);
+    const rolloutState = await readJsonFile(path.resolve(process.cwd(), requireOption(options, 'rollout-state')));
+    const result = await restorePreReleaseGatewayRollout(requireOption(options, 'environment'), {
+      repoRoot: process.cwd(),
+      rolloutState,
+      outputPath: typeof options.output === 'string' ? path.resolve(process.cwd(), options.output) : null,
+      accountId: typeof options['account-id'] === 'string' ? options['account-id'] : null,
+      apiToken: typeof options['api-token'] === 'string' ? options['api-token'] : null,
+    });
+    process.stdout.write(`${JSON.stringify({
+      environment_name: result.environment_name,
+      output_path: typeof options.output === 'string' ? options.output : null,
+      restored_deployment_id: result.restored_deployment_id,
+    }, null, 2)}\n`);
+    return;
+  }
   if (requestedEnvironment === 'nonlocal-run') {
     const options = parseKeyValueOptions(process.argv);
     const deployment = await readJsonFile(path.resolve(process.cwd(), requireOption(options, 'deployment')));
+    const accessSession = typeof options['access-session'] === 'string'
+      ? await readJsonFile(path.resolve(process.cwd(), options['access-session']))
+      : null;
+    const rolloutState = typeof options['rollout-state'] === 'string'
+      ? await readJsonFile(path.resolve(process.cwd(), options['rollout-state']))
+      : null;
     const result = await runEnvironmentBackedSuite(requireOption(options, 'environment'), process.cwd(), {
       runTimestamp: requireOption(options, 'timestamp'),
       outputRoot: path.resolve(process.cwd(), requireOption(options, 'output-root')),
@@ -245,11 +459,15 @@ async function main() {
       reviewedBy: requireOption(options, 'reviewed-by'),
       topologyKind: requireOption(options, 'topology-kind'),
       deploymentSummary: deployment,
+      accessSession,
+      rolloutState,
     });
     process.stdout.write(`${JSON.stringify({
       report_path: path.relative(process.cwd(), result.report_path),
       log_path: path.relative(process.cwd(), result.log_path),
       status: result.report.status,
+      readiness_probe_ready: result.report.readiness_probe?.ready ?? null,
+      readiness_probe_attempt_count: result.report.readiness_probe?.attempt_count ?? null,
       validation_error: result.validation_error,
     }, null, 2)}\n`);
     if (!result.ok) {
@@ -276,6 +494,69 @@ async function main() {
     }, null, 2)}\n`);
     return;
   }
+  if (requestedEnvironment === 'nonlocal-download-r2') {
+    const options = parseKeyValueOptions(process.argv);
+    const result = await downloadImmutableArtifactFromR2({
+      repoRoot: process.cwd(),
+      bucketName: requireOption(options, 'bucket'),
+      objectKey: requireOption(options, 'key'),
+      outputPath: path.resolve(process.cwd(), requireOption(options, 'output')),
+      accountId: typeof options['account-id'] === 'string' ? options['account-id'] : null,
+      apiToken: typeof options['api-token'] === 'string' ? options['api-token'] : null,
+    });
+    process.stdout.write(`${JSON.stringify({
+      object_uri: result.object_uri,
+      output_path: path.relative(process.cwd(), result.output_path),
+      file_sha256: result.file_sha256,
+    }, null, 2)}\n`);
+    return;
+  }
+  if (requestedEnvironment === 'prod-promote') {
+    const options = parseKeyValueOptions(process.argv);
+    const result = await promoteProductionEnvironment({
+      repoRoot: process.cwd(),
+      baselineRecord: await readJsonFile(path.resolve(process.cwd(), requireOption(options, 'baseline-record'))),
+      candidateManifest: await readJsonFile(path.resolve(process.cwd(), requireOption(options, 'candidate-manifest'))),
+      workingRoot: typeof options['working-root'] === 'string'
+        ? path.resolve(process.cwd(), options['working-root'])
+        : path.resolve(process.cwd(), '.tmp', 'prod', 'promote'),
+      outputPath: typeof options.output === 'string' ? path.resolve(process.cwd(), options.output) : null,
+      promotionId: typeof options['promotion-id'] === 'string' ? options['promotion-id'] : null,
+      deploymentId: typeof options['deployment-id'] === 'string' ? options['deployment-id'] : null,
+      accountId: typeof options['account-id'] === 'string' ? options['account-id'] : null,
+      apiToken: typeof options['api-token'] === 'string' ? options['api-token'] : null,
+      productionSecretSeed: typeof options['secret-seed'] === 'string' ? options['secret-seed'] : null,
+    });
+    process.stdout.write(`${JSON.stringify({
+      output_path: typeof options.output === 'string' ? options.output : null,
+      promotion_id: result.record.promotion_id,
+      promotion_mode: result.record.promotion_mode,
+      current_deployment_identity: result.record.current_deployment_identity,
+      gateway_rollout_steps: result.record.gateway_rollout_steps.length,
+    }, null, 2)}\n`);
+    return;
+  }
+  if (requestedEnvironment === 'prod-rollback') {
+    const options = parseKeyValueOptions(process.argv);
+    const result = await rollbackProductionEnvironment({
+      repoRoot: process.cwd(),
+      promotionRecord: await readJsonFile(path.resolve(process.cwd(), requireOption(options, 'promotion-record'))),
+      workingRoot: typeof options['working-root'] === 'string'
+        ? path.resolve(process.cwd(), options['working-root'])
+        : path.resolve(process.cwd(), '.tmp', 'prod', 'rollback'),
+      outputPath: typeof options.output === 'string' ? path.resolve(process.cwd(), options.output) : null,
+      rollbackId: typeof options['rollback-id'] === 'string' ? options['rollback-id'] : null,
+      accountId: typeof options['account-id'] === 'string' ? options['account-id'] : null,
+      apiToken: typeof options['api-token'] === 'string' ? options['api-token'] : null,
+    });
+    process.stdout.write(`${JSON.stringify({
+      output_path: typeof options.output === 'string' ? options.output : null,
+      rollback_id: result.record.rollback_id,
+      release_commit_sha: result.record.release_commit_sha,
+      readiness_probe_ready: result.record.readiness_probe.ready,
+    }, null, 2)}\n`);
+    return;
+  }
   if (requestedEnvironment === 'nonlocal-provenance') {
     const options = parseKeyValueOptions(process.argv);
     const deploymentSummary = await readJsonFile(path.resolve(process.cwd(), requireOption(options, 'deployment')));
@@ -289,6 +570,45 @@ async function main() {
       githubRunId: requireOption(options, 'github-run-id'),
       githubRunAttempt: requireOption(options, 'github-run-attempt'),
       deploymentSummary,
+      artifactUpload,
+      githubArtifact,
+      reviewRecordUri: typeof options['review-record-uri'] === 'string' ? options['review-record-uri'] : null,
+    });
+    process.stdout.write(`${JSON.stringify({
+      provenance_path: path.relative(process.cwd(), result.output_path),
+    }, null, 2)}\n`);
+    return;
+  }
+  if (requestedEnvironment === 'prod-cost-snapshot') {
+    const options = parseKeyValueOptions(process.argv);
+    const result = await captureProdCostSnapshot({
+      runTimestamp: requireOption(options, 'timestamp'),
+      outputPath: path.resolve(process.cwd(), requireOption(options, 'output')),
+      artifactRoot: path.resolve(process.cwd(), requireOption(options, 'artifact-root')),
+      fromDate: typeof options.from === 'string' ? options.from : null,
+      toDate: typeof options.to === 'string' ? options.to : null,
+      capturedBy: typeof options['captured-by'] === 'string' ? options['captured-by'] : null,
+      reviewedBy: typeof options['reviewed-by'] === 'string' ? options['reviewed-by'] : null,
+      accountId: typeof options['account-id'] === 'string' ? options['account-id'] : null,
+      apiToken: typeof options['api-token'] === 'string' ? options['api-token'] : null,
+    });
+    process.stdout.write(`${JSON.stringify({
+      output_path: path.relative(process.cwd(), result.output_path),
+      deployment_identity_path: path.relative(process.cwd(), result.deployment_identity_path),
+      billing_usage_path: path.relative(process.cwd(), result.billing_usage_path),
+      resource_snapshot_path: path.relative(process.cwd(), result.resource_snapshot_path),
+    }, null, 2)}\n`);
+    return;
+  }
+  if (requestedEnvironment === 'prod-cost-provenance') {
+    const options = parseKeyValueOptions(process.argv);
+    const deploymentIdentity = await readJsonFile(path.resolve(process.cwd(), requireOption(options, 'deployment-identity')));
+    const artifactUpload = await readJsonFile(path.resolve(process.cwd(), requireOption(options, 'artifact-upload')));
+    const githubArtifact = typeof options['github-artifact'] === 'string'
+      ? await readJsonFile(path.resolve(process.cwd(), options['github-artifact']))
+      : null;
+    const result = await writeProdCostSnapshotProvenance(path.resolve(process.cwd(), requireOption(options, 'output')), {
+      deploymentIdentity,
       artifactUpload,
       githubArtifact,
       reviewRecordUri: typeof options['review-record-uri'] === 'string' ? options['review-record-uri'] : null,
@@ -332,7 +652,9 @@ async function main() {
 
   let exitCode = 0;
   for (const environmentName of environments) {
-    const code = await runEnvironment(environmentName);
+    const code = await runEnvironment(environmentName, {
+      allowMissingRemoteHarness: requestedEnvironment === 'all' && environmentName !== 'local',
+    });
     if (code !== 0) {
       exitCode = code;
       break;

@@ -47,8 +47,28 @@
 * dedicated non-local environment 的 workflow 锁必须按环境全局串行，而不是按 branch/ref 局部串行；不同 ref / commit 不得并发写同一 `ci-integration`、`staging` 或 `pre-release` 资源，否则会污染 deployment identity 与 attestation provenance。
 * 新环境或空环境的 bootstrap 顺序固定为：先部署不含 jobs service binding 的 `gateway-worker`，再部署 `jobs-worker`、`ops-worker`，最后重新部署带完整 bindings 的 `gateway-worker`；任一步失败都必须停止，不得继续假设拓扑已完整。
 * non-local workflow 必须先确保或复用环境专属 D1/KV/R2/Queues，再执行 deploy、suite、artifact upload 与 attestation；资源存在性检查、更新策略和运行 identity 必须写入 workflow 工件，避免把旧部署误认成新运行。若 deploy 后无法从 Cloudflare 观察到 fresh deployment/version IDs，则必须 fail-closed，不得回退复用旧 identity；suite/attestation 阶段也必须回读 Cloudflare 当前 active deployment/version identity，拒绝 stale 或篡改过的 deployment summary。
+* deploy 后即使已经回读到 fresh deployment/version IDs，也不得直接把环境视为 ready。基于 `CF-WKR-012` 与 `CF-DO-005`，workflow 在启动 non-local suite 前还必须执行 bounded post-deploy readiness gate：至少用真实 HTTP surface 探测一个公开只读路径与一个关键写路径，并记录尝试次数、最终通过时间与探测目标；若在门限内仍未稳定通过，则必须 fail-closed，不得把 suite failure 混同为已验证完成。
 * 每次 non-local run 都必须记录 GitHub run identity、Cloudflare deployment identity（每个 Worker 的 deployment/version IDs）以及不可变 artifact object locator；GitHub workflow artifact 只作为补充审计链，不替代对象存储中的 immutable locator。
 * non-local suite 在消费 deployment summary 时，必须用当前目标 Cloudflare account 的真实 `workers.dev` subdomain 复核 Worker URL，不得只凭 `*.workers.dev` host 形状信任 deployment 文件。
+
+### 2.3 Production Automation Contract
+
+* 生产自动化必须与 non-local harness 分离，固定为四条 GitHub Actions workflow 责任：
+  * `prod-install`：ensure 固定命名 prod topology，并完成首次 bootstrap deploy；
+  * `release-candidate`：生成 reviewed `ReleaseCandidateManifest`；
+  * `promote-prod`：只消费 reviewed candidate manifest 做 production promotion；
+  * `rollback-prod`：只消费先前 `ProdPromotionRecord` 中的 rollback handle 做恢复。
+  月度 `prod-cost-monthly` 继续独立存在，不得和日常 promote 混写。
+* `prod-install` 必须先 ensure account-owned workers.dev subdomain、prod Access application、固定命名 D1/KV/R2/Queues，再按 `gateway bootstrap -> jobs -> ops -> gateway full` 顺序 deploy；它的成功产物必须是 `ProdInstallRecord`，而不是口头说明“prod topology 已存在”。一旦当前 target account 已存在 active `matrix-*-prod` Worker deployment identity，`prod-install` 就不得继续把自己当作日常 redeploy 入口，而必须 fail-closed 并要求转入 `promote-prod` / `rollback-prod`。
+* `release-candidate` 必须只在 `ci-integration` / `staging` / `pre-release` attestation 已真实存在时生成 `ReleaseCandidateManifest`；缺任一 attestation 时必须 fail-closed。production promote 不得重新脑补“当前 pushed head 即已验证候选”；consumer 还必须验证 `ReleaseCandidateManifest.source_repository` / `origin_repository` 与当前仓库一致。
+* `promote-prod` 在 `requires_do_migration = false` 时，必须使用 Cloudflare Worker versions/deployments 渐进发布 `gateway-worker`；`jobs-worker` / `ops-worker` 可先行切到单版本，但仍必须记录新的 deployment/version IDs。
+* `promote-prod` 在 `requires_do_migration = true` 或 prod 尚未 bootstrap 时，不得走 `wrangler versions upload`; 必须改用 `wrangler deploy` 路径，并把 migration-safe all-at-once path 记录到 `ProdPromotionRecord.promotion_mode = deploy_with_migration`。该路径在 live prod 上不得再复用 `gateway bootstrap -> jobs -> ops -> gateway full` 的首次安装序列；它必须以当前 prod deployment identity 作为 runtime baseline，按 `jobs -> ops -> gateway full` 的 migration-safe 顺序切换。
+* production rollout 必须在每个关键切换点执行 bounded readiness probe，并记录 attempt 数、最终通过时间或最后失败原因；若任一步 readiness 未通过，则必须 fail-closed 并停止后续 rollout。对 `deploy_with_migration` 路径，这个要求同样适用，至少要在 `jobs`、`ops`、`gateway` 三次切换后分别留下 readiness snapshot，而不是只在最后做一次总体验证。
+* `promote-prod` 在消费 baseline record 与 reviewed candidate manifest 前，必须验证它们的 `origin_repository` / `source_repository` 与当前仓库一致，并验证当前 checked-out git `HEAD` 等于 `ReleaseCandidateManifest.release_commit_sha`；否则必须 fail-closed。
+* `rollback-prod` 只允许消费上一轮 `ProdPromotionRecord` 中已记录的 rollback handle；若 source promotion 带 DO migration 或没有可恢复的 previous version identity，则 workflow 必须 fail-closed，并把“需要 forward-fix / restore path”写入 rollback artifact，而不是伪造“一键回滚”。在真正 replay rollback handle 前，还必须先验证当前 Cloudflare prod deployment identity 仍等于该 `ProdPromotionRecord.current_deployment_identity`；若 prod 已漂移，则必须 fail-closed。
+* production automation 的可审计基线固定为：`ReleaseCandidateManifest`、`ProdInstallRecord`、`ProdPromotionRecord`、`ProdRollbackRecord` 与 `ProdCostSnapshotAttestation`。这些工件都必须回链 GitHub run identity 与 Cloudflare deployment identity。
+* `release-candidate`、`prod-install`、`promote-prod`、`rollback-prod`、`prod-cost-monthly` 即使最终 fail-closed，也必须尽可能先把 raw state / blocker artifact 上传为 workflow artifact；`prod-cost-monthly` 还必须先把 raw cost bundle 上传到 immutable R2，再允许后续 provenance / attestation 阶段失败。
+* 若 production automation workflow 仍是 newly-added definition，尚未进入 repository default branch，则 same-head remote proof 可能会被 GitHub 官方 `workflow_dispatch` 默认分支限制阻断；此时仓库必须把 blocker 诚实写回 `TODO.md` / 对应 `OQ-ID`，而不是把“workflow 文件已存在于 feature branch”误写成“same-head remote proof 已可执行”。
 
 ## 3. Backward Compatibility Rules
 
@@ -125,7 +145,7 @@ DO 内部 SQLite schema 演进规则：
 ### 7.1 渐进发布规则
 
 * 若使用 gradual deployment，必须打开版本监测与异常回滚门禁。
-* 对同一 Durable Object，在任一部署下只会运行一个版本；但不同对象可在 rollout 期间处于不同版本。引用：`CF-DO-005`。
+* 对同一 Durable Object，在任一部署下只会运行一个版本；但不同对象可在 rollout 期间处于不同版本，且这些对象在该 deployment 中的 version assignment 由 deployment percentages 决定。引用：`CF-DO-005`,`CF-DO-021`。
 
 ### 7.2 版本亲和建议
 
@@ -134,6 +154,24 @@ DO 内部 SQLite schema 演进规则：
 * client 请求建议按 `user_id` 或 `session hash` 稳定选路；
 * federation 请求建议按 `server_name` 稳定选路；
 * 目标是减少同一用户或同一远端服务器在 rollout 期间的版本抖动。
+
+### 7.3 Pre-release Rollout-Skew Gate Contract
+
+* `TEST-OPS-001` 的 pre-release gate 必须以 Cloudflare Worker versions/deployments 为基础，而不是把单 deployment smoke、`/_ops/v1/healthz` 或 active deployment identity revalidation 误写成 skew proof。
+* 对不含 DO migration 的 skew gate，pre-release harness 必须先记录 baseline gateway deployment/version，再使用 `wrangler versions upload` 上传 candidate gateway version，并创建一个同时包含 baseline + candidate 的 dual-version deployment。由于 Cloudflare 对 gradual deployment 中的 Durable Object version assignment 取决于 deployment percentages，dual-version deployment 必须给 baseline 与 candidate 都保留非零份额；`baseline=100%`、`candidate=0%` 再配合 version override 只能证明 Worker request routing，不能诚实地产生 candidate-side DO assignment。
+* 当前官方 `version_metadata` runtime binding 只暴露 Worker version ID/tag/timestamp，不暴露 deployment ID；因此 `IF-OPS-009` 不得在 worker 内伪造 dual-version deployment ID，也不得为了读取该 ID 把 Cloudflare account API token 下放进 worker。GitHub Actions rollout harness 必须在 `versions deploy` 后回读 active dual-version deployment ID，并把它作为 probe request 的显式输入传给 `ops-worker`。
+* rollout probe 对 gateway version override 的 attested校验必须同时记录：
+  * targeted Cloudflare version IDs；
+  * 对应版本的 official version tags；
+  * gateway request path 实际回读到的 official version ID（若 runtime 确实提供）与 official version tag（若 runtime 提供）。
+  `IF-OPS-009` / `DATA-OPS-012` 的语义必须是 “target by official version ID, observe by official version ID or official version tag”；repo 注入的 `WORKER_VERSION_ID` fallback 只可作为本地诊断，不得再伪装成 attested `observed_gateway_version_id`。
+* 当前 Phase 08 rollout probe 通过 `ops-worker` 对 `MATRIX_PUBLIC_BASE_URL` 发起同 zone public HTTP request，以便在真实 gateway ingress 上携带 `Cloudflare-Workers-Version-Overrides` 并回读 probe headers。Cloudflare 官方 docs 已明确：同 zone global `fetch()` 若不使用 service binding 且未启用 `global_fetch_strictly_public`，会失败或绕到 zone origin 而不是目标 Worker。因此，在当前 `workers.dev` topology 继续沿用 public ingress 的前提下，`ops-worker` 的 wrangler/runtime manifest 必须显式钉住 `global_fetch_strictly_public`；若未来改走 service binding 或 custom domain，则也必须在 workflow/spec 中同步改写该 transport contract。任何 Cloudflare same-zone failure page（例如 error `1042`）都必须被判为平台约束命中，而不是 rollout proof。引用：`CF-WKR-028`。
+* skew proof 必须对至少两组 probe-owned authority identities 分别完成：
+  * 先在同一 dual-version deployment 中以 baseline-targeted seed request 做 bounded sampling，直到 probe-owned `UserDO` 与 `RoomDO` 都真实落到 baseline version，再由 candidate-targeted request 观测 `new Worker -> old DO`；
+  * 再以 candidate-targeted seed request 做 bounded sampling，直到 probe-owned `UserDO` 与 `RoomDO` 都真实落到 candidate version，再由 baseline-targeted request 观测 `old Worker -> new DO`。
+* `Cloudflare-Workers-Version-Key` / `Cloudflare-Workers-Version-Overrides` 只用于控制哪一个 Worker version 处理该次 gateway request；probe contract 不得把它们误当作“指定 Durable Object version”的能力。若 bounded sampling 在门限内仍拿不到四类所需 pairing 前置 identity，则必须 fail-closed。
+* 上述观测必须导出为 `RolloutSkewProbeResponse`，并随同 pre-release `EnvironmentRunReport` attestation 化；缺少 dual-version deployment ID、baseline/candidate version IDs、或任一 pairing assertion 时必须 fail-closed。
+* skew gate 完成后必须在 `finally` / `always()` 路径请求恢复 baseline deployment；恢复失败同样必须使该次 pre-release gate 失败，不得把“probe 成功但环境未恢复”记为 pass。
 
 ## 8. Secret Rotation and Deploy Coupling
 

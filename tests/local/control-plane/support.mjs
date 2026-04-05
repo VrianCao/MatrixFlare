@@ -15,10 +15,38 @@ function toPemPair(keyPair) {
   };
 }
 
-export function createFakeD1Database() {
+function detectStatementType(sql) {
+  const trimmed = typeof sql === 'string' ? sql.trim().replace(/^\uFEFF/, '') : '';
+  const match = /^([A-Za-z]+)/.exec(trimmed);
+  return match?.[1]?.toUpperCase() ?? '';
+}
+
+export function createFakeD1Database({
+  rejectRawTransactions = false,
+} = {}) {
   const database = new DatabaseSync(':memory:');
+  const executePreparedStatement = (sql, bindings) => {
+    const statement = database.prepare(sql);
+    const statementType = detectStatementType(sql);
+    if (['SELECT', 'PRAGMA', 'WITH'].includes(statementType)) {
+      return {
+        success: true,
+        results: statement.all(...bindings),
+      };
+    }
+    statement.run(...bindings);
+    return {
+      success: true,
+      results: [],
+    };
+  };
   return {
     exec(sql) {
+      if (rejectRawTransactions && ['BEGIN', 'COMMIT', 'ROLLBACK', 'SAVEPOINT', 'RELEASE'].includes(detectStatementType(sql))) {
+        throw new Error(
+          `D1_EXEC_ERROR: Error in line 1: ${sql.trim()}: To execute a transaction, please use the state.storage.transaction() or state.storage.transactionSync() APIs instead of the SQL BEGIN TRANSACTION or SAVEPOINT statements. The JavaScript API is safer because`,
+        );
+      }
       database.exec(sql);
       return Promise.resolve();
     },
@@ -27,6 +55,9 @@ export function createFakeD1Database() {
       return {
         bind(...bindings) {
           return {
+            __sql: sql,
+            __bindings: bindings,
+            __batchExecute: () => executePreparedStatement(sql, bindings),
             run: async () => {
               statement.run(...bindings);
               return { success: true };
@@ -38,6 +69,23 @@ export function createFakeD1Database() {
           };
         },
       };
+    },
+    batch(statements) {
+      database.exec('BEGIN');
+      try {
+        const results = [];
+        for (const statement of statements) {
+          if (!statement || typeof statement.__batchExecute !== 'function') {
+            throw new TypeError('batch() requires prepared statements returned by bind()');
+          }
+          results.push(statement.__batchExecute());
+        }
+        database.exec('COMMIT');
+        return Promise.resolve(results);
+      } catch (error) {
+        database.exec('ROLLBACK');
+        return Promise.reject(error);
+      }
     },
     close() {
       database.close();
@@ -177,6 +225,8 @@ export async function createControlPlaneRig({
   policies = [],
   jwkSequence = null,
   envOverrides = {},
+  initializeControlPlaneD1 = null,
+  controlPlaneD1Options = null,
 } = {}) {
   const accessKeyPair = generateKeyPairSync('rsa', { modulusLength: 2048 });
   const accessPrivatePem = accessKeyPair.privateKey.export({ format: 'pem', type: 'pkcs8' });
@@ -191,7 +241,10 @@ export async function createControlPlaneRig({
   stalePublicJwk.alg = 'RS256';
   stalePublicJwk.use = 'sig';
 
-  const d1 = createFakeD1Database();
+  const d1 = createFakeD1Database(controlPlaneD1Options ?? {});
+  if (typeof initializeControlPlaneD1 === 'function') {
+    await initializeControlPlaneD1(d1);
+  }
   const persistence = createD1ControlPlanePersistence(d1);
   await persistence.ensureSchema();
 
@@ -230,6 +283,7 @@ export async function createControlPlaneRig({
     CPU_LIMIT_CLASS: 'default',
     MANAGEMENT_API_BASE_URL: 'https://ops.example.test',
     MATRIX_PUBLIC_BASE_URL: 'https://matrix.example.test',
+    GATEWAY_WORKER_SCRIPT_NAME: 'matrix-gateway-worker-local',
     ACCESS_TEAM_DOMAIN: teamDomain,
     ACCESS_AUDIENCE: audience,
     FF_FEDERATION: 'false',
@@ -283,8 +337,10 @@ export async function createControlPlaneRig({
       aud: audienceOverride,
       exp: now + expiresInSeconds,
       nbf: now - 10,
-      sub: subject,
     };
+    if (subject !== null) {
+      payload.sub = subject;
+    }
     if (commonName) {
       payload.common_name = commonName;
     }

@@ -53,6 +53,7 @@ function createDefaultEnv(overrides = {}) {
     CPU_LIMIT_CLASS: 'default',
     MATRIX_PUBLIC_BASE_URL: 'https://matrix.example.test',
     MANAGEMENT_API_BASE_URL: 'https://ops.example.test',
+    GATEWAY_WORKER_SCRIPT_NAME: 'matrix-gateway-worker-local',
     MATRIX_MEDIA_MAX_UPLOAD_BYTES: '104857600',
     MATRIX_MEDIA_LEGACY_UNAUTH_FREEZE_AT: '',
     HOMESERVER_SIGNING_KEY_RING: 'hs-test-key-ring',
@@ -122,11 +123,16 @@ export function createGatewayPhase04Rig(overrides = {}) {
     if (body != null && json != null) {
       throw new TypeError('body and json are mutually exclusive');
     }
-    const request = new Request(`https://matrix.example.test${pathname}`, {
+    const resolvedBody = json == null ? body : JSON.stringify(json);
+    const requestInit = {
       method,
       headers: requestHeaders,
-      body: json == null ? body : JSON.stringify(json),
-    });
+      body: resolvedBody,
+    };
+    if (resolvedBody && typeof resolvedBody.getReader === 'function') {
+      requestInit.duplex = 'half';
+    }
+    const request = new Request(`https://matrix.example.test${pathname}`, requestInit);
     return gatewayWorkerModule.fetch(request, env);
   }
 

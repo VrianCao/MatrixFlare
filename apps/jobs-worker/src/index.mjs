@@ -12,10 +12,13 @@ import {
   INTERNAL_RUNTIME_DERIVED_WORK_PATH,
   instrumentEnvironmentBindings,
   loadWorkerRuntimeConfig,
+  MEDIA_WRITE_BACKOFF_TTL_SECONDS,
   normalizeDerivedWorkBatch,
   observeMetric,
   parseLegacyUnauthFreezeAt,
   recordCostAttribution,
+  resolveWorkerResourceBindingNames,
+  resolveRuntimeWorkerVersionId,
   resolveThumbnailAnimationPreference,
   RUNTIME_JOB_SCHEMA_VERSION,
   setGaugeMetric,
@@ -25,7 +28,7 @@ import { createSkeletonQueueHandler } from '../../../packages/runtime-core/src/i
 import {
   createJobsWorkerFetchHandler,
   createJobsWorkerQueueHandler,
-  QUEUE_NAMES,
+  resolveCanonicalControlPlaneQueueName,
 } from '../../../packages/control-plane/src/index.mjs';
 
 function jsonResponse(payload, status = 200) {
@@ -73,7 +76,7 @@ async function withMediaKeyBackoff(env, objectKey, operation) {
       try {
         if (cache && typeof cache.put === 'function') {
           await cache.put(cacheKey, JSON.stringify({ locked_at: new Date().toISOString() }), {
-            expirationTtl: 5,
+            expirationTtl: MEDIA_WRITE_BACKOFF_TTL_SECONDS,
           });
         }
         return await operation();
@@ -299,18 +302,51 @@ function normalizeRuntimeQueueMessage(queueName, body) {
   return body;
 }
 
+const RUNTIME_QUEUE_DEFINITIONS = Object.freeze([
+  Object.freeze({
+    bindingName: 'SEARCH_INDEX_QUEUE',
+    canonicalName: 'matrix-search-index-job',
+    kind: 'search_index',
+  }),
+  Object.freeze({
+    bindingName: 'MEDIA_THUMBNAIL_QUEUE',
+    canonicalName: 'matrix-media-thumbnail-job',
+    kind: 'media_thumbnail',
+  }),
+]);
+
+function resolveRuntimeQueueKind(queueName, queueBindingNames) {
+  for (const definition of RUNTIME_QUEUE_DEFINITIONS) {
+    if (queueName === definition.canonicalName || queueName === queueBindingNames[definition.bindingName]) {
+      return definition.kind;
+    }
+  }
+  return null;
+}
+
+function isControlPlaneQueueName(queueName, queueBindingNames) {
+  try {
+    resolveCanonicalControlPlaneQueueName(queueName, queueBindingNames);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function createRuntimeQueueHandler() {
   const placeholderQueue = createSkeletonQueueHandler('jobs-worker', {
     routeFamily: 'jobs-queue',
   });
   return async function runtimeQueue(batch, env) {
-    if (batch.queue !== 'matrix-search-index-job' && batch.queue !== 'matrix-media-thumbnail-job') {
+    const queueBindingNames = resolveWorkerResourceBindingNames(env).queues;
+    const runtimeQueueKind = resolveRuntimeQueueKind(batch.queue, queueBindingNames);
+    if (runtimeQueueKind == null) {
       return placeholderQueue(batch, env);
     }
     for (const message of batch.messages) {
       try {
         const body = normalizeRuntimeQueueMessage(batch.queue, message.body);
-        if (batch.queue === 'matrix-search-index-job') {
+        if (runtimeQueueKind === 'search_index') {
           await processSearchIndexMessage(body, env);
         } else {
           await processMediaThumbnailMessage(body, env);
@@ -377,7 +413,6 @@ function instrumentQueueBatch(batch, env) {
 const controlPlaneFetch = createJobsWorkerFetchHandler();
 const controlPlaneQueue = createJobsWorkerQueueHandler();
 const runtimeQueue = createRuntimeQueueHandler();
-const CONTROL_PLANE_QUEUES = new Set(Object.values(QUEUE_NAMES));
 
 const fetch = async (request, env) => {
   instrumentEnvironmentBindings(env);
@@ -386,13 +421,14 @@ const fetch = async (request, env) => {
     workerName: 'jobs-worker',
     config,
   });
+  const observedWorkerVersionId = resolveRuntimeWorkerVersionId(env, config.text.WORKER_VERSION_ID);
   const pathname = new URL(request.url).pathname;
   const routeFamily = pathname === INTERNAL_RUNTIME_DERIVED_WORK_PATH
     ? 'runtime-derived'
     : 'jobs-control-plane';
   const requestMetrics = startRequestMetrics(env, {
     workerName: 'jobs-worker',
-    workerVersion: config.text.WORKER_VERSION_ID,
+    workerVersion: observedWorkerVersionId,
     routeFamily,
   });
   try {
@@ -419,15 +455,17 @@ const queue = async (batch, env) => {
     workerName: 'jobs-worker',
     config,
   });
+  const observedWorkerVersionId = resolveRuntimeWorkerVersionId(env, config.text.WORKER_VERSION_ID);
   const routeFamily = `queue:${batch.queue}`;
   const requestMetrics = startRequestMetrics(env, {
     workerName: 'jobs-worker',
-    workerVersion: config.text.WORKER_VERSION_ID,
+    workerVersion: observedWorkerVersionId,
     routeFamily,
   });
   const instrumentedBatch = instrumentQueueBatch(batch, env);
   try {
-    const result = CONTROL_PLANE_QUEUES.has(batch.queue)
+    const queueBindingNames = resolveWorkerResourceBindingNames(env).queues;
+    const result = isControlPlaneQueueName(batch.queue, queueBindingNames)
       ? await controlPlaneQueue(instrumentedBatch, env)
       : await runtimeQueue(instrumentedBatch, env);
     requestMetrics.finish({

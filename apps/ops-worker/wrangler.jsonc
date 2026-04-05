@@ -4,8 +4,12 @@
   "compatibility_date": "2026-03-26",
   "compatibility_flags": [
     "nodejs_compat",
-    "nodejs_compat_do_not_populate_process_env"
+    "nodejs_compat_do_not_populate_process_env",
+    "global_fetch_strictly_public"
   ],
+  "version_metadata": {
+    "binding": "CF_VERSION_METADATA"
+  },
   "vars": {
     "ENVIRONMENT_NAME": "environment_name-placeholder",
     "MATRIX_SERVER_NAME": "matrix_server_name-placeholder",
@@ -18,9 +22,13 @@
     "CPU_LIMIT_CLASS": "default",
     "STARTUP_TIME_MS": 0,
     "ABUSE_GUARD_POLICY_JSON": "",
+    "MATRIX_PUBLIC_BASE_URL": "matrix_public_base_url-placeholder",
     "MANAGEMENT_API_BASE_URL": "management_api_base_url-placeholder",
+    "GATEWAY_WORKER_SCRIPT_NAME": "gateway_worker_script_name-placeholder",
     "ACCESS_TEAM_DOMAIN": "access_team_domain-placeholder",
     "ACCESS_AUDIENCE": "access_audience-placeholder",
+    "CLOUDFLARE_ACCOUNT_ID": "",
+    "CLOUDFLARE_RESOURCE_IDS_JSON": "",
     "FF_APPSERVICE_API": "false",
     "FF_OTEL_EXPORT": "false",
     "FF_OTEL_PERSIST": "true"

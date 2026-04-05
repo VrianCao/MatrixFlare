@@ -1,0 +1,176 @@
+name: Prod Cost Monthly
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 1 * *'
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: prod-cost-monthly
+  cancel-in-progress: false
+
+jobs:
+  local-foundation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Governance check
+        run: npm run governance:check
+
+      - name: Runtime harness parser tests
+        run: node --test tests/local/runtime-foundations/testing-harness.test.mjs
+
+      - name: Non-local tooling tests
+        run: node --test tests/local/runtime-foundations/nonlocal-tooling.test.mjs
+
+      - name: Local regression matrix
+        run: npm run test:all
+
+  prod-cost:
+    needs: local-foundation
+    runs-on: ubuntu-latest
+    environment: prod
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Require Cloudflare credentials
+        shell: bash
+        run: |
+          test -n "$CLOUDFLARE_ACCOUNT_ID"
+          test -n "$CLOUDFLARE_API_TOKEN"
+
+      - name: Define prod-cost paths
+        id: paths
+        shell: bash
+        run: |
+          run_timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+          state_root=".tmp/github/prod-cost/state"
+          artifact_root=".tmp/github/prod-cost/artifacts"
+          raw_artifact_name="prod-cost-raw-${run_timestamp}-${{ github.run_id }}-${{ github.run_attempt }}"
+          attestation_artifact_name="prod-cost-attestation-${run_timestamp}-${{ github.run_id }}-${{ github.run_attempt }}"
+          echo "run_timestamp=${run_timestamp}" >> "$GITHUB_OUTPUT"
+          echo "state_root=${state_root}" >> "$GITHUB_OUTPUT"
+          echo "artifact_root=${artifact_root}" >> "$GITHUB_OUTPUT"
+          echo "snapshot=${artifact_root}/prod-cost-snapshot.json" >> "$GITHUB_OUTPUT"
+          echo "deployment_identity=${artifact_root}/prod-deployment-identity.json" >> "$GITHUB_OUTPUT"
+          echo "bundle=${artifact_root}/cost-bundle.tgz" >> "$GITHUB_OUTPUT"
+          echo "bundle_upload=${state_root}/bundle-upload.json" >> "$GITHUB_OUTPUT"
+          echo "provenance=${state_root}/prod-cost-provenance.json" >> "$GITHUB_OUTPUT"
+          echo "attestation=${state_root}/prod-cost-attestation.json" >> "$GITHUB_OUTPUT"
+          echo "raw_artifact_name=${raw_artifact_name}" >> "$GITHUB_OUTPUT"
+          echo "attestation_artifact_name=${attestation_artifact_name}" >> "$GITHUB_OUTPUT"
+          mkdir -p "$state_root" "$artifact_root"
+          printf '{"run_timestamp":"%s","workflow":"prod-cost-monthly"}\n' "$run_timestamp" > "${artifact_root}/raw-state-metadata.json"
+
+      - name: Define closed monthly billing window
+        id: billing_window
+        shell: bash
+        run: |
+          from_date="$(date -u -d "$(date -u +%Y-%m-01) -1 month" +%Y-%m-01)"
+          to_date="$(date -u -d "$(date -u +%Y-%m-01) -1 day" +%Y-%m-%d)"
+          echo "from_date=${from_date}" >> "$GITHUB_OUTPUT"
+          echo "to_date=${to_date}" >> "$GITHUB_OUTPUT"
+
+      - name: Capture production cost snapshot
+        id: capture_snapshot
+        continue-on-error: true
+        run: |
+          node packages/testing/src/cli.mjs prod-cost-snapshot \
+            --timestamp "${{ steps.paths.outputs.run_timestamp }}" \
+            --artifact-root "${{ steps.paths.outputs.artifact_root }}" \
+            --output "${{ steps.paths.outputs.snapshot }}" \
+            --from "${{ steps.billing_window.outputs.from_date }}" \
+            --to "${{ steps.billing_window.outputs.to_date }}" \
+            --captured-by "github-actions:${{ github.actor }}" \
+            --reviewed-by "github-actions-run:${{ github.run_id }}"
+
+      - name: Bundle raw prod-cost artifacts
+        id: bundle_raw
+        if: always() && steps.paths.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          bundle_tmp="${{ steps.paths.outputs.state_root }}/cost-bundle.tgz"
+          tar -czf "$bundle_tmp" \
+            -C "${{ steps.paths.outputs.artifact_root }}" \
+            .
+          mv "$bundle_tmp" "${{ steps.paths.outputs.bundle }}"
+
+      - name: Upload raw prod-cost artifacts
+        id: upload_raw
+        if: always() && steps.paths.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.paths.outputs.raw_artifact_name }}
+          path: ${{ steps.paths.outputs.artifact_root }}
+          if-no-files-found: error
+
+      - name: Upload raw prod-cost bundle to R2
+        id: upload_bundle_r2
+        if: always() && steps.paths.outcome == 'success'
+        continue-on-error: true
+        run: |
+          node packages/testing/src/cli.mjs nonlocal-upload-r2 \
+            --bucket "matrix-evidence-prod" \
+            --key "gha/${{ github.run_id }}/${{ github.run_attempt }}/prod/${{ steps.paths.outputs.run_timestamp }}/cost-bundle.tgz" \
+            --file "${{ steps.paths.outputs.bundle }}" \
+            --content-type "application/gzip" \
+            --output "${{ steps.paths.outputs.bundle_upload }}"
+
+      - name: Write prod-cost provenance
+        if: steps.capture_snapshot.outcome == 'success' && steps.bundle_raw.outcome == 'success' && steps.upload_bundle_r2.outcome == 'success'
+        run: |
+          node packages/testing/src/cli.mjs prod-cost-provenance \
+            --deployment-identity "${{ steps.paths.outputs.deployment_identity }}" \
+            --artifact-upload "${{ steps.paths.outputs.bundle_upload }}" \
+            --output "${{ steps.paths.outputs.provenance }}"
+
+      - name: Write prod-cost attestation
+        if: steps.capture_snapshot.outcome == 'success' && steps.bundle_raw.outcome == 'success' && steps.upload_bundle_r2.outcome == 'success'
+        run: |
+          node packages/testing/src/cli.mjs prod-cost-attest \
+            --timestamp "${{ steps.paths.outputs.run_timestamp }}" \
+            --payload "${{ steps.paths.outputs.snapshot }}" \
+            --provenance "${{ steps.paths.outputs.provenance }}" \
+            --output "${{ steps.paths.outputs.attestation }}"
+
+      - name: Upload prod-cost attestation artifact
+        if: steps.capture_snapshot.outcome == 'success' && steps.bundle_raw.outcome == 'success' && steps.upload_bundle_r2.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.paths.outputs.attestation_artifact_name }}
+          path: ${{ steps.paths.outputs.attestation }}
+          if-no-files-found: error
+
+      - name: Enforce prod-cost fail-closed outcome after raw artifact preservation
+        if: always()
+        shell: bash
+        run: |
+          if [ "${{ steps.capture_snapshot.outcome }}" != "success" ]; then
+            echo "Capture production cost snapshot failed after raw artifacts were preserved." >&2
+            exit 1
+          fi
+          if [ "${{ steps.bundle_raw.outcome }}" != "success" ]; then
+            echo "Bundling raw prod-cost artifacts failed." >&2
+            exit 1
+          fi
+          if [ "${{ steps.upload_bundle_r2.outcome }}" != "success" ]; then
+            echo "Uploading raw prod-cost bundle to R2 failed." >&2
+            exit 1
+          fi

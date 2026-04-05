@@ -6,6 +6,8 @@ import {
   normalizeJobCancelRequest,
   normalizeRebuildJobRequest,
   normalizeRepairJobRequest,
+  normalizeRolloutSkewProbeRequest,
+  normalizeRolloutSkewProbeResponse,
   normalizeRestoreJobRequest,
   mapInternalJobStateToPublicState,
 } from './schemas.mjs';
@@ -32,9 +34,10 @@ function buildHealthResponse(config, deploymentRecord, dependencies, status) {
     service: 'ops-worker',
     status,
     observed_at: new Date().toISOString(),
-    worker_version_id: config.text.WORKER_VERSION_ID,
-    deployment_id: config.text.DEPLOYMENT_ID,
+    worker_version_id: deploymentRecord.worker_version_id,
+    deployment_id: deploymentRecord.deployment_id,
     compatibility_date: config.compatibilityDate,
+    compatibility_flags: deploymentRecord.compatibility_flags,
     release_profile: config.releaseProfile,
     cpu_limit_class: deploymentRecord.cpu_limit_class,
     startup_time_ms: deploymentRecord.startup_time_ms,
@@ -64,6 +67,12 @@ function routeInfo(url) {
   }
   if (pathname === ROUTE_TEMPLATES.repairs) {
     return { kind: 'job-create', routeTemplate: ROUTE_TEMPLATES.repairs, requiredScope: 'ops.repair.write' };
+  }
+  if (pathname === ROUTE_TEMPLATES.rolloutSkewProbe) {
+    return { kind: 'rollout-skew-probe', routeTemplate: ROUTE_TEMPLATES.rolloutSkewProbe, requiredScope: 'ops.rebuild.write' };
+  }
+  if (pathname === ROUTE_TEMPLATES.costObservation) {
+    return { kind: 'cost-observation', routeTemplate: ROUTE_TEMPLATES.costObservation, requiredScope: 'ops.read' };
   }
   if (pathname === ROUTE_TEMPLATES.jobsList) {
     return { kind: 'jobs-list', routeTemplate: ROUTE_TEMPLATES.jobsList, requiredScope: 'ops.read' };
@@ -129,6 +138,1164 @@ async function buildHealthDependencies(env, persistence) {
   return dependencies;
 }
 
+const ROLLOUT_PROBE_SECRET_HEADER = 'x-matrix-rollout-probe-secret';
+const ROLLOUT_PROBE_GATEWAY_VERSION_ID_HEADER = 'x-matrix-rollout-probe-gateway-version-id';
+const ROLLOUT_PROBE_GATEWAY_VERSION_TAG_HEADER = 'x-matrix-rollout-probe-gateway-version-tag';
+const PROBE_PASSWORD_SUFFIX = '-password';
+const ROLLOUT_PROBE_MAX_SEED_ATTEMPTS = 24;
+const CLOUDFLARE_API_BASE_URL = 'https://api.cloudflare.com/client/v4';
+const CLOUDFLARE_GRAPHQL_API_DOC_URI = 'https://developers.cloudflare.com/analytics/graphql-api/';
+const WORKERS_METRICS_DOC_URI = 'https://developers.cloudflare.com/workers/observability/metrics-and-analytics/';
+const DURABLE_OBJECTS_METRICS_DOC_URI = 'https://developers.cloudflare.com/durable-objects/observability/graphql-analytics/';
+const DURABLE_OBJECTS_PRICING_DOC_URI = 'https://developers.cloudflare.com/durable-objects/platform/pricing/';
+const WORKERS_SCRIPT_SETTINGS_DOC_URI = 'https://developers.cloudflare.com/api-next/resources/workers/subresources/scripts/subresources/settings/methods/get/';
+const BILLING_USAGE_API_DOC_URI = 'https://developers.cloudflare.com/api/resources/billing/subresources/usage/';
+
+function stableString(value) {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function normalizeProbeToken(value, {
+  fallback = 'probe',
+} = {}) {
+  const normalized = String(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9._=-]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return normalized.length > 0 ? normalized : fallback;
+}
+
+function sanitizeProbeToken(value, {
+  fallback = 'probe',
+  maxLength = 48,
+} = {}) {
+  const resolved = normalizeProbeToken(value, {
+    fallback,
+  });
+  return resolved.slice(0, Math.max(1, maxLength));
+}
+
+function buildProbeScopedToken(baseLabel, uniqueScope, {
+  fallback = 'probe',
+  maxLength = 48,
+  uniqueTailLength = 8,
+} = {}) {
+  const resolvedMaxLength = Math.max(1, maxLength);
+  const baseToken = sanitizeProbeToken(baseLabel, {
+    fallback,
+    maxLength: resolvedMaxLength,
+  });
+  const compactScopeToken = normalizeProbeToken(uniqueScope, {
+    fallback: 'scope',
+  }).replace(/[^a-z0-9]+/g, '');
+  if (compactScopeToken.length === 0 || resolvedMaxLength <= 1) {
+    return baseToken.slice(0, resolvedMaxLength);
+  }
+  const suffixLength = Math.min(
+    Math.max(1, uniqueTailLength),
+    compactScopeToken.length,
+    Math.max(1, resolvedMaxLength - 2),
+  );
+  const suffix = compactScopeToken.slice(-suffixLength);
+  const prefixBudget = Math.max(0, resolvedMaxLength - 1 - suffix.length);
+  const prefix = prefixBudget > 0 ? baseToken.slice(0, prefixBudget) : '';
+  return prefix.length > 0 ? `${prefix}-${suffix}` : suffix;
+}
+
+function sanitizeDeviceId(value) {
+  const normalized = String(value)
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, '')
+    .slice(0, 16);
+  return normalized.length > 0 ? normalized : 'ROLLPROBE01';
+}
+
+function buildSeedAttemptLabel(baseLabel, attemptIndex) {
+  return `${baseLabel}-${attemptIndex}`;
+}
+
+function summarizeObservedProbeVersions(observedVersionIds) {
+  const uniqueVersionIds = [...new Set(
+    observedVersionIds
+      .filter((value) => typeof value === 'string' && value.length > 0)
+      .map((value) => String(value)),
+  )];
+  return uniqueVersionIds.length === 0 ? 'none' : uniqueVersionIds.join(', ');
+}
+
+function describeObservedGatewayIdentity(observedGatewayVersionId, observedGatewayVersionTag) {
+  if (observedGatewayVersionId.length > 0 && observedGatewayVersionTag.length > 0) {
+    return `${observedGatewayVersionId} (${observedGatewayVersionTag})`;
+  }
+  if (observedGatewayVersionId.length > 0) {
+    return observedGatewayVersionId;
+  }
+  if (observedGatewayVersionTag.length > 0) {
+    return `tag ${observedGatewayVersionTag}`;
+  }
+  return 'none';
+}
+
+function createOpsValidationError(message, {
+  status = 422,
+  code = 'validation_failed',
+  retryable = false,
+} = {}) {
+  const error = new Error(message);
+  error.status = status;
+  error.code = code;
+  error.retryable = retryable;
+  return error;
+}
+
+function createOpsPreconditionError(message, {
+  status = 409,
+  code = 'precondition_failed',
+  retryable = false,
+} = {}) {
+  const error = new Error(message);
+  error.status = status;
+  error.code = code;
+  error.retryable = retryable;
+  return error;
+}
+
+function createRetryableProbeAttemptError(message, {
+  retryAfterMs = null,
+} = {}) {
+  const error = createOpsPreconditionError(message, {
+    retryable: true,
+  });
+  error.attempt_retryable = true;
+  error.retry_after_ms = Number.isInteger(retryAfterMs) && retryAfterMs > 0
+    ? retryAfterMs
+    : null;
+  return error;
+}
+
+function isRetryableProbeAttemptError(error) {
+  return error?.attempt_retryable === true;
+}
+
+function readRetryAfterMsFromGatewayResult(result) {
+  const retryAfterMs = result?.payload?.retry_after_ms;
+  return Number.isInteger(retryAfterMs) && retryAfterMs > 0
+    ? retryAfterMs
+    : null;
+}
+
+function requireGatewayProbeConfiguration(env) {
+  const baseUrl = stableString(env.MATRIX_PUBLIC_BASE_URL).replace(/\/+$/, '');
+  const scriptName = stableString(env.GATEWAY_WORKER_SCRIPT_NAME);
+  const sharedSecret = stableString(env.ROLLOUT_PROBE_SHARED_SECRET);
+  if (baseUrl.length === 0) {
+      throw createOpsPreconditionError('ops-worker requires MATRIX_PUBLIC_BASE_URL for rollout-skew probing', {
+        status: 503,
+        code: 'internal',
+        retryable: true,
+      });
+  }
+  if (scriptName.length === 0) {
+      throw createOpsPreconditionError('ops-worker requires GATEWAY_WORKER_SCRIPT_NAME for rollout-skew probing', {
+        status: 503,
+        code: 'internal',
+        retryable: true,
+      });
+  }
+  if (sharedSecret.length === 0) {
+      throw createOpsPreconditionError('ops-worker requires ROLLOUT_PROBE_SHARED_SECRET for rollout-skew probing', {
+        status: 503,
+        code: 'internal',
+        retryable: true,
+      });
+  }
+  return {
+    base_url: baseUrl,
+    script_name: scriptName,
+    shared_secret: sharedSecret,
+  };
+}
+
+function buildVersionOverrideHeader(scriptName, versionId) {
+  return `${scriptName}="${String(versionId).replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"`;
+}
+
+async function readGatewayPayload(response) {
+  const contentType = response.headers.get('content-type') ?? '';
+  if (contentType.toLowerCase().includes('json')) {
+    return response.json();
+  }
+  return response.text();
+}
+
+function describeGatewayFailure(result) {
+  return JSON.stringify({
+    status: result.response.status,
+    content_type: result.response.headers.get('content-type') ?? '',
+    body: result.payload,
+  });
+}
+
+function indicatesExistingProbeIdentity(result) {
+  return (
+    result.response.status === 400
+    || result.response.status === 409
+  ) && result.payload?.errcode === 'M_USER_IN_USE';
+}
+
+async function fetchGatewayWithVersionOverride(env, gatewayConfig, {
+  versionId,
+  versionTag,
+  pathname,
+  method = 'GET',
+  accessToken = null,
+  json = undefined,
+  requireObservedGatewayIdentity = true,
+} = {}) {
+  const headers = new Headers();
+  headers.set('Cloudflare-Workers-Version-Overrides', buildVersionOverrideHeader(gatewayConfig.script_name, versionId));
+  headers.set(ROLLOUT_PROBE_SECRET_HEADER, gatewayConfig.shared_secret);
+  if (accessToken != null) {
+    headers.set('authorization', `Bearer ${accessToken}`);
+  }
+  if (json !== undefined) {
+    headers.set('content-type', 'application/json; charset=utf-8');
+  }
+  const response = await fetch(`${gatewayConfig.base_url}${pathname}`, {
+    method,
+    headers,
+    body: json === undefined ? undefined : JSON.stringify(json),
+  });
+  const payload = await readGatewayPayload(response);
+  const observedGatewayVersionId = stableString(response.headers.get(ROLLOUT_PROBE_GATEWAY_VERSION_ID_HEADER));
+  const observedGatewayVersionTag = stableString(response.headers.get(ROLLOUT_PROBE_GATEWAY_VERSION_TAG_HEADER));
+  const expectedGatewayVersionTag = stableString(versionTag);
+  if (observedGatewayVersionId.length === 0 && observedGatewayVersionTag.length === 0 && requireObservedGatewayIdentity) {
+    throw createOpsPreconditionError(
+      `Gateway response for ${pathname} did not include ${ROLLOUT_PROBE_GATEWAY_VERSION_ID_HEADER} or ${ROLLOUT_PROBE_GATEWAY_VERSION_TAG_HEADER}`,
+    );
+  }
+  if (observedGatewayVersionId.length > 0 && observedGatewayVersionId !== versionId) {
+    throw createOpsPreconditionError(
+      `Gateway version override mismatch for ${pathname}: requested ${versionId}, observed ${describeObservedGatewayIdentity(observedGatewayVersionId, observedGatewayVersionTag)}`,
+    );
+  }
+  if (observedGatewayVersionTag.length > 0) {
+    if (expectedGatewayVersionTag.length === 0) {
+      throw createOpsPreconditionError(`Gateway response for ${pathname} included ${ROLLOUT_PROBE_GATEWAY_VERSION_TAG_HEADER} without an expected official version tag`);
+    }
+    if (observedGatewayVersionTag !== expectedGatewayVersionTag) {
+      throw createOpsPreconditionError(
+        `Gateway version override mismatch for ${pathname}: requested ${versionId} (${expectedGatewayVersionTag}), observed ${describeObservedGatewayIdentity(observedGatewayVersionId, observedGatewayVersionTag)}`,
+      );
+    }
+  }
+  if (observedGatewayVersionId.length === 0 && observedGatewayVersionTag.length === 0) {
+    return {
+      response,
+      payload,
+      observed_gateway_version_id: null,
+      observed_gateway_version_tag: null,
+    };
+  }
+  if (observedGatewayVersionId.length === 0 && observedGatewayVersionTag.length > 0 && expectedGatewayVersionTag.length === 0) {
+    throw createOpsPreconditionError(
+      `Gateway response for ${pathname} requires an expected official version tag when ${ROLLOUT_PROBE_GATEWAY_VERSION_ID_HEADER} is absent`,
+    );
+  }
+  return {
+    response,
+    payload,
+    observed_gateway_version_id: observedGatewayVersionId.length > 0 ? observedGatewayVersionId : null,
+    observed_gateway_version_tag: observedGatewayVersionTag.length > 0 ? observedGatewayVersionTag : null,
+  };
+}
+
+function getUserDoStub(env, userId) {
+  const namespace = env.USER_DO;
+  if (!namespace || typeof namespace.idFromName !== 'function' || typeof namespace.get !== 'function') {
+      throw createOpsPreconditionError('ops-worker requires USER_DO binding for rollout-skew probing', {
+        status: 503,
+        code: 'internal',
+        retryable: true,
+      });
+  }
+  return namespace.get(namespace.idFromName(userId));
+}
+
+function getRoomDoStub(env, roomId) {
+  const namespace = env.ROOM_DO;
+  if (!namespace || typeof namespace.idFromName !== 'function' || typeof namespace.get !== 'function') {
+      throw createOpsPreconditionError('ops-worker requires ROOM_DO binding for rollout-skew probing', {
+        status: 503,
+        code: 'internal',
+        retryable: true,
+      });
+  }
+  return namespace.get(namespace.idFromName(roomId));
+}
+
+async function inspectUserAuthority(env, userId) {
+  const result = await getUserDoStub(env, userId).inspectRuntimeIdentity();
+  if (!result?.ok || stableString(result.worker_version_id).length === 0) {
+    throw createOpsPreconditionError(`UserDO ${userId} did not expose a usable runtime identity`);
+  }
+  return result;
+}
+
+async function inspectRoomAuthority(env, roomId) {
+  const result = await getRoomDoStub(env, roomId).inspectRuntimeIdentity();
+  if (!result?.ok || stableString(result.worker_version_id).length === 0) {
+    throw createOpsPreconditionError(`RoomDO ${roomId} did not expose a usable runtime identity`);
+  }
+  return result;
+}
+
+async function loginProbeUser(env, gatewayConfig, {
+  username,
+  password,
+  deviceId,
+  gatewayVersionId,
+  gatewayVersionTag,
+} = {}) {
+  const result = await fetchGatewayWithVersionOverride(env, gatewayConfig, {
+    versionId: gatewayVersionId,
+    versionTag: gatewayVersionTag,
+    pathname: '/_matrix/client/v3/login',
+    method: 'POST',
+    requireObservedGatewayIdentity: false,
+    json: {
+      type: 'm.login.password',
+      identifier: {
+        type: 'm.id.user',
+        user: username,
+      },
+      password,
+      device_id: deviceId,
+    },
+  });
+  if (result.response.status !== 200 || typeof result.payload?.access_token !== 'string' || typeof result.payload?.user_id !== 'string') {
+    const retryAfterMs = readRetryAfterMsFromGatewayResult(result);
+    throw createRetryableProbeAttemptError(
+      `Probe login failed for ${username}: ${describeGatewayFailure(result)}${retryAfterMs == null ? '' : `; retry_after_ms=${retryAfterMs}`}`,
+      {
+        retryAfterMs,
+      },
+    );
+  }
+  return {
+    username,
+    password,
+    device_id: deviceId,
+    access_token: result.payload.access_token,
+    user_id: result.payload.user_id,
+  };
+}
+
+async function ensureProbeUser(env, gatewayConfig, probeRequest, {
+  userLabel,
+  gatewayVersionId,
+  gatewayVersionTag,
+} = {}) {
+  const username = buildProbeScopedToken(userLabel, `${probeRequest.seed_prefix}-${probeRequest.probe_run_id}`, {
+    fallback: userLabel,
+    maxLength: 32,
+    uniqueTailLength: 8,
+  });
+  const password = sanitizeProbeToken(`${probeRequest.probe_run_id}${PROBE_PASSWORD_SUFFIX}`, {
+    fallback: 'phase08-rollout-password',
+    maxLength: 48,
+  });
+  const deviceId = sanitizeDeviceId(`${userLabel}-${probeRequest.probe_run_id}`);
+  const challenge = await fetchGatewayWithVersionOverride(env, gatewayConfig, {
+    versionId: gatewayVersionId,
+    versionTag: gatewayVersionTag,
+    pathname: '/_matrix/client/v3/register',
+    method: 'POST',
+    requireObservedGatewayIdentity: false,
+    json: {
+      username,
+      password,
+      device_id: deviceId,
+    },
+  });
+  if (challenge.response.status === 200 && typeof challenge.payload?.access_token === 'string' && typeof challenge.payload?.user_id === 'string') {
+    return {
+      username,
+      password,
+      device_id: deviceId,
+      access_token: challenge.payload.access_token,
+      user_id: challenge.payload.user_id,
+    };
+  }
+  if (challenge.response.status === 401 && typeof challenge.payload?.session === 'string') {
+    const completed = await fetchGatewayWithVersionOverride(env, gatewayConfig, {
+      versionId: gatewayVersionId,
+      versionTag: gatewayVersionTag,
+      pathname: '/_matrix/client/v3/register',
+      method: 'POST',
+      requireObservedGatewayIdentity: false,
+      json: {
+        username,
+        password,
+        device_id: deviceId,
+        auth: {
+          type: 'm.login.dummy',
+          session: challenge.payload.session,
+        },
+      },
+    });
+    if (completed.response.status === 200 && typeof completed.payload?.access_token === 'string' && typeof completed.payload?.user_id === 'string') {
+      return {
+        username,
+        password,
+        device_id: deviceId,
+        access_token: completed.payload.access_token,
+        user_id: completed.payload.user_id,
+      };
+    }
+    if (indicatesExistingProbeIdentity(completed)) {
+      return loginProbeUser(env, gatewayConfig, {
+        username,
+        password,
+        deviceId,
+        gatewayVersionId,
+        gatewayVersionTag,
+      });
+    }
+    const retryAfterMs = readRetryAfterMsFromGatewayResult(completed);
+    throw createRetryableProbeAttemptError(
+      `Probe register completion failed for ${username}: ${describeGatewayFailure(completed)}${retryAfterMs == null ? '' : `; retry_after_ms=${retryAfterMs}`}`,
+      {
+        retryAfterMs,
+      },
+    );
+  }
+  if (indicatesExistingProbeIdentity(challenge)) {
+    return loginProbeUser(env, gatewayConfig, {
+      username,
+      password,
+      deviceId,
+      gatewayVersionId,
+      gatewayVersionTag,
+    });
+  }
+  const retryAfterMs = readRetryAfterMsFromGatewayResult(challenge);
+  throw createRetryableProbeAttemptError(
+    `Probe register challenge failed for ${username}: ${describeGatewayFailure(challenge)}${retryAfterMs == null ? '' : `; retry_after_ms=${retryAfterMs}`}`,
+    {
+      retryAfterMs,
+    },
+  );
+}
+
+async function ensureProbeRoom(env, gatewayConfig, probeRequest, {
+  roomLabel,
+  gatewayVersionId,
+  gatewayVersionTag,
+  accessToken,
+  serverName,
+} = {}) {
+  const aliasLocalpart = buildProbeScopedToken(roomLabel, `${probeRequest.seed_prefix}-${probeRequest.probe_run_id}`, {
+    fallback: roomLabel,
+    maxLength: 48,
+    uniqueTailLength: 12,
+  });
+  const roomAlias = `#${aliasLocalpart}:${serverName}`;
+  const created = await fetchGatewayWithVersionOverride(env, gatewayConfig, {
+    versionId: gatewayVersionId,
+    versionTag: gatewayVersionTag,
+    pathname: '/_matrix/client/v3/createRoom',
+    method: 'POST',
+    accessToken,
+    requireObservedGatewayIdentity: false,
+    json: {
+      visibility: 'public',
+      preset: 'public_chat',
+      room_alias_name: aliasLocalpart,
+      name: `Phase08 rollout ${roomLabel}`,
+    },
+  });
+  if (created.response.status === 200 && typeof created.payload?.room_id === 'string') {
+    return {
+      room_id: created.payload.room_id,
+      room_alias: roomAlias,
+    };
+  }
+  const createRetryAfterMs = readRetryAfterMsFromGatewayResult(created);
+  if (createRetryAfterMs != null) {
+    throw createRetryableProbeAttemptError(
+      `Probe room setup failed for ${roomAlias}: ${describeGatewayFailure(created)}; retry_after_ms=${createRetryAfterMs}`,
+      {
+        retryAfterMs: createRetryAfterMs,
+      },
+    );
+  }
+  const joined = await fetchGatewayWithVersionOverride(env, gatewayConfig, {
+    versionId: gatewayVersionId,
+    versionTag: gatewayVersionTag,
+    pathname: `/_matrix/client/v3/join/${encodeURIComponent(roomAlias)}`,
+    method: 'POST',
+    accessToken,
+    requireObservedGatewayIdentity: false,
+    json: {},
+  });
+  if (joined.response.status !== 200 || typeof joined.payload?.room_id !== 'string') {
+    const retryAfterMs = readRetryAfterMsFromGatewayResult(joined);
+    throw createRetryableProbeAttemptError(
+      `Probe room setup failed for ${roomAlias}: ${describeGatewayFailure(joined)}${retryAfterMs == null ? '' : `; retry_after_ms=${retryAfterMs}`}`,
+      {
+        retryAfterMs,
+      },
+    );
+  }
+  return {
+    room_id: joined.payload.room_id,
+    room_alias: roomAlias,
+  };
+}
+
+async function seedProbeUserForVersion(env, gatewayConfig, probeRequest, {
+  userLabel,
+  gatewayVersionId,
+  gatewayVersionTag,
+  expectedAuthorityVersionId,
+} = {}) {
+  const observedVersionIds = [];
+  const attemptErrors = [];
+  for (let attemptIndex = 1; attemptIndex <= ROLLOUT_PROBE_MAX_SEED_ATTEMPTS; attemptIndex += 1) {
+    let seededUser;
+    try {
+      seededUser = await ensureProbeUser(env, gatewayConfig, probeRequest, {
+        userLabel: buildSeedAttemptLabel(userLabel, attemptIndex),
+        gatewayVersionId,
+        gatewayVersionTag,
+      });
+    } catch (error) {
+      if (!isRetryableProbeAttemptError(error)) {
+        throw error;
+      }
+      attemptErrors.push(`attempt ${attemptIndex}: ${error.message}`);
+      if (Number.isInteger(error.retry_after_ms) && error.retry_after_ms > 0) {
+        throw createOpsPreconditionError(
+          `Unable to seed ${userLabel} on ${expectedAuthorityVersionId}; attempt ${attemptIndex} hit rate limiting and reported retry_after_ms=${error.retry_after_ms}, so bounded sampling stopped early instead of burning the remaining attempts${attemptErrors.length > 0 ? `; setup_failures=${attemptErrors.join(' | ')}` : ''}`,
+          { retryable: true },
+        );
+      }
+      continue;
+    }
+    const identity = await inspectUserAuthority(env, seededUser.user_id);
+    observedVersionIds.push(identity.worker_version_id);
+    if (identity.worker_version_id === expectedAuthorityVersionId) {
+      return seededUser;
+    }
+  }
+  throw createOpsPreconditionError(
+    `Unable to seed ${userLabel} on ${expectedAuthorityVersionId} within ${ROLLOUT_PROBE_MAX_SEED_ATTEMPTS} attempts; observed ${summarizeObservedProbeVersions(observedVersionIds)}${attemptErrors.length > 0 ? `; setup_failures=${attemptErrors.join(' | ')}` : ''}`,
+    { retryable: true },
+  );
+}
+
+async function seedProbeRoomForVersion(env, gatewayConfig, probeRequest, {
+  roomLabel,
+  gatewayVersionId,
+  gatewayVersionTag,
+  accessToken,
+  serverName,
+  expectedAuthorityVersionId,
+} = {}) {
+  const observedVersionIds = [];
+  const attemptErrors = [];
+  for (let attemptIndex = 1; attemptIndex <= ROLLOUT_PROBE_MAX_SEED_ATTEMPTS; attemptIndex += 1) {
+    let seededRoom;
+    try {
+      seededRoom = await ensureProbeRoom(env, gatewayConfig, probeRequest, {
+        roomLabel: buildSeedAttemptLabel(roomLabel, attemptIndex),
+        gatewayVersionId,
+        gatewayVersionTag,
+        accessToken,
+        serverName,
+      });
+    } catch (error) {
+      if (!isRetryableProbeAttemptError(error)) {
+        throw error;
+      }
+      attemptErrors.push(`attempt ${attemptIndex}: ${error.message}`);
+      if (Number.isInteger(error.retry_after_ms) && error.retry_after_ms > 0) {
+        throw createOpsPreconditionError(
+          `Unable to seed ${roomLabel} on ${expectedAuthorityVersionId}; attempt ${attemptIndex} hit rate limiting and reported retry_after_ms=${error.retry_after_ms}, so bounded sampling stopped early instead of burning the remaining attempts${attemptErrors.length > 0 ? `; setup_failures=${attemptErrors.join(' | ')}` : ''}`,
+          { retryable: true },
+        );
+      }
+      continue;
+    }
+    const identity = await inspectRoomAuthority(env, seededRoom.room_id);
+    observedVersionIds.push(identity.worker_version_id);
+    if (identity.worker_version_id === expectedAuthorityVersionId) {
+      return seededRoom;
+    }
+  }
+  throw createOpsPreconditionError(
+    `Unable to seed ${roomLabel} on ${expectedAuthorityVersionId} within ${ROLLOUT_PROBE_MAX_SEED_ATTEMPTS} attempts; observed ${summarizeObservedProbeVersions(observedVersionIds)}${attemptErrors.length > 0 ? `; setup_failures=${attemptErrors.join(' | ')}` : ''}`,
+    { retryable: true },
+  );
+}
+
+function buildRolloutObservation({
+  probeName,
+  requestGatewayVersionId,
+  observedGatewayVersionId,
+  observedGatewayVersionTag,
+  authorityVersionId,
+  authorityKind,
+  authorityKey,
+  requestPath,
+}) {
+  return {
+    probe_name: probeName,
+    request_gateway_version_id: requestGatewayVersionId,
+    observed_gateway_version_id: observedGatewayVersionId,
+    observed_gateway_version_tag: observedGatewayVersionTag,
+    observed_authority_version_id: authorityVersionId,
+    authority_kind: authorityKind,
+    authority_key: authorityKey,
+    request_path: requestPath,
+    observed_at: new Date().toISOString(),
+  };
+}
+
+function evaluateRolloutAssertions(observations, {
+  baselineGatewayVersionId,
+  baselineGatewayVersionTag,
+  candidateGatewayVersionId,
+  candidateGatewayVersionTag,
+} = {}) {
+  const hasExpectedGatewayIdentity = (entry, expectedGatewayVersionId, expectedGatewayVersionTag) => {
+    if (entry.observed_gateway_version_id === expectedGatewayVersionId) {
+      return entry.observed_gateway_version_tag == null
+        || entry.observed_gateway_version_tag === expectedGatewayVersionTag;
+    }
+    return (
+      entry.observed_gateway_version_id == null
+      && entry.observed_gateway_version_tag === expectedGatewayVersionTag
+    );
+  };
+  const hasExpectedObservation = (probeName, authorityKind, expectedGatewayVersionId, expectedGatewayVersionTag, expectedAuthorityVersionId) => observations.some((entry) => (
+    entry.probe_name === probeName
+    && entry.authority_kind === authorityKind
+    && entry.request_gateway_version_id === expectedGatewayVersionId
+    && hasExpectedGatewayIdentity(entry, expectedGatewayVersionId, expectedGatewayVersionTag)
+    && entry.observed_authority_version_id === expectedAuthorityVersionId
+  ));
+  return {
+    new_worker_old_authority: ['UserDO', 'RoomDO'].every((authorityKind) => hasExpectedObservation(
+      'new-worker-old-authority',
+      authorityKind,
+      candidateGatewayVersionId,
+      candidateGatewayVersionTag,
+      baselineGatewayVersionId,
+    )),
+    old_worker_new_authority: ['UserDO', 'RoomDO'].every((authorityKind) => hasExpectedObservation(
+      'old-worker-new-authority',
+      authorityKind,
+      baselineGatewayVersionId,
+      baselineGatewayVersionTag,
+      candidateGatewayVersionId,
+    )),
+  };
+}
+
+function createOpsInternalError(message, {
+  retryable = false,
+  details = null,
+} = {}) {
+  const error = new Error(message);
+  error.code = 'internal';
+  error.retryable = retryable;
+  error.details = details;
+  return error;
+}
+
+function getObservabilityFetch(env) {
+  return env?.__CLOUDFLARE_OBSERVABILITY_FETCH__ ?? globalThis.fetch;
+}
+
+function parseJsonObjectText(rawValue, label) {
+  const normalized = stableString(rawValue);
+  if (normalized.length === 0) {
+    throw createOpsPreconditionError(`${label} is required for cost observation`, {
+      status: 503,
+      code: 'internal',
+      retryable: true,
+    });
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(normalized);
+  } catch (error) {
+    throw createOpsPreconditionError(`${label} must be valid JSON: ${error.message}`, {
+      status: 503,
+      code: 'internal',
+      retryable: false,
+    });
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw createOpsPreconditionError(`${label} must decode to an object`, {
+      status: 503,
+      code: 'internal',
+      retryable: false,
+    });
+  }
+  return parsed;
+}
+
+function normalizeStringMap(value, label) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw createOpsPreconditionError(`${label} must be an object`, {
+      status: 503,
+      code: 'internal',
+      retryable: false,
+    });
+  }
+  const normalized = {};
+  for (const [key, rawEntry] of Object.entries(value)) {
+    const normalizedKey = stableString(key);
+    const normalizedValue = stableString(rawEntry);
+    if (normalizedKey.length > 0 && normalizedValue.length > 0) {
+      normalized[normalizedKey] = normalizedValue;
+    }
+  }
+  return Object.freeze(normalized);
+}
+
+function requireCostObservationConfiguration(env, config) {
+  const accountId = stableString(env.CLOUDFLARE_ACCOUNT_ID);
+  if (accountId.length === 0) {
+    throw createOpsPreconditionError('ops-worker requires CLOUDFLARE_ACCOUNT_ID for cost observation', {
+      status: 503,
+      code: 'internal',
+      retryable: true,
+    });
+  }
+  const apiToken = stableString(
+    config?.secrets?.get?.('cloudflare_observability_api_token')
+    ?? env.CLOUDFLARE_OBSERVABILITY_API_TOKEN,
+  );
+  if (apiToken.length === 0) {
+    throw createOpsPreconditionError('ops-worker requires CLOUDFLARE_OBSERVABILITY_API_TOKEN for cost observation', {
+      status: 503,
+      code: 'internal',
+      retryable: true,
+    });
+  }
+  const rawResourceIds = parseJsonObjectText(env.CLOUDFLARE_RESOURCE_IDS_JSON, 'CLOUDFLARE_RESOURCE_IDS_JSON');
+  const workerScripts = normalizeStringMap(
+    rawResourceIds.worker_scripts ?? {
+      'gateway-worker': env.GATEWAY_WORKER_SCRIPT_NAME,
+    },
+    'CLOUDFLARE_RESOURCE_IDS_JSON.worker_scripts',
+  );
+  const queueIds = normalizeStringMap(rawResourceIds.queue_ids ?? {}, 'CLOUDFLARE_RESOURCE_IDS_JSON.queue_ids');
+  const bucketNames = normalizeStringMap(rawResourceIds.r2_bucket_names ?? {}, 'CLOUDFLARE_RESOURCE_IDS_JSON.r2_bucket_names');
+  const resourceSnapshot = rawResourceIds.cloudflare_resources;
+  if (!resourceSnapshot || typeof resourceSnapshot !== 'object' || Array.isArray(resourceSnapshot)) {
+    throw createOpsPreconditionError('CLOUDFLARE_RESOURCE_IDS_JSON.cloudflare_resources must be present for cost observation', {
+      status: 503,
+      code: 'internal',
+      retryable: false,
+    });
+  }
+  const gatewayScriptName = workerScripts['gateway-worker'] ?? stableString(env.GATEWAY_WORKER_SCRIPT_NAME);
+  const jobsScriptName = workerScripts['jobs-worker'];
+  const opsScriptName = workerScripts['ops-worker'];
+  if (gatewayScriptName.length === 0 || jobsScriptName == null || opsScriptName == null) {
+    throw createOpsPreconditionError('CLOUDFLARE_RESOURCE_IDS_JSON.worker_scripts must include gateway-worker, jobs-worker, and ops-worker', {
+      status: 503,
+      code: 'internal',
+      retryable: false,
+    });
+  }
+  const mediaBucketName = bucketNames.MATRIX_MEDIA_BUCKET;
+  const archiveBucketName = bucketNames.MATRIX_ARCHIVE_BUCKET;
+  if (mediaBucketName == null || archiveBucketName == null) {
+    throw createOpsPreconditionError('CLOUDFLARE_RESOURCE_IDS_JSON.r2_bucket_names must include MATRIX_MEDIA_BUCKET and MATRIX_ARCHIVE_BUCKET', {
+      status: 503,
+      code: 'internal',
+      retryable: false,
+    });
+  }
+  const d1DatabaseId = stableString(rawResourceIds.d1_database_id);
+  const kvNamespaceId = stableString(rawResourceIds.kv_namespace_id);
+  if (d1DatabaseId.length === 0 || kvNamespaceId.length === 0) {
+    throw createOpsPreconditionError('CLOUDFLARE_RESOURCE_IDS_JSON must include d1_database_id and kv_namespace_id', {
+      status: 503,
+      code: 'internal',
+      retryable: false,
+    });
+  }
+  if (Object.keys(queueIds).length === 0) {
+    throw createOpsPreconditionError('CLOUDFLARE_RESOURCE_IDS_JSON.queue_ids must not be empty', {
+      status: 503,
+      code: 'internal',
+      retryable: false,
+    });
+  }
+  return Object.freeze({
+    account_id: accountId,
+    api_token: apiToken,
+    worker_scripts: workerScripts,
+    gateway_script_name: gatewayScriptName,
+    d1_database_id: d1DatabaseId,
+    kv_namespace_id: kvNamespaceId,
+    queue_ids: queueIds,
+    r2_bucket_names: bucketNames,
+    cloudflare_resources: resourceSnapshot,
+  });
+}
+
+async function callCloudflareAccountApi(fetchImpl, {
+  accountId,
+  apiToken,
+  method = 'GET',
+  pathname,
+  body = null,
+}) {
+  const response = await fetchImpl(`${CLOUDFLARE_API_BASE_URL}/accounts/${accountId}${pathname}`, {
+    method,
+    headers: {
+      authorization: `Bearer ${apiToken}`,
+      accept: 'application/json',
+      ...(body == null ? {} : { 'content-type': 'application/json; charset=utf-8' }),
+    },
+    body: body == null ? undefined : JSON.stringify(body),
+  });
+  const text = await response.text();
+  let payload = null;
+  try {
+    payload = text.length === 0 ? null : JSON.parse(text);
+  } catch {
+    payload = {
+      success: false,
+      errors: [{ message: text.length === 0 ? `${method} ${pathname} returned an empty response body` : text }],
+    };
+  }
+  if (!response.ok || payload?.success === false) {
+    const errors = Array.isArray(payload?.errors) ? payload.errors : [];
+    const errorMessage = errors.length > 0
+      ? errors.map((entry) => entry?.message ?? JSON.stringify(entry)).join('; ')
+      : `${method} ${pathname} failed`;
+    throw createOpsInternalError(`Cloudflare API ${method} ${pathname} failed: ${errorMessage}`, {
+      retryable: response.status >= 500 || response.status === 429,
+    });
+  }
+  return payload;
+}
+
+async function fetchWorkerUsageModel(fetchImpl, {
+  accountId,
+  apiToken,
+  scriptName,
+}) {
+  const payload = await callCloudflareAccountApi(fetchImpl, {
+    accountId,
+    apiToken,
+    pathname: `/workers/scripts/${scriptName}/settings`,
+  });
+  const result = payload?.result;
+  if (!result || typeof result !== 'object' || Array.isArray(result)) {
+    throw createOpsInternalError('Cloudflare Worker settings did not include a result object', {
+      retryable: false,
+    });
+  }
+  const usageModel = stableString(result.usage_model ?? result.usageModel);
+  if (usageModel.length === 0) {
+    throw createOpsInternalError(`Cloudflare Worker settings for ${scriptName} did not expose usage_model`, {
+      retryable: false,
+    });
+  }
+  return usageModel.toLowerCase();
+}
+
+function buildCostObservationBlockerDetails() {
+  return Object.freeze({
+    blocker_ids: Object.freeze(['OQ-0006']),
+    blocker_reasons: Object.freeze([
+      'Cloudflare GraphQL Analytics is aggregated analytics and the official GraphQL docs say not to use it for billing.',
+      'Workers metrics expose request counts and CPU percentiles, but not a billing-safe total CPU figure for the bounded pre-release workload window.',
+      'Durable Objects pricing bills wall-clock duration GB-s, while the official Durable Objects analytics surface exposes cpuTime and storage, not billed duration.',
+      'Cloudflare Billing Usage and PayGo API automation remains beta/select-account and is not yet proven for per-environment pre-release snapshots in the current same-account topology.',
+    ]),
+    official_source_uris: Object.freeze([
+      CLOUDFLARE_GRAPHQL_API_DOC_URI,
+      WORKERS_METRICS_DOC_URI,
+      DURABLE_OBJECTS_METRICS_DOC_URI,
+      DURABLE_OBJECTS_PRICING_DOC_URI,
+      WORKERS_SCRIPT_SETTINGS_DOC_URI,
+      BILLING_USAGE_API_DOC_URI,
+    ]),
+  });
+}
+
+async function handleCostObservation(request, env, config, requestContext) {
+  const operator = await authenticateOperatorIdentity({
+    request,
+    env,
+    config,
+    requiredScope: 'ops.read',
+  });
+  if (request.method !== 'GET') {
+    return opsErrorResponse({
+      requestId: requestContext.requestId,
+      code: 'internal',
+      message: 'Unsupported cost observation method',
+    });
+  }
+  authorizeOperatorRequest({
+    operator,
+    targetScope: {
+      scope_kind: 'global',
+      scope_id: null,
+    },
+  });
+  if (config.environmentName !== 'pre-release') {
+    return opsErrorResponse({
+      requestId: requestContext.requestId,
+      code: 'internal',
+      message: 'Cost observation is only supported in pre-release',
+    });
+  }
+
+  try {
+    const fetchImpl = getObservabilityFetch(env);
+    const costConfig = requireCostObservationConfiguration(env, config);
+    const usageModels = await Promise.all(
+      [...new Set(Object.values(costConfig.worker_scripts))]
+        .map(async (scriptName) => ({
+          script_name: scriptName,
+          usage_model: await fetchWorkerUsageModel(fetchImpl, {
+            accountId: costConfig.account_id,
+            apiToken: costConfig.api_token,
+            scriptName,
+          }),
+        })),
+    );
+    const nonStandardUsageModels = usageModels.filter((entry) => entry.usage_model !== 'standard');
+    if (nonStandardUsageModels.length > 0) {
+      throw createOpsPreconditionError(
+        `Cloudflare Worker usage_model must be standard for TEST-COST-001, received ${nonStandardUsageModels.map((entry) => `${entry.script_name}=${entry.usage_model}`).join(', ')}`,
+        {
+          status: 503,
+          code: 'internal',
+          retryable: false,
+        },
+      );
+    }
+    throw createOpsInternalError(
+      'TEST-COST-001 pre-release proof remains fail-closed: current official Cloudflare surfaces do not yet support a truthful actual_total_usd and model_comparison for this bounded pre-release window; see OQ-0006.',
+      {
+        retryable: false,
+        details: buildCostObservationBlockerDetails(),
+      },
+    );
+  } catch (error) {
+    return opsErrorResponse({
+      requestId: requestContext.requestId,
+      code: stableString(error?.code) || 'internal',
+      message: error?.message ?? 'Cost observation failed',
+      retryable: error?.retryable === true,
+      details: error?.details ?? null,
+    });
+  }
+}
+
+async function handleRolloutSkewProbe(request, env, config, requestContext) {
+  const operator = await authenticateOperatorIdentity({
+    request,
+    env,
+    config,
+    requiredScope: 'ops.rebuild.write',
+  });
+  if (request.method !== 'POST') {
+    return opsErrorResponse({
+      requestId: requestContext.requestId,
+      code: 'not_found',
+      message: 'Unsupported rollout skew probe method',
+    });
+  }
+  authorizeOperatorRequest({
+    operator,
+    targetScope: {
+      scope_kind: 'global',
+      scope_id: null,
+    },
+  });
+  if (config.environmentName !== 'pre-release') {
+    return opsErrorResponse({
+      requestId: requestContext.requestId,
+      code: 'precondition_failed',
+      message: 'Rollout skew probing is only supported in pre-release',
+    });
+  }
+
+  try {
+    const probeRequest = normalizeRolloutSkewProbeRequest(await readJsonBody(request));
+    const gatewayConfig = requireGatewayProbeConfiguration(env);
+    const serverName = stableString(env.MATRIX_SERVER_NAME);
+    if (serverName.length === 0) {
+      throw createOpsPreconditionError('ops-worker requires MATRIX_SERVER_NAME for rollout-skew probing', {
+        status: 503,
+        code: 'internal',
+        retryable: true,
+      });
+    }
+
+    const baselineUser = await seedProbeUserForVersion(env, gatewayConfig, probeRequest, {
+      userLabel: 'baseline-user',
+      gatewayVersionId: probeRequest.baseline_gateway_version_id,
+      gatewayVersionTag: probeRequest.baseline_gateway_version_tag,
+      expectedAuthorityVersionId: probeRequest.baseline_gateway_version_id,
+    });
+
+    const baselineRoom = await seedProbeRoomForVersion(env, gatewayConfig, probeRequest, {
+      roomLabel: 'baseline-room',
+      gatewayVersionId: probeRequest.baseline_gateway_version_id,
+      gatewayVersionTag: probeRequest.baseline_gateway_version_tag,
+      accessToken: baselineUser.access_token,
+      serverName,
+      expectedAuthorityVersionId: probeRequest.baseline_gateway_version_id,
+    });
+
+    const candidateUser = await seedProbeUserForVersion(env, gatewayConfig, probeRequest, {
+      userLabel: 'candidate-user',
+      gatewayVersionId: probeRequest.candidate_gateway_version_id,
+      gatewayVersionTag: probeRequest.candidate_gateway_version_tag,
+      expectedAuthorityVersionId: probeRequest.candidate_gateway_version_id,
+    });
+
+    const candidateRoom = await seedProbeRoomForVersion(env, gatewayConfig, probeRequest, {
+      roomLabel: 'candidate-room',
+      gatewayVersionId: probeRequest.candidate_gateway_version_id,
+      gatewayVersionTag: probeRequest.candidate_gateway_version_tag,
+      accessToken: candidateUser.access_token,
+      serverName,
+      expectedAuthorityVersionId: probeRequest.candidate_gateway_version_id,
+    });
+
+    const observations = [];
+
+    const candidateWhoAmI = await fetchGatewayWithVersionOverride(env, gatewayConfig, {
+      versionId: probeRequest.candidate_gateway_version_id,
+      versionTag: probeRequest.candidate_gateway_version_tag,
+      pathname: '/_matrix/client/v3/account/whoami',
+      accessToken: baselineUser.access_token,
+    });
+    if (candidateWhoAmI.response.status !== 200) {
+      throw createOpsPreconditionError(`Candidate-targeted whoami probe failed: ${JSON.stringify(candidateWhoAmI.payload)}`);
+    }
+    const postCandidateUserIdentity = await inspectUserAuthority(env, baselineUser.user_id);
+    observations.push(buildRolloutObservation({
+      probeName: 'new-worker-old-authority',
+      requestGatewayVersionId: probeRequest.candidate_gateway_version_id,
+      observedGatewayVersionId: candidateWhoAmI.observed_gateway_version_id,
+      observedGatewayVersionTag: candidateWhoAmI.observed_gateway_version_tag,
+      authorityVersionId: postCandidateUserIdentity.worker_version_id,
+      authorityKind: 'UserDO',
+      authorityKey: baselineUser.user_id,
+      requestPath: '/_matrix/client/v3/account/whoami',
+    }));
+
+    const candidateRoomState = await fetchGatewayWithVersionOverride(env, gatewayConfig, {
+      versionId: probeRequest.candidate_gateway_version_id,
+      versionTag: probeRequest.candidate_gateway_version_tag,
+      pathname: `/_matrix/client/v3/rooms/${encodeURIComponent(baselineRoom.room_id)}/state`,
+      accessToken: baselineUser.access_token,
+    });
+    if (candidateRoomState.response.status !== 200) {
+      throw createOpsPreconditionError(`Candidate-targeted room state probe failed: ${JSON.stringify(candidateRoomState.payload)}`);
+    }
+    const postCandidateRoomIdentity = await inspectRoomAuthority(env, baselineRoom.room_id);
+    observations.push(buildRolloutObservation({
+      probeName: 'new-worker-old-authority',
+      requestGatewayVersionId: probeRequest.candidate_gateway_version_id,
+      observedGatewayVersionId: candidateRoomState.observed_gateway_version_id,
+      observedGatewayVersionTag: candidateRoomState.observed_gateway_version_tag,
+      authorityVersionId: postCandidateRoomIdentity.worker_version_id,
+      authorityKind: 'RoomDO',
+      authorityKey: baselineRoom.room_id,
+      requestPath: `/_matrix/client/v3/rooms/${baselineRoom.room_id}/state`,
+    }));
+
+    const baselineWhoAmI = await fetchGatewayWithVersionOverride(env, gatewayConfig, {
+      versionId: probeRequest.baseline_gateway_version_id,
+      versionTag: probeRequest.baseline_gateway_version_tag,
+      pathname: '/_matrix/client/v3/account/whoami',
+      accessToken: candidateUser.access_token,
+    });
+    if (baselineWhoAmI.response.status !== 200) {
+      throw createOpsPreconditionError(`Baseline-targeted whoami probe failed: ${JSON.stringify(baselineWhoAmI.payload)}`);
+    }
+    const postBaselineUserIdentity = await inspectUserAuthority(env, candidateUser.user_id);
+    observations.push(buildRolloutObservation({
+      probeName: 'old-worker-new-authority',
+      requestGatewayVersionId: probeRequest.baseline_gateway_version_id,
+      observedGatewayVersionId: baselineWhoAmI.observed_gateway_version_id,
+      observedGatewayVersionTag: baselineWhoAmI.observed_gateway_version_tag,
+      authorityVersionId: postBaselineUserIdentity.worker_version_id,
+      authorityKind: 'UserDO',
+      authorityKey: candidateUser.user_id,
+      requestPath: '/_matrix/client/v3/account/whoami',
+    }));
+
+    const baselineRoomState = await fetchGatewayWithVersionOverride(env, gatewayConfig, {
+      versionId: probeRequest.baseline_gateway_version_id,
+      versionTag: probeRequest.baseline_gateway_version_tag,
+      pathname: `/_matrix/client/v3/rooms/${encodeURIComponent(candidateRoom.room_id)}/state`,
+      accessToken: candidateUser.access_token,
+    });
+    if (baselineRoomState.response.status !== 200) {
+      throw createOpsPreconditionError(`Baseline-targeted room state probe failed: ${JSON.stringify(baselineRoomState.payload)}`);
+    }
+    const postBaselineRoomIdentity = await inspectRoomAuthority(env, candidateRoom.room_id);
+    observations.push(buildRolloutObservation({
+      probeName: 'old-worker-new-authority',
+      requestGatewayVersionId: probeRequest.baseline_gateway_version_id,
+      observedGatewayVersionId: baselineRoomState.observed_gateway_version_id,
+      observedGatewayVersionTag: baselineRoomState.observed_gateway_version_tag,
+      authorityVersionId: postBaselineRoomIdentity.worker_version_id,
+      authorityKind: 'RoomDO',
+      authorityKey: candidateRoom.room_id,
+      requestPath: `/_matrix/client/v3/rooms/${candidateRoom.room_id}/state`,
+    }));
+
+    const assertions = evaluateRolloutAssertions(observations, {
+      baselineGatewayVersionId: probeRequest.baseline_gateway_version_id,
+      baselineGatewayVersionTag: probeRequest.baseline_gateway_version_tag,
+      candidateGatewayVersionId: probeRequest.candidate_gateway_version_id,
+      candidateGatewayVersionTag: probeRequest.candidate_gateway_version_tag,
+    });
+
+    return jsonResponse(normalizeRolloutSkewProbeResponse({
+      environment_name: config.environmentName,
+      probe_run_id: probeRequest.probe_run_id,
+      dual_version_deployment_id: probeRequest.dual_version_deployment_id,
+      baseline_gateway_version_id: probeRequest.baseline_gateway_version_id,
+      baseline_gateway_version_tag: probeRequest.baseline_gateway_version_tag,
+      candidate_gateway_version_id: probeRequest.candidate_gateway_version_id,
+      candidate_gateway_version_tag: probeRequest.candidate_gateway_version_tag,
+      override_strategy: 'cloudflare-version-overrides',
+      observations,
+      assertions,
+    }));
+  } catch (error) {
+    return opsErrorResponse({
+      requestId: requestContext.requestId,
+      code: stableString(error?.code) || 'validation_failed',
+      message: error?.message ?? 'Rollout skew probe failed',
+      retryable: error?.retryable === true,
+    });
+  }
+}
+
 async function handleAppserviceList(request, env, config, requestContext, persistence) {
   const requiredScope = request.method === 'GET' ? 'ops.read' : 'ops.appservice.write';
   const operator = await authenticateOperatorIdentity({
@@ -184,9 +1351,9 @@ async function handleAppserviceList(request, env, config, requestContext, persis
     persistence,
     scope,
     body,
-    mutate: async () => {
+    mutate: async (tx) => {
       const now = new Date().toISOString();
-      await persistence.upsertAppserviceConfig({
+      await tx.upsertAppserviceConfig({
         appservice_id: body.appservice.appservice_id,
         descriptor: body.appservice,
         created_at: now,
@@ -250,8 +1417,8 @@ async function handleAppserviceItem(request, env, config, requestContext, persis
       persistence,
       scope,
       body,
-      mutate: async () => {
-        await persistence.deleteAppserviceConfig(appserviceId);
+      mutate: async (tx) => {
+        await tx.deleteAppserviceConfig(appserviceId);
         return {
           appservice: null,
           appservices: null,
@@ -283,10 +1450,10 @@ async function handleAppserviceItem(request, env, config, requestContext, persis
     persistence,
     scope,
     body,
-    mutate: async () => {
-      const existing = await persistence.getAppserviceConfig(appserviceId);
+    prepare: async (tx) => tx.getAppserviceConfig(appserviceId),
+    mutate: async (tx, existing) => {
       const createdAt = existing?.created_at ?? new Date().toISOString();
-      await persistence.upsertAppserviceConfig({
+      await tx.upsertAppserviceConfig({
         appservice_id: appserviceId,
         descriptor: body.appservice,
         created_at: createdAt,
@@ -379,7 +1546,7 @@ export function createOpsWorkerFetchHandler() {
           operator,
           targetScope: parsed.scope,
         });
-        return startControlPlaneJob({
+        return await startControlPlaneJob({
           env,
           config,
           persistence,
@@ -389,6 +1556,14 @@ export function createOpsWorkerFetchHandler() {
           request,
           requestBody: parsed,
         });
+      }
+
+      if (info.kind === 'rollout-skew-probe') {
+        return await handleRolloutSkewProbe(request, env, config, requestContext);
+      }
+
+      if (info.kind === 'cost-observation') {
+        return await handleCostObservation(request, env, config, requestContext);
       }
 
       if (info.kind === 'jobs-list') {

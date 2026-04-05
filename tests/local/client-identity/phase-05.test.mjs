@@ -64,6 +64,24 @@ async function postJson(rig, accessToken, pathname, json = {}) {
   return response.json();
 }
 
+async function putJson(rig, accessToken, pathname, json = {}) {
+  const response = await rig.gatewayFetch(pathname, {
+    method: 'PUT',
+    headers: rig.authHeaders(accessToken),
+    json,
+  });
+  assert.equal(response.status, 200);
+  return response.json();
+}
+
+async function getJson(rig, accessToken, pathname) {
+  const response = await rig.gatewayFetch(pathname, {
+    headers: rig.authHeaders(accessToken),
+  });
+  assert.equal(response.status, 200);
+  return response.json();
+}
+
 async function seedJoinedRoom(rig, {
   roomId = '!phase05:matrix.example.test',
   userId = '@alice:matrix.example.test',
@@ -1001,6 +1019,360 @@ test('Phase 05 room fanout projections surface timeline and unread counts throug
     },
   });
   assert.equal(roomDo.persistence.fanoutOutbox.get({ room_pos: filteredDelta.roomPos, user_id: aliceUserId }).status, 'acked');
+});
+
+test('Phase 05 /sync applies timeline limits plus full_state, use_state_after, lazy-load members, and include_leave semantics', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, {
+    username: 'phase05-sync-alice',
+    password: 'correct horse battery staple',
+    deviceId: 'SYNCALICE',
+  });
+  const bob = await registerUser(rig, {
+    username: 'phase05-sync-bob',
+    password: 'correct horse battery staple',
+    deviceId: 'SYNCBOB',
+  });
+  const carol = await registerUser(rig, {
+    username: 'phase05-sync-carol',
+    password: 'correct horse battery staple',
+    deviceId: 'SYNCCAROL',
+  });
+
+  const room = await postJson(rig, alice.access_token, '/_matrix/client/v3/createRoom', {
+    invite: [bob.user_id, carol.user_id],
+    name: 'Phase 05 Sync Room',
+  });
+  const roomId = room.room_id;
+  await postJson(rig, bob.access_token, roomPath(roomId, '/join'));
+  await postJson(rig, carol.access_token, roomPath(roomId, '/join'));
+
+  const syncFilter = encodeURIComponent(JSON.stringify({
+    room: {
+      include_leave: true,
+      timeline: {
+        limit: 1,
+      },
+      state: {
+        lazy_load_members: true,
+      },
+    },
+  }));
+  const baselineSync = await syncRequest(
+    rig,
+    bob.access_token,
+    `filter=${syncFilter}`,
+  );
+
+  const firstMessage = await putJson(
+    rig,
+    alice.access_token,
+    roomPath(roomId, '/send/m.room.message/phase05-limit-1'),
+    {
+      msgtype: 'm.text',
+      body: 'phase05 limited first',
+    },
+  );
+  const secondMessage = await putJson(
+    rig,
+    alice.access_token,
+    roomPath(roomId, '/send/m.room.message/phase05-limit-2'),
+    {
+      msgtype: 'm.text',
+      body: 'phase05 limited second',
+    },
+  );
+
+  const limitedSync = await syncRequest(
+    rig,
+    bob.access_token,
+    `since=${encodeURIComponent(baselineSync.next_batch)}&filter=${syncFilter}`,
+  );
+  const limitedRoom = getJoinedRoomEntry(limitedSync, roomId);
+  assert.ok(limitedRoom);
+  assert.equal(limitedRoom.timeline.events.length, 1);
+  assert.equal(limitedRoom.timeline.events[0].event_id, secondMessage.event_id);
+  assert.equal(limitedRoom.timeline.limited, true);
+  assert.equal(typeof limitedRoom.timeline.prev_batch, 'string');
+  const limitedBackfill = await getJson(
+    rig,
+    bob.access_token,
+    `${roomPath(roomId, '/messages')}?from=${encodeURIComponent(limitedRoom.timeline.prev_batch)}&dir=b&limit=1`,
+  );
+  assert.deepEqual(limitedBackfill.chunk.map((event) => event.event_id), [firstMessage.event_id]);
+
+  await putJson(
+    rig,
+    alice.access_token,
+    roomPath(roomId, '/state/m.room.topic'),
+    {
+      topic: 'phase05 use_state_after topic',
+    },
+  );
+  await putJson(
+    rig,
+    alice.access_token,
+    roomPath(roomId, '/send/m.room.message/phase05-state-after'),
+    {
+      msgtype: 'm.text',
+      body: 'phase05 state after sender',
+    },
+  );
+
+  const useStateAfterSync = await syncRequest(
+    rig,
+    bob.access_token,
+    `since=${encodeURIComponent(limitedSync.next_batch)}&use_state_after=true&filter=${syncFilter}`,
+  );
+  const useStateAfterRoom = getJoinedRoomEntry(useStateAfterSync, roomId);
+  assert.ok(useStateAfterRoom);
+  assert.ok(!('state' in useStateAfterRoom));
+  assert.ok(Array.isArray(useStateAfterRoom.state_after?.events));
+  const stateAfterTopic = getStateEvent(useStateAfterRoom, {
+    type: 'm.room.topic',
+    stateKey: '',
+  });
+  assert.ok(stateAfterTopic);
+  assert.equal(stateAfterTopic.content.topic, 'phase05 use_state_after topic');
+  const stateAfterAliceMembership = getStateEvent(useStateAfterRoom, {
+    type: 'm.room.member',
+    stateKey: alice.user_id,
+  });
+  assert.ok(stateAfterAliceMembership);
+  const stateAfterBobMembership = getStateEvent(useStateAfterRoom, {
+    type: 'm.room.member',
+    stateKey: bob.user_id,
+  });
+  assert.ok(stateAfterBobMembership);
+  const stateAfterCarolMembership = getStateEvent(useStateAfterRoom, {
+    type: 'm.room.member',
+    stateKey: carol.user_id,
+  });
+  assert.equal(stateAfterCarolMembership, null);
+
+  const fullStateSync = await syncRequest(
+    rig,
+    bob.access_token,
+    `since=${encodeURIComponent(useStateAfterSync.next_batch)}&full_state=true&filter=${syncFilter}`,
+  );
+  const fullStateRoom = getJoinedRoomEntry(fullStateSync, roomId);
+  assert.ok(fullStateRoom);
+  assert.ok(Array.isArray(fullStateRoom.state?.events));
+  assert.ok(!('state_after' in fullStateRoom));
+  const fullStateTopic = getStateEvent(fullStateRoom, {
+    type: 'm.room.topic',
+    stateKey: '',
+  });
+  assert.ok(fullStateTopic);
+  const fullStateBobMembership = getStateEvent(fullStateRoom, {
+    type: 'm.room.member',
+    stateKey: bob.user_id,
+  });
+  assert.ok(fullStateBobMembership);
+  const fullStateCarolMembership = getStateEvent(fullStateRoom, {
+    type: 'm.room.member',
+    stateKey: carol.user_id,
+  });
+  assert.equal(fullStateCarolMembership, null);
+
+  await postJson(rig, bob.access_token, roomPath(roomId, '/leave'));
+  const leaveSync = await syncRequest(
+    rig,
+    bob.access_token,
+    `since=${encodeURIComponent(fullStateSync.next_batch)}&filter=${syncFilter}`,
+  );
+  assert.ok(leaveSync.rooms?.leave?.[roomId]);
+  assert.ok(leaveSync.rooms.leave[roomId].timeline.events.some((event) => (
+    event.type === 'm.room.member'
+    && event.state_key === bob.user_id
+    && event.content?.membership === 'leave'
+  )));
+
+  assert.notEqual(firstMessage.event_id, secondMessage.event_id);
+});
+
+test('Phase 05 room fanout notification counts follow the current push-rules snapshot', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, {
+    username: 'phase05-notify-alice',
+    password: 'correct horse battery staple',
+    deviceId: 'NOTIFYALICE',
+  });
+  const bob = await registerUser(rig, {
+    username: 'phase05-notify-bob',
+    password: 'correct horse battery staple',
+    deviceId: 'NOTIFYBOB',
+  });
+
+  const room = await postJson(rig, alice.access_token, '/_matrix/client/v3/createRoom', {
+    invite: [bob.user_id],
+  });
+  const roomId = room.room_id;
+  await postJson(rig, bob.access_token, roomPath(roomId, '/join'));
+
+  const baselineSync = await syncRequest(rig, bob.access_token);
+
+  const suppressRule = await rig.gatewayFetch('/_matrix/client/v3/pushrules/global/override/com.example.suppress-message', {
+    method: 'PUT',
+    headers: rig.authHeaders(bob.access_token),
+    json: {
+      conditions: [
+        {
+          kind: 'event_match',
+          key: 'type',
+          pattern: 'm.room.message',
+        },
+      ],
+      actions: [],
+    },
+  });
+  assert.equal(suppressRule.status, 200);
+
+  const afterSuppressRuleSync = await syncRequest(
+    rig,
+    bob.access_token,
+    `since=${encodeURIComponent(baselineSync.next_batch)}&timeout=0`,
+  );
+  assert.ok(afterSuppressRuleSync.account_data?.events?.some((event) => event.type === 'm.push_rules'));
+
+  await putJson(
+    rig,
+    alice.access_token,
+    roomPath(roomId, '/send/m.room.message/phase05-suppressed'),
+    {
+      msgtype: 'm.text',
+      body: 'phase05 suppressed message',
+    },
+  );
+  const suppressedMessageSync = await syncRequest(
+    rig,
+    bob.access_token,
+    `since=${encodeURIComponent(afterSuppressRuleSync.next_batch)}&timeout=0`,
+  );
+  const suppressedRoom = getJoinedRoomEntry(suppressedMessageSync, roomId);
+  assert.ok(suppressedRoom);
+  assert.deepEqual(suppressedRoom.unread_notifications, {
+    highlight_count: 0,
+    notification_count: 0,
+  });
+
+  const enableHighlightRule = await rig.gatewayFetch('/_matrix/client/v3/pushrules/global/override/com.example.suppress-message/actions', {
+    method: 'PUT',
+    headers: rig.authHeaders(bob.access_token),
+    json: {
+      actions: ['notify', { set_tweak: 'highlight', value: true }],
+    },
+  });
+  assert.equal(enableHighlightRule.status, 200);
+
+  const afterHighlightRuleSync = await syncRequest(
+    rig,
+    bob.access_token,
+    `since=${encodeURIComponent(suppressedMessageSync.next_batch)}&timeout=0`,
+  );
+  assert.ok(afterHighlightRuleSync.account_data?.events?.some((event) => event.type === 'm.push_rules'));
+
+  await putJson(
+    rig,
+    alice.access_token,
+    roomPath(roomId, '/send/m.room.message/phase05-highlighted'),
+    {
+      msgtype: 'm.text',
+      body: 'phase05 highlighted message',
+    },
+  );
+  const highlightedMessageSync = await syncRequest(
+    rig,
+    bob.access_token,
+    `since=${encodeURIComponent(afterHighlightRuleSync.next_batch)}&timeout=0`,
+  );
+  const highlightedRoom = getJoinedRoomEntry(highlightedMessageSync, roomId);
+  assert.ok(highlightedRoom);
+  assert.deepEqual(highlightedRoom.unread_notifications, {
+    highlight_count: 1,
+    notification_count: 1,
+  });
+
+  const disableCustomRule = await rig.gatewayFetch('/_matrix/client/v3/pushrules/global/override/com.example.suppress-message/enabled', {
+    method: 'PUT',
+    headers: rig.authHeaders(bob.access_token),
+    json: {
+      enabled: false,
+    },
+  });
+  assert.equal(disableCustomRule.status, 200);
+
+  const afterDisableRuleSync = await syncRequest(
+    rig,
+    bob.access_token,
+    `since=${encodeURIComponent(highlightedMessageSync.next_batch)}&timeout=0`,
+  );
+  assert.ok(afterDisableRuleSync.account_data?.events?.some((event) => event.type === 'm.push_rules'));
+
+  await putJson(
+    rig,
+    alice.access_token,
+    roomPath(roomId, '/send/m.room.message/phase05-room-mention'),
+    {
+      msgtype: 'm.text',
+      body: 'phase05 room mention message',
+      'm.mentions': {
+        room: true,
+      },
+    },
+  );
+  const roomMentionSync = await syncRequest(
+    rig,
+    bob.access_token,
+    `since=${encodeURIComponent(afterDisableRuleSync.next_batch)}&timeout=0`,
+  );
+  const roomMentionRoom = getJoinedRoomEntry(roomMentionSync, roomId);
+  assert.ok(roomMentionRoom);
+  assert.deepEqual(roomMentionRoom.unread_notifications, {
+    highlight_count: 2,
+    notification_count: 2,
+  });
+
+  const enableMasterRule = await rig.gatewayFetch('/_matrix/client/v3/pushrules/global/override/.m.rule.master/enabled', {
+    method: 'PUT',
+    headers: rig.authHeaders(bob.access_token),
+    json: {
+      enabled: true,
+    },
+  });
+  assert.equal(enableMasterRule.status, 200);
+
+  const afterMasterRuleSync = await syncRequest(
+    rig,
+    bob.access_token,
+    `since=${encodeURIComponent(roomMentionSync.next_batch)}&timeout=0`,
+  );
+  assert.ok(afterMasterRuleSync.account_data?.events?.some((event) => event.type === 'm.push_rules'));
+
+  await putJson(
+    rig,
+    alice.access_token,
+    roomPath(roomId, '/send/m.room.message/phase05-master-muted'),
+    {
+      msgtype: 'm.text',
+      body: 'phase05 master rule muted message',
+    },
+  );
+  const masterSuppressedSync = await syncRequest(
+    rig,
+    bob.access_token,
+    `since=${encodeURIComponent(afterMasterRuleSync.next_batch)}&timeout=0`,
+  );
+  const masterSuppressedRoom = getJoinedRoomEntry(masterSuppressedSync, roomId);
+  assert.ok(masterSuppressedRoom);
+  assert.deepEqual(masterSuppressedRoom.unread_notifications, {
+    highlight_count: 2,
+    notification_count: 2,
+  });
 });
 
 test('Phase 05 stale profile refreshes do not overwrite newer room membership or fan out', async (t) => {

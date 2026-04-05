@@ -95,7 +95,8 @@
 
 适用规则：
 
-* [23-interface-contract-catalog.md](./23-interface-contract-catalog.md) 中所有 `typed ops error` 及其带显式 HTTP status 后缀的变体，都必须实例化为 `OpsErrorResponse`。
+* [23-interface-contract-catalog.md](./23-interface-contract-catalog.md) 中所有已经到达 `ops-worker` 的 `typed ops error` 及其带显式 HTTP status 后缀的变体，都必须实例化为 `OpsErrorResponse`。
+* 若请求在 Cloudflare Access 边缘就被拒绝、从未到达 `ops-worker`，该响应不属于 `OpsErrorResponse` 契约范围；非本地门禁应把它视为 Access-protected ingress 的 fail-closed 结果，而不是 origin typed-error 违规。
 * 若 `Error Model` 写成 `typed ops error; 401/403/404/409/422` 之类形式，分号后的状态集合只约束允许返回的 HTTP status；响应体 shape 仍固定为 `OpsErrorResponse`。
 * `OpsErrorResponse.code` 与 HTTP status 的默认映射固定如下：`unauthorized -> 401`，`forbidden -> 403`，`not_found -> 404`，`idempotency_conflict -> 409`，`precondition_failed -> 409`，`validation_failed -> 422`，`rate_limited -> 429`，`internal -> 500` 或 `503`（仅当 `retryable = true` 时允许 `503`）。
 
@@ -217,6 +218,7 @@
 | `worker_version_id` | string | 当前 Worker version ID |
 | `deployment_id` | string | 当前 deployment ID |
 | `compatibility_date` | string | 当前 compatibility date |
+| `compatibility_flags` | array | 当前部署显式启用的 compatibility flags；必须与 deployment record / wrangler manifest 一致 |
 | `release_profile` | string | `L1`,`L2`,`L3` 之一 |
 | `cpu_limit_class` | string | 当前 Worker 的显式 CPU limit class |
 | `startup_time_ms` | integer | 当前 Worker 的启动校验耗时；若未采样则必须返回 `0` |
@@ -224,6 +226,48 @@
 | `feature_gates` | object | 当前启用/禁用的 feature gate 布尔值快照 |
 | `secret_versions` | object | 仅允许返回 secret version 摘要；禁止返回 secret material，允许嵌套对象表达 signing/encryption active version |
 | `dependencies` | array | 每项至少包含 `name`,`kind`,`status`,`detail` |
+
+### 5.2.1 `RolloutSkewProbeRequest`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `probe_run_id` | string | 非空；同一 pre-release skew probe 的稳定标识 |
+| `baseline_gateway_version_id` | string | 非空；必须属于当前 dual-version deployment |
+| `baseline_gateway_version_tag` | string | 非空；必须对应 `baseline_gateway_version_id` 的 official version tag |
+| `candidate_gateway_version_id` | string | 非空；必须属于当前 dual-version deployment 且不得与 baseline 相同 |
+| `candidate_gateway_version_tag` | string | 非空；必须对应 `candidate_gateway_version_id` 的 official version tag，且不得与 baseline 相同 |
+| `dual_version_deployment_id` | string | 非空；必须由 GitHub Actions rollout harness 在 `versions deploy` 后回读当前 active dual-version deployment ID 并传入 |
+| `authority_kind` | string | 首版固定为 `matrix-core`；表示 probe 必须同时覆盖 `UserDO` 与 `RoomDO` |
+| `seed_prefix` | string | 非空；probe-owned authority identity 前缀，用于防止跨 run 混淆 |
+
+### 5.2.2 `RolloutSkewObservation`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `probe_name` | string | 非空；首版至少包含 `new-worker-old-authority` 与 `old-worker-new-authority` |
+| `request_gateway_version_id` | string | 该次请求显式 targeting 的 gateway version ID |
+| `observed_gateway_version_id` | string or null | 由目标 gateway request 实际回读到的 official version ID；若 runtime 未提供 official ID，则必须为 `null`，不得改塞 repo-local fallback |
+| `observed_gateway_version_tag` | string or null | 由目标 gateway request 实际回读到的 official version tag；当 `observed_gateway_version_id = null` 时必须非空 |
+| `observed_authority_version_id` | string | 由 probe-owned `UserDO` / `RoomDO` 实际回读到的 version ID |
+| `authority_kind` | string | `UserDO` 或 `RoomDO` |
+| `authority_key` | string | probe-owned authority identity |
+| `request_path` | string | 非空；记录触发该 pairing 的 gateway path |
+| `observed_at` | string | RFC 3339 UTC |
+
+### 5.2.3 `RolloutSkewProbeResponse`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `environment_name` | string | 固定为 `pre-release` |
+| `probe_run_id` | string | 必须与 request 一致 |
+| `dual_version_deployment_id` | string | 非空；必须与 request 一致 |
+| `baseline_gateway_version_id` | string | 必须与 request 一致 |
+| `baseline_gateway_version_tag` | string | 必须与 request 一致 |
+| `candidate_gateway_version_id` | string | 必须与 request 一致 |
+| `candidate_gateway_version_tag` | string | 必须与 request 一致 |
+| `override_strategy` | string | 首版固定为 `cloudflare-version-overrides` |
+| `observations` | array | `RolloutSkewObservation[]`；至少各包含一条 `new-worker-old-authority` 与 `old-worker-new-authority` 观测 |
+| `assertions` | object | 至少包含布尔字段 `new_worker_old_authority`、`old_worker_new_authority`，两者都必须为 `true` 才能判为 pass |
 
 ### 5.3 `ExportJobRequest`
 
@@ -368,12 +412,28 @@
 | `d1_databases` | array | 非空字符串数组 |
 | `r2_buckets` | array | 非空字符串数组 |
 | `kv_namespaces` | array | 非空字符串数组 |
+| `ratelimit_namespaces` | array | 非空字符串数组；记录本次执行或采样所使用的 Workers `ratelimits.namespace_id` 集合，便于审计环境隔离与 provenance |
 | `queues` | array | 非空字符串数组 |
 
 适用面：
 
 * `EnvironmentRunReport`
 * `ProdCostSnapshot`
+
+### 5.16.1 `PreReleaseCostObservation`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `observation_id` | string | 非空；同一 pre-release bounded workload 的稳定标识 |
+| `source_environment` | string | 固定为 `pre-release` |
+| `captured_at` | string | RFC 3339 UTC |
+| `capture_window` | object | 必须包含 `start`,`end` RFC 3339 UTC，且 `start <= end` |
+| `capture_method` | string | 首版固定为 `cloudflare-official-metrics` |
+| `source_query_uris` | array | 非空绝对 `https:` URI 数组；host 必须是 `cloudflare.com` 或其子域，记录本次 observation 查询的官方 Cloudflare surface |
+| `topology_kind` | string | 非本地拓扑标识；不得为 `local` |
+| `cloudflare_resources` | `CloudflareResourceSnapshot` | 本次 observation 绑定的 pre-release 资源快照 |
+| `cost_surfaces` | object | 至少包含 `workers`,`durable_objects`,`d1`,`r2`,`kv`,`queues`；字段集合与 `ProdCostSnapshot.cost_surfaces` 相同 |
+| `model_comparison` | object | 至少包含 `status`,`summary`,`actual_total_usd`,`modeled_total_usd`,`drift_ratio` |
 
 ### 5.16 `EnvironmentRunReport`
 
@@ -400,6 +460,8 @@
 | `source_run_uri` | string | 绝对外部 URI / locator；必须具 authority，或使用格式完整的 `urn:<nid>:<nss>`；不得为裸 `urn:`，且不得为 `about:` / `blob:` / `file:` / `data:` / `javascript:` |
 | `topology_kind` | string | 非本地拓扑标识；不得为 `local` |
 | `cloudflare_resources` | `CloudflareResourceSnapshot` | 本次执行所绑定资源快照 |
+| `rollout_skew_probe` | `RolloutSkewProbeResponse` or null | `pre-release` 且覆盖 `TEST-OPS-001` 时必须非空；其他环境必须为 `null`。有效 payload 必须保留 targeted version IDs、对应 official version tags，以及 observation 中的 official version ID / tag 观测结果；若 runtime 未提供 official version ID，则 `observed_gateway_version_id` 必须为 `null` 并改由 `observed_gateway_version_tag` 承载 override 观测。 |
+| `pre_release_cost_observation` | `PreReleaseCostObservation` or null | `pre-release` 且覆盖 `TEST-COST-001` 时必须非空；其他环境必须为 `null` |
 
 ### 5.17 `ProdCostSnapshot`
 
@@ -431,9 +493,10 @@
 | Field | Type | Rule |
 | --- | --- | --- |
 | `origin_system` | string | 非空；产出 attestation 的 workflow / capture system 名称 |
+| `origin_repository` | string | 非空；GitHub `owner/repo` slug。对 Phase 08 GitHub Actions provenance，它必须与 `origin_run_uri` 中编码的 repository 一致 |
 | `origin_run_id` | string | 非空；workflow / capture run ID |
 | `origin_run_attempt` | integer | 正整数；同一 run 的重试序号 |
-| `origin_run_uri` | string | 绝对外部 URI / locator；必须具 authority，或使用格式完整的 `urn:<nid>:<nss>`；不得为裸 `urn:`，且不得为 `about:` / `blob:` / `file:` / `data:` / `javascript:` |
+| `origin_run_uri` | string | 绝对外部 URI / locator；必须具 authority，或使用格式完整的 `urn:<nid>:<nss>`；不得为裸 `urn:`，且不得为 `about:` / `blob:` / `file:` / `data:` / `javascript:`。对 Phase 08 GitHub Actions provenance，它必须等于 `https://github.com/<origin_repository>/actions/runs/<origin_run_id>` |
 | `artifact_store_uri` | string | 绝对外部 URI / locator；必须具 authority，或使用格式完整的 `urn:<nid>:<nss>`；不得为裸 `urn:`，且不得为 `about:` / `blob:` / `file:` / `data:` / `javascript:` |
 | `artifact_store_key` | string | 非空；对象键或等价 immutable locator。对 Phase 08 GitHub Actions + R2 provenance，必须编码为 `gha/<origin_run_id>/<origin_run_attempt>/<source_environment>/<run_timestamp>/...` |
 | `artifact_sha256` | string | 64 字符小写 hex；对应外部原始工件摘要 |
@@ -458,6 +521,8 @@
 
 * release-gate evidence 只接受 `EnvironmentRunAttestation`，不得直接接受裸 `EnvironmentRunReport`。
 * 若 `payload.expanded_test_files` 触及 `tests/local/*`、存在 repo boundary escape、或存在 unresolved dynamic import，consumer 必须 fail-closed。
+* 若 `payload.test_files` / `payload.expanded_test_files` 覆盖 `tests/pre-release/test-ops-001*.test.mjs`，则 `payload.rollout_skew_probe` 必须非空，且 `payload.rollout_skew_probe.assertions.new_worker_old_authority` 与 `payload.rollout_skew_probe.assertions.old_worker_new_authority` 都必须为 `true`。
+* 若 `payload.test_files` / `payload.expanded_test_files` 覆盖 `tests/pre-release/test-cost-001*.test.mjs`，则 `payload.pre_release_cost_observation` 必须非空，且 `payload.pre_release_cost_observation.capture_method` 必须为 `cloudflare-official-metrics`。
 
 ### 5.21 `ProdCostSnapshotAttestation`
 
@@ -476,6 +541,115 @@
 
 * release-gate evidence 只接受 `ProdCostSnapshotAttestation`，不得直接接受裸 `ProdCostSnapshot`。
 * 若 attestation 缺少 audited artifact reference、review record 或 deployment identity，consumer 必须 fail-closed。
+
+### 5.22 `ReleaseCandidateManifest`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `schema_version` | integer | 固定为 `1` |
+| `artifact_id` | string | 固定为 `prod_release_candidate` |
+| `candidate_id` | string | 非空；同一 reviewed candidate 的稳定标识 |
+| `created_at` | string | RFC 3339 UTC |
+| `release_ref` | string | 非空；用户选择的 ref/tag/sha |
+| `release_commit_sha` | string | 40 字符小写 git sha |
+| `requires_do_migration` | boolean | 显式声明这次 promote 是否必须走 migration-safe path |
+| `source_repository` | string | 非空 GitHub `owner/repo` slug |
+| `source_run_uri` | string | GitHub Actions run URL |
+| `origin_repository` | string | 非空 GitHub `owner/repo` slug；必须是生成该 manifest 的 workflow 所在仓库 |
+| `origin_run_id` | string | 非空；必须与 `origin_run_uri` 对应 |
+| `origin_run_attempt` | integer | 正整数 |
+| `origin_run_uri` | string | GitHub Actions run URL；必须回链当前 `release-candidate` workflow run |
+| `topology_kind` | string | 非本地拓扑标识；不得为 `local` |
+| `ci_integration_attestation` | `EnvironmentRunAttestation` | `source_environment` 必须为 `ci-integration` |
+| `staging_attestation` | `EnvironmentRunAttestation` | `source_environment` 必须为 `staging` |
+| `pre_release_attestation` | `EnvironmentRunAttestation` | `source_environment` 必须为 `pre-release` |
+
+附加规则：
+
+* 三个 attestation 的 `run_timestamp` 必须一致。
+* 三个 attestation 的 `provenance.origin_repository` 必须与 `source_repository` 一致。
+* `origin_repository` / `origin_run_id` / `origin_run_attempt` / `origin_run_uri` 必须回链生成该 manifest 的当前 `release-candidate` workflow run；它们不得与 reviewed source run identity 混淆。
+* consumer 在用于 prod promote 前，必须额外验证 `source_repository` 与 `origin_repository` 都等于当前仓库。
+* prod promote 只接受 `ReleaseCandidateManifest`；不得直接用“当前 pushed head”跳过 reviewed candidate manifest。
+
+### 5.23 `ProdInstallRecord`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `schema_version` | integer | 固定为 `1` |
+| `artifact_id` | string | 固定为 `prod_install_record` |
+| `source_environment` | string | 固定为 `prod` |
+| `install_id` | string | 非空 |
+| `installed_at` | string | RFC 3339 UTC |
+| `origin_repository` | string | 非空 GitHub `owner/repo` slug；必须是生成该 record 的 workflow 所在仓库 |
+| `origin_run_id` | string | 非空；必须与 `origin_run_uri` 对应 |
+| `origin_run_attempt` | integer | 正整数 |
+| `origin_run_uri` | string | GitHub Actions run URL；必须回链当前 `prod-install` workflow run |
+| `release_commit_sha` | string | 40 字符小写 git sha |
+| `topology_kind` | string | 非本地拓扑标识；不得为 `local` |
+| `workers_subdomain` | string | 非空 account-owned workers.dev subdomain |
+| `cloudflare_resources` | `CloudflareResourceSnapshot` | 必须包含 prod 固定命名资源 |
+| `access` | object | 至少包含 `auth_domain`,`application_id`,`application_audience`,`application_domain`,`protected_ops_url` |
+| `deployment_identity` | `EvidenceDeploymentIdentity` | 不得省略 |
+| `workers` | object | 至少包含 `gateway-worker`,`jobs-worker`,`ops-worker` 的 deployment / version / script identity |
+
+附加规则：
+
+* `workers.gateway-worker.url`、`workers.jobs-worker.url`、`workers.ops-worker.url` 必须与 `workers_subdomain` 及各自 `script_name` 一致，禁止只保留“某个 `*.workers.dev` URL”而不证明它属于当前 prod topology。
+* consumer 在用于 prod promote / rollback / prod-cost 前，必须额外验证 `origin_repository` 等于当前仓库。
+
+### 5.24 `ProdPromotionRecord`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `schema_version` | integer | 固定为 `1` |
+| `artifact_id` | string | 固定为 `prod_promotion_record` |
+| `source_environment` | string | 固定为 `prod` |
+| `promotion_id` | string | 非空 |
+| `promoted_at` | string | RFC 3339 UTC |
+| `origin_repository` | string | 非空 GitHub `owner/repo` slug；必须是生成该 record 的 workflow 所在仓库 |
+| `origin_run_id` | string | 非空；必须与 `origin_run_uri` 对应 |
+| `origin_run_attempt` | integer | 正整数 |
+| `origin_run_uri` | string | GitHub Actions run URL；必须回链当前 `promote-prod` workflow run |
+| `release_commit_sha` | string | 40 字符小写 git sha |
+| `promotion_mode` | string | `gradual` 或 `deploy_with_migration` |
+| `source_candidate` | object | 至少包含 `candidate_id`,`source_run_uri`；它表示被当前 workflow 消费的 reviewed candidate manifest 引用 |
+| `previous_deployment_identity` | `EvidenceDeploymentIdentity` | 不得省略 |
+| `current_deployment_identity` | `EvidenceDeploymentIdentity` | 不得省略 |
+| `gateway_rollout_steps` | array | `promotion_mode = gradual` 时必须非空；每步至少记录 `percentage`,`deployment_id`,`ready`,`attempt_count`,`last_error` |
+| `readiness_checks` | object | `promotion_mode = gradual` 时至少包含 `jobs_promoted`,`ops_promoted`；`promotion_mode = deploy_with_migration` 时至少包含 `jobs_promoted`,`ops_promoted`,`gateway_promoted` |
+| `rollback_handle` | object or null | 无 migration 的 promote 必须非空；至少包含 `workers_subdomain`，以及每个 worker 的 `script_name`,`previous_deployment_id`,`previous_worker_version_id`,`restore_version_specs` |
+
+附加规则：
+
+* consumer 在执行 promote 前，必须额外验证 `origin_repository` 等于当前仓库，且当前 checked-out git `HEAD` 等于 `release_commit_sha`。
+* producer 在写出 gradual promote record 前，必须先证明当前 Cloudflare prod identity 等于 `previous_deployment_identity`；若发生漂移，record 不得生成。
+* `promotion_mode = deploy_with_migration` 时，不得复用首次安装的 `gateway bootstrap` 阶段；`readiness_checks.jobs_promoted`、`ops_promoted`、`gateway_promoted` 必须分别对应 live prod 上每次关键切换后的 readiness snapshot。
+
+### 5.25 `ProdRollbackRecord`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `schema_version` | integer | 固定为 `1` |
+| `artifact_id` | string | 固定为 `prod_rollback_record` |
+| `source_environment` | string | 固定为 `prod` |
+| `rollback_id` | string | 非空 |
+| `rolled_back_at` | string | RFC 3339 UTC |
+| `origin_repository` | string | 非空 GitHub `owner/repo` slug；必须是生成该 record 的 workflow 所在仓库 |
+| `origin_run_id` | string | 非空；必须与 `origin_run_uri` 对应 |
+| `origin_run_attempt` | integer | 正整数 |
+| `origin_run_uri` | string | GitHub Actions run URL；必须回链当前 `rollback-prod` workflow run |
+| `source_promotion_id` | string | 非空；必须回链 `ProdPromotionRecord.promotion_id` |
+| `release_commit_sha` | string | 40 字符小写 git sha |
+| `requested_rollback_handle` | object | 不得省略；必须回链当前 workflow 实际消费的 rollback handle |
+| `restored_deployment_identity` | `EvidenceDeploymentIdentity` | 不得省略 |
+| `worker_results` | object | 至少包含 `gateway-worker`,`jobs-worker`,`ops-worker` 的 restore 结果 |
+| `readiness_probe` | object | 不得省略；至少记录 `ready`,`attempt_count`,`last_error` |
+
+附加规则：
+
+* consumer 在 replay `requested_rollback_handle` 前，必须先证明当前 Cloudflare prod identity 仍等于 source `ProdPromotionRecord.current_deployment_identity`；否则该 rollback request 必须 fail-closed。
+* consumer 在用于审计前，必须额外验证 `origin_repository` 等于当前仓库。
 
 ## 6. 内部 RPC 与异步作业 Payload
 

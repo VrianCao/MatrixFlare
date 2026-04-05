@@ -70,6 +70,7 @@
 * `Cf-Access-Authenticated-User-Email`、common-name 等 Access 注入头只能用于日志和展示，不得单独作为授权依据。
 * 不得把 `CF_Authorization` cookie 当成唯一身份源；只有在 `Cf-Access-Jwt-Assertion` 缺失且已存在显式 `DEC-ID` 豁免时，才允许讨论替代路径。默认实现必须 fail-closed。引用：`CF-NET-004`。
 * Access JWT、service-token ingress headers、cookie 与任何附加 auth metadata 的组合也必须遵守 Workers header 总量上限；若未来引入额外 claims 或转发链路，不得依赖“header 无限大”假设。引用：`CF-WKR-024`。
+* Cloudflare Access 可以在边缘直接拒绝未授权请求；当请求未到达 `ops-worker` 时，返回体由 Access 保护入口控制，可能不是 JSON，也不受 `OpsErrorResponse` 约束。`OpsErrorResponse` 只适用于已经穿过 Access 并进入 `ops-worker` 的请求。
 
 #### 3.3.2 `ops-worker` JWT 验证与裁决步骤
 
@@ -77,7 +78,7 @@
 
 1. 读取 `Cf-Access-Jwt-Assertion`，缺失则直接返回 `401`。
 2. 使用 Access team domain 的 `/cdn-cgi/access/certs` JWK/cert 集按 JWT `kid` 验证签名；实现必须缓存当前和上一个有效 key，并在 `kid` miss 时先强制刷新一次 JWK 集再裁决。不得把单一 `public_cert` 硬编码为唯一信任根。引用：`CF-NET-005`。
-3. 校验 `iss`、`aud`、`exp`、`nbf`、`sub`；任一失败都必须返回 `401`。
+3. 校验 `iss`、`aud`、`exp`、`nbf`；若 JWT 携带 `sub`，其值必须是可规范化的非空字符串。service principal 的 Access JWT 可以出现空或缺失 `sub`，但此时必须仍能在下一步通过稳定主体 claim 解析出 `stable_subject`；否则必须返回 `401`。
 4. 以 `{iss,aud,stable_subject}` 映射 `DATA-D1-006 principal_id`；其中 human 默认取 JWT `sub`，service principal 必须取部署时明确登记的“稳定服务主体 claim 优先级列表”中的首个命中项；若没有稳定 claim 命中，则必须返回 `401/403`，不得退化为展示性邮箱或空 `sub`。
 5. 按 `allowed_scopes` 与 `target_scope_constraints` 裁决授权；失败返回 `403`。
 6. 对写请求读取 `idempotency_key` 并查询 `DATA-OPS-004` dedupe projection；冲突返回 `409`。
@@ -140,6 +141,7 @@
 ### 6.1 Rate Limit Placement
 
 * 粗粒度入口限流放在 `gateway-worker`。
+* `gateway-worker` 的 coarse edge shaping 若采用 Workers `ratelimits` binding，只能把它当作 per-location、permissive 的前置护栏；任何 correctness-sensitive 的用户、会话、媒体、membership 或房间写语义配额，仍必须在应用拥有者侧实现。引用：`CF-WKR-027`。
 * 语义级配额和并发控制放在主权对象内实现。
 * Cloudflare 平台防护可作为附加防线，但不能替代业务语义配额。
 

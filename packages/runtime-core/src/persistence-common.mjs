@@ -2,6 +2,8 @@ function isPlainObject(value) {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 
+const sqlTransactionSyncBindings = new WeakMap();
+
 export function assertPlainObject(value, label) {
   if (!isPlainObject(value)) {
     throw new TypeError(`${label} must be an object`);
@@ -74,6 +76,14 @@ export function requireSqlStorage(sql, label = 'sql') {
   return sql;
 }
 
+export function bindSqlStorageTransactionSync(sql, transactionSync) {
+  const normalizedSql = requireSqlStorage(sql);
+  if (typeof transactionSync === 'function') {
+    sqlTransactionSyncBindings.set(normalizedSql, transactionSync);
+  }
+  return normalizedSql;
+}
+
 export function sqlRun(sql, query, ...bindings) {
   requireSqlStorage(sql).exec(query, ...bindings);
 }
@@ -91,17 +101,28 @@ export function sqlFirst(sql, query, ...bindings) {
 }
 
 export function withSqliteTransaction(sql, callback) {
-  sqlRun(sql, 'BEGIN IMMEDIATE');
+  const normalizedSql = requireSqlStorage(sql);
+  const transactionSync = sqlTransactionSyncBindings.get(normalizedSql);
+  if (typeof transactionSync === 'function') {
+    return transactionSync(() => {
+      const result = callback();
+      if (result && typeof result.then === 'function') {
+        throw new TypeError('withSqliteTransaction callback must be synchronous');
+      }
+      return result;
+    });
+  }
+  sqlRun(normalizedSql, 'BEGIN IMMEDIATE');
   try {
     const result = callback();
     if (result && typeof result.then === 'function') {
       throw new TypeError('withSqliteTransaction callback must be synchronous');
     }
-    sqlRun(sql, 'COMMIT');
+    sqlRun(normalizedSql, 'COMMIT');
     return result;
   } catch (error) {
     try {
-      sqlRun(sql, 'ROLLBACK');
+      sqlRun(normalizedSql, 'ROLLBACK');
     } catch {
       // Ignore rollback failures so the original error is preserved.
     }

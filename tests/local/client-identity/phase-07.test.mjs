@@ -404,6 +404,53 @@ test('Phase 07 covers local media upload/download, compatibility routes, thumbna
   assert.equal(cleanedGrant.state, 'cleaned');
 });
 
+test('Phase 07 media upload uses multipart writes for request streams without content-length', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, { username: 'phase07-stream-upload-alice' });
+  const originalCreateMultipartUpload = rig.env.MATRIX_MEDIA_BUCKET.createMultipartUpload.bind(rig.env.MATRIX_MEDIA_BUCKET);
+  let multipartUploadUsed = false;
+  let uploadedPartCount = 0;
+
+  rig.env.MATRIX_MEDIA_BUCKET.createMultipartUpload = async (...args) => {
+    multipartUploadUsed = true;
+    const upload = await originalCreateMultipartUpload(...args);
+    const originalUploadPart = upload.uploadPart.bind(upload);
+    return {
+      async uploadPart(partNumber, value) {
+        uploadedPartCount += 1;
+        return originalUploadPart(partNumber, value);
+      },
+      complete: upload.complete.bind(upload),
+      abort: upload.abort.bind(upload),
+    };
+  };
+
+  const uploadResponse = await rig.gatewayFetch('/_matrix/media/v3/upload?filename=stream-upload.txt', {
+    method: 'POST',
+    headers: {
+      ...rig.authHeaders(alice.access_token),
+      'content-type': 'text/plain; charset=utf-8',
+    },
+    body: new ReadableStream({
+      start(controller) {
+        controller.enqueue(Buffer.from('chunked-stream-', 'utf8'));
+        controller.enqueue(Buffer.from('body', 'utf8'));
+        controller.close();
+      },
+    }),
+  });
+  assert.equal(uploadResponse.status, 200);
+  assert.equal(multipartUploadUsed, true);
+  assert.equal(uploadedPartCount, 1);
+
+  const uploaded = parseMxc((await uploadResponse.json()).content_uri);
+  const stored = await rig.buckets.media.get(buildLocalMediaObjectKey(uploaded.mediaId));
+  assert.ok(stored);
+  assert.equal(await stored.text(), 'chunked-stream-body');
+});
+
 test('Phase 07 media upload failures fail closed and preserve orphan cleanup state', async (t) => {
   const rig = createGatewayPhase04Rig({
     MATRIX_MEDIA_MAX_UPLOAD_BYTES: '8',
