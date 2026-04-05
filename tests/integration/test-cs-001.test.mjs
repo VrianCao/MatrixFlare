@@ -30,6 +30,14 @@ test('TEST-CS-001 ci-integration covers discovery, session lifecycle, and capabi
   assert.equal(loginFlows.response.status, 200);
   assert.deepEqual(loginFlows.payload?.flows, [{ type: 'm.login.password' }]);
 
+  const registerFlows = await request(harness, '/_matrix/client/v3/register');
+  assert.equal(registerFlows.response.status, 200);
+  assert.deepEqual(registerFlows.payload?.flows, [{ stages: ['m.login.dummy'] }]);
+
+  const registerFlowsCompatibility = await request(harness, '/_matrix/client/r0/register');
+  assert.equal(registerFlowsCompatibility.response.status, 200);
+  assert.deepEqual(registerFlowsCompatibility.payload?.flows, [{ stages: ['m.login.dummy'] }]);
+
   const availabilityBefore = await request(
     harness,
     `/_matrix/client/v3/register/available?username=${encodeURIComponent(availableLocalpart)}`,
@@ -37,12 +45,44 @@ test('TEST-CS-001 ci-integration covers discovery, session lifecycle, and capabi
   assert.equal(availabilityBefore.response.status, 200);
   assert.deepEqual(availabilityBefore.payload, { available: true });
 
+  const availabilityBeforeCompatibility = await request(
+    harness,
+    `/_matrix/client/r0/register/available?username=${encodeURIComponent(availableLocalpart)}`,
+  );
+  assert.equal(availabilityBeforeCompatibility.response.status, 200);
+  assert.deepEqual(availabilityBeforeCompatibility.payload, { available: true });
+
   const tokenValidity = await request(
     harness,
     '/_matrix/client/v1/register/m.login.registration_token/validity?token=bogus',
   );
   assert.equal(tokenValidity.response.status, 200);
   assert.deepEqual(tokenValidity.payload, { valid: false });
+
+  const browserOrigin = 'https://app.element.io';
+  const browserRegisterFlows = await request(harness, '/_matrix/client/v3/register', {
+    headers: {
+      origin: browserOrigin,
+    },
+  });
+  assert.equal(browserRegisterFlows.response.status, 200);
+  assert.equal(browserRegisterFlows.response.headers.get('access-control-allow-origin'), browserOrigin);
+  assert.match(browserRegisterFlows.response.headers.get('vary') ?? '', /Origin/i);
+
+  const browserRegisterPreflight = await request(harness, '/_matrix/client/v3/register', {
+    method: 'OPTIONS',
+    headers: {
+      origin: browserOrigin,
+      'access-control-request-method': 'POST',
+      'access-control-request-headers': 'content-type,authorization',
+    },
+  });
+  assert.equal(browserRegisterPreflight.response.status, 204);
+  assert.equal(browserRegisterPreflight.response.headers.get('access-control-allow-origin'), browserOrigin);
+  assert.equal(browserRegisterPreflight.response.headers.get('access-control-allow-headers'), 'content-type,authorization');
+  assert.match(browserRegisterPreflight.response.headers.get('access-control-allow-methods') ?? '', /\bPOST\b/);
+  assert.match(browserRegisterPreflight.response.headers.get('vary') ?? '', /Origin/i);
+  assert.match(browserRegisterPreflight.response.headers.get('vary') ?? '', /Access-Control-Request-Headers/i);
 
   const alice = await registerUser(harness, {
     usernamePrefix: 'cs1-ci-alice',

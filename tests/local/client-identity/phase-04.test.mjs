@@ -138,10 +138,36 @@ test('Phase 04 discovery surfaces return spec-aligned truth', async (t) => {
     unstable_features: {},
   });
 
+  const registerFlows = await rig.gatewayFetch('/_matrix/client/v3/register');
+  assert.equal(registerFlows.status, 200);
+  assert.equal(registerFlows.headers.get('cache-control'), 'no-store');
+  assert.deepEqual(await registerFlows.json(), {
+    flows: [{ stages: ['m.login.dummy'] }],
+  });
+
+  const registerFlowsR0 = await rig.gatewayFetch('/_matrix/client/r0/register');
+  assert.equal(registerFlowsR0.status, 200);
+  assert.equal(registerFlowsR0.headers.get('cache-control'), 'no-store');
+  assert.deepEqual(await registerFlowsR0.json(), {
+    flows: [{ stages: ['m.login.dummy'] }],
+  });
+
+  const registerFlowsV1 = await rig.gatewayFetch('/_matrix/client/v1/register');
+  assert.equal(registerFlowsV1.status, 200);
+  assert.equal(registerFlowsV1.headers.get('cache-control'), 'no-store');
+  assert.deepEqual(await registerFlowsV1.json(), {
+    flows: [{ stages: ['m.login.dummy'] }],
+  });
+
   const availability = await rig.gatewayFetch('/_matrix/client/v3/register/available?username=alice');
   assert.equal(availability.status, 200);
   assert.equal(availability.headers.get('cache-control'), 'no-store');
   assert.deepEqual(await availability.json(), { available: true });
+
+  const availabilityR0 = await rig.gatewayFetch('/_matrix/client/r0/register/available?username=alice');
+  assert.equal(availabilityR0.status, 200);
+  assert.equal(availabilityR0.headers.get('cache-control'), 'no-store');
+  assert.deepEqual(await availabilityR0.json(), { available: true });
 
   const tokenValidity = await rig.gatewayFetch('/_matrix/client/v1/register/m.login.registration_token/validity?token=bogus');
   assert.equal(tokenValidity.status, 200);
@@ -170,6 +196,15 @@ test('Phase 04 discovery and login surfaces serve browser CORS and preflight tru
   assert.equal(loginFlows.status, 200);
   assert.equal(loginFlows.headers.get('access-control-allow-origin'), browserOrigin);
   assert.match(loginFlows.headers.get('vary') ?? '', /Origin/i);
+
+  const registerFlows = await rig.gatewayFetch('/_matrix/client/v3/register', {
+    headers: {
+      origin: browserOrigin,
+    },
+  });
+  assert.equal(registerFlows.status, 200);
+  assert.equal(registerFlows.headers.get('access-control-allow-origin'), browserOrigin);
+  assert.match(registerFlows.headers.get('vary') ?? '', /Origin/i);
 
   const clientWellKnown = await rig.gatewayFetch('/.well-known/matrix/client', {
     headers: {
@@ -934,9 +969,26 @@ test('Phase 04 registration policy can fail closed when disabled', async (t) => 
   });
   t.after(() => rig.close());
 
+  const registerFlows = await rig.gatewayFetch('/_matrix/client/v3/register');
+  await expectMatrixError(registerFlows, 403, 'M_FORBIDDEN');
+
   const availability = await rig.gatewayFetch('/_matrix/client/v3/register/available?username=closed');
   await expectMatrixError(availability, 403, 'M_FORBIDDEN');
 
   const validity = await rig.gatewayFetch('/_matrix/client/v1/register/m.login.registration_token/validity?token=any');
   await expectMatrixError(validity, 403, 'M_FORBIDDEN');
+});
+
+test('Phase 04 registration discovery does not overstate UIA stages when tokens are required', async (t) => {
+  const rig = createGatewayPhase04Rig({
+    MATRIX_REGISTRATION_TOKENS: 'invite-a, invite-b',
+  });
+  t.after(() => rig.close());
+
+  const registerFlows = await rig.gatewayFetch('/_matrix/client/v3/register');
+  assert.equal(registerFlows.status, 200);
+  assert.equal(registerFlows.headers.get('cache-control'), 'no-store');
+  assert.deepEqual(await registerFlows.json(), {
+    flows: [{ stages: ['m.login.dummy'] }],
+  });
 });
