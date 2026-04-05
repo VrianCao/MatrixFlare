@@ -30,21 +30,12 @@ jobs:
       CLOUDFLARE_OBSERVABILITY_API_TOKEN: ${{ secrets.CLOUDFLARE_OBSERVABILITY_API_TOKEN }}
       MATRIX_PROD_SECRET_SEED: ${{ secrets.MATRIX_PROD_SECRET_SEED }}
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.release_ref }}
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-
       - name: Define install paths
         id: paths
         shell: bash
         run: |
           run_timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
           workspace_root=".tmp/github/prod-install"
-          release_commit_sha="$(git rev-parse HEAD)"
           state_root="${workspace_root}/state"
           artifact_root="${workspace_root}/artifacts"
           record_key="gha/${{ github.run_id }}/${{ github.run_attempt }}/prod/${run_timestamp}/prod-install-record.json"
@@ -52,7 +43,6 @@ jobs:
           raw_state_artifact_name="prod-install-raw-state-${run_timestamp}-${{ github.run_id }}-${{ github.run_attempt }}"
           echo "run_timestamp=${run_timestamp}" >> "$GITHUB_OUTPUT"
           echo "workspace_root=${workspace_root}" >> "$GITHUB_OUTPUT"
-          echo "release_commit_sha=${release_commit_sha}" >> "$GITHUB_OUTPUT"
           echo "state_root=${state_root}" >> "$GITHUB_OUTPUT"
           echo "artifact_root=${artifact_root}" >> "$GITHUB_OUTPUT"
           echo "record=${artifact_root}/prod-install-record.json" >> "$GITHUB_OUTPUT"
@@ -61,9 +51,36 @@ jobs:
           echo "raw_state_artifact_name=${raw_state_artifact_name}" >> "$GITHUB_OUTPUT"
           mkdir -p "$workspace_root" "$state_root" "$artifact_root"
           printf '{"run_timestamp":"%s","workflow":"prod-install"}\n' "$run_timestamp" > "${state_root}/raw-state-metadata.json"
+          cat > "${state_root}/dispatch-request.json" <<EOF
+          {
+            "release_ref": "${{ inputs.release_ref }}",
+            "workers_subdomain": "${{ inputs.workers_subdomain }}"
+          }
+          EOF
+
+      - uses: actions/checkout@v4
+        id: checkout_release
+        with:
+          ref: ${{ inputs.release_ref }}
+
+      - uses: actions/setup-node@v4
+        id: setup_node
+        if: steps.checkout_release.outcome == 'success'
+        with:
+          node-version: '22'
+
+      - name: Resolve release commit sha
+        id: resolve_release_commit
+        if: steps.setup_node.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          release_commit_sha="$(git rev-parse HEAD)"
+          echo "release_commit_sha=${release_commit_sha}" >> "$GITHUB_OUTPUT"
 
       - name: Require production secrets
         id: require_secrets
+        if: steps.setup_node.outcome == 'success'
         continue-on-error: true
         shell: bash
         run: |
@@ -93,7 +110,7 @@ jobs:
 
       - name: Install production topology
         id: install_topology
-        if: steps.require_secrets.outcome == 'success'
+        if: steps.require_secrets.outcome == 'success' && steps.resolve_release_commit.outcome == 'success'
         continue-on-error: true
         run: |
           args=(
@@ -142,6 +159,18 @@ jobs:
         if: always()
         shell: bash
         run: |
+          if [ "${{ steps.checkout_release.outcome }}" != "success" ]; then
+            echo "Checking out the requested production release ref failed after raw state preservation." >&2
+            exit 1
+          fi
+          if [ "${{ steps.setup_node.outcome }}" != "success" ]; then
+            echo "Setting up Node.js for prod-install failed after raw state preservation." >&2
+            exit 1
+          fi
+          if [ "${{ steps.resolve_release_commit.outcome }}" != "success" ]; then
+            echo "Resolving the requested production release commit sha failed after raw state preservation." >&2
+            exit 1
+          fi
           if [ "${{ steps.require_secrets.outcome }}" != "success" ]; then
             echo "Required production secrets were missing after raw state preservation." >&2
             exit 1

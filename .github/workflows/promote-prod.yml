@@ -31,12 +31,6 @@ jobs:
       CLOUDFLARE_OBSERVABILITY_API_TOKEN: ${{ secrets.CLOUDFLARE_OBSERVABILITY_API_TOKEN }}
       MATRIX_PROD_SECRET_SEED: ${{ secrets.MATRIX_PROD_SECRET_SEED }}
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-
       - name: Define promote paths
         id: paths
         shell: bash
@@ -60,9 +54,25 @@ jobs:
           echo "raw_state_artifact_name=${raw_state_artifact_name}" >> "$GITHUB_OUTPUT"
           mkdir -p "$workspace_root" "$state_root" "$download_root" "$artifact_root"
           printf '{"run_timestamp":"%s","workflow":"promote-prod"}\n' "$run_timestamp" > "${state_root}/raw-state-metadata.json"
+          cat > "${state_root}/dispatch-request.json" <<EOF
+          {
+            "candidate_run_id": "${{ inputs.candidate_run_id }}",
+            "baseline_run_id": "${{ inputs.baseline_run_id }}"
+          }
+          EOF
+
+      - uses: actions/checkout@v4
+        id: checkout_workflow_ref
+
+      - uses: actions/setup-node@v4
+        id: setup_node
+        if: steps.checkout_workflow_ref.outcome == 'success'
+        with:
+          node-version: '22'
 
       - name: Require production secrets
         id: require_secrets
+        if: steps.setup_node.outcome == 'success'
         continue-on-error: true
         shell: bash
         run: |
@@ -222,6 +232,14 @@ jobs:
         if: always()
         shell: bash
         run: |
+          if [ "${{ steps.checkout_workflow_ref.outcome }}" != "success" ]; then
+            echo "Checking out the workflow ref for promote-prod failed after raw state preservation." >&2
+            exit 1
+          fi
+          if [ "${{ steps.setup_node.outcome }}" != "success" ]; then
+            echo "Setting up Node.js for promote-prod failed after raw state preservation." >&2
+            exit 1
+          fi
           if [ "${{ steps.require_secrets.outcome }}" != "success" ]; then
             echo "Required production secrets were missing after raw state preservation." >&2
             exit 1

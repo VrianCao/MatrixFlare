@@ -43,18 +43,6 @@ jobs:
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-
-      - name: Require Cloudflare credentials
-        shell: bash
-        run: |
-          test -n "$CLOUDFLARE_ACCOUNT_ID"
-          test -n "$CLOUDFLARE_API_TOKEN"
-
       - name: Define prod-cost paths
         id: paths
         shell: bash
@@ -78,8 +66,47 @@ jobs:
           mkdir -p "$state_root" "$artifact_root"
           printf '{"run_timestamp":"%s","workflow":"prod-cost-monthly"}\n' "$run_timestamp" > "${artifact_root}/raw-state-metadata.json"
 
+      - uses: actions/checkout@v4
+        id: checkout_workflow_ref
+
+      - uses: actions/setup-node@v4
+        id: setup_node
+        if: steps.checkout_workflow_ref.outcome == 'success'
+        with:
+          node-version: '22'
+
+      - name: Require Cloudflare credentials
+        id: require_credentials
+        if: steps.setup_node.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          missing=()
+          for secret_name in CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN; do
+            if [ -z "${!secret_name}" ]; then
+              missing+=("$secret_name")
+            fi
+          done
+
+          missing_json="$(printf '%s\n' "${missing[@]}" | node -e "const fs=require('fs');const values=fs.readFileSync(0,'utf8').split(/\n/).filter(Boolean);process.stdout.write(JSON.stringify(values));")"
+          cat > "${{ steps.paths.outputs.artifact_root }}/credentials-check.json" <<EOF
+          {
+            "required_secrets": [
+              "CLOUDFLARE_ACCOUNT_ID",
+              "CLOUDFLARE_API_TOKEN"
+            ],
+            "missing_secrets": ${missing_json}
+          }
+          EOF
+
+          if [ "${#missing[@]}" -ne 0 ]; then
+            echo "Missing required Cloudflare credentials: ${missing[*]}" >&2
+            exit 1
+          fi
+
       - name: Define closed monthly billing window
         id: billing_window
+        if: steps.require_credentials.outcome == 'success'
         shell: bash
         run: |
           from_date="$(date -u -d "$(date -u +%Y-%m-01) -1 month" +%Y-%m-01)"
@@ -89,6 +116,7 @@ jobs:
 
       - name: Capture production cost snapshot
         id: capture_snapshot
+        if: steps.billing_window.outcome == 'success'
         continue-on-error: true
         run: |
           node packages/testing/src/cli.mjs prod-cost-snapshot \
@@ -162,6 +190,22 @@ jobs:
         if: always()
         shell: bash
         run: |
+          if [ "${{ steps.checkout_workflow_ref.outcome }}" != "success" ]; then
+            echo "Checking out the workflow ref for prod-cost-monthly failed after raw artifacts were preserved." >&2
+            exit 1
+          fi
+          if [ "${{ steps.setup_node.outcome }}" != "success" ]; then
+            echo "Setting up Node.js for prod-cost-monthly failed after raw artifacts were preserved." >&2
+            exit 1
+          fi
+          if [ "${{ steps.require_credentials.outcome }}" != "success" ]; then
+            echo "Required Cloudflare credentials were missing after raw artifacts were preserved." >&2
+            exit 1
+          fi
+          if [ "${{ steps.billing_window.outcome }}" != "success" ]; then
+            echo "Computing the closed billing window failed after raw artifacts were preserved." >&2
+            exit 1
+          fi
           if [ "${{ steps.capture_snapshot.outcome }}" != "success" ]; then
             echo "Capture production cost snapshot failed after raw artifacts were preserved." >&2
             exit 1
