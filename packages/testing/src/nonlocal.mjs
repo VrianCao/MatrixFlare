@@ -2040,6 +2040,16 @@ function buildBillingUsageApiPath({
   return `/billing/usage/paygo${query.length > 0 ? `?${query}` : ''}`;
 }
 
+const PROD_BILLING_WINDOW_RESOLUTION_METHODS = Object.freeze({
+  profileNextBillDate: 'cloudflare-account-billing-profile-next-bill-date',
+  subscriptionsCurrentPeriodEnd: 'cloudflare-account-subscriptions-current-period-end',
+});
+
+const PROD_BILLING_WINDOW_RESOLUTION_METHOD_PATHS = Object.freeze({
+  [PROD_BILLING_WINDOW_RESOLUTION_METHODS.profileNextBillDate]: '/billing/profile',
+  [PROD_BILLING_WINDOW_RESOLUTION_METHODS.subscriptionsCurrentPeriodEnd]: '/subscriptions',
+});
+
 function formatBillingPeriodDateFromUtcMillis(utcMillis, label) {
   if (!Number.isFinite(utcMillis)) {
     throw new RangeError(`${label} must be a valid UTC timestamp`);
@@ -2123,11 +2133,26 @@ function normalizeCloudflareBillingProfile(value) {
     throw new TypeError('Cloudflare billing profile result must be an object');
   }
   const nextBillDate = stableString(value.next_bill_date);
-  if (!isNonEmptyString(nextBillDate) || !Number.isFinite(Date.parse(nextBillDate))) {
-    throw new Error('Cloudflare billing profile must include a valid next_bill_date');
+  if (!isNonEmptyString(nextBillDate)) {
+    return Object.freeze({
+      next_bill_date: null,
+    });
+  }
+  if (!Number.isFinite(Date.parse(nextBillDate))) {
+    throw new Error('Cloudflare billing profile next_bill_date must be a valid date');
   }
   return Object.freeze({
     next_bill_date: nextBillDate,
+  });
+}
+
+function normalizeCloudflareSubscription(value, index) {
+  if (!isPlainObject(value)) {
+    throw new TypeError(`Cloudflare account subscription ${index} must be an object`);
+  }
+  return Object.freeze({
+    id: stableString(value.id),
+    current_period_end: stableString(value.current_period_end),
   });
 }
 
@@ -2193,14 +2218,61 @@ function deriveClosedBillingWindowFromNextBillDate({
   });
 }
 
+function deriveClosedBillingWindowFromSubscriptionCurrentPeriodEnd({
+  currentPeriodEnd,
+  now = new Date(),
+} = {}) {
+  return deriveClosedBillingWindowFromNextBillDate({
+    nextBillDate: normalizeUpcomingBillingProfileNextBillDate(currentPeriodEnd, {
+      now,
+      label: 'Cloudflare account subscriptions current_period_end',
+    }),
+    now,
+  });
+}
+
+function normalizeCloudflareSubscriptionsBillingCycleAnchor(value, {
+  now = new Date(),
+} = {}) {
+  const subscriptions = extractArrayResult(value).map((entry, index) => normalizeCloudflareSubscription(entry, index));
+  const observedAnchors = sortUniqueStringArray(
+    subscriptions
+      .map((entry) => {
+        if (!isNonEmptyString(entry.current_period_end) || !Number.isFinite(Date.parse(entry.current_period_end))) {
+          return null;
+        }
+        return entry.current_period_end;
+      })
+      .filter((entry) => entry != null),
+  );
+  if (observedAnchors.length === 0) {
+    throw new Error('Cloudflare account subscriptions must include at least one valid current_period_end');
+  }
+  if (observedAnchors.length !== 1) {
+    throw new Error(`Cloudflare account subscriptions returned multiple current_period_end anchors: ${observedAnchors.join(', ')}`);
+  }
+  const derivedBillingWindow = deriveClosedBillingWindowFromSubscriptionCurrentPeriodEnd({
+    currentPeriodEnd: observedAnchors[0],
+    now,
+  });
+  return Object.freeze({
+    nextBillDate: observedAnchors[0],
+    fromDate: derivedBillingWindow.fromDate,
+    toDate: derivedBillingWindow.toDate,
+  });
+}
+
 function normalizeResolvedClosedProdBillingWindow(value, {
   now = new Date(),
 } = {}) {
   if (!isPlainObject(value)) {
     throw new TypeError('resolved production billing window must be an object');
   }
-  if (stableString(value.resolution_method) !== 'cloudflare-account-billing-profile-next-bill-date') {
-    throw new Error('resolved production billing window resolution_method must be cloudflare-account-billing-profile-next-bill-date');
+  const resolutionMethod = stableString(value.resolution_method);
+  if (!Object.values(PROD_BILLING_WINDOW_RESOLUTION_METHODS).includes(resolutionMethod)) {
+    throw new Error(
+      'resolved production billing window resolution_method must be cloudflare-account-billing-profile-next-bill-date or cloudflare-account-subscriptions-current-period-end',
+    );
   }
   const billingProfile = normalizeCloudflareBillingProfile({
     next_bill_date: value.next_bill_date,
@@ -2216,11 +2288,41 @@ function normalizeResolvedClosedProdBillingWindow(value, {
     throw new Error('resolved production billing window to_date must match the latest closed billing period derived from next_bill_date');
   }
   return Object.freeze({
-    resolutionMethod: 'cloudflare-account-billing-profile-next-bill-date',
+    resolutionMethod,
     nextBillDate: billingProfile.next_bill_date,
     fromDate: derivedBillingWindow.fromDate,
     toDate: derivedBillingWindow.toDate,
   });
+}
+
+function buildProdBillingCycleAnchorSourceUri(accountId, resolutionMethod) {
+  const normalizedAccountId = stableString(accountId);
+  if (!isNonEmptyString(normalizedAccountId)) {
+    throw new RangeError('Cloudflare account id is required to build the prod billing-cycle anchor source URI');
+  }
+  const normalizedResolutionMethod = stableString(resolutionMethod);
+  const pathname = PROD_BILLING_WINDOW_RESOLUTION_METHOD_PATHS[normalizedResolutionMethod];
+  if (!isNonEmptyString(pathname)) {
+    throw new RangeError(`Unsupported prod billing window resolution method "${normalizedResolutionMethod}"`);
+  }
+  return `https://api.cloudflare.com/client/v4/accounts/${normalizedAccountId}${pathname}`;
+}
+
+function buildProdBillingCycleAnchorArtifactReference(resolutionMethod) {
+  const normalizedResolutionMethod = stableString(resolutionMethod);
+  if (normalizedResolutionMethod === PROD_BILLING_WINDOW_RESOLUTION_METHODS.profileNextBillDate) {
+    return Object.freeze({
+      artifact_path: 'billing-profile.json',
+      field_selector: 'result.next_bill_date',
+    });
+  }
+  if (normalizedResolutionMethod === PROD_BILLING_WINDOW_RESOLUTION_METHODS.subscriptionsCurrentPeriodEnd) {
+    return Object.freeze({
+      artifact_path: 'billing-subscriptions.json',
+      field_selector: 'result[*].current_period_end',
+    });
+  }
+  throw new RangeError(`Unsupported prod billing window resolution method "${normalizedResolutionMethod}"`);
 }
 
 function normalizeBillingLookupKey(value) {
@@ -2798,27 +2900,91 @@ export async function resolveClosedProdBillingWindow({
   const resolvedArtifactRoot = path.resolve(artifactRoot ?? path.join(process.cwd(), '.tmp', 'prod-cost'));
   const resolvedOutputPath = path.resolve(outputPath ?? path.join(resolvedArtifactRoot, 'billing-window.json'));
   const resolvedProfileOutputPath = path.resolve(profileOutputPath ?? path.join(resolvedArtifactRoot, 'billing-profile.json'));
+  const resolvedSubscriptionsOutputPath = path.join(resolvedArtifactRoot, 'billing-subscriptions.json');
   await Promise.all([
     fs.mkdir(path.dirname(resolvedOutputPath), { recursive: true }),
     fs.mkdir(path.dirname(resolvedProfileOutputPath), { recursive: true }),
+    fs.mkdir(path.dirname(resolvedSubscriptionsOutputPath), { recursive: true }),
   ]);
 
   let profilePayload = null;
+  let subscriptionsPayload = null;
+  const attemptedResolutionMethods = [];
   try {
-    profilePayload = await callCloudflareApiImpl({
-      accountId,
-      apiToken,
-      pathname: '/billing/profile',
-    });
-    await fs.writeFile(resolvedProfileOutputPath, stableJson(profilePayload));
-    const billingProfile = normalizeCloudflareBillingProfile(profilePayload.result);
-    const billingWindow = deriveClosedBillingWindowFromNextBillDate({
-      nextBillDate: billingProfile.next_bill_date,
-      now,
-    });
+    let resolutionMethod = null;
+    let nextBillDate = null;
+    let billingWindow = null;
+    let allowSubscriptionsFallback = false;
+
+    try {
+      profilePayload = await callCloudflareApiImpl({
+        accountId,
+        apiToken,
+        pathname: '/billing/profile',
+      });
+      await fs.writeFile(resolvedProfileOutputPath, stableJson(profilePayload));
+      const billingProfile = normalizeCloudflareBillingProfile(profilePayload.result);
+      attemptedResolutionMethods.push(PROD_BILLING_WINDOW_RESOLUTION_METHODS.profileNextBillDate);
+      if (billingProfile.next_bill_date != null) {
+        resolutionMethod = PROD_BILLING_WINDOW_RESOLUTION_METHODS.profileNextBillDate;
+        nextBillDate = billingProfile.next_bill_date;
+        billingWindow = deriveClosedBillingWindowFromNextBillDate({
+          nextBillDate,
+          now,
+        });
+      } else {
+        allowSubscriptionsFallback = true;
+      }
+    } catch (error) {
+      const diagnosticPayload = profilePayload == null
+        ? {
+            pathname: '/billing/profile',
+            error: String(error?.message ?? error),
+          }
+        : {
+            profile_payload: profilePayload,
+            error: String(error?.message ?? error),
+          };
+      await fs.writeFile(resolvedProfileOutputPath, stableJson(diagnosticPayload));
+      throw error;
+    }
+
+    if (billingWindow == null && allowSubscriptionsFallback) {
+      try {
+        attemptedResolutionMethods.push(PROD_BILLING_WINDOW_RESOLUTION_METHODS.subscriptionsCurrentPeriodEnd);
+        subscriptionsPayload = await callCloudflareApiImpl({
+          accountId,
+          apiToken,
+          pathname: '/subscriptions',
+        });
+        await fs.writeFile(resolvedSubscriptionsOutputPath, stableJson(subscriptionsPayload));
+        const subscriptionBillingWindow = normalizeCloudflareSubscriptionsBillingCycleAnchor(
+          subscriptionsPayload.result,
+          { now },
+        );
+        resolutionMethod = PROD_BILLING_WINDOW_RESOLUTION_METHODS.subscriptionsCurrentPeriodEnd;
+        nextBillDate = subscriptionBillingWindow.nextBillDate;
+        billingWindow = subscriptionBillingWindow;
+      } catch (subscriptionsError) {
+        const diagnosticPayload = subscriptionsPayload == null
+          ? {
+              pathname: '/subscriptions',
+              error: String(subscriptionsError?.message ?? subscriptionsError),
+            }
+          : {
+              subscriptions_payload: subscriptionsPayload,
+              error: String(subscriptionsError?.message ?? subscriptionsError),
+            };
+        await fs.writeFile(resolvedSubscriptionsOutputPath, stableJson(diagnosticPayload));
+        throw new Error(
+          `Cloudflare billing cycle anchor resolution failed: billing profile response omitted next_bill_date, and subscriptions fallback failed with "${String(subscriptionsError?.message ?? subscriptionsError)}"`,
+        );
+      }
+    }
+
     const outputPayload = {
-      resolution_method: 'cloudflare-account-billing-profile-next-bill-date',
-      next_bill_date: billingProfile.next_bill_date,
+      resolution_method: resolutionMethod,
+      next_bill_date: nextBillDate,
       from_date: billingWindow.fromDate,
       to_date: billingWindow.toDate,
     };
@@ -2826,10 +2992,11 @@ export async function resolveClosedProdBillingWindow({
     return {
       output_path: resolvedOutputPath,
       profile_path: resolvedProfileOutputPath,
+      subscriptions_path: subscriptionsPayload == null ? null : resolvedSubscriptionsOutputPath,
       from_date: billingWindow.fromDate,
       to_date: billingWindow.toDate,
       billing_window: billingWindow,
-      billing_profile: billingProfile,
+      resolution_method: resolutionMethod,
     };
   } catch (error) {
     const diagnosticPayload = profilePayload == null
@@ -2837,14 +3004,12 @@ export async function resolveClosedProdBillingWindow({
           pathname: '/billing/profile',
           error: String(error?.message ?? error),
         }
-      : {
-          profile_payload: profilePayload,
-          error: String(error?.message ?? error),
-        };
+      : null;
     await Promise.allSettled([
-      fs.writeFile(resolvedProfileOutputPath, stableJson(diagnosticPayload)),
+      ...(diagnosticPayload == null ? [] : [fs.writeFile(resolvedProfileOutputPath, stableJson(diagnosticPayload))]),
       fs.writeFile(resolvedOutputPath, stableJson({
-        resolution_method: 'cloudflare-account-billing-profile-next-bill-date',
+        resolution_method: attemptedResolutionMethods.length === 1 ? attemptedResolutionMethods[0] : null,
+        attempted_resolution_methods: attemptedResolutionMethods,
         error: String(error?.message ?? error),
       })),
     ]);
@@ -2993,6 +3158,8 @@ export async function captureProdCostSnapshot({
     reviewed_by: reviewedBy ?? `github-actions-run:${claims.run_id}`,
     source_dashboard_uri: `https://api.cloudflare.com/client/v4/accounts/${accountId}${billingUsagePathname}`,
     billing_window_resolution_method: normalizedBillingWindow.resolutionMethod,
+    billing_cycle_anchor_source_uri: buildProdBillingCycleAnchorSourceUri(accountId, normalizedBillingWindow.resolutionMethod),
+    billing_cycle_anchor_artifact: buildProdBillingCycleAnchorArtifactReference(normalizedBillingWindow.resolutionMethod),
     billing_cycle_next_bill_date: normalizedBillingWindow.nextBillDate,
     topology_kind: 'cloudflare-prod',
     topology_baseline_install: {

@@ -591,12 +591,13 @@ function buildMinimalProdBillingUsageRecords({
 }
 
 function buildResolvedProdBillingWindowFixture({
+  resolutionMethod = 'cloudflare-account-billing-profile-next-bill-date',
   nextBillDate = '2026-04-15T12:21:59.345Z',
   fromDate = '2026-02-16',
   toDate = '2026-03-15',
 } = {}) {
   return {
-    resolution_method: 'cloudflare-account-billing-profile-next-bill-date',
+    resolution_method: resolutionMethod,
     next_bill_date: nextBillDate,
     from_date: fromDate,
     to_date: toDate,
@@ -3707,7 +3708,122 @@ test('prod cost billing window resolution derives the latest closed billing peri
   }
 });
 
-test('prod cost billing window resolution preserves blocker artifacts when the billing profile is invalid', async () => {
+test('prod cost billing window resolution falls back to account subscriptions current_period_end when billing profile omits next_bill_date', async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-prod-cost-billing-window-subscriptions-'));
+  const outputPath = path.join(tempRoot, 'billing-window.json');
+  const profileOutputPath = path.join(tempRoot, 'billing-profile.json');
+
+  try {
+    const result = await resolveClosedProdBillingWindow({
+      artifactRoot: tempRoot,
+      outputPath,
+      profileOutputPath,
+    }, {
+      requireGitHubActionsExecutionImpl: async () => ({
+        repository: 'VrianCao/MatrixFlare',
+        run_id: '81234',
+      }),
+      requireCloudflareCredentialsImpl: () => ({
+        accountId: 'cf-account',
+        apiToken: 'cf-token',
+      }),
+      callCloudflareApiImpl: async ({ pathname }) => {
+        if (pathname === '/billing/profile') {
+          return {
+            success: true,
+            result: {},
+          };
+        }
+        if (pathname === '/subscriptions') {
+          return {
+            success: true,
+            result: [
+              {
+                id: 'sub-workers-paid',
+                current_period_end: '2026-05-15T12:21:59.3456Z',
+              },
+              {
+                id: 'sub-r2',
+                current_period_end: '2026-05-15T12:21:59.3456Z',
+              },
+            ],
+          };
+        }
+        throw new Error(`Unexpected Cloudflare API pathname: ${pathname}`);
+      },
+      now: new Date('2026-05-05T00:00:00.000Z'),
+    });
+
+    assert.equal(result.from_date, '2026-03-16');
+    assert.equal(result.to_date, '2026-04-15');
+    assert.equal(result.resolution_method, 'cloudflare-account-subscriptions-current-period-end');
+    assert.deepEqual(
+      JSON.parse(await fs.readFile(outputPath, 'utf8')),
+      {
+        resolution_method: 'cloudflare-account-subscriptions-current-period-end',
+        next_bill_date: '2026-05-15T12:21:59.3456Z',
+        from_date: '2026-03-16',
+        to_date: '2026-04-15',
+      },
+    );
+    assert.deepEqual(
+      JSON.parse(await fs.readFile(path.join(tempRoot, 'billing-subscriptions.json'), 'utf8')).result.map((entry) => entry.current_period_end),
+      ['2026-05-15T12:21:59.3456Z', '2026-05-15T12:21:59.3456Z'],
+    );
+  } finally {
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('prod cost billing window resolution does not mask billing profile transport failures with subscriptions fallback', async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-prod-cost-billing-window-profile-error-'));
+  const outputPath = path.join(tempRoot, 'billing-window.json');
+  const profileOutputPath = path.join(tempRoot, 'billing-profile.json');
+
+  try {
+    await assert.rejects(
+      () => resolveClosedProdBillingWindow({
+        artifactRoot: tempRoot,
+        outputPath,
+        profileOutputPath,
+      }, {
+        requireGitHubActionsExecutionImpl: async () => ({
+          repository: 'VrianCao/MatrixFlare',
+          run_id: '81234',
+        }),
+        requireCloudflareCredentialsImpl: () => ({
+          accountId: 'cf-account',
+          apiToken: 'cf-token',
+        }),
+        callCloudflareApiImpl: async ({ pathname }) => {
+          if (pathname === '/billing/profile') {
+            throw new Error('billing profile request returned 403');
+          }
+          if (pathname === '/subscriptions') {
+            throw new Error('subscriptions fallback should not be called');
+          }
+          throw new Error(`Unexpected Cloudflare API pathname: ${pathname}`);
+        },
+      }),
+      /billing profile request returned 403/,
+    );
+
+    assert.match(JSON.parse(await fs.readFile(outputPath, 'utf8')).error, /billing profile request returned 403/u);
+    assert.deepEqual(
+      JSON.parse(await fs.readFile(outputPath, 'utf8')).attempted_resolution_methods,
+      [],
+    );
+    assert.match(JSON.parse(await fs.readFile(profileOutputPath, 'utf8')).error, /billing profile request returned 403/u);
+    await assert.rejects(
+      fs.stat(path.join(tempRoot, 'billing-subscriptions.json')),
+      /ENOENT/u,
+    );
+  } finally {
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('prod cost billing window resolution preserves blocker artifacts when both billing cycle anchors are invalid', async () => {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-prod-cost-billing-window-invalid-'));
   const outputPath = path.join(tempRoot, 'billing-window.json');
   const profileOutputPath = path.join(tempRoot, 'billing-profile.json');
@@ -3727,17 +3843,110 @@ test('prod cost billing window resolution preserves blocker artifacts when the b
           accountId: 'cf-account',
           apiToken: 'cf-token',
         }),
-        callCloudflareApiImpl: async () => ({
-          success: true,
-          result: {},
-        }),
+        callCloudflareApiImpl: async ({ pathname }) => {
+          if (pathname === '/billing/profile') {
+            return {
+              success: true,
+              result: {},
+            };
+          }
+          if (pathname === '/subscriptions') {
+            return {
+              success: true,
+              result: [
+                { id: 'sub-workers-paid' },
+              ],
+            };
+          }
+          throw new Error(`Unexpected Cloudflare API pathname: ${pathname}`);
+        },
         now: new Date('2026-05-05T00:00:00.000Z'),
       }),
-      /next_bill_date/,
+      /billing cycle anchor resolution failed/,
     );
 
-    assert.match(JSON.parse(await fs.readFile(outputPath, 'utf8')).error, /next_bill_date/u);
-    assert.match(JSON.parse(await fs.readFile(profileOutputPath, 'utf8')).error, /next_bill_date/u);
+    assert.deepEqual(
+      JSON.parse(await fs.readFile(outputPath, 'utf8')),
+      {
+        resolution_method: null,
+        attempted_resolution_methods: [
+          'cloudflare-account-billing-profile-next-bill-date',
+          'cloudflare-account-subscriptions-current-period-end',
+        ],
+        error: 'Cloudflare billing cycle anchor resolution failed: billing profile response omitted next_bill_date, and subscriptions fallback failed with "Cloudflare account subscriptions must include at least one valid current_period_end"',
+      },
+    );
+    assert.deepEqual(JSON.parse(await fs.readFile(profileOutputPath, 'utf8')).result, {});
+    assert.match(JSON.parse(await fs.readFile(path.join(tempRoot, 'billing-subscriptions.json'), 'utf8')).error, /current_period_end/u);
+  } finally {
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('prod cost billing window resolution fails closed when subscriptions expose conflicting current_period_end anchors', async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-prod-cost-billing-window-conflicting-'));
+  const outputPath = path.join(tempRoot, 'billing-window.json');
+  const profileOutputPath = path.join(tempRoot, 'billing-profile.json');
+
+  try {
+    await assert.rejects(
+      () => resolveClosedProdBillingWindow({
+        artifactRoot: tempRoot,
+        outputPath,
+        profileOutputPath,
+      }, {
+        requireGitHubActionsExecutionImpl: async () => ({
+          repository: 'VrianCao/MatrixFlare',
+          run_id: '81234',
+        }),
+        requireCloudflareCredentialsImpl: () => ({
+          accountId: 'cf-account',
+          apiToken: 'cf-token',
+        }),
+        callCloudflareApiImpl: async ({ pathname }) => {
+          if (pathname === '/billing/profile') {
+            return {
+              success: true,
+              result: {},
+            };
+          }
+          if (pathname === '/subscriptions') {
+            return {
+              success: true,
+              result: [
+                {
+                  id: 'sub-workers-paid',
+                  current_period_end: '2026-05-15T12:21:59.3456Z',
+                },
+                {
+                  id: 'sub-r2',
+                  current_period_end: '2026-05-20T12:21:59.3456Z',
+                },
+              ],
+            };
+          }
+          throw new Error(`Unexpected Cloudflare API pathname: ${pathname}`);
+        },
+        now: new Date('2026-05-05T00:00:00.000Z'),
+      }),
+      /multiple current_period_end anchors/,
+    );
+
+    assert.deepEqual(
+      JSON.parse(await fs.readFile(outputPath, 'utf8')),
+      {
+        resolution_method: null,
+        attempted_resolution_methods: [
+          'cloudflare-account-billing-profile-next-bill-date',
+          'cloudflare-account-subscriptions-current-period-end',
+        ],
+        error: 'Cloudflare billing cycle anchor resolution failed: billing profile response omitted next_bill_date, and subscriptions fallback failed with "Cloudflare account subscriptions returned multiple current_period_end anchors: 2026-05-15T12:21:59.3456Z, 2026-05-20T12:21:59.3456Z"',
+      },
+    );
+    assert.deepEqual(
+      JSON.parse(await fs.readFile(path.join(tempRoot, 'billing-subscriptions.json'), 'utf8')).subscriptions_payload.result.map((entry) => entry.current_period_end),
+      ['2026-05-15T12:21:59.3456Z', '2026-05-20T12:21:59.3456Z'],
+    );
   } finally {
     await fs.rm(tempRoot, { recursive: true, force: true });
   }
@@ -4150,6 +4359,11 @@ test('prod cost snapshot capture normalizes official billing usage into a valid 
     assert.equal(result.snapshot.cost_surfaces.queues.write_ops, 300_000);
     assert.equal(result.snapshot.source_dashboard_uri, 'https://api.cloudflare.com/client/v4/accounts/cf-account/billing/usage/paygo?from=2026-02-16&to=2026-03-15');
     assert.equal(result.snapshot.billing_window_resolution_method, 'cloudflare-account-billing-profile-next-bill-date');
+    assert.equal(result.snapshot.billing_cycle_anchor_source_uri, 'https://api.cloudflare.com/client/v4/accounts/cf-account/billing/profile');
+    assert.deepEqual(result.snapshot.billing_cycle_anchor_artifact, {
+      artifact_path: 'billing-profile.json',
+      field_selector: 'result.next_bill_date',
+    });
     assert.equal(result.snapshot.billing_cycle_next_bill_date, '2026-04-15T12:21:59.345Z');
     assert.equal(result.snapshot.topology_baseline_install.install_id, 'install-prod-topology-v1');
     assert.ok(await fs.stat(path.join(artifactRoot, 'billing-usage-paygo.json')));

@@ -5399,16 +5399,66 @@ export function validateManualArtifactPayload(artifactId, payload, {
         error: 'prod_cost_snapshot source_dashboard_uri must be an official Cloudflare HTTPS locator',
       };
     }
-    if (payload.billing_window_resolution_method !== 'cloudflare-account-billing-profile-next-bill-date') {
+    if (
+      payload.billing_window_resolution_method !== 'cloudflare-account-billing-profile-next-bill-date'
+      && payload.billing_window_resolution_method !== 'cloudflare-account-subscriptions-current-period-end'
+    ) {
       return {
         valid: false,
-        error: 'prod_cost_snapshot billing_window_resolution_method must be cloudflare-account-billing-profile-next-bill-date',
+        error: 'prod_cost_snapshot billing_window_resolution_method must be cloudflare-account-billing-profile-next-bill-date or cloudflare-account-subscriptions-current-period-end',
       };
     }
     if (!isRfc3339UtcTimestamp(payload.billing_cycle_next_bill_date)) {
       return {
         valid: false,
         error: 'prod_cost_snapshot billing_cycle_next_bill_date must be an RFC 3339 UTC timestamp',
+      };
+    }
+    if (!isOfficialCloudflareLocator(payload.billing_cycle_anchor_source_uri)) {
+      return {
+        valid: false,
+        error: 'prod_cost_snapshot billing_cycle_anchor_source_uri must be an official Cloudflare HTTPS locator',
+      };
+    }
+    try {
+      const anchorSourceUrl = new URL(payload.billing_cycle_anchor_source_uri);
+      const expectedAnchorPathname = payload.billing_window_resolution_method === 'cloudflare-account-billing-profile-next-bill-date'
+        ? '/client/v4/accounts/.+/billing/profile'
+        : '/client/v4/accounts/.+/subscriptions';
+      if (!new RegExp(`^${expectedAnchorPathname}$`, 'u').test(anchorSourceUrl.pathname)) {
+        return {
+          valid: false,
+          error: 'prod_cost_snapshot billing_cycle_anchor_source_uri must match the official Cloudflare billing-cycle source for billing_window_resolution_method',
+        };
+      }
+    } catch {
+      return {
+        valid: false,
+        error: 'prod_cost_snapshot billing_cycle_anchor_source_uri must be an official Cloudflare HTTPS locator',
+      };
+    }
+    if (!isPlainObject(payload.billing_cycle_anchor_artifact)) {
+      return {
+        valid: false,
+        error: 'prod_cost_snapshot must include billing_cycle_anchor_artifact',
+      };
+    }
+    const expectedAnchorArtifactPath = payload.billing_window_resolution_method === 'cloudflare-account-billing-profile-next-bill-date'
+      ? 'billing-profile.json'
+      : 'billing-subscriptions.json';
+    const expectedAnchorFieldSelector = payload.billing_window_resolution_method === 'cloudflare-account-billing-profile-next-bill-date'
+      ? 'result.next_bill_date'
+      : 'result[*].current_period_end';
+    if (payload.billing_cycle_anchor_artifact.artifact_path !== expectedAnchorArtifactPath) {
+      return {
+        valid: false,
+        error: 'prod_cost_snapshot billing_cycle_anchor_artifact.artifact_path must match the retained raw billing-cycle artifact for billing_window_resolution_method',
+      };
+    }
+    if (payload.billing_cycle_anchor_artifact.field_selector !== expectedAnchorFieldSelector) {
+      return {
+        valid: false,
+        error: 'prod_cost_snapshot billing_cycle_anchor_artifact.field_selector must match the retained raw billing-cycle field selector for billing_window_resolution_method',
       };
     }
     if (!isNonEmptyString(payload.topology_kind) || payload.topology_kind === 'local') {

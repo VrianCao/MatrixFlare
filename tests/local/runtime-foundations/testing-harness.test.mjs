@@ -397,7 +397,12 @@ function buildValidProdCostSnapshot(runTimestamp, overrides = {}) {
     captured_by: 'finance-bot',
     reviewed_by: 'platform-reviewer',
     source_dashboard_uri: 'https://api.cloudflare.com/client/v4/accounts/cf-account/billing/usage/paygo?from=2026-04-16&to=2026-05-15',
-    billing_window_resolution_method: 'cloudflare-account-billing-profile-next-bill-date',
+    billing_window_resolution_method: 'cloudflare-account-subscriptions-current-period-end',
+    billing_cycle_anchor_source_uri: 'https://api.cloudflare.com/client/v4/accounts/cf-account/subscriptions',
+    billing_cycle_anchor_artifact: {
+      artifact_path: 'billing-subscriptions.json',
+      field_selector: 'result[*].current_period_end',
+    },
     billing_cycle_next_bill_date: '2026-06-15T12:21:59.345Z',
     topology_kind: 'cloudflare-prod',
     topology_baseline_install: {
@@ -2146,7 +2151,62 @@ test('manual artifact payload validation requires structured non-local reports a
     }),
     {
       valid: false,
-      error: 'prod_cost_snapshot billing_window_resolution_method must be cloudflare-account-billing-profile-next-bill-date',
+      error: 'prod_cost_snapshot billing_window_resolution_method must be cloudflare-account-billing-profile-next-bill-date or cloudflare-account-subscriptions-current-period-end',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('prod_cost_snapshot', {
+      ...validProdCostSnapshot,
+      billing_cycle_anchor_source_uri: '',
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'prod_cost_snapshot billing_cycle_anchor_source_uri must be an official Cloudflare HTTPS locator',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('prod_cost_snapshot', {
+      ...validProdCostSnapshot,
+      billing_cycle_anchor_source_uri: 'https://api.cloudflare.com/client/v4/accounts/cf-account/billing/profile',
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'prod_cost_snapshot billing_cycle_anchor_source_uri must match the official Cloudflare billing-cycle source for billing_window_resolution_method',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('prod_cost_snapshot', {
+      ...validProdCostSnapshot,
+      billing_cycle_anchor_artifact: null,
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'prod_cost_snapshot must include billing_cycle_anchor_artifact',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('prod_cost_snapshot', {
+      ...validProdCostSnapshot,
+      billing_cycle_anchor_artifact: {
+        artifact_path: 'billing-profile.json',
+        field_selector: 'result.next_bill_date',
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'prod_cost_snapshot billing_cycle_anchor_artifact.artifact_path must match the retained raw billing-cycle artifact for billing_window_resolution_method',
     },
   );
 

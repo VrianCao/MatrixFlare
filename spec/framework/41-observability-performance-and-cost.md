@@ -148,7 +148,7 @@
 * Queues 成本必须按 write / read / delete 三类操作分别计数，并按每 `64 KB` payload chunk 换算（`KB = 1000 bytes`）；每条消息还隐含约 `100` bytes 平台元数据；retry 会额外产生 read op，DLQ 写入会额外产生 write op，过期消息只产生 write+delete；batch 只改变吞吐与调用频率，不会把多条消息折叠成一次计费。引用：`CF-QUE-001`。
 * 若为冷归档采用 R2 Infrequent Access，成本模型必须额外纳入 retrieval fee、`30` 天 minimum storage duration 与“无 included quota”的事实；默认 Included Quotas Matrix 只适用于 R2 Standard。引用：`CF-R2-005`。
 * 当 deployment 启用 Cloudflare traces 或 OTel export 时，成本模型必须分别暴露 `trace_span_count`、`exported_log_event_count` 与 `persist_enabled`，并在 `OQ-0002` 关闭前禁止默认把 trace spans 自动并入 Workers Logs quota。引用：`CF-WKR-017`,`CF-WKR-018`。
-* production monthly cost automation 若使用 Cloudflare Billing Usage API，必须先由官方 billing profile `next_bill_date` 解析 latest closed billing period，并把该解析结果编码进 `ProdCostSnapshot`；同时还必须消费当前 prod baseline `ProdInstallRecord`，证明 `billing_period.start` 严格晚于 `installed_at` 对应 UTC 日期。若 target account 不具备 Billing Usage API access，无法证明当前 query window 正对应 latest closed billing period，或窗口仍覆盖 pre-install spend，则必须 fail-closed。引用：`CF-WKR-029`,`CF-WKR-030`。
+* production monthly cost automation 若使用 Cloudflare Billing Usage API，必须先由官方 billing-cycle anchor 解析 latest closed billing period：优先使用 billing profile `next_bill_date`，若该字段在目标账号上缺失，则只允许退回到唯一的 account subscriptions `current_period_end`；并把该解析结果、对应官方 source URI、以及 raw bundle 中哪份 retained artifact / field selector 才是 anchor 证据一并编码进 `ProdCostSnapshot`。同时还必须消费当前 prod baseline `ProdInstallRecord`，证明 `billing_period.start` 严格晚于 `installed_at` 对应 UTC 日期。若 target account 不具备 Billing Usage API access，无法证明当前 query window 正对应 latest closed billing period，subscriptions 返回多个不一致 anchor，或窗口仍覆盖 pre-install spend，则必须 fail-closed。引用：`CF-WKR-029`,`CF-WKR-030`。
 
 ### 6.4 Pre-release Cost Proof Contract
 

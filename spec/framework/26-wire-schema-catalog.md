@@ -474,8 +474,10 @@
 | `captured_by` | string | 非空执行者标识 |
 | `reviewed_by` | string | 非空审查者标识 |
 | `source_dashboard_uri` | string | 官方 Cloudflare HTTPS locator；必须回链当前 account 的 billing usage query，不得为非 Cloudflare host |
-| `billing_window_resolution_method` | string | 固定为 `cloudflare-account-billing-profile-next-bill-date` |
-| `billing_cycle_next_bill_date` | string | RFC 3339 UTC；必须来自官方 Cloudflare billing profile `next_bill_date`，且 `billing_period` 必须能由它相对 `captured_at` 推导为 latest closed billing period |
+| `billing_window_resolution_method` | string | 只允许 `cloudflare-account-billing-profile-next-bill-date` 或 `cloudflare-account-subscriptions-current-period-end` |
+| `billing_cycle_anchor_source_uri` | string | 官方 Cloudflare HTTPS locator；必须回链当前 account 的 billing-cycle anchor query，并且要与 `billing_window_resolution_method` 一致：profile method 只允许 `/client/v4/accounts/<account_id>/billing/profile`，subscriptions method 只允许 `/client/v4/accounts/<account_id>/subscriptions` |
+| `billing_cycle_anchor_artifact` | object | 必须把 attestation provenance 指向的 raw bundle 中哪份 retained artifact 才是 anchor 证据写清楚：profile method 只允许 `{ artifact_path: "billing-profile.json", field_selector: "result.next_bill_date" }`，subscriptions method 只允许 `{ artifact_path: "billing-subscriptions.json", field_selector: "result[*].current_period_end" }` |
+| `billing_cycle_next_bill_date` | string | RFC 3339 UTC；必须来自官方 Cloudflare billing-cycle anchor：billing profile `next_bill_date` 或 account subscriptions `current_period_end`；`billing_period` 必须能由它相对 `captured_at` 推导为 latest closed billing period |
 | `topology_kind` | string | 非本地拓扑标识；不得为 `local` |
 | `topology_baseline_install` | object | 至少包含 `install_id`,`installed_at`,`origin_run_uri`；必须回链当前 prod baseline `ProdInstallRecord`，且 `billing_period.start` 必须严格晚于 `installed_at` 对应 UTC 日期 |
 | `cloudflare_resources` | `CloudflareResourceSnapshot` | 生产资源快照 |
