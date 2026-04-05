@@ -1116,6 +1116,30 @@ test('cost evidence keeps the production snapshot requirement alongside pre-rele
   );
 });
 
+test('cost evidence source ids stay in sync with the evidence register', () => {
+  const definition = getL1EvidenceDefinition('EVID-COST-001');
+  assert.deepEqual(
+    definition.declared_source_ids,
+    [
+      'REQ-OPS-003',
+      'CF-WKR-015',
+      'CF-WKR-016',
+      'CF-WKR-017',
+      'CF-WKR-018',
+      'CF-WKR-019',
+      'CF-WKR-029',
+      'CF-WKR-030',
+      'CF-DO-011',
+      'CF-DO-012',
+      'CF-DO-013',
+      'CF-D1-006',
+      'CF-KV-003',
+      'CF-R2-005',
+      'CF-QUE-001',
+    ],
+  );
+});
+
 test('L1 evidence definitions keep attested generation methods in sync with the evidence register', () => {
   assert.equal(
     getL1EvidenceDefinition('EVID-CS-001').generation_method,
@@ -7558,6 +7582,18 @@ test('writeL1Evidence keeps end-to-end bundle gating fail-closed without manual 
     assert.equal(stagingEnvironmentResult?.readiness_probe?.attempt_count, 1);
     assert.equal(stagingEnvironmentResult?.deployment_identity_validation?.before_suite?.workers?.['gateway-worker']?.script_name, 'matrix-gateway-worker-staging');
     assert.match(passSummary, /readiness: ready=true, attempts=1/);
+    const passCostRoot = passResult.bundles.find((bundle) => bundle.evid_id === 'EVID-COST-001')?.evidence_root;
+    const passCostSourceIds = JSON.parse(
+      await fs.readFile(path.join(passCostRoot, 'artifacts', 'source-ids.json'), 'utf8'),
+    );
+    assert.deepEqual(
+      passCostSourceIds.declared_source_ids,
+      getL1EvidenceDefinition('EVID-COST-001').declared_source_ids,
+    );
+    assert.ok(passCostSourceIds.expanded_source_ids.includes('CF-WKR-029'));
+    assert.ok(passCostSourceIds.expanded_source_ids.includes('CF-WKR-030'));
+    assert.ok(passCostSourceIds.applicable_source_ids.includes('CF-WKR-029'));
+    assert.ok(passCostSourceIds.applicable_source_ids.includes('CF-WKR-030'));
   } finally {
     await fs.rm(fixtureParent, { recursive: true, force: true });
   }

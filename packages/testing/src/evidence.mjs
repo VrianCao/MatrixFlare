@@ -355,7 +355,7 @@ const L1_EVIDENCE_DEFINITIONS = Object.freeze([
     evidence_type: 'cost',
     generation_method: 'attested monthly dashboard snapshot + model comparison',
     required_environments: ['pre-release'],
-    declared_source_ids: ['REQ-OPS-003', 'CF-WKR-015', 'CF-WKR-016', 'CF-WKR-017', 'CF-WKR-018', 'CF-WKR-019', 'CF-DO-011', 'CF-DO-012', 'CF-DO-013', 'CF-D1-006', 'CF-KV-003', 'CF-R2-005', 'CF-QUE-001'],
+    declared_source_ids: ['REQ-OPS-003', 'CF-WKR-015', 'CF-WKR-016', 'CF-WKR-017', 'CF-WKR-018', 'CF-WKR-019', 'CF-WKR-029', 'CF-WKR-030', 'CF-DO-011', 'CF-DO-012', 'CF-DO-013', 'CF-D1-006', 'CF-KV-003', 'CF-R2-005', 'CF-QUE-001'],
     required_manual_artifacts: [
       Object.freeze({
         artifact_id: 'prod_cost_snapshot',
