@@ -357,10 +357,10 @@
 
 ### 04.01 实现公开 discovery 面
 
-- [x] 实现 `IF-PUB-001`,`IF-PUB-002`,`IF-CS-001`,`IF-CS-002`,`IF-CS-005`,`IF-CS-009`,`IF-CS-066`。
+- [x] 实现 `IF-PUB-001`,`IF-PUB-002`,`IF-CS-001`,`IF-CS-002`,`IF-CS-005`,`IF-CS-009`,`IF-CS-066`,`IF-CS-067`。
   Spec refs: `23` 3.1, `30` 4-5, `32` 3, `25` `FLOW-CS-DISCOVERY`,`FLOW-FED-METADATA-SERVE`
   产出:
-  `/.well-known`、`/versions`、`/capabilities`、`/login`、`/register/available`、registration token validity handlers。
+  `/.well-known`、`/versions`、`/capabilities`、`/login`、`/register` compatibility discovery、`/register/available`、registration token validity handlers。
   完成标准:
   discoverability truth 与当前启用能力完全一致。
   当前状态:

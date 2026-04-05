@@ -105,6 +105,8 @@ const STUB_ROUTE_MATCHERS = Object.freeze([
   { methods: ['GET'], pattern: /^\/_matrix\/client\/v3\/rooms\/[^/]+\/initialSync$/ },
   { methods: ['GET'], pattern: /^\/_matrix\/client\/v1\/auth_metadata$/ },
 ]);
+const CLIENT_REGISTER_DISCOVERY_PATTERN = /^\/_matrix\/client\/(?:r0|v1|v3)\/register$/;
+const CLIENT_REGISTER_AVAILABILITY_PATTERN = /^\/_matrix\/client\/(?:r0|v1|v3)\/register\/available$/;
 
 function jsonResponse(payload, status = 200, headers = {}) {
   return new Response(JSON.stringify(payload), {
@@ -1691,6 +1693,21 @@ function handleRegistrationTokenValidity(url, env) {
   const token = url.searchParams.get('token') ?? '';
   return jsonResponse({
     valid: getRegistrationTokenSet(env).has(token),
+  });
+}
+
+function handleRegisterDiscovery(env) {
+  if (!isRegistrationEnabled(env)) {
+    return matrixErrorResponse(403, 'M_FORBIDDEN', 'Registration is currently disabled', null, {
+      'cache-control': 'no-store',
+    });
+  }
+  return jsonResponse({
+    flows: [{
+      stages: ['m.login.dummy'],
+    }],
+  }, 200, {
+    'cache-control': 'no-store',
   });
 }
 
@@ -4854,11 +4871,14 @@ async function handleRequest(request, env) {
           'cache-control': 'public, max-age=60',
         });
       }
-      if (pathname === '/_matrix/client/v3/register/available' && method === 'GET') {
+      if (CLIENT_REGISTER_AVAILABILITY_PATTERN.test(pathname) && method === 'GET') {
         return handleRegisterAvailable(url, env);
       }
       if (pathname === '/_matrix/client/v1/register/m.login.registration_token/validity' && method === 'GET') {
         return handleRegistrationTokenValidity(url, env);
+      }
+      if (CLIENT_REGISTER_DISCOVERY_PATTERN.test(pathname) && method === 'GET') {
+        return handleRegisterDiscovery(env);
       }
       if (pathname === '/_matrix/client/v3/login' && method === 'POST') {
         return handleLogin(request, env);
