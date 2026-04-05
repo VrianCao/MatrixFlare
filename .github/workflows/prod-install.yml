@@ -117,7 +117,7 @@ jobs:
             node packages/testing/src/cli.mjs prod-install
             --working-root "${{ steps.paths.outputs.state_root }}/install"
             --output "${{ steps.paths.outputs.record }}"
-            --release-commit-sha "${{ steps.paths.outputs.release_commit_sha }}"
+            --release-commit-sha "${{ steps.resolve_release_commit.outputs.release_commit_sha }}"
             --install-id "gha-prod-install-${{ steps.paths.outputs.run_timestamp }}-${{ github.run_id }}-${{ github.run_attempt }}"
           )
           if [ -n "${{ inputs.workers_subdomain }}" ]; then

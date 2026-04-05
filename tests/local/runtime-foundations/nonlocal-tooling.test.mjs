@@ -3523,6 +3523,8 @@ test('production workflow YAMLs stay aligned with the prod automation CLI contra
   assertStepOrder(prodInstallWorkflow, 'paths', 'id: checkout_release', 'prod-install must define raw-artifact paths before checkout');
   assert.match(prodInstallWorkflow, /id:\s+require_secrets[\s\S]*?continue-on-error:\s+true/u, 'prod-install secret preflight must fail closed only after raw state can be preserved');
   assert.match(prodInstallWorkflow, /id:\s+resolve_release_commit[\s\S]*?continue-on-error:\s+true/u, 'prod-install must preserve raw state when release commit resolution fails');
+  assert.match(prodInstallWorkflow, /--release-commit-sha "\$\{\{\s*steps\.resolve_release_commit\.outputs\.release_commit_sha\s*\}\}"/u, 'prod-install must pass the resolved release commit sha into the CLI contract');
+  assert.doesNotMatch(prodInstallWorkflow, /--release-commit-sha "\$\{\{\s*steps\.paths\.outputs\.release_commit_sha\s*\}\}"/u, 'prod-install must not source release_commit_sha from unrelated path outputs');
   assert.match(prodInstallWorkflow, /RUNNER_TEMP/u, 'prod-install raw blocker artifacts must live outside the checkout-cleaned workspace');
   assert.match(prodInstallWorkflow, /secret-check\.json/u, 'prod-install must persist a machine-readable secret blocker artifact');
   assert.match(prodInstallWorkflow, /dispatch-request\.json/u, 'prod-install raw state must retain the requested release inputs');
