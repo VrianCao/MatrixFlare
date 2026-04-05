@@ -3523,6 +3523,11 @@ test('production workflow YAMLs stay aligned with the prod automation CLI contra
   assert.match(releaseCandidateWorkflow, /--ci-integration-attestation/u, 'release-candidate workflow must require ci-integration attestation input');
   assert.match(releaseCandidateWorkflow, /--staging-attestation/u, 'release-candidate workflow must require staging attestation input');
   assert.match(releaseCandidateWorkflow, /--pre-release-attestation/u, 'release-candidate workflow must require pre-release attestation input');
+  assert.match(releaseCandidateWorkflow, /id:\s+source_run[\s\S]*?continue-on-error:\s+true/u, 'release-candidate must preserve raw state when source-run metadata resolution fails');
+  assert.match(releaseCandidateWorkflow, /id:\s+require_source_match[\s\S]*?continue-on-error:\s+true/u, 'release-candidate must preserve raw state when source-run head validation fails');
+  assert.match(releaseCandidateWorkflow, /id:\s+download_reviewed_attestations[\s\S]*?continue-on-error:\s+true/u, 'release-candidate must preserve raw state when attestation download fails');
+  assert.match(releaseCandidateWorkflow, /id:\s+write_candidate[\s\S]*?continue-on-error:\s+true/u, 'release-candidate must preserve raw state before failing closed');
+  assert.match(releaseCandidateWorkflow, /prod-release-candidate-raw-state-/u, 'release-candidate must upload a dedicated raw-state artifact');
 
   assert.match(promoteProdWorkflow, /node packages\/testing\/src\/cli\.mjs prod-promote/u, 'promote-prod workflow must invoke the prod-promote CLI entry');
   assert.match(promoteProdWorkflow, /\.github\/workflows\/release-candidate\.yml/u, 'promote-prod workflow must require candidate runs from release-candidate.yml');
@@ -3532,6 +3537,12 @@ test('production workflow YAMLs stay aligned with the prod automation CLI contra
   assert.match(promoteProdWorkflow, /--promotion-id/u, 'promote-prod workflow must persist an explicit promotion id');
   assert.doesNotMatch(promoteProdWorkflow, /--install-record/u, 'promote-prod workflow must not use the superseded install-record flag');
   assert.doesNotMatch(promoteProdWorkflow, /workers_subdomain:/u, 'promote-prod must not reintroduce manual workers_subdomain input friction');
+  assert.match(promoteProdWorkflow, /id:\s+runs[\s\S]*?continue-on-error:\s+true/u, 'promote-prod must preserve raw state when upstream run resolution fails');
+  assert.match(promoteProdWorkflow, /id:\s+download_candidate[\s\S]*?continue-on-error:\s+true/u, 'promote-prod must preserve raw state when candidate download fails');
+  assert.match(promoteProdWorkflow, /id:\s+download_baseline[\s\S]*?continue-on-error:\s+true/u, 'promote-prod must preserve raw state when baseline download fails');
+  assert.match(promoteProdWorkflow, /id:\s+candidate[\s\S]*?continue-on-error:\s+true/u, 'promote-prod must preserve raw state when candidate sha resolution fails');
+  assert.match(promoteProdWorkflow, /id:\s+checkout_candidate[\s\S]*?continue-on-error:\s+true/u, 'promote-prod must preserve raw state when candidate checkout fails');
+  assert.match(promoteProdWorkflow, /id:\s+require_candidate_checkout_match[\s\S]*?continue-on-error:\s+true/u, 'promote-prod must preserve raw state when candidate checkout validation fails');
   assert.match(promoteProdWorkflow, /id:\s+promote_candidate[\s\S]*?continue-on-error:\s+true/u, 'promote-prod must preserve raw state before failing closed');
   assert.match(promoteProdWorkflow, /prod-promote-raw-state-/u, 'promote-prod must upload a dedicated raw-state artifact');
 
@@ -3542,6 +3553,8 @@ test('production workflow YAMLs stay aligned with the prod automation CLI contra
   assert.equal((rollbackProdWorkflow.match(/uses:\s+actions\/checkout@v4/gu) ?? []).length, 1, 'rollback-prod must not perform a second checkout to the promoted commit');
   assert.doesNotMatch(rollbackProdWorkflow, /Resolve promotion commit sha/u, 'rollback-prod must not require a promotion commit checkout precondition');
   assert.doesNotMatch(rollbackProdWorkflow, /workers_subdomain:/u, 'rollback-prod must not reintroduce manual workers_subdomain input friction');
+  assert.match(rollbackProdWorkflow, /id:\s+promotion_run[\s\S]*?continue-on-error:\s+true/u, 'rollback-prod must preserve raw state when source promotion metadata resolution fails');
+  assert.match(rollbackProdWorkflow, /id:\s+download_promotion_record[\s\S]*?continue-on-error:\s+true/u, 'rollback-prod must preserve raw state when promotion record download fails');
   assert.match(rollbackProdWorkflow, /id:\s+execute_rollback[\s\S]*?continue-on-error:\s+true/u, 'rollback-prod must preserve raw state before failing closed');
   assert.match(rollbackProdWorkflow, /prod-rollback-raw-state-/u, 'rollback-prod must upload a dedicated raw-state artifact');
 

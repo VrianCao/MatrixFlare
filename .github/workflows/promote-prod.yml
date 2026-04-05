@@ -44,8 +44,33 @@ jobs:
           test -n "$CLOUDFLARE_API_TOKEN"
           test -n "$MATRIX_PROD_SECRET_SEED"
 
+      - name: Define promote paths
+        id: paths
+        shell: bash
+        run: |
+          run_timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+          workspace_root=".tmp/github/promote-prod"
+          state_root="${workspace_root}/state"
+          download_root="${workspace_root}/downloaded"
+          artifact_root="${workspace_root}/artifacts"
+          record_key="gha/${{ github.run_id }}/${{ github.run_attempt }}/prod/${run_timestamp}/prod-promotion-record.json"
+          artifact_name="prod-promotion-record-${run_timestamp}-${{ github.run_id }}-${{ github.run_attempt }}"
+          raw_state_artifact_name="prod-promote-raw-state-${run_timestamp}-${{ github.run_id }}-${{ github.run_attempt }}"
+          echo "run_timestamp=${run_timestamp}" >> "$GITHUB_OUTPUT"
+          echo "workspace_root=${workspace_root}" >> "$GITHUB_OUTPUT"
+          echo "state_root=${state_root}" >> "$GITHUB_OUTPUT"
+          echo "download_root=${download_root}" >> "$GITHUB_OUTPUT"
+          echo "artifact_root=${artifact_root}" >> "$GITHUB_OUTPUT"
+          echo "record=${artifact_root}/prod-promotion-record.json" >> "$GITHUB_OUTPUT"
+          echo "record_key=${record_key}" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=${artifact_name}" >> "$GITHUB_OUTPUT"
+          echo "raw_state_artifact_name=${raw_state_artifact_name}" >> "$GITHUB_OUTPUT"
+          mkdir -p "$workspace_root" "$state_root" "$download_root" "$artifact_root"
+          printf '{"run_timestamp":"%s","workflow":"promote-prod"}\n' "$run_timestamp" > "${state_root}/raw-state-metadata.json"
+
       - name: Resolve candidate and baseline runs
         id: runs
+        continue-on-error: true
         uses: actions/github-script@v7
         env:
           CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
@@ -75,31 +100,10 @@ jobs:
             core.setOutput('baseline_artifact_prefix', baseline.data.path === '.github/workflows/prod-install.yml' ? 'prod-install-record' : 'prod-promotion-record');
             core.setOutput('baseline_record_name', baseline.data.path === '.github/workflows/prod-install.yml' ? 'prod-install-record.json' : 'prod-promotion-record.json');
 
-      - name: Define promote paths
-        id: paths
-        shell: bash
-        run: |
-          run_timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-          workspace_root=".tmp/github/promote-prod"
-          state_root="${workspace_root}/state"
-          download_root="${workspace_root}/downloaded"
-          artifact_root="${workspace_root}/artifacts"
-          record_key="gha/${{ github.run_id }}/${{ github.run_attempt }}/prod/${run_timestamp}/prod-promotion-record.json"
-          artifact_name="prod-promotion-record-${run_timestamp}-${{ github.run_id }}-${{ github.run_attempt }}"
-          raw_state_artifact_name="prod-promote-raw-state-${run_timestamp}-${{ github.run_id }}-${{ github.run_attempt }}"
-          echo "run_timestamp=${run_timestamp}" >> "$GITHUB_OUTPUT"
-          echo "workspace_root=${workspace_root}" >> "$GITHUB_OUTPUT"
-          echo "state_root=${state_root}" >> "$GITHUB_OUTPUT"
-          echo "download_root=${download_root}" >> "$GITHUB_OUTPUT"
-          echo "artifact_root=${artifact_root}" >> "$GITHUB_OUTPUT"
-          echo "record=${artifact_root}/prod-promotion-record.json" >> "$GITHUB_OUTPUT"
-          echo "record_key=${record_key}" >> "$GITHUB_OUTPUT"
-          echo "artifact_name=${artifact_name}" >> "$GITHUB_OUTPUT"
-          echo "raw_state_artifact_name=${raw_state_artifact_name}" >> "$GITHUB_OUTPUT"
-          mkdir -p "$workspace_root" "$state_root" "$download_root" "$artifact_root"
-          printf '{"run_timestamp":"%s","workflow":"promote-prod"}\n' "$run_timestamp" > "${state_root}/raw-state-metadata.json"
-
       - name: Download release candidate
+        id: download_candidate
+        if: steps.runs.outcome == 'success'
+        continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           github-token: ${{ github.token }}
@@ -110,6 +114,9 @@ jobs:
           path: ${{ steps.paths.outputs.download_root }}/candidate
 
       - name: Download production baseline record
+        id: download_baseline
+        if: steps.runs.outcome == 'success'
+        continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           github-token: ${{ github.token }}
@@ -121,6 +128,8 @@ jobs:
 
       - name: Resolve candidate commit sha
         id: candidate
+        if: steps.download_candidate.outcome == 'success'
+        continue-on-error: true
         shell: bash
         run: |
           candidate_manifest="${{ steps.paths.outputs.download_root }}/candidate/prod-release-candidate.json"
@@ -129,16 +138,23 @@ jobs:
           echo "release_commit_sha=${candidate_commit_sha}" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v4
+        id: checkout_candidate
+        if: steps.candidate.outcome == 'success'
+        continue-on-error: true
         with:
           ref: ${{ steps.candidate.outputs.release_commit_sha }}
 
       - name: Require candidate checkout match
+        id: require_candidate_checkout_match
+        if: steps.checkout_candidate.outcome == 'success'
+        continue-on-error: true
         shell: bash
         run: |
           test "$(git rev-parse HEAD)" = "${{ steps.candidate.outputs.release_commit_sha }}"
 
       - name: Promote reviewed candidate into production
         id: promote_candidate
+        if: steps.download_baseline.outcome == 'success' && steps.candidate.outcome == 'success' && steps.checkout_candidate.outcome == 'success' && steps.require_candidate_checkout_match.outcome == 'success'
         continue-on-error: true
         run: |
           node packages/testing/src/cli.mjs prod-promote \
@@ -183,6 +199,30 @@ jobs:
         if: always()
         shell: bash
         run: |
+          if [ "${{ steps.runs.outcome }}" != "success" ]; then
+            echo "Resolving candidate/baseline runs failed after raw state preservation." >&2
+            exit 1
+          fi
+          if [ "${{ steps.download_candidate.outcome }}" != "success" ]; then
+            echo "Downloading release candidate artifact failed after raw state preservation." >&2
+            exit 1
+          fi
+          if [ "${{ steps.download_baseline.outcome }}" != "success" ]; then
+            echo "Downloading production baseline artifact failed after raw state preservation." >&2
+            exit 1
+          fi
+          if [ "${{ steps.candidate.outcome }}" != "success" ]; then
+            echo "Resolving candidate commit sha failed after raw state preservation." >&2
+            exit 1
+          fi
+          if [ "${{ steps.checkout_candidate.outcome }}" != "success" ]; then
+            echo "Checking out candidate commit failed after raw state preservation." >&2
+            exit 1
+          fi
+          if [ "${{ steps.require_candidate_checkout_match.outcome }}" != "success" ]; then
+            echo "Candidate checkout/manifest match failed after raw state preservation." >&2
+            exit 1
+          fi
           if [ "${{ steps.promote_candidate.outcome }}" != "success" ]; then
             echo "Promote reviewed candidate failed after raw state preservation." >&2
             exit 1
