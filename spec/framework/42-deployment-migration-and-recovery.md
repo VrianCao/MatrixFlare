@@ -67,7 +67,8 @@
 * `promote-prod` 在消费 baseline record 与 reviewed candidate manifest 前，必须验证它们的 `origin_repository` / `source_repository` 与当前仓库一致，并验证当前 checked-out git `HEAD` 等于 `ReleaseCandidateManifest.release_commit_sha`；否则必须 fail-closed。
 * `rollback-prod` 只允许消费上一轮 `ProdPromotionRecord` 中已记录的 rollback handle；若 source promotion 带 DO migration 或没有可恢复的 previous version identity，则 workflow 必须 fail-closed，并把“需要 forward-fix / restore path”写入 rollback artifact，而不是伪造“一键回滚”。在真正 replay rollback handle 前，还必须先验证当前 Cloudflare prod deployment identity 仍等于该 `ProdPromotionRecord.current_deployment_identity`；若 prod 已漂移，则必须 fail-closed。
 * production automation 的可审计基线固定为：`ReleaseCandidateManifest`、`ProdInstallRecord`、`ProdPromotionRecord`、`ProdRollbackRecord` 与 `ProdCostSnapshotAttestation`。这些工件都必须回链 GitHub run identity 与 Cloudflare deployment identity。
-* `prod-install`、`promote-prod`、`rollback-prod`、`prod-cost-monthly` 即使最终 fail-closed，也必须尽可能先把 raw state / blocker artifact 上传为 workflow artifact；`prod-cost-monthly` 还必须先把 raw cost bundle 上传到 immutable R2，再允许后续 provenance / attestation 阶段失败。
+* `release-candidate`、`prod-install`、`promote-prod`、`rollback-prod`、`prod-cost-monthly` 即使最终 fail-closed，也必须尽可能先把 raw state / blocker artifact 上传为 workflow artifact；`prod-cost-monthly` 还必须先把 raw cost bundle 上传到 immutable R2，再允许后续 provenance / attestation 阶段失败。
+* 若 production automation workflow 仍是 newly-added definition，尚未进入 repository default branch，则 same-head remote proof 可能会被 GitHub 官方 `workflow_dispatch` 默认分支限制阻断；此时仓库必须把 blocker 诚实写回 `TODO.md` / 对应 `OQ-ID`，而不是把“workflow 文件已存在于 feature branch”误写成“same-head remote proof 已可执行”。
 
 ## 3. Backward Compatibility Rules
 
