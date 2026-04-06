@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
+import { createStoredFilterEnvelope } from '../../../packages/runtime-core/src/client-domain.mjs';
 import { createGatewayPhase04Rig } from './support.mjs';
 
 async function expectMatrixError(response, status, errcode) {
@@ -49,6 +50,90 @@ async function syncRequest(rig, accessToken, query = '') {
   assert.equal(response.status, 200);
   return response.json();
 }
+
+test('Phase 05 browser-origin /sync keeps auth, CORS, preflight, and long-poll truth aligned', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const registration = await registerUser(rig, {
+    username: 'browser-sync-user',
+    password: 'phase05-browser-sync-password',
+    deviceId: 'BROWSERSYNC',
+  });
+
+  const browserOrigin = 'https://app.element.io';
+  const browserSyncWithoutToken = await rig.gatewayFetch('/_matrix/client/v3/sync?timeout=0', {
+    headers: {
+      origin: browserOrigin,
+    },
+  });
+  await expectMatrixError(browserSyncWithoutToken, 401, 'M_MISSING_TOKEN');
+  assert.equal(browserSyncWithoutToken.headers.get('access-control-allow-origin'), browserOrigin);
+  assert.match(browserSyncWithoutToken.headers.get('vary') ?? '', /Origin/i);
+
+  const browserSync = await rig.gatewayFetch('/_matrix/client/v3/sync?timeout=0', {
+    headers: {
+      ...rig.authHeaders(registration.access_token),
+      origin: browserOrigin,
+    },
+  });
+  assert.equal(browserSync.status, 200);
+  assert.equal(browserSync.headers.get('access-control-allow-origin'), browserOrigin);
+  assert.match(browserSync.headers.get('vary') ?? '', /Origin/i);
+  const browserSyncBody = await browserSync.json();
+  assert.equal(typeof browserSyncBody.next_batch, 'string');
+
+  const browserSyncPreflight = await rig.gatewayFetch('/_matrix/client/v3/sync?timeout=0', {
+    method: 'OPTIONS',
+    headers: {
+      origin: browserOrigin,
+      'access-control-request-method': 'GET',
+      'access-control-request-headers': 'authorization',
+    },
+  });
+  assert.equal(browserSyncPreflight.status, 204);
+  assert.equal(browserSyncPreflight.headers.get('access-control-allow-origin'), browserOrigin);
+  assert.equal(browserSyncPreflight.headers.get('access-control-allow-headers'), 'authorization');
+  assert.match(browserSyncPreflight.headers.get('access-control-allow-methods') ?? '', /\bGET\b/);
+  assert.match(browserSyncPreflight.headers.get('vary') ?? '', /Origin/i);
+  assert.match(browserSyncPreflight.headers.get('vary') ?? '', /Access-Control-Request-Headers/i);
+
+  const pendingBrowserSync = rig.gatewayFetch(
+    `/_matrix/client/v3/sync?since=${encodeURIComponent(browserSyncBody.next_batch)}&timeout=1000`,
+    {
+      headers: {
+        ...rig.authHeaders(registration.access_token),
+        origin: browserOrigin,
+      },
+    },
+  );
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const wakeWrite = await rig.gatewayFetch(
+    `/_matrix/client/v3/user/${encodeURIComponent('@browser-sync-user:matrix.example.test')}/account_data/com.example.browser.syncwake`,
+    {
+      method: 'PUT',
+      headers: rig.authHeaders(registration.access_token),
+      json: {
+        tick: 1,
+      },
+    },
+  );
+  assert.equal(wakeWrite.status, 200);
+  const browserLongPollResponse = await pendingBrowserSync;
+  assert.equal(browserLongPollResponse.status, 200);
+  assert.equal(browserLongPollResponse.headers.get('access-control-allow-origin'), browserOrigin);
+  assert.match(browserLongPollResponse.headers.get('vary') ?? '', /Origin/i);
+  const browserLongPollBody = await browserLongPollResponse.json();
+  assert.notEqual(browserLongPollBody.next_batch, browserSyncBody.next_batch);
+  assert.deepEqual(browserLongPollBody.account_data?.events, [
+    {
+      type: 'com.example.browser.syncwake',
+      content: {
+        tick: 1,
+      },
+    },
+  ]);
+});
 
 function roomPath(roomId, suffix = '') {
   return `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}${suffix}`;
@@ -923,6 +1008,72 @@ test('Phase 05 account data, filters, sync waiting, and room account-data deltas
   const wokenSync = await wokenSyncResponse.json();
   assert.equal('account_data' in wokenSync, false);
   assert.notEqual(wokenSync.next_batch, incrementalSync.next_batch);
+});
+
+test('Phase 05 /sync since tokens remain valid when the caller switches between inline and stored filters', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, {
+    username: 'alice',
+    password: 'correct horse battery staple',
+    deviceId: 'ALICEPHONE',
+  });
+
+  const inlineFilter = {
+    room: {
+      state: {
+        lazy_load_members: true,
+      },
+      timeline: {
+        limit: 8,
+      },
+    },
+  };
+  const inlineSync = await syncRequest(
+    rig,
+    alice.access_token,
+    `filter=${encodeURIComponent(JSON.stringify(inlineFilter))}`,
+  );
+
+  const storedFilter = createStoredFilterEnvelope(inlineFilter);
+  const storeFilter = await rig.gatewayFetch('/_matrix/client/v3/user/@alice:matrix.example.test/filter', {
+    method: 'POST',
+    headers: rig.authHeaders(alice.access_token),
+    json: inlineFilter,
+  });
+  assert.equal(storeFilter.status, 200);
+  assert.deepEqual(await storeFilter.json(), {
+    filter_id: storedFilter.filter_id,
+  });
+
+  const storedSync = await syncRequest(
+    rig,
+    alice.access_token,
+    `since=${encodeURIComponent(inlineSync.next_batch)}&filter=${encodeURIComponent(storedFilter.filter_id)}`,
+  );
+  assert.equal(typeof storedSync.next_batch, 'string');
+
+  const inlineRetry = await syncRequest(
+    rig,
+    alice.access_token,
+    `since=${encodeURIComponent(storedSync.next_batch)}&filter=${encodeURIComponent(JSON.stringify(inlineFilter))}`,
+  );
+  assert.equal(typeof inlineRetry.next_batch, 'string');
+
+  const broaderFilter = {
+    room: {
+      timeline: {
+        limit: 16,
+      },
+    },
+  };
+  const switchedFilterSync = await syncRequest(
+    rig,
+    alice.access_token,
+    `since=${encodeURIComponent(inlineRetry.next_batch)}&filter=${encodeURIComponent(JSON.stringify(broaderFilter))}`,
+  );
+  assert.equal(typeof switchedFilterSync.next_batch, 'string');
 });
 
 test('Phase 05 room fanout projections surface timeline and unread counts through /sync', async (t) => {

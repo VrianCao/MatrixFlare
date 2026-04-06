@@ -556,10 +556,69 @@ test('Phase 04 session lifecycle covers register, login, refresh, logout, whoami
       'm.3pid_changes': { enabled: false },
       'm.get_login_token': { enabled: false },
       'm.profile_fields': { enabled: true },
+      'm.room_versions': {
+        default: '12',
+        available: {
+          '11': 'stable',
+          '12': 'stable',
+        },
+      },
       'm.set_avatar_url': { enabled: true },
       'm.set_displayname': { enabled: true },
     },
   });
+
+  const browserOrigin = 'https://app.element.io';
+  const browserCapabilitiesWithoutToken = await rig.gatewayFetch('/_matrix/client/v3/capabilities', {
+    headers: {
+      origin: browserOrigin,
+    },
+  });
+  await expectMatrixError(browserCapabilitiesWithoutToken, 401, 'M_MISSING_TOKEN');
+  assert.equal(browserCapabilitiesWithoutToken.headers.get('access-control-allow-origin'), browserOrigin);
+  assert.match(browserCapabilitiesWithoutToken.headers.get('vary') ?? '', /Origin/i);
+
+  const browserCapabilities = await rig.gatewayFetch('/_matrix/client/v3/capabilities', {
+    headers: {
+      ...rig.authHeaders(registration.access_token),
+      origin: browserOrigin,
+    },
+  });
+  assert.equal(browserCapabilities.status, 200);
+  assert.equal(browserCapabilities.headers.get('access-control-allow-origin'), browserOrigin);
+  assert.match(browserCapabilities.headers.get('vary') ?? '', /Origin/i);
+  assert.deepEqual(await browserCapabilities.json(), {
+    capabilities: {
+      'm.change_password': { enabled: true },
+      'm.3pid_changes': { enabled: false },
+      'm.get_login_token': { enabled: false },
+      'm.profile_fields': { enabled: true },
+      'm.room_versions': {
+        default: '12',
+        available: {
+          '11': 'stable',
+          '12': 'stable',
+        },
+      },
+      'm.set_avatar_url': { enabled: true },
+      'm.set_displayname': { enabled: true },
+    },
+  });
+
+  const browserCapabilitiesPreflight = await rig.gatewayFetch('/_matrix/client/v3/capabilities', {
+    method: 'OPTIONS',
+    headers: {
+      origin: browserOrigin,
+      'access-control-request-method': 'GET',
+      'access-control-request-headers': 'authorization',
+    },
+  });
+  assert.equal(browserCapabilitiesPreflight.status, 204);
+  assert.equal(browserCapabilitiesPreflight.headers.get('access-control-allow-origin'), browserOrigin);
+  assert.equal(browserCapabilitiesPreflight.headers.get('access-control-allow-headers'), 'authorization');
+  assert.match(browserCapabilitiesPreflight.headers.get('access-control-allow-methods') ?? '', /\bGET\b/);
+  assert.match(browserCapabilitiesPreflight.headers.get('vary') ?? '', /Origin/i);
+  assert.match(browserCapabilitiesPreflight.headers.get('vary') ?? '', /Access-Control-Request-Headers/i);
 
   const whoAmI = await rig.gatewayFetch('/_matrix/client/v3/account/whoami', {
     headers: rig.authHeaders(registration.access_token),

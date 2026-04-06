@@ -51,8 +51,8 @@
 
 对浏览器可达的 Matrix 公开入口，`gateway-worker` 还必须满足：
 
-* `/.well-known/matrix/client`、`/_matrix/client/versions` 与 `/_matrix/client/*` 在收到合法 browser `Origin` 时，实际响应必须返回一致的 CORS allow-origin 语义，避免 Web client 因跨域读取被阻断。
-* 对这些同一路由族所需的 `OPTIONS` preflight，`gateway-worker` 必须直接返回 `2xx/204` CORS 响应；不得把预检请求落到 route-specific `M_UNRECOGNIZED` 或 plain-text `404`。
+* `/.well-known/matrix/client`、`/_matrix/client/versions`、`/_matrix/client/*`，以及 browser-readable 的 `/_matrix/media/*` 兼容 surface，在收到合法 browser `Origin` 时都必须返回一致的 CORS allow-origin 语义，避免 Web client 因跨域读取被阻断。
+* 对这些路由族所需的 `OPTIONS` preflight，`gateway-worker` 必须直接返回 `2xx/204` CORS 响应；不得把预检请求落到 route-specific `M_UNRECOGNIZED`、plain-text `404` 或 auth gate。
 * 该要求只适用于公开 Matrix client ingress；不得借此把受保护的 `/_ops` 或其它非 Matrix 管理面扩大成 browser-readable public surface。
 * `GET /_matrix/client/versions` 必须返回 pinned Matrix `v1.17`，并同时保留当前 browser-client 兼容所需的 cumulative stable version ladder：至少包括 `r0.6.1` 与 `v1.1` 到 `v1.17`。只返回最新 pinned stable version 会让当前官方 browser client baseline 把 homeserver 误判为“不满足最低 API 版本”。
 * 该 ladder 的语义受 [DEC-0007](/root/Matrix/spec/decisions/DEC-0007.md) 约束：它是 browser compatibility discovery contract，而不是对全部历史 stable optional surfaces 的无条件启用声明；stub-only / unsupported truth 仍由对应 `MX-*`、`IF-*`、`TEST-*`、`EVID-*` 与 `DEC-0001` 控制。
@@ -124,8 +124,9 @@
 
 * `GET /_matrix/client/r0/register`、`GET /_matrix/client/v1/register` 与 `GET /_matrix/client/v3/register` 都必须存在，作为 registration discovery compatibility surface 返回当前真实支持的 registration UIA stages；当 homeserver 当前不允许 registration 时，必须返回 `403 M_FORBIDDEN`。
 * `GET /_matrix/client/*/register` 只能宣告当前真实实现的 registration UIA stage；当前基线只允许宣告 `m.login.dummy`。registration token policy 若存在，必须继续由 `POST /register` 的 policy enforcement 与 `GET /register/m.login.registration_token/validity` 真值承担，不得被误宣告成已实现的 UIA stage。
+* Matrix `v1.17` 对 application-service `m.login.application_service` register semantics（包括 `inhibit_login = true`）另有专门要求；当前仓库尚未定义 `gateway-worker` 可用的 appservice token validation / namespace ownership contract，因此该 flow 在 [`OQ-0008`](/root/Matrix/spec/open-questions/OQ-0008.md) 关闭前不得被 `GET /register` 宣告为已支持，也不得被隐式视为“与普通注册共用同一 truth”。
 * `GET /_matrix/client/*/register` 不得被 shared edge cache、browser cache 或其它跨请求缓存当作可陈旧结果复用；响应必须使用 `no-store` 语义。
-* `POST /_matrix/client/*/register` 在缺少或未完成 UIA 时，必须优先返回 route-bound `401` challenge，而不是先因为缺少 `username`、`password` 或 `registration_token` 之类的请求字段返回 `400/403`；这条顺序约束是为了兼容先用空请求探测 registration options 的客户端。
+* 对普通 UIA registration path，`POST /_matrix/client/*/register` 在缺少或未完成 UIA 时，必须优先返回 route-bound `401` challenge，而不是先因为缺少 `username`、`password` 或 `registration_token` 之类的请求字段返回 `400/403`；这条顺序约束是为了兼容先用空请求探测 registration options 的客户端。该规则不自动覆盖 Matrix `v1.17` 单独定义的 `m.login.application_service` special case。
 * `GET /_matrix/client/*/register/available` 必须存在，并只根据当前 registration policy、MXID grammar 与本地账户真值裁决可用性；不得读取可陈旧目录索引替代 `DATA-USER-017`。
 * `GET /_matrix/client/*/register/available` 不得被 shared edge cache、browser cache 或其它跨请求缓存当作可陈旧结果复用；响应必须使用 `no-store` 语义，最多只允许同一请求链路内的局部 memoization。
 * `GET /_matrix/client/v1/register/m.login.registration_token/validity` 必须存在；当 homeserver 当前不允许 registration 时，必须返回 `403 M_FORBIDDEN`；否则必须返回 `200 { valid: boolean }`，并对未知或当前无效 token 返回 `valid = false`。
@@ -141,6 +142,7 @@
 * `GET /_matrix/client/r0/login`、`GET /_matrix/client/v1/login` 与 `GET /_matrix/client/v3/login` 都必须始终可用，并由 `IF-CS-005` 输出当前真实支持的 login flow 集合。
 * `L1-L3` 基线下，`GET /login` 必须宣告 `m.login.password`；只有在 `MX-CS-003` 真正启用且 dedicated contracts 完整落地后，才允许宣告 `m.login.sso`。
 * `m.login.token` 只有在服务器同时支持对应的 login-token consumption 语义时才允许出现在 `GET /login`；当前默认关闭 `MX-CS-003` 时不得宣告。
+* Matrix `v1.17` 对 `m.login.application_service` 规定了独立的 legacy-auth compatibility 语义；当前仓库由于 appservice client-auth contract 尚未闭合（见 [`OQ-0008`](/root/Matrix/spec/open-questions/OQ-0008.md)），`GET /login` 不得宣告该 flow，且 `POST /login` 的 appservice path 不得被假装成普通 password login 的变体。
 * `POST /_matrix/client/r0/login`、`POST /_matrix/client/v1/login` 与 `POST /_matrix/client/v3/login` 都必须收敛到同一 password-login 真值，不得因 alias 不同而漂移成功条件、错误模型或 session/device 副作用。
 * `POST /login` 若收到未在 `GET /login` 中宣告的 login type，必须按 Matrix `v1.17` core login 规则返回 `400` + `M_UNKNOWN`，不得把“关闭的 flow”做成节点间漂移的任意错误。
 * `POST /login` 对本地 password flow 的认证真值必须来自 `DATA-USER-017.password_hash_or_null` 与 `password_login_enabled`；不得绕过 `UserDO` 在 Worker 内直接验密。
@@ -204,6 +206,7 @@
 * 当 `MX-CS-005` 默认关闭时，`GET /_matrix/client/*/capabilities` 必须显式返回 `m.3pid_changes.enabled = false`，避免客户端按“未列出即默认可改”误判。
 * 当 `MX-CS-003` 默认关闭时，`GET /_matrix/client/*/capabilities` 必须显式返回 `m.get_login_token.enabled = false`。
 * `m.profile_fields`、`m.set_avatar_url`、`m.set_displayname`、room versions 等 capability 不得“宣称支持但写路径拒绝”。
+* `GET /_matrix/client/*/capabilities` 在 `L1-L3` 下必须显式返回 `m.room_versions`，且至少包含 `default = 12` 与 `available.{11,12} = stable`。省略该 capability 会让当前 browser client 回退到 legacy room-version 默认值，并把新建房间错误地请求为 room version `1`。
 * stored filters 的权威表是 `DATA-USER-014`。
 * filter 创建时必须按 [22-data-consistency-and-routing.md](/root/Matrix/spec/framework/22-data-consistency-and-routing.md) 的非事件 JSON canonicalization 规则处理 JSON，再生成稳定 hash 和 `filter_id`；`filter_id` 不得以 `{` 开头。
 * `GET /_matrix/client/*/sync` 的 `filter` 查询参数必须按首字符解释：若首字符是 `{`，则视为 inline JSON filter string；否则视为此前创建的 stored `filter_id`。
@@ -317,10 +320,14 @@
 ### 6.3 关键规则
 
 * `/keys/claim` 必须保证 one-time key 至多返回一次。引用：`REQ-ARCH-011`,`DATA-USER-004`。
+* `GET /_matrix/client/*/keys/changes` 必须存在，并返回 `from` 与 `to` 两个 `/sync` token 之间观察到的 device-list 变化；两者都必须是当前认证用户且当前设备签发的合法 sync token，且 `from` 不得晚于 `to`。
+* `GET /_matrix/client/*/keys/changes` 的 `changed` / `left` 真值必须直接来自 `DATA-USER-010` 中的 `device_state` 用户流增量，而不是维护一套独立的 device-list change cursor；同一 `{from,to}` 重试必须稳定返回同一结果。
 * fallback key 可以重复返回直至被替换或按协议标记失效，但它的使用状态必须进入 `/sync`。
 * `POST /_matrix/client/*/keys/device_signing/upload` 对普通 client 必须遵循 Matrix `v1.17` 的 conditional UIA 语义：首次 master key 上传可免 UIA，完全等价的 key-set 重放可免 UIA，其余 regular-client key-set 变更必须走 route-bound UIA。
 * `POST /_matrix/client/*/keys/signatures/upload` 只允许向当前 homeserver 已知的 device key / cross-signing object 追加与该 object 主体一致的 signatures；任何 signed JSON object 若与既有主体不匹配，必须返回 deterministic per-key failure，不得 silent overwrite。
 * 任何设备 key 或 cross-signing 变更都必须生成 `device_lists` 增量。
+* `GET /_matrix/client/*/keys/changes` 的 `changed` 只允许包含当前仍与调用方共享至少一个启用 `m.room.encryption` 的房间、且在 `from` 与 `to` 之间发生过 device-list 真值变化的用户；本地实现对其它本地用户的这类变化必须 fanout 到共享加密房间用户的 `DATA-USER-010.device_state` 增量。
+* `GET /_matrix/client/*/keys/changes` 的 `left` 只允许包含同一区间内被本地用户流标记为“可能已离开先前共享的加密房间集合、因而不再与调用方共享任何启用 `m.room.encryption` 的房间”的用户；本地实现至少必须在最后一个共享加密本地房间离开时向仍留在该房间且不再共享其它加密房间的本地用户写入 `left_user_ids` 增量。
 * room key backup 的版本元数据由 `DATA-USER-011` 持有；大体量密文分片可写入 `DATA-R2-006`，服务端只保证完整性和版本隔离，不解释密钥明文。
 
 ## 7. `/sync` 目标与令牌模型
@@ -342,6 +349,7 @@
 * token 不得要求服务端保留 mutable waiter state 才能解析。
 * token 必须具备完整性保护，防止客户端通过篡改 `user_stream_pos`、`device_id` 或 `filter_hash` 伪造更远的游标；任何签名/校验失败都必须 deterministic `400 M_INVALID_PARAM`。
 * token 可选包含 `device_id_hash`、`filter_hash`、`capability_bits` 以做误用检测，但授权仍以 access token 为准。
+* token 中若携带 `filter_hash`，它只能作为 opaque integrity/debug metadata；调用方后续以同一 `since` token 在 inline JSON 与 stored `filter_id` 之间切换，或改用另一个合法 filter，都不得仅因 token 中的旧 `filter_hash` 而被 `400 M_INVALID_PARAM` 拒绝。
 * 无新数据时允许返回新的 `next_batch` 等于旧 token 对应位置。
 
 ### 7.3 用户流模型
@@ -377,6 +385,7 @@
 
 * `timeout_ms_normalized = min(max(requested_timeout_ms,0), configured_sync_timeout_max_ms)`
 * stored filter 与 inline filter 都必须先解析到同一个 `canonical_filter_hash`
+* 合法的增量 `/sync` 必须允许在 inline JSON 与 stored `filter_id` 之间切换；若调用方提供了另一个合法 filter，则同一 `since` token 也必须继续可用，差异只体现在本次请求的收集/投影结果与 waiter key 上，而不是被视为 token 失效
 * waiter 去重必须基于 `SyncRequestKey`，而不是原始 query string
 * 若两个并发请求只有 `timeout_ms_normalized` 不同，则实现可以保留较新的请求并结束较旧请求，但不得让二者同时长期驻留
 * 若请求未显式给出 `timeout`，其规范默认值必须按 Matrix `v1.17` 解释为 `0`，即服务器在无新数据时也要立即返回，而不是擅自升级为长轮询。

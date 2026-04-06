@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { createGatewayPhase04Rig } from './support.mjs';
+import { issueSyncToken } from '../../../packages/runtime-core/src/client-domain.mjs';
 
 async function expectMatrixError(response, status, errcode) {
   assert.equal(response.status, status);
@@ -74,6 +75,32 @@ async function syncRequest(rig, accessToken, query = '') {
   });
   assert.equal(response.status, 200);
   return response.json();
+}
+
+async function requestAs(rig, accessToken, pathname, {
+  method = 'GET',
+  json = undefined,
+} = {}) {
+  return rig.gatewayFetch(pathname, {
+    method,
+    headers: rig.authHeaders(accessToken),
+    json,
+  });
+}
+
+async function enableMegolmRoom(rig, accessToken, roomId) {
+  const response = await requestAs(
+    rig,
+    accessToken,
+    `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/state/m.room.encryption`,
+    {
+      method: 'PUT',
+      json: {
+        algorithm: 'm.megolm.v1.aes-sha2',
+      },
+    },
+  );
+  assert.equal(response.status, 200);
 }
 
 test('Phase 05A device management requires route-bound UIA and revokes deleted device sessions', async (t) => {
@@ -389,6 +416,77 @@ test('Phase 05A keys, cross-signing, signatures, and claim flows update sync tru
     signed_curve25519: 1,
   });
   assert.deepEqual(aliceAfterKeyUpload.device_unused_fallback_key_types, ['signed_curve25519']);
+
+  const keysChangesAfterUpload = await rig.gatewayFetch(
+    `/_matrix/client/v3/keys/changes?from=${encodeURIComponent(aliceInitialSync.next_batch)}&to=${encodeURIComponent(aliceAfterKeyUpload.next_batch)}`,
+    {
+      headers: rig.authHeaders(alice.access_token),
+    },
+  );
+  assert.equal(keysChangesAfterUpload.status, 200);
+  assert.deepEqual(await keysChangesAfterUpload.json(), {
+    changed: ['@alice:matrix.example.test'],
+    left: [],
+  });
+
+  const keysChangesCompatibility = await rig.gatewayFetch(
+    `/_matrix/client/v1/keys/changes?from=${encodeURIComponent(aliceInitialSync.next_batch)}&to=${encodeURIComponent(aliceAfterKeyUpload.next_batch)}`,
+    {
+      headers: rig.authHeaders(alice.access_token),
+    },
+  );
+  assert.equal(keysChangesCompatibility.status, 200);
+  assert.deepEqual(await keysChangesCompatibility.json(), {
+    changed: ['@alice:matrix.example.test'],
+    left: [],
+  });
+
+  const keysChangesMissingFrom = await rig.gatewayFetch(
+    `/_matrix/client/v3/keys/changes?to=${encodeURIComponent(aliceAfterKeyUpload.next_batch)}`,
+    {
+      headers: rig.authHeaders(alice.access_token),
+    },
+  );
+  await expectMatrixError(keysChangesMissingFrom, 400, 'M_MISSING_PARAM');
+
+  const keysChangesFromFuture = await rig.gatewayFetch(
+    `/_matrix/client/v3/keys/changes?from=${encodeURIComponent(aliceAfterKeyUpload.next_batch)}&to=${encodeURIComponent(aliceInitialSync.next_batch)}`,
+    {
+      headers: rig.authHeaders(alice.access_token),
+    },
+  );
+  await expectMatrixError(keysChangesFromFuture, 400, 'M_INVALID_PARAM');
+
+  const crossDeviceLogin = await loginWithPassword(rig, {
+    user: 'alice',
+    password: 'correct horse battery staple',
+    deviceId: 'ALICETABLET',
+  });
+  assert.equal(crossDeviceLogin.status, 200);
+  const crossDeviceSession = await crossDeviceLogin.json();
+  const crossDeviceSync = await syncRequest(rig, crossDeviceSession.access_token);
+
+  const keysChangesCrossDevice = await rig.gatewayFetch(
+    `/_matrix/client/v3/keys/changes?from=${encodeURIComponent(aliceInitialSync.next_batch)}&to=${encodeURIComponent(crossDeviceSync.next_batch)}`,
+    {
+      headers: rig.authHeaders(alice.access_token),
+    },
+  );
+  await expectMatrixError(keysChangesCrossDevice, 400, 'M_INVALID_PARAM');
+
+  const futureToken = issueSyncToken({
+    user_id: alice.user_id,
+    device_id: 'ALICEPHONE',
+    user_stream_pos: 9999,
+    secret_value: rig.env.SESSION_ROOT_KEY_RING,
+  });
+  const keysChangesFutureTo = await rig.gatewayFetch(
+    `/_matrix/client/v3/keys/changes?from=${encodeURIComponent(aliceInitialSync.next_batch)}&to=${encodeURIComponent(futureToken)}`,
+    {
+      headers: rig.authHeaders(alice.access_token),
+    },
+  );
+  await expectMatrixError(keysChangesFutureTo, 400, 'M_INVALID_PARAM');
 
   const queryAliceKeys = await rig.gatewayFetch('/_matrix/client/v3/keys/query', {
     method: 'POST',
@@ -775,6 +873,162 @@ test('Phase 05A keys, cross-signing, signatures, and claim flows update sync tru
   );
   assert.deepEqual(bobAfterClaimSync.device_one_time_keys_count, {});
   assert.deepEqual(bobAfterClaimSync.device_unused_fallback_key_types, []);
+});
+
+test('Phase 05A keys/changes reports shared-room peer changes and left users', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, {
+    username: 'alice',
+    password: 'correct horse battery staple',
+    deviceId: 'ALICEPHONE',
+  });
+  const bob = await registerUser(rig, {
+    username: 'bob',
+    password: 'secret bob password',
+    deviceId: 'BOBPHONE',
+  });
+
+  const createRoom = await requestAs(rig, alice.access_token, '/_matrix/client/v3/createRoom', {
+    method: 'POST',
+    json: {
+      invite: [bob.user_id],
+    },
+  });
+  assert.equal(createRoom.status, 200);
+  const { room_id: roomId } = await createRoom.json();
+  await enableMegolmRoom(rig, alice.access_token, roomId);
+
+  const bobJoin = await requestAs(rig, bob.access_token, `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/join`, {
+    method: 'POST',
+    json: {},
+  });
+  assert.equal(bobJoin.status, 200);
+
+  const bobBaselineSync = await syncRequest(rig, bob.access_token);
+  const bobTabletLogin = await loginWithPassword(rig, {
+    user: 'bob',
+    password: 'secret bob password',
+    deviceId: 'BOBTABLET',
+  });
+  assert.equal(bobTabletLogin.status, 200);
+  const bobTabletSession = await bobTabletLogin.json();
+  const bobTabletSync = await syncRequest(rig, bobTabletSession.access_token);
+
+  const aliceUpload = await requestAs(rig, alice.access_token, '/_matrix/client/v3/keys/upload', {
+    method: 'POST',
+    json: {
+      device_keys: {
+        user_id: alice.user_id,
+        device_id: 'ALICEPHONE',
+        algorithms: ['m.olm.v1.curve25519-aes-sha256'],
+        keys: {
+          'curve25519:ALICEPHONE': 'alice-peer-curve',
+          'ed25519:ALICEPHONE': 'alice-peer-ed',
+        },
+        signatures: {},
+      },
+    },
+  });
+  assert.equal(aliceUpload.status, 200);
+
+  const bobAfterAliceChange = await syncRequest(
+    rig,
+    bob.access_token,
+    `since=${encodeURIComponent(bobBaselineSync.next_batch)}&timeout=0`,
+  );
+  assert.deepEqual(bobAfterAliceChange.device_lists.changed, [alice.user_id]);
+
+  const bobKeysChanges = await requestAs(
+    rig,
+    bob.access_token,
+    `/_matrix/client/v3/keys/changes?from=${encodeURIComponent(bobBaselineSync.next_batch)}&to=${encodeURIComponent(bobAfterAliceChange.next_batch)}`,
+  );
+  assert.equal(bobKeysChanges.status, 200);
+  assert.deepEqual(await bobKeysChanges.json(), {
+    changed: [alice.user_id],
+    left: [],
+  });
+
+  const bobKeysChangesCrossDevice = await requestAs(
+    rig,
+    bob.access_token,
+    `/_matrix/client/v3/keys/changes?from=${encodeURIComponent(bobBaselineSync.next_batch)}&to=${encodeURIComponent(bobTabletSync.next_batch)}`,
+  );
+  await expectMatrixError(bobKeysChangesCrossDevice, 400, 'M_INVALID_PARAM');
+
+  const futureToken = issueSyncToken({
+    user_id: bob.user_id,
+    device_id: 'BOBPHONE',
+    user_stream_pos: 9999,
+    secret_value: rig.env.SESSION_ROOT_KEY_RING,
+  });
+  const bobKeysChangesFuture = await requestAs(
+    rig,
+    bob.access_token,
+    `/_matrix/client/v3/keys/changes?from=${encodeURIComponent(bobBaselineSync.next_batch)}&to=${encodeURIComponent(futureToken)}`,
+  );
+  await expectMatrixError(bobKeysChangesFuture, 400, 'M_INVALID_PARAM');
+
+  const aliceBaselineForBobLeave = await syncRequest(rig, alice.access_token);
+  const bobLeave = await requestAs(rig, bob.access_token, `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/leave`, {
+    method: 'POST',
+    json: {},
+  });
+  assert.equal(bobLeave.status, 200);
+
+  const aliceAfterBobLeave = await syncRequest(
+    rig,
+    alice.access_token,
+    `since=${encodeURIComponent(aliceBaselineForBobLeave.next_batch)}&timeout=0`,
+  );
+  assert.deepEqual(aliceAfterBobLeave.device_lists.left, [bob.user_id]);
+
+  const aliceKeysChangesAfterLeave = await requestAs(
+    rig,
+    alice.access_token,
+    `/_matrix/client/v3/keys/changes?from=${encodeURIComponent(aliceBaselineForBobLeave.next_batch)}&to=${encodeURIComponent(aliceAfterBobLeave.next_batch)}`,
+  );
+  assert.equal(aliceKeysChangesAfterLeave.status, 200);
+  assert.deepEqual(await aliceKeysChangesAfterLeave.json(), {
+    changed: [],
+    left: [bob.user_id],
+  });
+
+  const plainCreateRoom = await requestAs(rig, alice.access_token, '/_matrix/client/v3/createRoom', {
+    method: 'POST',
+    json: {
+      invite: [bob.user_id],
+      name: 'plain-room-negative-device-lists',
+    },
+  });
+  assert.equal(plainCreateRoom.status, 200);
+  const { room_id: plainRoomId } = await plainCreateRoom.json();
+
+  const bobPlainJoin = await requestAs(rig, bob.access_token, `/_matrix/client/v3/rooms/${encodeURIComponent(plainRoomId)}/join`, {
+    method: 'POST',
+    json: {},
+  });
+  assert.equal(bobPlainJoin.status, 200);
+
+  const alicePlainBaseline = await syncRequest(
+    rig,
+    alice.access_token,
+    `since=${encodeURIComponent(aliceAfterBobLeave.next_batch)}&timeout=0`,
+  );
+  const bobPlainLeave = await requestAs(rig, bob.access_token, `/_matrix/client/v3/rooms/${encodeURIComponent(plainRoomId)}/leave`, {
+    method: 'POST',
+    json: {},
+  });
+  assert.equal(bobPlainLeave.status, 200);
+
+  const aliceAfterPlainLeave = await syncRequest(
+    rig,
+    alice.access_token,
+    `since=${encodeURIComponent(alicePlainBaseline.next_batch)}&timeout=0`,
+  );
+  assert.deepEqual(aliceAfterPlainLeave.device_lists.left ?? [], []);
 });
 
 test('Phase 05A room key backup metadata and opaque backup objects round-trip via HTTP surface', async (t) => {

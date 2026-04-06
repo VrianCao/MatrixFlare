@@ -21,6 +21,10 @@ function currentEnvironmentName() {
   return stableString(process.env.MATRIX_TEST_ENVIRONMENT) || 'local';
 }
 
+function allowMissingRemoteHarnessInAggregateLocalRun() {
+  return stableString(process.env.MATRIX_AGGREGATE_LOCAL_NONLOCAL_SKIP) === 'true';
+}
+
 function uniqueToken(prefix = 'phase08') {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`.toLowerCase();
 }
@@ -41,21 +45,20 @@ export function requireRemoteHarnessContext(testContext, expectedEnvironment) {
   }
   const baseUrl = stableString(process.env.MATRIX_REMOTE_BASE_URL);
   const serverName = stableString(process.env.MATRIX_REMOTE_SERVER_NAME);
-  if (!baseUrl || !serverName) {
+  if (baseUrl.length === 0 && serverName.length === 0 && allowMissingRemoteHarnessInAggregateLocalRun()) {
     testContext.skip(`Remote ${expectedEnvironment} harness requires MATRIX_REMOTE_BASE_URL and MATRIX_REMOTE_SERVER_NAME`);
     return null;
   }
+  assert.notEqual(baseUrl.length, 0, `Remote ${expectedEnvironment} harness requires MATRIX_REMOTE_BASE_URL`);
+  assert.notEqual(serverName.length, 0, `Remote ${expectedEnvironment} harness requires MATRIX_REMOTE_SERVER_NAME`);
   let parsedBaseUrl;
   try {
     parsedBaseUrl = new URL(baseUrl);
   } catch {
-    testContext.skip('MATRIX_REMOTE_BASE_URL must be a valid absolute URL');
-    return null;
+    throw new TypeError('MATRIX_REMOTE_BASE_URL must be a valid absolute URL');
   }
-  if (parsedBaseUrl.protocol !== 'https:' || parsedBaseUrl.host !== serverName) {
-    testContext.skip('Remote harness must target an HTTPS gateway host matching MATRIX_REMOTE_SERVER_NAME');
-    return null;
-  }
+  assert.equal(parsedBaseUrl.protocol, 'https:', 'MATRIX_REMOTE_BASE_URL must target an HTTPS origin');
+  assert.equal(parsedBaseUrl.host, serverName, 'MATRIX_REMOTE_SERVER_NAME must match the host of MATRIX_REMOTE_BASE_URL');
   return {
     environmentName: expectedEnvironment,
     baseUrl: trimTrailingSlash(parsedBaseUrl.toString()),

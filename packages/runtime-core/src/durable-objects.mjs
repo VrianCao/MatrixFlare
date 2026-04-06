@@ -1151,6 +1151,8 @@ function normalizeRoomFanoutDelta(delta = {}) {
     ephemeral_events: Array.isArray(delta.ephemeral_events)
       ? structuredClone(delta.ephemeral_events)
       : [],
+    local_joined_user_ids: uniqueStringArray(delta.local_joined_user_ids),
+    encrypted_local_joined_user_ids: uniqueStringArray(delta.encrypted_local_joined_user_ids),
   };
 }
 
@@ -2269,19 +2271,6 @@ export class UserDO extends BaseDurableObject {
         matrix_error: parsedForDevice.matrix_error,
       };
     }
-    if (parsedToken.filter_hash && filterHash && parsedToken.filter_hash !== filterHash) {
-      return {
-        ok: false,
-        matrix_error: {
-          status: 400,
-          body: {
-            errcode: 'M_INVALID_PARAM',
-            error: 'Sync token was issued for a different filter',
-          },
-        },
-      };
-    }
-
     const now = request?.now ?? new Date().toISOString();
     const sincePos = parsedForDevice.since_pos;
     const upperBound = Math.max(0, (this.persistence.getRuntimeState()?.next_user_stream_pos ?? 1) - 1);
@@ -2438,6 +2427,128 @@ export class UserDO extends BaseDurableObject {
     });
   }
 
+  async getKeysChanges() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const [request = {}] = arguments;
+    const sessionRootKeyRing = this.config.secrets.require('session_root_key_ring');
+    const userId = normalizeString(request?.user_id, 'request.user_id');
+    const sessionId = normalizeString(request?.session_id, 'request.session_id');
+    const fromToken = normalizeString(request?.from_token, 'request.from_token');
+    const toToken = normalizeString(request?.to_token, 'request.to_token');
+
+    const principal = this.persistence.userPrincipal.get();
+    if (!principal || principal.user_id !== userId) {
+      return createMatrixError(404, 'M_NOT_FOUND', 'User does not exist');
+    }
+
+    const session = this.persistence.sessions.get(sessionId);
+    if (!session || session.revoked_at) {
+      return {
+        ok: false,
+        matrix_error: {
+          status: 401,
+          body: {
+            errcode: 'M_UNKNOWN_TOKEN',
+            error: 'Unknown or unsupported token',
+          },
+        },
+      };
+    }
+    const device = this.persistence.devices.get(session.device_id);
+    if (!device || device.deleted_at) {
+      return {
+        ok: false,
+        matrix_error: {
+          status: 401,
+          body: {
+            errcode: 'M_UNKNOWN_TOKEN',
+            error: 'Unknown or unsupported token',
+          },
+        },
+      };
+    }
+
+    const parsedFrom = parseSyncToken(fromToken, {
+      expected_user_id: userId,
+      expected_device_id: session.device_id,
+      secret_value: sessionRootKeyRing,
+    });
+    if (!parsedFrom.ok) {
+      return {
+        ok: false,
+        matrix_error: parsedFrom.matrix_error,
+      };
+    }
+    const parsedTo = parseSyncToken(toToken, {
+      expected_user_id: userId,
+      expected_device_id: session.device_id,
+      secret_value: sessionRootKeyRing,
+    });
+    if (!parsedTo.ok) {
+      return {
+        ok: false,
+        matrix_error: parsedTo.matrix_error,
+      };
+    }
+
+    const fromPos = parsedFrom.since_pos;
+    const toPos = parsedTo.since_pos;
+    const upperBound = Math.max(0, (this.persistence.getRuntimeState()?.next_user_stream_pos ?? 1) - 1);
+    if (fromPos > toPos) {
+      return {
+        ok: false,
+        matrix_error: {
+          status: 400,
+          body: {
+            errcode: 'M_INVALID_PARAM',
+            error: 'keys/changes from token points past the to token',
+          },
+        },
+      };
+    }
+    if (toPos > upperBound) {
+      return {
+        ok: false,
+        matrix_error: {
+          status: 400,
+          body: {
+            errcode: 'M_INVALID_PARAM',
+            error: 'keys/changes token points past the current user stream',
+          },
+        },
+      };
+    }
+
+    const changed = new Set();
+    const left = new Set();
+    for (const entry of this.persistence.listUserStreamSince(fromPos, 10_000)) {
+      if (entry.stream_pos > toPos) {
+        break;
+      }
+      if (entry.stream_kind !== 'device_state') {
+        continue;
+      }
+      for (const changedUserId of entry.payload?.changed_user_ids ?? []) {
+        if (typeof changedUserId === 'string' && changedUserId.length > 0) {
+          changed.add(changedUserId);
+        }
+      }
+      for (const leftUserId of entry.payload?.left_user_ids ?? []) {
+        if (typeof leftUserId === 'string' && leftUserId.length > 0) {
+          left.add(leftUserId);
+        }
+      }
+    }
+
+    return createSuccessResult({
+      response: {
+        changed: [...changed],
+        left: [...left],
+      },
+    });
+  }
+
   async appendRoomFanout() {
     await this.ensureCurrentness();
     await this.ensureSchema();
@@ -2503,6 +2614,7 @@ export class UserDO extends BaseDurableObject {
       ...notificationState,
     };
     let wakePos = 0;
+    let updatedPrincipal = principal;
     const sql = this.requireSqlStorage();
     withSqliteTransaction(sql, () => {
       const streamEntry = this.persistence.appendUserStreamWithinTransaction({
@@ -2515,14 +2627,15 @@ export class UserDO extends BaseDurableObject {
         payload: effectiveDelta,
       });
       wakePos = streamEntry.stream_pos;
-      this.persistence.userPrincipal.put(principalRowToPutRecord(principal, {
+      updatedPrincipal = principalRowToPutRecord(principal, {
         record: mergeRoomSyncMembershipRecord(principal, {
           room_id: effectiveDelta.room_id,
           membership_bucket: effectiveDelta.membership_bucket,
           room_pos: effectiveDelta.room_pos,
           updated_at: now,
         }),
-      }));
+      });
+      this.persistence.userPrincipal.put(updatedPrincipal);
     });
     this.incrementAuthorityMetric('userdo.stream.append.count', 1, {
       stream_kind: 'room_fanout',
@@ -2531,11 +2644,171 @@ export class UserDO extends BaseDurableObject {
       user_id: principal.user_id,
       user_stream_pos: wakePos,
     });
+    if (effectiveDelta.membership_bucket === 'leave' && effectiveDelta.encrypted_local_joined_user_ids.length > 0) {
+      await this.notifyDepartureToFormerPeers({
+        departedUserId: principal.user_id,
+        departedRoomEncryptedJoinedLocalUserIds: effectiveDelta.encrypted_local_joined_user_ids,
+        principal: updatedPrincipal,
+        now,
+      });
+    }
     return createSuccessResult({
       ack: {
         accepted: true,
         accepted_at: now,
         durable_stream_pos: wakePos,
+      },
+    });
+  }
+
+  isLocalUserId(userId) {
+    return typeof userId === 'string' && userId.endsWith(`:${this.env.MATRIX_SERVER_NAME}`);
+  }
+
+  async listSharedLocalUsersForPrincipal(principal, requesterUserId, {
+    requireEncrypted = false,
+  } = {}) {
+    const shared = new Set();
+    const joinedRooms = listRoomSyncMembershipEntries(principal)
+      .filter((entry) => entry.membership_bucket === 'join');
+    for (const entry of joinedRooms) {
+      const roomDo = getRoomDoStub(this.env, entry.room_id);
+      if (requireEncrypted) {
+        try {
+          const encryptionResult = await roomDo.queryRoom({
+            kind: 'state',
+            room_id: entry.room_id,
+            requester_user_id: requesterUserId,
+            cursor: {
+              event_type: 'm.room.encryption',
+              state_key: '',
+            },
+          });
+          if (!encryptionResult?.ok || !encryptionResult.event) {
+            continue;
+          }
+        } catch {
+          continue;
+        }
+      }
+      const joinedResult = await roomDo.queryRoom({
+        kind: 'joined_members',
+        room_id: entry.room_id,
+        requester_user_id: requesterUserId,
+      });
+      if (!joinedResult?.ok || !joinedResult.joined || typeof joinedResult.joined !== 'object') {
+        continue;
+      }
+      for (const userId of Object.keys(joinedResult.joined)) {
+        if (this.isLocalUserId(userId)) {
+          shared.add(userId);
+        }
+      }
+    }
+    return shared;
+  }
+
+  async fanoutDeviceStateChangeToSharedUsers({
+    subjectUserId,
+    changedUserIds = [],
+    leftUserIds = [],
+    excludeUserIds = [],
+    principal,
+    now,
+  }) {
+    const sharedLocalUsers = await this.listSharedLocalUsersForPrincipal(principal, subjectUserId, {
+      requireEncrypted: true,
+    });
+    const excluded = new Set(excludeUserIds);
+    excluded.add(subjectUserId);
+    for (const peerUserId of sharedLocalUsers) {
+      if (excluded.has(peerUserId)) {
+        continue;
+      }
+      try {
+        await getUserDoStub(this.env, peerUserId).appendObservedDeviceStateChange({
+          user_id: peerUserId,
+          changed_user_ids: changedUserIds,
+          left_user_ids: leftUserIds,
+          now,
+        });
+      } catch {
+        // Shared-user device-state fanout is asynchronous; a later repair pass can re-drive misses.
+      }
+    }
+  }
+
+  async notifyDepartureToFormerPeers({
+    departedUserId,
+    departedRoomEncryptedJoinedLocalUserIds = [],
+    principal,
+    now,
+  }) {
+    const stillShared = await this.listSharedLocalUsersForPrincipal(principal, departedUserId, {
+      requireEncrypted: true,
+    });
+    for (const peerUserId of uniqueStringArray(departedRoomEncryptedJoinedLocalUserIds)) {
+      if (peerUserId === departedUserId || stillShared.has(peerUserId)) {
+        continue;
+      }
+      try {
+        await getUserDoStub(this.env, peerUserId).appendObservedDeviceStateChange({
+          user_id: peerUserId,
+          changed_user_ids: [],
+          left_user_ids: [departedUserId],
+          now,
+        });
+      } catch {
+        // Shared-user device-state fanout is asynchronous; a later repair pass can re-drive misses.
+      }
+    }
+  }
+
+  async appendObservedDeviceStateChange() {
+    await this.ensureCurrentness();
+    await this.ensureSchema();
+    const [request = {}] = arguments;
+    const userId = normalizeString(request?.user_id, 'request.user_id');
+    const principal = this.persistence.userPrincipal.get();
+    if (!principal || principal.user_id !== userId) {
+      return {
+        ok: false,
+        error: createInternalErrorEnvelope({
+          code: 'target_not_local',
+          message: 'Target user does not exist on this homeserver',
+          retryable: false,
+        }),
+      };
+    }
+    const now = request?.now ?? new Date().toISOString();
+    const payload = buildDeviceStatePayload({
+      changed_user_ids: request?.changed_user_ids ?? [],
+      left_user_ids: request?.left_user_ids ?? [],
+    });
+    if (payload.changed_user_ids.length === 0 && payload.left_user_ids.length === 0) {
+      return createSuccessResult({
+        ack: {
+          accepted: true,
+          accepted_at: now,
+          durable_stream_pos: null,
+        },
+      });
+    }
+    const streamEntry = this.persistence.appendUserStream({
+      user_id: principal.user_id,
+      stream_kind: 'device_state',
+      created_at: now,
+      payload,
+    });
+    wakeSyncWaiters(this.env, {
+      user_id: principal.user_id,
+      user_stream_pos: streamEntry.stream_pos,
+    });
+    return createSuccessResult({
+      ack: {
+        accepted: true,
+        accepted_at: now,
+        durable_stream_pos: streamEntry.stream_pos,
       },
     });
   }
@@ -2962,6 +3235,13 @@ export class UserDO extends BaseDurableObject {
         user_id: userId,
         user_stream_pos: wakePos,
       });
+      await this.fanoutDeviceStateChangeToSharedUsers({
+        subjectUserId: userId,
+        changedUserIds: [userId],
+        leftUserIds: [],
+        principal: this.persistence.userPrincipal.get(),
+        now,
+      });
     }
     return result;
   }
@@ -3001,6 +3281,7 @@ export class UserDO extends BaseDurableObject {
     }
 
     let wakePos = 0;
+    let didDeviceListChange = false;
     const sql = this.requireSqlStorage();
     withSqliteTransaction(sql, () => {
       let deviceListChanged = false;
@@ -3054,12 +3335,22 @@ export class UserDO extends BaseDurableObject {
           changed_user_ids: deviceListChanged ? [userId] : [],
         }).stream_pos;
       }
+      didDeviceListChange = deviceListChanged;
     });
     if (wakePos > 0) {
       wakeSyncWaiters(this.env, {
         user_id: userId,
         user_stream_pos: wakePos,
       });
+      if (didDeviceListChange) {
+        await this.fanoutDeviceStateChangeToSharedUsers({
+          subjectUserId: userId,
+          changedUserIds: [userId],
+          leftUserIds: [],
+          principal: this.persistence.userPrincipal.get(),
+          now,
+        });
+      }
     }
     return createSuccessResult({
       response: {
@@ -3264,6 +3555,13 @@ export class UserDO extends BaseDurableObject {
         user_id: userId,
         user_stream_pos: wakePos,
       });
+      await this.fanoutDeviceStateChangeToSharedUsers({
+        subjectUserId: userId,
+        changedUserIds: [userId],
+        leftUserIds: [],
+        principal: this.persistence.userPrincipal.get(),
+        now,
+      });
     }
     return result;
   }
@@ -3369,6 +3667,13 @@ export class UserDO extends BaseDurableObject {
       wakeSyncWaiters(this.env, {
         user_id: userId,
         user_stream_pos: wakePos,
+      });
+      await this.fanoutDeviceStateChangeToSharedUsers({
+        subjectUserId: userId,
+        changedUserIds: [userId],
+        leftUserIds: [],
+        principal: this.persistence.userPrincipal.get(),
+        now,
       });
     }
     return result;
@@ -7263,6 +7568,10 @@ export class RoomDO extends BaseDurableObject {
         .filter((row) => row.snapshot_id === snapshotId)
         .map((row) => row.event_id)
       : [];
+    const localJoinedUserIds = this.persistence.membershipProjection.list()
+      .filter((membership) => membership.membership === 'join' && this.isLocalUserId(membership.user_id))
+      .map((membership) => membership.user_id);
+    const roomEncrypted = getTypedStateEvent(stateMap, 'm.room.encryption', '') != null;
     const deltas = [];
     for (const membership of this.persistence.membershipProjection.list()) {
       if (!this.isLocalUserId(membership.user_id)) {
@@ -7311,6 +7620,8 @@ export class RoomDO extends BaseDurableObject {
             : false,
         },
         summary,
+        local_joined_user_ids: localJoinedUserIds,
+        encrypted_local_joined_user_ids: roomEncrypted ? localJoinedUserIds : [],
       };
       if (membershipBucket === 'join' || membershipBucket === 'leave') {
         delta.timeline_event_ids.push(committedEvent.event_id);

@@ -136,6 +136,7 @@ membership 变更规则：
 * 新建房间默认 room version 为 `12`。
 * 面向联邦 GA 前，必须稳定支持 room version `11` 与 `12`。
 * `createRoom` 必须允许显式请求 `11`；当请求未显式指定版本时，项目策略默认选 `12`，并与 Matrix `v1.17` 对新房间默认 room version 的推荐值保持一致。
+* `GET /_matrix/client/*/capabilities` 也必须把这条 truth 同步暴露给客户端：`m.room_versions.default` 必须为 `12`，`available` 至少列出 `11` 与 `12` 为 `stable`。若省略该 capability，当前 browser client 会回退到 legacy room-version 默认值，并把 create-room 请求误送到不受支持的 room version。
 * 若客户端请求不支持的 room version，必须 deterministic 返回 `400` + Matrix `M_UNSUPPORTED_ROOM_VERSION`，不得退化成隐式降级到 `11`/`12` 或一般性 `M_BAD_JSON`。
 * 若联邦 join/invite/knock 或其他 room-version-sensitive 语义遇到本实现不支持的 room version，必须以 Matrix federation 错误 `M_INCOMPATIBLE_ROOM_VERSION` 拒绝，且不得产生 partial state 或半创建房间。
 

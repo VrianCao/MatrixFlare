@@ -86,6 +86,7 @@ export async function request(harness, pathname, {
   headers = {},
   json = undefined,
   body = undefined,
+  responseType = 'auto',
 } = {}) {
   const requestHeaders = new Headers(headers);
   if (json !== undefined && !requestHeaders.has('content-type')) {
@@ -101,9 +102,18 @@ export async function request(harness, pathname, {
       : {}),
   });
   const contentType = response.headers.get('content-type') ?? '';
-  const payload = contentType.includes('application/json')
-    ? await response.json()
-    : await response.text();
+  let payload;
+  if (responseType === 'bytes') {
+    payload = Buffer.from(await response.arrayBuffer());
+  } else if (responseType === 'json') {
+    payload = await response.json();
+  } else if (responseType === 'text') {
+    payload = await response.text();
+  } else {
+    payload = contentType.includes('application/json')
+      ? await response.json()
+      : await response.text();
+  }
   return {
     response,
     payload,

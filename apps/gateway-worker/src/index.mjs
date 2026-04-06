@@ -128,6 +128,7 @@ const CLIENT_DISCOVERY_VERSIONS = Object.freeze([
 const CLIENT_REGISTER_DISCOVERY_PATTERN = /^\/_matrix\/client\/(?:r0|v1|v3)\/register$/;
 const CLIENT_REGISTER_AVAILABILITY_PATTERN = /^\/_matrix\/client\/(?:r0|v1|v3)\/register\/available$/;
 const CLIENT_LOGIN_PATTERN = /^\/_matrix\/client\/(?:r0|v1|v3)\/login$/;
+const CLIENT_KEYS_CHANGES_PATTERN = /^\/_matrix\/client\/(?:r0|v1|v3)\/keys\/changes$/;
 
 function jsonResponse(payload, status = 200, headers = {}) {
   return new Response(JSON.stringify(payload), {
@@ -169,7 +170,8 @@ function isBrowserOrigin(origin) {
 function isPublicMatrixCorsPath(pathname) {
   return pathname === '/.well-known/matrix/client'
     || pathname === '/_matrix/client/versions'
-    || pathname.startsWith('/_matrix/client/');
+    || pathname.startsWith('/_matrix/client/')
+    || pathname.startsWith('/_matrix/media/');
 }
 
 function appendVary(headers, value) {
@@ -3674,6 +3676,32 @@ async function handleKeysClaim(request, env) {
   return jsonResponse(response);
 }
 
+async function handleKeysChanges(request, env) {
+  const access = await requireAccessSession(request, env);
+  if (!access.ok) {
+    return access.response;
+  }
+  const url = new URL(request.url);
+  const fromToken = url.searchParams.get('from');
+  const toToken = url.searchParams.get('to');
+  if (!fromToken) {
+    return matrixErrorResponse(400, 'M_MISSING_PARAM', 'from is required');
+  }
+  if (!toToken) {
+    return matrixErrorResponse(400, 'M_MISSING_PARAM', 'to is required');
+  }
+  const result = await access.user_do.getKeysChanges({
+    user_id: access.session.user_id,
+    session_id: access.session.session_id,
+    from_token: fromToken,
+    to_token: toToken,
+  });
+  if (!result.ok) {
+    return jsonResponse(result.matrix_error.body, result.matrix_error.status);
+  }
+  return jsonResponse(result.response);
+}
+
 async function handleCrossSigningUpload(request, env) {
   const access = await requireAccessSession(request, env);
   if (!access.ok) {
@@ -5303,6 +5331,9 @@ async function handleRequest(request, env) {
       }
       if (pathname === '/_matrix/client/v3/keys/claim' && method === 'POST') {
         return handleKeysClaim(request, env);
+      }
+      if (CLIENT_KEYS_CHANGES_PATTERN.test(pathname) && method === 'GET') {
+        return handleKeysChanges(request, env);
       }
       if (pathname === '/_matrix/client/v3/keys/device_signing/upload' && method === 'POST') {
         return handleCrossSigningUpload(request, env);

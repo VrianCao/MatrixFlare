@@ -75,6 +75,7 @@
 * `/_matrix/client/v1/media/{config,download,thumbnail}` current authenticated media 路由必须要求 access token。
 * deprecated `/_matrix/media/*/config` compatibility 路由仍要求 access token。
 * deprecated `/_matrix/media/*/download` 与 `/_matrix/media/*/thumbnail` compatibility 路由不得要求 access token；它们必须改按 immutable `legacy_unauth_media_freeze_at` 与对象 metadata 中的 `legacy_unauth_access_flag` 执行 legacy unauthenticated + freeze 裁决。
+* 当请求携带合法 browser `Origin` 时，`/_matrix/client/v1/media/*` current surface 与 `/_matrix/media/*` compatibility surface 都必须返回可读的 CORS 响应；对带 `Authorization` 等 header 的 browser preflight，`OPTIONS` 必须在 auth/route dispatch 之前直接返回 `2xx/204`，否则浏览器客户端无法读取 authenticated media config 与其它 JS-fetch media surfaces。
 * 优先通过 R2 binding 读取并流式返回。
 * `/_matrix/client/v1/media/*` current surface 与 `/_matrix/media/*` compatibility surface 必须共用同一对象真相、参数解释、缓存命中与审计逻辑；但 deprecated `download` / `thumbnail` compatibility 路由的 legacy unauthenticated + freeze 裁决不得被“统一 auth gate”覆盖。
 * 若对象不存在但目录残留，返回协议错误并记审计事件。

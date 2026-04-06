@@ -239,6 +239,56 @@ test('Phase 07 covers local media upload/download, compatibility routes, thumbna
     'M_MISSING_TOKEN',
   );
 
+  const browserOrigin = 'https://app.cinny.in';
+  const currentConfigBrowser = await rig.gatewayFetch('/_matrix/client/v1/media/config', {
+    headers: {
+      origin: browserOrigin,
+      authorization: `Bearer ${alice.access_token}`,
+    },
+  });
+  assert.equal(currentConfigBrowser.status, 200);
+  assert.equal(currentConfigBrowser.headers.get('access-control-allow-origin'), browserOrigin);
+  assert.match(currentConfigBrowser.headers.get('vary') ?? '', /Origin/i);
+
+  const currentConfigPreflight = await rig.gatewayFetch('/_matrix/client/v1/media/config', {
+    method: 'OPTIONS',
+    headers: {
+      origin: browserOrigin,
+      'access-control-request-method': 'GET',
+      'access-control-request-headers': 'authorization',
+    },
+  });
+  assert.equal(currentConfigPreflight.status, 204);
+  assert.equal(currentConfigPreflight.headers.get('access-control-allow-origin'), browserOrigin);
+  assert.equal(currentConfigPreflight.headers.get('access-control-allow-headers'), 'authorization');
+  assert.match(currentConfigPreflight.headers.get('access-control-allow-methods') ?? '', /\bGET\b/);
+  assert.match(currentConfigPreflight.headers.get('vary') ?? '', /Origin/i);
+  assert.match(currentConfigPreflight.headers.get('vary') ?? '', /Access-Control-Request-Headers/i);
+
+  const legacyConfigBrowser = await rig.gatewayFetch('/_matrix/media/v3/config', {
+    headers: {
+      origin: browserOrigin,
+      authorization: `Bearer ${alice.access_token}`,
+    },
+  });
+  assert.equal(legacyConfigBrowser.status, 200);
+  assert.equal(legacyConfigBrowser.headers.get('access-control-allow-origin'), browserOrigin);
+
+  const legacyConfigPreflight = await rig.gatewayFetch('/_matrix/media/v3/config', {
+    method: 'OPTIONS',
+    headers: {
+      origin: browserOrigin,
+      'access-control-request-method': 'GET',
+      'access-control-request-headers': 'authorization',
+    },
+  });
+  assert.equal(legacyConfigPreflight.status, 204);
+  assert.equal(legacyConfigPreflight.headers.get('access-control-allow-origin'), browserOrigin);
+  assert.equal(legacyConfigPreflight.headers.get('access-control-allow-headers'), 'authorization');
+  assert.match(legacyConfigPreflight.headers.get('access-control-allow-methods') ?? '', /\bGET\b/);
+  assert.match(legacyConfigPreflight.headers.get('vary') ?? '', /Origin/i);
+  assert.match(legacyConfigPreflight.headers.get('vary') ?? '', /Access-Control-Request-Headers/i);
+
   const uploadResponse = await rig.gatewayFetch('/_matrix/media/v3/upload?filename=phase07.txt', {
     method: 'POST',
     headers: {
