@@ -27,6 +27,9 @@ import {
   listEnvironmentRateLimitNamespaces,
   listProductionRateLimitNamespaces,
 } from './cloudflare-resources.mjs';
+import {
+  CLIENT_DISCOVERY_VERSION_COUNT,
+} from './client-discovery.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -5112,6 +5115,17 @@ function validateEnvironmentRunReadinessProbe(reportLabel, readinessProbe, expec
       error: `${reportLabel} readiness_probe final attempt must include successful steps: ${missingRequiredSteps.join(', ')}`,
     };
   }
+  const versionsStep = finalAttempt.steps.find((step) => step.step === 'versions' && step.ok === true) ?? null;
+  if (
+    !isPlainObject(versionsStep?.detail)
+    || versionsStep.detail.versions_count !== CLIENT_DISCOVERY_VERSION_COUNT
+    || versionsStep.detail.browser_compatible_version_ladder !== true
+  ) {
+    return {
+      valid: false,
+      error: `${reportLabel} readiness_probe final versions step must prove the browser-compatible version ladder`,
+    };
+  }
   if (readinessProbe.last_error !== null) {
     return {
       valid: false,
@@ -5297,6 +5311,12 @@ export function validateManualArtifactPayload(artifactId, payload, {
       return {
         valid: false,
         error: 'environment run report must include reviewed_by',
+      };
+    }
+    if (!isGitCommitSha(payload.git_commit)) {
+      return {
+        valid: false,
+        error: 'environment run report must include git_commit as a 40-character lowercase git sha',
       };
     }
     if (!isAbsoluteExternalUri(payload.source_run_uri)) {
@@ -5766,6 +5786,7 @@ export async function validateEnvironmentRunExecutionProof(artifactId, payload, 
 export function validateEvidenceAttestationBundle(artifactId, payload, {
   runTimestamp = null,
   expectedGitHubRepository = null,
+  expectedGitCommit = null,
 } = {}) {
   if (!isPlainObject(payload)) {
     return {
@@ -6014,6 +6035,16 @@ export function validateEvidenceAttestationBundle(artifactId, payload, {
     return {
       valid: false,
       error: 'attestation bundle payload source_run_uri must equal provenance.origin_run_uri',
+    };
+  }
+  if (
+    contract.attestation_kind === 'environment_run'
+    && isNonEmptyString(expectedGitCommit)
+    && payload.payload.git_commit !== expectedGitCommit
+  ) {
+    return {
+      valid: false,
+      error: 'attestation bundle payload git_commit must match the current HEAD commit',
     };
   }
   if (
@@ -6327,18 +6358,21 @@ function normalizeOptionalArtifactPath(repoRoot, artifactPath) {
 
 async function collectCodeVersionContext(repoRoot) {
   try {
-    const [{ stdout: commitStdout }, { stdout: statusStdout }] = await Promise.all([
+    const [{ stdout: commitStdout }, { stdout: statusStdout }, { stdout: trackedStatusStdout }] = await Promise.all([
       execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: repoRoot }),
       execFileAsync('git', ['status', '--short'], { cwd: repoRoot }),
+      execFileAsync('git', ['status', '--short', '--untracked-files=no'], { cwd: repoRoot }),
     ]);
     return {
       git_commit: commitStdout.trim() || null,
       worktree_dirty: statusStdout.trim().length > 0,
+      tracked_worktree_dirty: trackedStatusStdout.trim().length > 0,
     };
   } catch {
     return {
       git_commit: null,
       worktree_dirty: null,
+      tracked_worktree_dirty: null,
     };
   }
 }
@@ -6488,6 +6522,8 @@ function buildApplicableSourceIds(definition, expandedSourceIds) {
 
 export async function collectManualArtifactResults(definition, repoRoot, manualArtifacts = {}, runTimestamp, {
   expectedGitHubRepository = null,
+  expectedGitCommit = null,
+  trackedWorktreeDirty = null,
 } = {}) {
   const requiredManualArtifacts = buildRequiredManualArtifactDefinitions(definition);
   const resolvedExpectedGitHubRepository = await resolveExpectedGitHubRepositoryForRepoRoot(
@@ -6544,6 +6580,7 @@ export async function collectManualArtifactResults(definition, repoRoot, manualA
         const validation = validateEvidenceAttestationBundle(artifactRequirement.artifact_id, parsedPayload, {
           runTimestamp,
           expectedGitHubRepository: resolvedExpectedGitHubRepository,
+          expectedGitCommit,
         });
         valid = validation.valid;
         validation_error = validation.error;
@@ -6582,6 +6619,10 @@ export async function collectManualArtifactResults(definition, repoRoot, manualA
         if (valid && expectedEnvironmentName != null && harnessReadiness?.ready === false) {
           valid = false;
           validation_error = `${expectedEnvironmentName} harness is not environment-backed: ${harnessReadiness.reason}`;
+        }
+        if (valid && trackedWorktreeDirty === true) {
+          valid = false;
+          validation_error = 'current checkout has tracked modifications; external attestations may only be reused from a clean tracked worktree';
         }
         if (valid) {
           attestation_kind = parsedPayload.attestation_kind ?? null;
@@ -6863,6 +6904,8 @@ async function writeEvidenceBundle(repoRoot, {
   const applicableSourceIds = buildApplicableSourceIds(definition, expandedSourceIds);
   const manualArtifactResults = await collectManualArtifactResults(definition, repoRoot, manualArtifacts, runTimestamp, {
     expectedGitHubRepository,
+    expectedGitCommit: codeVersion.git_commit,
+    trackedWorktreeDirty: codeVersion.tracked_worktree_dirty,
   });
   const coverageEnvironmentRuns = {};
   if (environmentRuns.local) {
@@ -6946,6 +6989,7 @@ async function writeEvidenceBundle(repoRoot, {
     '',
     `- code_version.git_commit: ${codeVersion.git_commit == null ? '`unknown`' : `\`${codeVersion.git_commit}\``}`,
     `- code_version.worktree_dirty: ${codeVersion.worktree_dirty == null ? 'unknown' : String(codeVersion.worktree_dirty)}`,
+    `- code_version.tracked_worktree_dirty: ${codeVersion.tracked_worktree_dirty == null ? 'unknown' : String(codeVersion.tracked_worktree_dirty)}`,
     `- data_version.analysis_sha256: \`${dataVersion.analysis_sha256}\``,
     `- data_version.requirement_register_sha256: \`${dataVersion.requirement_register_sha256}\``,
     `- data_version.traceability_matrix_sha256: \`${dataVersion.traceability_matrix_sha256}\``,

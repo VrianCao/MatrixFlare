@@ -36,6 +36,9 @@ import {
   getTestEnvironmentDirectory,
   getReleaseGateTestFiles,
 } from './bootstrap.mjs';
+import {
+  summarizeClientDiscoveryVersionPayload,
+} from './client-discovery.mjs';
 
 const NON_LOCAL_ENVIRONMENT_NAMES = Object.freeze([
   'ci-integration',
@@ -3935,9 +3938,7 @@ async function requestRemoteHarnessJson(remoteHarnessEnv, pathname, {
 
 function summarizeReadinessProbeStepDetail(stepName, payload) {
   if (stepName === 'versions') {
-    return {
-      versions_count: Array.isArray(payload?.versions) ? payload.versions.length : 0,
-    };
+    return summarizeClientDiscoveryVersionPayload(payload);
   }
   if (stepName === 'public_rooms') {
     return {
@@ -4098,7 +4099,11 @@ async function runNonLocalReadinessProbeAttempt(environmentName, remoteHarnessEn
     const versions = await requestRemoteHarnessJson(remoteHarnessEnv, '/_matrix/client/versions', {
       fetchImpl,
     });
-    if (versions.response.status !== 200 || !Array.isArray(versions.payload?.versions)) {
+    if (
+      versions.response.status !== 200
+      || !Array.isArray(versions.payload?.versions)
+      || !summarizeClientDiscoveryVersionPayload(versions.payload).browser_compatible_version_ladder
+    ) {
       return {
         ok: false,
         steps,
@@ -7044,6 +7049,8 @@ export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
   await requireGitHubActionsExecutionImpl('runEnvironmentBackedSuite', {
     expectedEnvironmentName: normalizedEnvironmentName,
   });
+  const currentRepository = await resolveCurrentGitHubRepository(repoRoot);
+  const currentHeadSha = await resolveCurrentGitCommitSha(repoRoot);
   const readiness = await assessNonLocalEnvironmentHarnessReadinessImpl(normalizedEnvironmentName, repoRoot, {
     getRequiredTestFilesImpl,
   });
@@ -7238,7 +7245,9 @@ export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
     log_artifact: logArtifact,
     executed_by: executedBy,
     reviewed_by: reviewedBy,
+    source_repository: currentRepository,
     source_run_uri: sourceRunUri,
+    git_commit: currentHeadSha,
     topology_kind: topologyKind,
     cloudflare_resources: validatedCloudflareResources,
     rollout_skew_probe: rolloutSkewProbe,

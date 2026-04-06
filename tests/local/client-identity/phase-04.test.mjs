@@ -5,6 +5,27 @@ import test from 'node:test';
 import { parseSessionRootKeyRing } from '../../../packages/runtime-core/src/user-identity.mjs';
 import { createGatewayPhase04Rig } from './support.mjs';
 
+const CLIENT_DISCOVERY_VERSIONS = Object.freeze([
+  'r0.6.1',
+  'v1.1',
+  'v1.2',
+  'v1.3',
+  'v1.4',
+  'v1.5',
+  'v1.6',
+  'v1.7',
+  'v1.8',
+  'v1.9',
+  'v1.10',
+  'v1.11',
+  'v1.12',
+  'v1.13',
+  'v1.14',
+  'v1.15',
+  'v1.16',
+  'v1.17',
+]);
+
 async function expectMatrixError(response, status, errcode) {
   assert.equal(response.status, status);
   const body = await response.json();
@@ -170,7 +191,7 @@ test('Phase 04 discovery surfaces return spec-aligned truth', async (t) => {
   const versions = await rig.gatewayFetch('/_matrix/client/versions');
   assert.equal(versions.status, 200);
   assert.deepEqual(await versions.json(), {
-    versions: ['v1.17'],
+    versions: [...CLIENT_DISCOVERY_VERSIONS],
     unstable_features: {},
   });
 
@@ -258,6 +279,10 @@ test('Phase 04 discovery and login surfaces serve browser CORS and preflight tru
   assert.equal(versions.status, 200);
   assert.equal(versions.headers.get('access-control-allow-origin'), browserOrigin);
   assert.match(versions.headers.get('vary') ?? '', /Origin/i);
+  assert.deepEqual(await versions.json(), {
+    versions: [...CLIENT_DISCOVERY_VERSIONS],
+    unstable_features: {},
+  });
 
   const loginFlows = await rig.gatewayFetch('/_matrix/client/v3/login', {
     headers: {
