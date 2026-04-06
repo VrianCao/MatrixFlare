@@ -57,7 +57,7 @@
 * 任何来自 `evidence/common/_test-runs/` 的本地产物、或仍扩展 `tests/local/*` 的薄 harness 结果，都不得被提升为 non-local release evidence。
 * `TEST-OPS-001` 所依赖的 pre-release attested report 还必须包含 `rollout_skew_probe`，至少记录 baseline/candidate gateway version IDs、对应 official version tags、dual-version deployment ID 与两类 pairing assertion；对每条 observation，还必须保留官方 `observed_gateway_version_id`（若 runtime 提供）和 `observed_gateway_version_tag`（若 runtime 提供）。当 runtime 未提供官方 version ID 时，consumer 必须允许 `observed_gateway_version_id = null`，并改用 official version tag 完成 override 观测；缺失两者、或把 repo-local fallback 冒充 official version ID 时，`EVID-OPS-001` 必须 fail-closed。
 * `TEST-COST-001` 的 pre-release half 还必须在 attested report 中包含 `pre_release_cost_observation`，并保留 official Cloudflare HTTPS query source locators（`cloudflare.com` 或其子域）；缺失或使用非官方 locator 时 `EVID-COST-001` 必须 fail-closed，即便 production snapshot 另行提供也不例外。
-* `EVID-OPS-003` 在 remote workflow 最终失败时，仍要求至少保留 raw blocker artifacts；`release-candidate`、`prod-install`、`promote-prod`、`rollback-prod` 都必须先留下 workflow raw state / blocker artifact，`prod-cost-monthly` 还必须先把 raw cost bundle 上传到 immutable R2，再允许 provenance / attestation 阶段 fail-closed。
+* `EVID-OPS-003` 在 remote workflow 最终失败时，仍要求至少保留 raw blocker artifacts；`release-candidate`、`prod-install`、`promote-prod`、`operational-prod-refresh`、`rollback-prod` 都必须先留下 workflow raw state / blocker artifact，`prod-cost-monthly` 还必须先把 raw cost bundle 上传到 immutable R2，再允许 provenance / attestation 阶段 fail-closed。
 
 ## 3. Evidence Catalog
 
