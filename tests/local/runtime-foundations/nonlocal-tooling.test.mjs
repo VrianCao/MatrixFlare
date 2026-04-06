@@ -12,6 +12,8 @@ import {
   buildProdPromotionRecord,
   buildProdRollbackRecord,
   buildPreReleaseRolloutVersionSpecs,
+  buildProductionGatewayRolloutReadinessOptions,
+  buildProductionWorkerPromotionReadinessOptions,
   buildEnvironmentRunProvenance,
   buildGitHubRunUrl,
   buildNonLocalEnvironmentPlan,
@@ -40,6 +42,7 @@ import {
   validateReleaseCandidateManifest,
   validateRemoteHarnessEnvironmentVariables,
   waitForNonLocalDeploymentReadiness,
+  waitForProductionDeploymentReadiness,
   writeProdCostSnapshotProvenance,
   writeProdCostSnapshotAttestation,
   writeEnvironmentWranglerConfig,
@@ -60,7 +63,10 @@ import {
 } from '../../../packages/runtime-core/src/abuse-guard.mjs';
 
 const CLIENT_DISCOVERY_VERSION_STEP_DETAIL = Object.freeze(
-  summarizeClientDiscoveryVersionPayload({ versions: CLIENT_DISCOVERY_VERSIONS }),
+  {
+    ...summarizeClientDiscoveryVersionPayload({ versions: CLIENT_DISCOVERY_VERSIONS }),
+    browser_compatible_cors: true,
+  },
 );
 const DEFAULT_TEST_GIT_COMMIT = '0123456789abcdef0123456789abcdef01234567';
 
@@ -1440,11 +1446,25 @@ test('non-local deployment readiness retries with fresh per-attempt registration
     '/_matrix/media/v3/create',
   ];
   const responses = [
-    new Response(JSON.stringify({ versions: [...CLIENT_DISCOVERY_VERSIONS] }), { status: 200, headers: { 'content-type': 'application/json' } }),
+    new Response(JSON.stringify({ versions: [...CLIENT_DISCOVERY_VERSIONS] }), {
+      status: 200,
+      headers: {
+        'content-type': 'application/json',
+        'access-control-allow-origin': 'https://app.element.io',
+        vary: 'Origin',
+      },
+    }),
     new Response(JSON.stringify({ chunk: [] }), { status: 200, headers: { 'content-type': 'application/json' } }),
     new Response(JSON.stringify({ flows: [{ stages: ['m.login.dummy'] }], session: 'uia-1' }), { status: 401, headers: { 'content-type': 'application/json' } }),
     new Response(JSON.stringify({ errcode: 'M_UNKNOWN', error: 'transient deploy window' }), { status: 500, headers: { 'content-type': 'application/json' } }),
-    new Response(JSON.stringify({ versions: [...CLIENT_DISCOVERY_VERSIONS] }), { status: 200, headers: { 'content-type': 'application/json' } }),
+    new Response(JSON.stringify({ versions: [...CLIENT_DISCOVERY_VERSIONS] }), {
+      status: 200,
+      headers: {
+        'content-type': 'application/json',
+        'access-control-allow-origin': 'https://app.element.io',
+        vary: 'Origin',
+      },
+    }),
     new Response(JSON.stringify({ chunk: [] }), { status: 200, headers: { 'content-type': 'application/json' } }),
     new Response(JSON.stringify({ flows: [{ stages: ['m.login.dummy'] }], session: 'uia-2' }), { status: 401, headers: { 'content-type': 'application/json' } }),
     new Response(JSON.stringify({ user_id: '@ready:example.test', access_token: 'atk.ready' }), { status: 200, headers: { 'content-type': 'application/json' } }),
@@ -1570,6 +1590,165 @@ test('non-local deployment readiness fails closed when /versions lacks the brows
   assert.match(readiness.last_error, /versions/);
 });
 
+test('non-local deployment readiness fails closed when /versions lacks browser CORS headers', async () => {
+  const remoteHarnessEnv = {
+    MATRIX_REMOTE_BASE_URL: 'https://matrix-gateway-worker-ci-integration.matrixflare.workers.dev',
+    MATRIX_REMOTE_SERVER_NAME: 'matrix-gateway-worker-ci-integration.matrixflare.workers.dev',
+  };
+
+  const readiness = await waitForNonLocalDeploymentReadiness('ci-integration', remoteHarnessEnv, {
+    maxAttempts: 1,
+    fetchImpl: async (url) => {
+      const requestUrl = new URL(String(url));
+      assert.equal(`${requestUrl.pathname}${requestUrl.search}`, '/_matrix/client/versions');
+      assert.equal(requestUrl.search, '');
+      return new Response(JSON.stringify({
+        versions: CLIENT_DISCOVERY_VERSIONS,
+        unstable_features: {},
+      }), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+        },
+      });
+    },
+  });
+
+  assert.equal(readiness.ready, false);
+  assert.equal(readiness.attempt_count, 1);
+  assert.equal(readiness.attempts[0].failure.step_name, 'versions');
+  assert.deepEqual(readiness.attempts[0].failure.detail, {
+    status: 200,
+    versions_count: CLIENT_DISCOVERY_VERSIONS.length,
+    browser_compatible_version_ladder: true,
+    browser_compatible_cors: false,
+  });
+});
+
+test('production readiness can defer the browser-compatible version ladder until gateway rollout', async () => {
+  const requestLog = [];
+  const readiness = await waitForProductionDeploymentReadiness({
+    MATRIX_REMOTE_BASE_URL: 'https://matrix-gateway-worker-prod.matrixflare.workers.dev',
+    MATRIX_REMOTE_SERVER_NAME: 'matrix-gateway-worker-prod.matrixflare.workers.dev',
+    MATRIX_REMOTE_OPS_BASE_URL: 'https://matrix-ops-worker-prod.matrixflare.workers.dev',
+    MATRIX_REMOTE_OPS_ACCESS_CLIENT_ID: 'service-token-id.access',
+    MATRIX_REMOTE_OPS_ACCESS_CLIENT_SECRET: 'service-token-secret',
+  }, {
+    maxAttempts: 1,
+    requireBrowserCompatibleVersionLadder: false,
+    fetchImpl: async (url, init = {}) => {
+      const requestUrl = new URL(String(url));
+      requestLog.push({
+        pathname: requestUrl.pathname,
+        search: requestUrl.search,
+        headers: new Headers(init.headers),
+      });
+      if (requestUrl.pathname === '/_matrix/client/versions') {
+        return new Response(JSON.stringify({
+          versions: ['v1.17'],
+          unstable_features: {},
+        }), {
+          status: 200,
+          headers: {
+            'content-type': 'application/json',
+            'access-control-allow-origin': 'https://app.element.io',
+            vary: 'Origin',
+          },
+        });
+      }
+      if (requestUrl.pathname === '/_matrix/client/v3/publicRooms') {
+        return new Response(JSON.stringify({ chunk: [] }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (requestUrl.pathname === '/_matrix/client/v3/register') {
+        const body = JSON.parse(init.body);
+        if (body.auth == null) {
+          return new Response(JSON.stringify({
+            session: 'session-1',
+            flows: [{ stages: ['m.login.dummy'] }],
+          }), {
+            status: 401,
+            headers: { 'content-type': 'application/json' },
+          });
+        }
+        return new Response(JSON.stringify({
+          user_id: '@probe:matrixflare.test',
+          access_token: 'probe-access-token',
+        }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (requestUrl.pathname === '/_matrix/client/v3/sync') {
+        return new Response(JSON.stringify({ next_batch: 'batch-1' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (requestUrl.pathname === '/_matrix/media/v3/create') {
+        return new Response(JSON.stringify({ content_uri: 'mxc://matrixflare.test/media' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (requestUrl.pathname === '/_ops/v1/healthz') {
+        return new Response(JSON.stringify({ service: 'ops-worker', status: 'ok' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (requestUrl.pathname === '/_ops/v1/rebuilds') {
+        const idempotencyKey = new Headers(init.headers).get('Idempotency-Key');
+        return new Response(JSON.stringify({
+          job_id: 'job-1',
+          job_type: 'rebuild',
+          state: 'accepted',
+          idempotency_key_echo: idempotencyKey,
+        }), {
+          status: 202,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      throw new Error(`Unexpected request ${requestUrl.pathname}${requestUrl.search}`);
+    },
+  });
+
+  assert.equal(readiness.ready, true);
+  assert.equal(readiness.attempts[0].steps[0].step, 'versions');
+  assert.deepEqual(readiness.attempts[0].steps[0].detail, {
+    versions_count: 1,
+    browser_compatible_version_ladder: false,
+    browser_compatible_cors: true,
+  });
+  assert.equal(requestLog[0].headers.get('origin'), 'https://app.element.io');
+});
+
+test('production worker promotion readiness only requires the browser-compatible ladder for gateway-worker', () => {
+  assert.deepEqual(buildProductionWorkerPromotionReadinessOptions('jobs-worker'), {
+    requireBrowserCompatibleVersionLadder: false,
+  });
+  assert.deepEqual(buildProductionWorkerPromotionReadinessOptions('ops-worker'), {
+    requireBrowserCompatibleVersionLadder: false,
+  });
+  assert.deepEqual(buildProductionWorkerPromotionReadinessOptions('gateway-worker'), {
+    requireBrowserCompatibleVersionLadder: true,
+  });
+});
+
+test('production gateway rollout readiness only requires the browser-compatible ladder at 100 percent', () => {
+  assert.deepEqual(buildProductionGatewayRolloutReadinessOptions(10), {
+    requireBrowserCompatibleVersionLadder: false,
+  });
+  assert.deepEqual(buildProductionGatewayRolloutReadinessOptions(50), {
+    requireBrowserCompatibleVersionLadder: false,
+  });
+  assert.deepEqual(buildProductionGatewayRolloutReadinessOptions(100), {
+    requireBrowserCompatibleVersionLadder: true,
+  });
+});
+
 test('non-local deployment readiness refuses to probe staging without an Access session payload', async () => {
   await assert.rejects(
     () => waitForNonLocalDeploymentReadiness('staging', {
@@ -1607,9 +1786,14 @@ test('non-local deployment readiness probes authenticated ops health when Access
         },
       });
       if (requestUrl.pathname === '/_matrix/client/versions') {
+        assert.equal(headers.get('origin'), 'https://app.element.io');
         return new Response(JSON.stringify({ versions: [...CLIENT_DISCOVERY_VERSIONS] }), {
           status: 200,
-          headers: { 'content-type': 'application/json' },
+          headers: {
+            'content-type': 'application/json',
+            'access-control-allow-origin': 'https://app.element.io',
+            vary: 'Origin',
+          },
         });
       }
       if (requestUrl.pathname === '/_matrix/client/v3/publicRooms') {
@@ -1719,9 +1903,14 @@ test('non-local deployment readiness reuses the same ops rebuild idempotency key
       const requestUrl = new URL(String(url));
       const headers = new Headers(init.headers ?? {});
       if (requestUrl.pathname === '/_matrix/client/versions') {
+        assert.equal(headers.get('origin'), 'https://app.element.io');
         return new Response(JSON.stringify({ versions: [...CLIENT_DISCOVERY_VERSIONS] }), {
           status: 200,
-          headers: { 'content-type': 'application/json' },
+          headers: {
+            'content-type': 'application/json',
+            'access-control-allow-origin': 'https://app.element.io',
+            vary: 'Origin',
+          },
         });
       }
       if (requestUrl.pathname === '/_matrix/client/v3/publicRooms') {

@@ -667,6 +667,8 @@
 
 `2026-04-05` 新确认的结构性事实：若继续坚持“必须先通过正式 reviewed candidate promote，才能让 prod 给真实用户使用”，则 `OQ-0002` 会进入死锁，因为项目永远拿不到 fixed prod topology 的 post-install真实月度成本窗口。current accepted handling 见 `DEC-0006`：允许一条明确标记为 `operational_unblock` 的受控 `operational-prod-refresh` 路径，把当前 `master` 刷新到现有 prod topology，仅用于解开 `OQ-0002` / `OQ-0006` 成本闭环死锁；这不等于 `08.05` 完成，也不等于 `L1 Local-Core` 达成。
 
+`2026-04-06` 新确认的 live prod/browser truth：Playwright 直连 `https://app.element.io` 并把 homeserver 指向当前 prod `https://matrix-gateway-worker-prod.yevdndjyebksug.workers.dev` 时，Element 在登录前就因 `/_matrix/client/versions` 仍只返回 `["v1.17"]` 而拒绝继续，说明 live prod 仍停在旧部署。对应 repair 已把 production readiness contract 明确收紧为“中间 rollout step 可暂时不要求 browser `/versions` ladder，但最终 `gateway-worker` `100%` cutover、generic browser smoke 与任何 browser-facing prod usable claim 都必须继续 fail-closed”；这条边界现由 `42` 与 `DEC-0007` 同步固定，不得再只改实现不改文档。
+
 目标：补齐 `Local-Core` 必需门禁，拿到第一个可验证 profile。
 
 ### 08.01 实现 baseline abuse guard

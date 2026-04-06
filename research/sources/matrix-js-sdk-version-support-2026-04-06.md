@@ -2,7 +2,7 @@
 
 - Captured at: `2026-04-06`
 - Upstream repository: `https://github.com/matrix-org/matrix-js-sdk`
-- Upstream branch observed: `develop`
+- Observed branch metadata (non-authoritative): `develop`
 - Observed commit: `d02205652f23d3ea1a9433938a5e1eb5b6d74f5d`
 - Commit-pinned source URL:
   `https://raw.githubusercontent.com/matrix-org/matrix-js-sdk/d02205652f23d3ea1a9433938a5e1eb5b6d74f5d/src/version-support.ts`

@@ -20,11 +20,18 @@ export const CLIENT_DISCOVERY_VERSIONS = Object.freeze([
 ]);
 
 export const CLIENT_DISCOVERY_VERSION_COUNT = CLIENT_DISCOVERY_VERSIONS.length;
+export const CLIENT_DISCOVERY_BROWSER_ORIGIN = 'https://app.element.io';
 
 export function matchesClientDiscoveryVersionLadder(versions) {
   return Array.isArray(versions)
     && versions.length === CLIENT_DISCOVERY_VERSIONS.length
     && versions.every((value, index) => value === CLIENT_DISCOVERY_VERSIONS[index]);
+}
+
+export function hasClientDiscoveryBrowserCors(response, expectedOrigin = CLIENT_DISCOVERY_BROWSER_ORIGIN) {
+  const allowOrigin = response?.headers?.get?.('access-control-allow-origin') ?? null;
+  const vary = response?.headers?.get?.('vary') ?? '';
+  return allowOrigin === expectedOrigin && /\bOrigin\b/iu.test(vary);
 }
 
 export function summarizeClientDiscoveryVersionPayload(payload) {
