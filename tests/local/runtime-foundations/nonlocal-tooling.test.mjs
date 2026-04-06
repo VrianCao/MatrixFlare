@@ -29,16 +29,21 @@ import {
   captureProdCostSnapshot,
   createEnvironmentWranglerConfig,
   fetchWorkerDeploymentState,
+  normalizeProdCurrentStateSnapshot,
   observeProductionCurrentCloudflareState,
   observeProductionInstallTopologyState,
+  resolveProductionBaselineInputArtifact,
   resolveClosedProdBillingWindow,
   resolveFreshCloudflareIdentity,
   resolvePreDeployWorkerDeploymentState,
   runEnvironmentBackedSuite,
+  stageProductionRawStateArtifactForUpload,
   summarizeWorkerDeploymentState,
   uploadImmutableArtifactToR2,
   validateDeploymentSummaryAgainstCurrentCloudflareState,
   validateLatestActiveCloudflareWorkerIdentity,
+  validateProductionCurrentStateFailureArtifacts,
+  validateProdCurrentStateSnapshot,
   validateProdInstallRecord,
   validateProdPromotionRecord,
   validateProdRollbackRecord,
@@ -633,6 +638,8 @@ function buildResolvedProdBillingWindowFixture({
 function buildProdInstallRecordFixture({
   installedAt = '2026-02-01T00:00:00.000Z',
   repository = 'VrianCao/MatrixFlare',
+  runId = '24000789563',
+  runAttempt = 1,
 } = {}) {
   return buildProdInstallRecord({
     releaseCommitSha: '0123456789abcdef0123456789abcdef01234567',
@@ -640,11 +647,217 @@ function buildProdInstallRecordFixture({
     deploymentSummary: buildProductionDeploymentSummaryFixture(),
     originRunIdentity: buildProducerRunIdentityFixture({
       repository,
-      runId: '24000789563',
+      runId,
+      runAttempt,
     }),
     installId: 'install-prod-topology-v1',
     installedAt,
   });
+}
+
+function buildProdPromotionRecordFixture({
+  repository = 'VrianCao/MatrixFlare',
+  runId = '24033537033',
+  runAttempt = 1,
+  promotedAt = '2026-04-06T13:35:00.000Z',
+} = {}) {
+  const installRecord = buildProdInstallRecordFixture({
+    repository,
+  });
+  return buildProdPromotionRecord({
+    releaseCommitSha: '89abcdef0123456789abcdef0123456789abcdef',
+    sourceCandidate: {
+      candidate_id: 'candidate-phase08-prod-v2',
+      source_run_uri: buildGitHubRunUrl(repository, '24033537030'),
+    },
+    originRunIdentity: buildProducerRunIdentityFixture({
+      repository,
+      runId,
+      runAttempt,
+    }),
+    promotionMode: 'gradual',
+    previousDeploymentIdentity: installRecord.deployment_identity,
+    currentDeploymentIdentity: {
+      environment_id: 'prod',
+      deployment_ids: ['jobs-prod-deployment-v2', 'ops-prod-deployment-v2', 'gateway-prod-deployment-v2'],
+      worker_version_ids: ['jobs@prod-v2', 'ops@prod-v2', 'gateway@prod-v2'],
+    },
+    gatewayRolloutSteps: [
+      { percentage: 10, deployment_id: 'gateway-prod-rollout-10', ready: true, attempt_count: 1, last_error: null },
+      { percentage: 50, deployment_id: 'gateway-prod-rollout-50', ready: true, attempt_count: 1, last_error: null },
+      { percentage: 100, deployment_id: 'gateway-prod-rollout-100', ready: true, attempt_count: 1, last_error: null },
+    ],
+    readinessChecks: {
+      jobs_promoted: buildProductionReadinessProbeFixture(),
+      ops_promoted: buildProductionReadinessProbeFixture(),
+    },
+    rollbackHandle: {
+      workers_subdomain: installRecord.workers_subdomain,
+      worker_versions: {
+        'gateway-worker': {
+          script_name: installRecord.workers['gateway-worker'].script_name,
+          previous_deployment_id: installRecord.workers['gateway-worker'].deployment_id,
+          previous_worker_version_id: installRecord.workers['gateway-worker'].worker_version_id,
+          restore_version_specs: [`${installRecord.workers['gateway-worker'].worker_version_id}@100`],
+        },
+        'jobs-worker': {
+          script_name: installRecord.workers['jobs-worker'].script_name,
+          previous_deployment_id: installRecord.workers['jobs-worker'].deployment_id,
+          previous_worker_version_id: installRecord.workers['jobs-worker'].worker_version_id,
+          restore_version_specs: [`${installRecord.workers['jobs-worker'].worker_version_id}@100`],
+        },
+        'ops-worker': {
+          script_name: installRecord.workers['ops-worker'].script_name,
+          previous_deployment_id: installRecord.workers['ops-worker'].deployment_id,
+          previous_worker_version_id: installRecord.workers['ops-worker'].worker_version_id,
+          restore_version_specs: [`${installRecord.workers['ops-worker'].worker_version_id}@100`],
+        },
+      },
+    },
+    promotionId: 'promotion-prod-v2',
+    promotedAt,
+  });
+}
+
+function buildProdCurrentStateSnapshotFixture({
+  repository = 'VrianCao/MatrixFlare',
+  runId = '24033537026',
+  runAttempt = 1,
+} = {}) {
+  const deploymentSummary = buildProductionDeploymentSummaryFixture();
+  const currentObservation = {
+    observed_at: '2026-04-06T13:25:12.818Z',
+    environment_id: 'prod',
+    current_deployment_identity: deploymentSummary.deployment_identity,
+    problems: [],
+    workers: Object.fromEntries(
+      Object.entries(deploymentSummary.workers).map(([workerName, worker]) => [
+        workerName,
+        {
+          worker_name: workerName,
+          script_name: worker.script_name,
+          latest_active_deployment_id: worker.deployment_id,
+          deployment_ids: [worker.deployment_id],
+          active_worker_version_ids: [worker.worker_version_id],
+          worker_version_ids: [worker.worker_version_id],
+          raw_cloudflare_api_results: {
+            deployments: {
+              deployments: [],
+            },
+            versions: {
+              items: [
+                {
+                  id: worker.worker_version_id,
+                  annotations: {
+                    'workers/tag': worker.worker_version_tag,
+                  },
+                },
+              ],
+            },
+          },
+          error: null,
+        },
+      ]),
+    ),
+  };
+  return buildProductionCurrentStateSnapshot({
+    baselineRecord: buildProdInstallRecordFixture({
+      repository,
+    }),
+    currentObservation,
+    originRunIdentity: buildProducerRunIdentityFixture({
+      repository,
+      runId,
+      runAttempt,
+    }),
+  });
+}
+
+function buildProdCurrentStateDispositionFixture({
+  disposition = 'refreshed',
+  observedAt = '2026-04-06T13:40:00.000Z',
+  refreshError = disposition === 'refreshed' ? null : 'post-mutation refresh failed',
+} = {}) {
+  return {
+    schema_version: 1,
+    artifact_id: 'prod_current_state_disposition',
+    observed_at: observedAt,
+    current_state_path: 'current-production-state.json',
+    disposition,
+    pre_failure_snapshot_path: disposition === 'quarantined'
+      ? 'pre-failure-current-production-state.json'
+      : null,
+    canonical_snapshot_removed: disposition === 'removed',
+    refresh_error: refreshError,
+  };
+}
+
+function buildProdCurrentStateObservationFixture({
+  jobsDeploymentId = 'jobs-prod-deployment-v2',
+  jobsWorkerVersionId = 'jobs@prod-v2',
+} = {}) {
+  return {
+    observed_at: '2026-04-06T08:28:40.000Z',
+    environment_id: 'prod',
+    current_deployment_identity: {
+      environment_id: 'prod',
+      deployment_ids: [jobsDeploymentId, 'ops-prod-deployment-v1', 'gateway-prod-deployment-v1'],
+      worker_version_ids: [jobsWorkerVersionId, 'ops@prod-v1', 'gateway@prod-v1'],
+    },
+    problems: [],
+    workers: {
+      'jobs-worker': {
+        worker_name: 'jobs-worker',
+        script_name: 'matrix-jobs-worker-prod',
+        latest_active_deployment_id: jobsDeploymentId,
+        deployment_ids: [jobsDeploymentId, 'jobs-prod-deployment-v1'],
+        active_worker_version_ids: [jobsWorkerVersionId],
+        worker_version_ids: [jobsWorkerVersionId, 'jobs@prod-v1'],
+        raw_cloudflare_api_results: {
+          deployments: {
+            deployments: [
+              { id: jobsDeploymentId, versions: [{ version_id: jobsWorkerVersionId }] },
+            ],
+          },
+          versions: {
+            items: [
+              { id: jobsWorkerVersionId, annotations: { workers_tag: 'mx-jw-d-prod2' } },
+            ],
+          },
+        },
+        error: null,
+      },
+      'ops-worker': {
+        worker_name: 'ops-worker',
+        script_name: 'matrix-ops-worker-prod',
+        latest_active_deployment_id: 'ops-prod-deployment-v1',
+        deployment_ids: ['ops-prod-deployment-v1'],
+        active_worker_version_ids: ['ops@prod-v1'],
+        worker_version_ids: ['ops@prod-v1'],
+        raw_cloudflare_api_results: null,
+        error: null,
+      },
+      'gateway-worker': {
+        worker_name: 'gateway-worker',
+        script_name: 'matrix-gateway-worker-prod',
+        latest_active_deployment_id: 'gateway-prod-deployment-v1',
+        deployment_ids: ['gateway-prod-deployment-v1'],
+        active_worker_version_ids: ['gateway@prod-v1'],
+        worker_version_ids: ['gateway@prod-v1'],
+        raw_cloudflare_api_results: null,
+        error: null,
+      },
+    },
+  };
+}
+
+async function pathExists(targetPath) {
+  try {
+    await fs.access(targetPath);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 test('non-local environment plan derives deterministic workers.dev scripts and resource names', () => {
@@ -3986,6 +4199,538 @@ test('production automation validators can bind consumed artifacts to the curren
   });
 });
 
+test('prod current-state snapshots satisfy the shared automation contract and can be used as a recovery baseline', () => {
+  const snapshot = buildProdCurrentStateSnapshotFixture();
+  assert.deepEqual(validateProdCurrentStateSnapshot(snapshot), {
+    valid: true,
+    error: null,
+  });
+
+  const normalized = normalizeProdCurrentStateSnapshot(snapshot, {
+    baselineRecord: buildProdInstallRecordFixture(),
+    originRunIdentity: buildProducerRunIdentityFixture({
+      runId: '24033537026',
+    }),
+  });
+  assert.equal(normalized.artifact_id, 'prod_current_state_snapshot');
+  assert.equal(normalized.workers_subdomain, 'matrixflare');
+  assert.deepEqual(
+    normalized.current_deployment_observation.current_deployment_identity,
+    buildProductionDeploymentSummaryFixture().deployment_identity,
+  );
+  assert.equal(
+    normalized.workers['gateway-worker'].url,
+    buildProductionDeploymentSummaryFixture().workers['gateway-worker'].url,
+  );
+});
+
+test('typed prod current-state snapshots must match the supplied upstream producer run identity', () => {
+  const snapshot = buildProdCurrentStateSnapshotFixture({
+    runId: '24033537026',
+  });
+  const mismatchedOriginRunIdentity = buildProducerRunIdentityFixture({
+    runId: '24033537031',
+  });
+
+  assert.deepEqual(
+    validateProdCurrentStateSnapshot(snapshot, {
+      expectedOriginRunIdentity: mismatchedOriginRunIdentity,
+      requireUsableBaseline: true,
+    }),
+    {
+      valid: false,
+      error: 'prod current state snapshot.origin_run_id must match expectedOriginRunIdentity.origin_run_id',
+    },
+  );
+
+  assert.throws(
+    () => normalizeProdCurrentStateSnapshot(snapshot, {
+      baselineRecord: buildProdInstallRecordFixture(),
+      originRunIdentity: mismatchedOriginRunIdentity,
+    }),
+    /typed prod current state snapshot is invalid: prod current state snapshot\.origin_run_id must match expectedOriginRunIdentity\.origin_run_id/u,
+  );
+});
+
+test('typed prod current-state snapshots require RFC3339 observed_at, structured baseline_match, and raw observation workers before they can be reused as baselines', () => {
+  const invalidObservedAt = structuredClone(buildProdCurrentStateSnapshotFixture());
+  invalidObservedAt.observed_at = 'not-a-timestamp';
+  assert.deepEqual(
+    validateProdCurrentStateSnapshot(invalidObservedAt, {
+      requireUsableBaseline: true,
+    }),
+    {
+      valid: false,
+      error: 'prod current state snapshot observed_at must be an RFC 3339 UTC timestamp',
+    },
+  );
+
+  const invalidBaselineMatch = structuredClone(buildProdCurrentStateSnapshotFixture());
+  invalidBaselineMatch.baseline_match = {};
+  assert.deepEqual(
+    validateProdCurrentStateSnapshot(invalidBaselineMatch, {
+      requireUsableBaseline: true,
+    }),
+    {
+      valid: false,
+      error: 'prod current state snapshot baseline_match.matches must be a boolean',
+    },
+  );
+
+  const invalidObservationWorkers = structuredClone(buildProdCurrentStateSnapshotFixture());
+  invalidObservationWorkers.current_deployment_observation.workers = {};
+  assert.deepEqual(
+    validateProdCurrentStateSnapshot(invalidObservationWorkers, {
+      requireUsableBaseline: true,
+    }),
+    {
+      valid: false,
+      error: 'prod current state snapshot current_deployment_observation.workers.jobs-worker must be an object',
+    },
+  );
+});
+
+test('typed prod current-state snapshots require protected_ops_url to match the current prod ops-worker host', () => {
+  const snapshot = structuredClone(buildProdCurrentStateSnapshotFixture());
+  snapshot.access.protected_ops_url = 'https://example.com/not-prod';
+
+  assert.deepEqual(
+    validateProdCurrentStateSnapshot(snapshot, {
+      requireUsableBaseline: true,
+    }),
+    {
+      valid: false,
+      error: 'prod current state snapshot access.protected_ops_url must match the current prod ops-worker host',
+    },
+  );
+});
+
+test('production baseline input resolver finds the embedded baseline record before normalizing current-state blockers', async () => {
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-prod-baseline-resolve-'));
+  const downloadRoot = path.join(workspaceRoot, 'downloaded', 'baseline');
+  const rawSnapshotPath = path.join(downloadRoot, 'state', 'operational-refresh', 'current-production-state.json');
+  const embeddedBaselineRecordPath = path.join(downloadRoot, 'recovered', 'upstream', 'prod-install-record.json');
+  const normalizedOutputPath = path.join(workspaceRoot, 'state', 'normalized-baseline', 'current-production-state.json');
+  const baselineRecord = buildProdInstallRecordFixture({
+    runId: '24033537026',
+  });
+  const typedSnapshot = buildProdCurrentStateSnapshotFixture({
+    runId: '24033537026',
+  });
+  const snapshot = {
+    observed_at: typedSnapshot.observed_at,
+    baseline_record: typedSnapshot.baseline_record,
+    baseline_match: typedSnapshot.baseline_match,
+    current_deployment_observation: typedSnapshot.current_deployment_observation,
+  };
+
+  await fs.mkdir(path.dirname(rawSnapshotPath), { recursive: true });
+  await fs.mkdir(path.dirname(embeddedBaselineRecordPath), { recursive: true });
+  await fs.writeFile(rawSnapshotPath, `${JSON.stringify(snapshot, null, 2)}\n`);
+  await fs.writeFile(embeddedBaselineRecordPath, `${JSON.stringify(baselineRecord, null, 2)}\n`);
+
+  const resolved = await resolveProductionBaselineInputArtifact({
+    downloadRoot,
+    baselineInputKind: 'current_state',
+    baselineInputPath: 'state/operational-refresh/current-production-state.json',
+    baselineRecordName: 'prod-install-record.json',
+    normalizedOutputPath,
+    originRunIdentity: buildProducerRunIdentityFixture({
+      runId: '24033537026',
+    }),
+  });
+
+  assert.equal(resolved.raw_baseline_input_path, rawSnapshotPath);
+  assert.equal(resolved.baseline_record_path, embeddedBaselineRecordPath);
+  assert.equal(resolved.resolved_baseline_input_path, normalizedOutputPath);
+  assert.deepEqual(
+    validateProdCurrentStateSnapshot(JSON.parse(await fs.readFile(normalizedOutputPath, 'utf8')), {
+      requireUsableBaseline: true,
+    }),
+    { valid: true, error: null },
+  );
+});
+
+test('production baseline input resolver accepts typed current-state blockers without an embedded baseline record', async () => {
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-prod-baseline-direct-'));
+  const downloadRoot = path.join(workspaceRoot, 'downloaded', 'baseline');
+  const rawSnapshotPath = path.join(downloadRoot, 'state', 'operational-refresh', 'current-production-state.json');
+  const dispositionPath = path.join(downloadRoot, 'state', 'operational-refresh', 'current-production-state-disposition.json');
+  const normalizedOutputPath = path.join(workspaceRoot, 'state', 'normalized-baseline', 'current-production-state.json');
+  const snapshot = buildProdCurrentStateSnapshotFixture({
+    runId: '24033537031',
+  });
+
+  await fs.mkdir(path.dirname(rawSnapshotPath), { recursive: true });
+  await fs.writeFile(rawSnapshotPath, `${JSON.stringify(snapshot, null, 2)}\n`);
+  await fs.writeFile(
+    dispositionPath,
+    `${JSON.stringify(buildProdCurrentStateDispositionFixture(), null, 2)}\n`,
+  );
+
+  const resolved = await resolveProductionBaselineInputArtifact({
+    downloadRoot,
+    baselineInputKind: 'current_state',
+    baselineInputPath: 'state/operational-refresh/current-production-state.json',
+    baselineRecordName: 'prod-promotion-record.json',
+    normalizedOutputPath,
+    originRunIdentity: buildProducerRunIdentityFixture({
+      runId: '24033537031',
+    }),
+  });
+
+  assert.equal(resolved.raw_baseline_input_path, rawSnapshotPath);
+  assert.equal(resolved.baseline_record_path, null);
+  assert.equal(resolved.resolved_baseline_input_path, normalizedOutputPath);
+  assert.deepEqual(
+    JSON.parse(await fs.readFile(normalizedOutputPath, 'utf8')),
+    snapshot,
+  );
+});
+
+test('production baseline input resolver rejects typed current-state blockers when a disposition sidecar marks the canonical snapshot refresh_failed', async () => {
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-prod-baseline-disposition-'));
+  const downloadRoot = path.join(workspaceRoot, 'downloaded', 'baseline');
+  const rawSnapshotPath = path.join(downloadRoot, 'state', 'operational-refresh', 'current-production-state.json');
+  const dispositionPath = path.join(downloadRoot, 'state', 'operational-refresh', 'current-production-state-disposition.json');
+  const normalizedOutputPath = path.join(workspaceRoot, 'state', 'normalized-baseline', 'current-production-state.json');
+  const snapshot = buildProdCurrentStateSnapshotFixture({
+    runId: '24033537035',
+  });
+
+  await fs.mkdir(path.dirname(rawSnapshotPath), { recursive: true });
+  await fs.writeFile(rawSnapshotPath, `${JSON.stringify(snapshot, null, 2)}\n`);
+  await fs.writeFile(
+    dispositionPath,
+    `${JSON.stringify(buildProdCurrentStateDispositionFixture({
+      disposition: 'refresh_failed',
+    }), null, 2)}\n`,
+  );
+
+  await assert.rejects(
+    () => resolveProductionBaselineInputArtifact({
+      downloadRoot,
+      baselineInputKind: 'current_state',
+      baselineInputPath: 'state/operational-refresh/current-production-state.json',
+      baselineRecordName: 'prod-promotion-record.json',
+      normalizedOutputPath,
+      originRunIdentity: buildProducerRunIdentityFixture({
+        runId: '24033537035',
+      }),
+    }),
+    /current-state baseline input is unavailable because prod current state disposition marked the canonical snapshot as refresh_failed/u,
+  );
+});
+
+test('production current-state failure artifact validator rejects missing disposition sidecars once only the quarantined pre-failure snapshot remains', async () => {
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-prod-current-state-failure-missing-disposition-'));
+  const rawSnapshotPath = path.join(workspaceRoot, 'state', 'operational-refresh', 'current-production-state.json');
+  const preFailureSnapshotPath = path.join(workspaceRoot, 'state', 'operational-refresh', 'pre-failure-current-production-state.json');
+  const snapshot = buildProdCurrentStateSnapshotFixture({
+    runId: '24033537036',
+  });
+
+  await fs.mkdir(path.dirname(preFailureSnapshotPath), { recursive: true });
+  await fs.writeFile(preFailureSnapshotPath, `${JSON.stringify(snapshot, null, 2)}\n`);
+
+  assert.deepEqual(
+    await validateProductionCurrentStateFailureArtifacts({
+      currentStateSnapshotPath: rawSnapshotPath,
+    }),
+    {
+      valid: false,
+      error: 'prod current state failure artifacts must include current-production-state-disposition.json',
+    },
+  );
+});
+
+test('production current-state failure artifact validator rejects refresh_failed sidecars that leave the canonical snapshot in place', async () => {
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-prod-current-state-failure-stale-canonical-'));
+  const rawSnapshotPath = path.join(workspaceRoot, 'state', 'operational-refresh', 'current-production-state.json');
+  const dispositionPath = path.join(workspaceRoot, 'state', 'operational-refresh', 'current-production-state-disposition.json');
+  const snapshot = buildProdCurrentStateSnapshotFixture({
+    runId: '24033537037',
+  });
+
+  await fs.mkdir(path.dirname(rawSnapshotPath), { recursive: true });
+  await fs.writeFile(rawSnapshotPath, `${JSON.stringify(snapshot, null, 2)}\n`);
+  await fs.writeFile(
+    dispositionPath,
+    `${JSON.stringify(buildProdCurrentStateDispositionFixture({
+      disposition: 'refresh_failed',
+    }), null, 2)}\n`,
+  );
+
+  assert.deepEqual(
+    await validateProductionCurrentStateFailureArtifacts({
+      currentStateSnapshotPath: rawSnapshotPath,
+    }),
+    {
+      valid: false,
+      error: 'prod current state disposition refresh_failed requires canonical current-production-state.json to be absent',
+    },
+  );
+});
+
+test('production current-state failure artifact validator accepts refresh_failed sidecars once the canonical snapshot is gone and quarantine evidence remains', async () => {
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-prod-current-state-failure-quarantined-'));
+  const rawSnapshotPath = path.join(workspaceRoot, 'state', 'operational-refresh', 'current-production-state.json');
+  const preFailureSnapshotPath = path.join(workspaceRoot, 'state', 'operational-refresh', 'pre-failure-current-production-state.json');
+  const dispositionPath = path.join(workspaceRoot, 'state', 'operational-refresh', 'current-production-state-disposition.json');
+  const snapshot = buildProdCurrentStateSnapshotFixture({
+    runId: '24033537038',
+  });
+
+  await fs.mkdir(path.dirname(preFailureSnapshotPath), { recursive: true });
+  await fs.writeFile(preFailureSnapshotPath, `${JSON.stringify(snapshot, null, 2)}\n`);
+  await fs.writeFile(
+    dispositionPath,
+    `${JSON.stringify(buildProdCurrentStateDispositionFixture({
+      disposition: 'refresh_failed',
+    }), null, 2)}\n`,
+  );
+
+  assert.deepEqual(
+    await validateProductionCurrentStateFailureArtifacts({
+      currentStateSnapshotPath: rawSnapshotPath,
+    }),
+    {
+      valid: true,
+      error: null,
+    },
+  );
+});
+
+test('production raw-state staging preserves stale canonical current-state snapshots as uploaded forensic evidence', async () => {
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-prod-raw-stage-stale-'));
+  const stateRoot = path.join(workspaceRoot, 'state');
+  const downloadRoot = path.join(workspaceRoot, 'downloaded');
+  const artifactRoot = path.join(workspaceRoot, 'artifacts');
+  const outputRoot = path.join(workspaceRoot, 'upload');
+  const currentStatePath = path.join(stateRoot, 'operational-refresh', 'current-production-state.json');
+  const dispositionPath = path.join(stateRoot, 'operational-refresh', 'current-production-state-disposition.json');
+  const downloadMarker = path.join(downloadRoot, 'baseline', 'marker.txt');
+  const artifactMarker = path.join(artifactRoot, 'prod-promotion-record.json');
+
+  await fs.mkdir(path.dirname(currentStatePath), { recursive: true });
+  await fs.mkdir(path.dirname(downloadMarker), { recursive: true });
+  await fs.mkdir(artifactRoot, { recursive: true });
+  await fs.writeFile(currentStatePath, `${JSON.stringify(buildProdCurrentStateSnapshotFixture(), null, 2)}\n`);
+  await fs.writeFile(
+    dispositionPath,
+    `${JSON.stringify(buildProdCurrentStateDispositionFixture({
+      disposition: 'refresh_failed',
+    }), null, 2)}\n`,
+  );
+  await fs.writeFile(downloadMarker, 'baseline-marker\n');
+  await fs.writeFile(artifactMarker, '{}\n');
+
+  const result = await stageProductionRawStateArtifactForUpload({
+    stateRoot,
+    downloadRoot,
+    artifactRoot,
+    outputRoot,
+  });
+
+  assert.equal(
+    await pathExists(path.join(outputRoot, 'state', 'operational-refresh', 'current-production-state.json')),
+    true,
+  );
+  assert.equal(
+    await pathExists(path.join(outputRoot, 'state', 'operational-refresh', 'current-production-state-disposition.json')),
+    true,
+  );
+  assert.equal(await pathExists(path.join(outputRoot, 'downloaded', 'baseline', 'marker.txt')), true);
+  assert.equal(await pathExists(path.join(outputRoot, 'artifacts', 'prod-promotion-record.json')), true);
+  assert.equal(result.staged_state_root, path.join(outputRoot, 'state'));
+  assert.equal(result.staged_download_root, path.join(outputRoot, 'downloaded'));
+  assert.equal(result.staged_artifact_root, path.join(outputRoot, 'artifacts'));
+});
+
+test('production raw-state staging preserves canonical current-state snapshots when disposition is refreshed', async () => {
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-prod-raw-stage-refreshed-'));
+  const stateRoot = path.join(workspaceRoot, 'state');
+  const downloadRoot = path.join(workspaceRoot, 'downloaded');
+  const artifactRoot = path.join(workspaceRoot, 'artifacts');
+  const outputRoot = path.join(workspaceRoot, 'upload');
+  const currentStatePath = path.join(stateRoot, 'promote', 'current-production-state.json');
+  const dispositionPath = path.join(stateRoot, 'promote', 'current-production-state-disposition.json');
+
+  await fs.mkdir(path.dirname(currentStatePath), { recursive: true });
+  await fs.mkdir(downloadRoot, { recursive: true });
+  await fs.mkdir(artifactRoot, { recursive: true });
+  await fs.writeFile(currentStatePath, `${JSON.stringify(buildProdCurrentStateSnapshotFixture(), null, 2)}\n`);
+  await fs.writeFile(
+    dispositionPath,
+    `${JSON.stringify(buildProdCurrentStateDispositionFixture({
+      disposition: 'refreshed',
+    }), null, 2)}\n`,
+  );
+
+  const result = await stageProductionRawStateArtifactForUpload({
+    stateRoot,
+    downloadRoot,
+    artifactRoot,
+    outputRoot,
+  });
+
+  assert.equal(
+    await pathExists(path.join(outputRoot, 'state', 'promote', 'current-production-state.json')),
+    true,
+  );
+  assert.equal(result.staged_state_root, path.join(outputRoot, 'state'));
+});
+
+test('production baseline input resolver rejects invalid typed current-state blockers instead of falling back to embedded baseline records', async () => {
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-prod-baseline-invalid-'));
+  const downloadRoot = path.join(workspaceRoot, 'downloaded', 'baseline');
+  const rawSnapshotPath = path.join(downloadRoot, 'state', 'operational-refresh', 'current-production-state.json');
+  const embeddedBaselineRecordPath = path.join(downloadRoot, 'recovered', 'upstream', 'prod-install-record.json');
+  const normalizedOutputPath = path.join(workspaceRoot, 'state', 'normalized-baseline', 'current-production-state.json');
+  const snapshot = structuredClone(buildProdCurrentStateSnapshotFixture({
+    runId: '24033537032',
+  }));
+  snapshot.access.protected_ops_url = '';
+
+  await fs.mkdir(path.dirname(rawSnapshotPath), { recursive: true });
+  await fs.mkdir(path.dirname(embeddedBaselineRecordPath), { recursive: true });
+  await fs.writeFile(rawSnapshotPath, `${JSON.stringify(snapshot, null, 2)}\n`);
+  await fs.writeFile(embeddedBaselineRecordPath, `${JSON.stringify(buildProdInstallRecordFixture(), null, 2)}\n`);
+
+  await assert.rejects(
+    () => resolveProductionBaselineInputArtifact({
+      downloadRoot,
+      baselineInputKind: 'current_state',
+      baselineInputPath: 'state/operational-refresh/current-production-state.json',
+      baselineRecordName: 'prod-install-record.json',
+      normalizedOutputPath,
+      originRunIdentity: buildProducerRunIdentityFixture({
+        runId: '24033537032',
+      }),
+    }),
+    /typed prod current state snapshot is invalid: prod current state snapshot access\.protected_ops_url must be non-empty/u,
+  );
+});
+
+test('production baseline input resolver binds record baselines to the selected upstream run identity', async () => {
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-prod-baseline-record-'));
+  const downloadRoot = path.join(workspaceRoot, 'downloaded', 'baseline');
+  const baselineRecordPath = path.join(downloadRoot, 'prod-promotion-record.json');
+  const record = buildProdPromotionRecordFixture({
+    runId: '24033537033',
+  });
+
+  await fs.mkdir(path.dirname(baselineRecordPath), { recursive: true });
+  await fs.writeFile(baselineRecordPath, `${JSON.stringify(record, null, 2)}\n`);
+
+  const resolved = await resolveProductionBaselineInputArtifact({
+    downloadRoot,
+    baselineInputKind: 'record',
+    baselineInputPath: 'prod-promotion-record.json',
+    baselineRecordName: 'prod-promotion-record.json',
+    originRunIdentity: buildProducerRunIdentityFixture({
+      runId: '24033537033',
+    }),
+  });
+
+  assert.equal(resolved.raw_baseline_input_path, baselineRecordPath);
+  assert.equal(resolved.baseline_record_path, baselineRecordPath);
+  assert.equal(resolved.resolved_baseline_input_path, baselineRecordPath);
+
+  await assert.rejects(
+    () => resolveProductionBaselineInputArtifact({
+      downloadRoot,
+      baselineInputKind: 'record',
+      baselineInputPath: 'prod-promotion-record.json',
+      baselineRecordName: 'prod-promotion-record.json',
+      originRunIdentity: buildProducerRunIdentityFixture({
+        runId: '24033537034',
+      }),
+    }),
+    /record baseline input is invalid: prod promotion record\.origin_run_id must match expectedOriginRunIdentity\.origin_run_id/u,
+  );
+});
+
+test('production baseline input resolver rejects embedded baseline records that do not match the selected upstream run identity', async () => {
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-prod-baseline-embedded-origin-'));
+  const downloadRoot = path.join(workspaceRoot, 'downloaded', 'baseline');
+  const rawSnapshotPath = path.join(downloadRoot, 'state', 'operational-refresh', 'current-production-state.json');
+  const embeddedBaselineRecordPath = path.join(downloadRoot, 'recovered', 'upstream', 'prod-install-record.json');
+  const normalizedOutputPath = path.join(workspaceRoot, 'state', 'normalized-baseline', 'current-production-state.json');
+  const snapshot = {
+    observed_at: '2026-04-06T14:00:00.000Z',
+    baseline_record: {
+      artifact_id: 'prod_install_record',
+      origin_run_uri: buildGitHubRunUrl('VrianCao/MatrixFlare', '24033537035'),
+      deployment_identity: {
+        environment_id: 'prod',
+        deployment_ids: ['jobs-prod-deployment-v1', 'ops-prod-deployment-v1', 'gateway-prod-deployment-v1'],
+        worker_version_ids: ['jobs@prod-v1', 'ops@prod-v1', 'gateway@prod-v1'],
+      },
+    },
+    baseline_match: {
+      matches: false,
+      mismatched_fields: ['gateway-worker'],
+      problems: [],
+    },
+    current_deployment_observation: buildProdCurrentStateSnapshotFixture({
+      runId: '24033537035',
+    }).current_deployment_observation,
+  };
+  const embeddedBaselineRecord = buildProdInstallRecordFixture({
+    runId: '24033537036',
+  });
+
+  await fs.mkdir(path.dirname(rawSnapshotPath), { recursive: true });
+  await fs.mkdir(path.dirname(embeddedBaselineRecordPath), { recursive: true });
+  await fs.writeFile(rawSnapshotPath, `${JSON.stringify(snapshot, null, 2)}\n`);
+  await fs.writeFile(embeddedBaselineRecordPath, `${JSON.stringify(embeddedBaselineRecord, null, 2)}\n`);
+
+  await assert.rejects(
+    () => resolveProductionBaselineInputArtifact({
+      downloadRoot,
+      baselineInputKind: 'current_state',
+      baselineInputPath: 'state/operational-refresh/current-production-state.json',
+      baselineRecordName: 'prod-install-record.json',
+      normalizedOutputPath,
+      originRunIdentity: buildProducerRunIdentityFixture({
+        runId: '24033537035',
+      }),
+    }),
+    /baselineRecord is invalid: prod install record\.origin_run_id must match expectedOriginRunIdentity\.origin_run_id/u,
+  );
+});
+
+test('legacy prod current-state snapshots can be normalized into the current recovery baseline schema', () => {
+  const snapshot = buildProdCurrentStateSnapshotFixture();
+  const legacySnapshot = {
+    observed_at: snapshot.observed_at,
+    baseline_record: snapshot.baseline_record,
+    baseline_match: snapshot.baseline_match,
+    current_deployment_observation: snapshot.current_deployment_observation,
+  };
+
+  assert.deepEqual(validateProdCurrentStateSnapshot(legacySnapshot), {
+    valid: false,
+    error: 'prod current state snapshot schema_version must equal 1',
+  });
+
+  const normalized = normalizeProdCurrentStateSnapshot(legacySnapshot, {
+    baselineRecord: buildProdInstallRecordFixture({
+      runId: '24033537026',
+    }),
+    originRunIdentity: buildProducerRunIdentityFixture({
+      runId: '24033537026',
+    }),
+  });
+  assert.deepEqual(validateProdCurrentStateSnapshot(normalized), {
+    valid: true,
+    error: null,
+  });
+  assert.equal(normalized.origin_run_id, '24033537026');
+  assert.equal(normalized.workers['ops-worker'].script_name, 'matrix-ops-worker-prod');
+});
+
 test('production automation validators fail closed on missing rollback data and wrong promotion shape', () => {
   assert.deepEqual(validateProdPromotionRecord({
     schema_version: 1,
@@ -4235,65 +4980,21 @@ test('production current state snapshot records baseline drift with observed Clo
 
   const snapshot = buildProductionCurrentStateSnapshot({
     baselineRecord,
-    currentObservation: {
-      observed_at: '2026-04-06T08:28:40.000Z',
-      environment_id: 'prod',
-      current_deployment_identity: {
-        environment_id: 'prod',
-        deployment_ids: ['jobs-prod-deployment-v2', 'ops-prod-deployment-v1', 'gateway-prod-deployment-v1'],
-        worker_version_ids: ['jobs@prod-v2', 'ops@prod-v1', 'gateway@prod-v1'],
-      },
-      problems: [],
-      workers: {
-        'jobs-worker': {
-          worker_name: 'jobs-worker',
-          script_name: 'matrix-jobs-worker-prod',
-          latest_active_deployment_id: 'jobs-prod-deployment-v2',
-          deployment_ids: ['jobs-prod-deployment-v2', 'jobs-prod-deployment-v1'],
-          active_worker_version_ids: ['jobs@prod-v2'],
-          worker_version_ids: ['jobs@prod-v2', 'jobs@prod-v1'],
-          raw_cloudflare_api_results: {
-            deployments: {
-              deployments: [
-                { id: 'jobs-prod-deployment-v2', versions: [{ version_id: 'jobs@prod-v2' }] },
-              ],
-            },
-            versions: {
-              items: [
-                { id: 'jobs@prod-v2', annotations: { workers_tag: 'mx-jw-d-prod2' } },
-              ],
-            },
-          },
-          error: null,
-        },
-        'ops-worker': {
-          worker_name: 'ops-worker',
-          script_name: 'matrix-ops-worker-prod',
-          latest_active_deployment_id: 'ops-prod-deployment-v1',
-          deployment_ids: ['ops-prod-deployment-v1'],
-          active_worker_version_ids: ['ops@prod-v1'],
-          worker_version_ids: ['ops@prod-v1'],
-          raw_cloudflare_api_results: null,
-          error: null,
-        },
-        'gateway-worker': {
-          worker_name: 'gateway-worker',
-          script_name: 'matrix-gateway-worker-prod',
-          latest_active_deployment_id: 'gateway-prod-deployment-v1',
-          deployment_ids: ['gateway-prod-deployment-v1'],
-          active_worker_version_ids: ['gateway@prod-v1'],
-          worker_version_ids: ['gateway@prod-v1'],
-          raw_cloudflare_api_results: null,
-          error: null,
-        },
-      },
-    },
+    currentObservation: buildProdCurrentStateObservationFixture(),
+    originRunIdentity: buildProducerRunIdentityFixture({ runId: '24033537026' }),
   });
 
+  assert.equal(snapshot.artifact_id, 'prod_current_state_snapshot');
+  assert.equal(snapshot.origin_repository, 'VrianCao/MatrixFlare');
+  assert.equal(snapshot.source_environment, 'prod');
+  assert.equal(snapshot.workers_subdomain, baselineRecord.workers_subdomain);
   assert.equal(snapshot.baseline_record.artifact_id, 'prod_install_record');
   assert.equal(snapshot.baseline_match.matches, false);
   assert.deepEqual(snapshot.baseline_match.mismatched_fields, ['deployment_ids', 'worker_version_ids']);
   assert.deepEqual(snapshot.baseline_match.problems, []);
+  assert.equal(snapshot.workers['jobs-worker'].deployment_id, 'jobs-prod-deployment-v2');
+  assert.equal(snapshot.workers['jobs-worker'].worker_version_id, 'jobs@prod-v2');
+  assert.equal(snapshot.workers['jobs-worker'].worker_version_tag, 'mx-jw-d-prod2');
   assert.equal(
     snapshot.current_deployment_observation.workers['jobs-worker'].raw_cloudflare_api_results.deployments.deployments[0].id,
     'jobs-prod-deployment-v2',
@@ -4350,6 +5051,7 @@ test('production current state snapshot stays fail-closed when current identity 
         },
       },
     },
+    originRunIdentity: buildProducerRunIdentityFixture({ runId: '24033537027' }),
   });
 
   assert.equal(snapshot.baseline_match.matches, false);
@@ -4419,6 +5121,7 @@ test('production current state snapshot retains partially successful Cloudflare 
         },
       },
     },
+    originRunIdentity: buildProducerRunIdentityFixture({ runId: '24033537028' }),
   });
 
   assert.equal(snapshot.baseline_match.matches, false);
@@ -4439,6 +5142,86 @@ test('production current state snapshot retains partially successful Cloudflare 
     snapshot.current_deployment_observation.workers['ops-worker'].raw_cloudflare_api_results.versions,
     null,
   );
+});
+
+test('usable production current state snapshots validate as baseline-capable artifacts', () => {
+  const snapshot = buildProductionCurrentStateSnapshot({
+    baselineRecord: buildProdInstallRecordFixture(),
+    currentObservation: buildProdCurrentStateObservationFixture(),
+    originRunIdentity: buildProducerRunIdentityFixture({ runId: '24033537029' }),
+  });
+
+  assert.deepEqual(
+    validateProdCurrentStateSnapshot(snapshot, {
+      expectedGitHubRepository: 'VrianCao/MatrixFlare',
+      requireUsableBaseline: true,
+    }),
+    { valid: true, error: null },
+  );
+});
+
+test('production current state snapshots cannot be consumed as baselines without full worker closure metadata', () => {
+  const snapshot = structuredClone(buildProdCurrentStateSnapshotFixture());
+  delete snapshot.workers['gateway-worker'];
+
+  const validation = validateProdCurrentStateSnapshot(snapshot, {
+    expectedGitHubRepository: 'VrianCao/MatrixFlare',
+    requireUsableBaseline: true,
+  });
+  assert.equal(validation.valid, false);
+  assert.match(validation.error, /workers\.gateway-worker/);
+});
+
+test('production current state snapshots stay unusable as baselines when current identity cannot be normalized', () => {
+  const snapshot = buildProductionCurrentStateSnapshot({
+    baselineRecord: buildProdInstallRecordFixture(),
+    currentObservation: {
+      observed_at: '2026-04-06T08:28:40.000Z',
+      environment_id: 'prod',
+      current_deployment_identity: null,
+      problems: ['Cloudflare must expose exactly one active worker version id for matrix-gateway-worker-prod before production promotion'],
+      workers: {
+        'jobs-worker': {
+          worker_name: 'jobs-worker',
+          script_name: 'matrix-jobs-worker-prod',
+          latest_active_deployment_id: 'jobs-prod-deployment-v2',
+          deployment_ids: ['jobs-prod-deployment-v2'],
+          active_worker_version_ids: ['jobs@prod-v2'],
+          worker_version_ids: ['jobs@prod-v2'],
+          raw_cloudflare_api_results: null,
+          error: null,
+        },
+        'ops-worker': {
+          worker_name: 'ops-worker',
+          script_name: 'matrix-ops-worker-prod',
+          latest_active_deployment_id: 'ops-prod-deployment-v1',
+          deployment_ids: ['ops-prod-deployment-v1'],
+          active_worker_version_ids: ['ops@prod-v1'],
+          worker_version_ids: ['ops@prod-v1'],
+          raw_cloudflare_api_results: null,
+          error: null,
+        },
+        'gateway-worker': {
+          worker_name: 'gateway-worker',
+          script_name: 'matrix-gateway-worker-prod',
+          latest_active_deployment_id: 'gateway-prod-deployment-v1',
+          deployment_ids: ['gateway-prod-deployment-v1'],
+          active_worker_version_ids: ['gateway@prod-v2', 'gateway@prod-v1'],
+          worker_version_ids: ['gateway@prod-v2', 'gateway@prod-v1'],
+          raw_cloudflare_api_results: null,
+          error: null,
+        },
+      },
+    },
+    originRunIdentity: buildProducerRunIdentityFixture({ runId: '24033537030' }),
+  });
+
+  const validation = validateProdCurrentStateSnapshot(snapshot, {
+    expectedGitHubRepository: 'VrianCao/MatrixFlare',
+    requireUsableBaseline: true,
+  });
+  assert.equal(validation.valid, false);
+  assert.match(validation.error, /current_deployment_observation\.current_deployment_identity/);
 });
 
 test('observeProductionInstallTopologyState retains raw Cloudflare worker state for active-topology install blockers', async () => {
@@ -4530,13 +5313,78 @@ test('production automation runtime paths persist current-production-state block
   );
   assert.match(
     source,
-    /export async function promoteProductionEnvironment[\s\S]*?const currentStateSnapshotPath = path\.join\(resolvedWorkingRoot, 'current-production-state\.json'\);\s+const currentObservation = await observeProductionCurrentCloudflareState\(resolvedBaselineRecord,[\s\S]*?await writeProductionCurrentStateSnapshot\(\{\s+baselineRecord: resolvedBaselineRecord,\s+currentObservation,\s+outputPath: currentStateSnapshotPath,[\s\S]*?assertProductionBaselineMatchesCurrentIdentity\(resolvedBaselineRecord, currentIdentity, \{\s+observedStatePath: currentStateSnapshotPath,/su,
+    /export async function promoteProductionEnvironment[\s\S]*?const currentStateSnapshotPath = path\.join\(resolvedWorkingRoot, 'current-production-state\.json'\);\s+const currentObservation = await observeProductionCurrentCloudflareState\(resolvedBaselineRecord,[\s\S]*?await writeProductionCurrentStateSnapshot\(\{\s+baselineRecord: resolvedBaselineRecord,\s+currentObservation,[\s\S]*?outputPath: currentStateSnapshotPath,[\s\S]*?assertProductionBaselineMatchesCurrentIdentity\(resolvedBaselineRecord, currentIdentity, \{\s+observedStatePath: currentStateSnapshotPath,/su,
     'promote-prod must persist current-production-state.json before failing closed on baseline/current drift',
   );
   assert.match(
     source,
-    /export async function operationalRefreshProductionEnvironment[\s\S]*?const currentStateSnapshotPath = path\.join\(resolvedWorkingRoot, 'current-production-state\.json'\);\s+const currentObservation = await observeProductionCurrentCloudflareState\(resolvedBaselineRecord,[\s\S]*?await writeProductionCurrentStateSnapshot\(\{\s+baselineRecord: resolvedBaselineRecord,\s+currentObservation,\s+outputPath: currentStateSnapshotPath,[\s\S]*?assertProductionBaselineMatchesCurrentIdentity\(resolvedBaselineRecord, currentIdentity, \{\s+observedStatePath: currentStateSnapshotPath,/su,
+    /export async function operationalRefreshProductionEnvironment[\s\S]*?const currentStateSnapshotPath = path\.join\(resolvedWorkingRoot, 'current-production-state\.json'\);\s+const currentObservation = await observeProductionCurrentCloudflareState\(resolvedBaselineRecord,[\s\S]*?await writeProductionCurrentStateSnapshot\(\{\s+baselineRecord: resolvedBaselineRecord,\s+currentObservation,[\s\S]*?outputPath: currentStateSnapshotPath,[\s\S]*?assertProductionBaselineMatchesCurrentIdentity\(resolvedBaselineRecord, currentIdentity, \{\s+observedStatePath: currentStateSnapshotPath,/su,
     'operational-prod-refresh must persist current-production-state.json before failing closed on baseline/current drift',
+  );
+  assert.match(
+    source,
+    /export async function promoteProductionEnvironment[\s\S]*?catch \(error\) \{\s+throw await refreshProductionCurrentStateSnapshotAfterFailure\(\{\s+baselineRecord: resolvedBaselineRecord,\s+currentStateSnapshotPath,\s+originRunIdentity,\s+accountId,\s+apiToken,\s+error,/su,
+    'promote-prod must refresh current-production-state.json after partial prod mutation failures',
+  );
+  assert.match(
+    source,
+    /export async function operationalRefreshProductionEnvironment[\s\S]*?catch \(error\) \{\s+throw await refreshProductionCurrentStateSnapshotAfterFailure\(\{\s+baselineRecord: resolvedBaselineRecord,\s+currentStateSnapshotPath,\s+originRunIdentity,\s+accountId,\s+apiToken,\s+error,/su,
+    'operational-prod-refresh must refresh current-production-state.json after partial prod mutation failures',
+  );
+  assert.match(
+    source,
+    /if \(candidateManifest\.requires_do_migration\) \{[\s\S]*?await markProductionCurrentStateSnapshotPotentiallyStale\(currentStateSnapshotPath\);[\s\S]*?const deployedWorker = await deployWorker\(/su,
+    'promote-prod must mark the pre-mutation current-production-state snapshot as potentially stale before the first migration-safe prod mutation',
+  );
+  assert.match(
+    source,
+    /const jobsUpload = await uploadWorkerVersion\('jobs-worker'[\s\S]*?await markProductionCurrentStateSnapshotPotentiallyStale\(currentStateSnapshotPath\);[\s\S]*?const jobsDeploy = await deployProductionWorkerVersion\(\s+'jobs-worker'/su,
+    'promote-prod must mark the pre-mutation current-production-state snapshot as potentially stale before the first gradual prod mutation',
+  );
+  assert.match(
+    source,
+    /export async function operationalRefreshProductionEnvironment[\s\S]*?const jobsUpload = await uploadWorkerVersion\('jobs-worker'[\s\S]*?await markProductionCurrentStateSnapshotPotentiallyStale\(currentStateSnapshotPath\);[\s\S]*?const jobsDeploy = await deployProductionWorkerVersion\(\s+'jobs-worker'/su,
+    'operational-prod-refresh must mark the pre-mutation current-production-state snapshot as potentially stale before the first prod mutation',
+  );
+  assert.match(
+    source,
+    /async function writeProductionCurrentStateSnapshot\(\{[\s\S]*?const temporaryOutputPath = path\.join\([\s\S]*?await fs\.writeFile\(temporaryOutputPath, stableJson\(snapshot\)\);\s+await fs\.rename\(temporaryOutputPath, outputPath\);[\s\S]*?await fs\.rm\(temporaryOutputPath, \{ force: true \}\);/su,
+    'prod recovery helpers must replace current-production-state.json atomically so partial writes cannot masquerade as a valid blocker snapshot',
+  );
+  assert.match(
+    source,
+    /async function refreshProductionCurrentStateSnapshotAfterFailure[\s\S]*?await markProductionCurrentStateSnapshotPotentiallyStale\(currentStateSnapshotPath\);[\s\S]*?const refreshedObservation = await observeProductionCurrentCloudflareState/su,
+    'prod recovery helpers must mark the pre-failure current-production-state snapshot as stale before attempting the post-failure refresh',
+  );
+  assert.match(
+    source,
+    /async function refreshProductionCurrentStateSnapshotAfterFailure[\s\S]*?catch \(initialDispositionError\) \{[\s\S]*?await quarantinePotentiallyStaleProductionCurrentStateSnapshot\(currentStateSnapshotPath\);[\s\S]*?await fs\.rm\(currentStateSnapshotPath, \{ force: true \}\);/su,
+    'prod recovery helpers must quarantine or delete the stale canonical current-production-state snapshot if the provisional disposition marker cannot be written',
+  );
+  assert.match(
+    source,
+    /async function refreshProductionCurrentStateSnapshotAfterFailure[\s\S]*?await quarantinePotentiallyStaleProductionCurrentStateSnapshot\(currentStateSnapshotPath\);[\s\S]*?await fs\.rm\(currentStateSnapshotPath, \{ force: true \}\);/su,
+    'prod recovery helpers must remove the canonical current-production-state.json when quarantine itself fails',
+  );
+  assert.match(
+    source,
+    /let dispositionPath = provisionalDispositionPath;[\s\S]*?await writeProductionCurrentStateDisposition\(\{/su,
+    'prod recovery helpers must preserve the provisional stale-marker path unless a more specific refreshed or quarantined disposition can be written',
+  );
+  assert.match(
+    source,
+    /current-production-state-disposition\.json/su,
+    'prod recovery helpers must retain an explicit disposition artifact for stale current-production-state handling',
+  );
+  assert.match(
+    source,
+    /async function quarantinePotentiallyStaleProductionCurrentStateSnapshot\(currentStateSnapshotPath\)[\s\S]*?pre-failure-current-production-state\.json[\s\S]*?await fs\.rename\(currentStateSnapshotPath, staleSnapshotPath\);/su,
+    'prod recovery helpers must quarantine the pre-failure snapshot instead of leaving a stale current-production-state.json in place',
+  );
+  assert.match(
+    source,
+    /async function refreshProductionCurrentStateSnapshotAfterFailure[\s\S]*?removed current-production-state snapshot because it may be stale[\s\S]*?preserved the pre-failure snapshot at/su,
+    'prod recovery helpers must explicitly mark the current-production-state snapshot unusable when the post-failure refresh cannot be completed',
   );
   assert.match(
     source,
@@ -4545,7 +5393,7 @@ test('production automation runtime paths persist current-production-state block
   );
   assert.match(
     source,
-    /await writeProductionCurrentStateSnapshot\(\{\s+baselineRecord: promotionRecord,\s+currentObservation,\s+outputPath: currentStateSnapshotPath,/su,
+    /await writeProductionCurrentStateSnapshot\(\{\s+baselineRecord: promotionRecord,\s+currentObservation,[\s\S]*?outputPath: currentStateSnapshotPath,/su,
     'rollback-prod must persist current-production-state.json before failing closed on current-state drift',
   );
   assert.match(
@@ -4598,7 +5446,12 @@ test('production workflow YAMLs stay aligned with the prod automation CLI contra
 
   assert.match(promoteProdWorkflow, /node packages\/testing\/src\/cli\.mjs prod-promote/u, 'promote-prod workflow must invoke the prod-promote CLI entry');
   assert.match(promoteProdWorkflow, /\.github\/workflows\/release-candidate\.yml/u, 'promote-prod workflow must require candidate runs from release-candidate.yml');
-  assert.match(promoteProdWorkflow, /baseline_artifact_prefix/u, 'promote-prod workflow must derive the exact baseline artifact prefix from the upstream workflow path');
+  assert.match(promoteProdWorkflow, /\.github\/workflows\/operational-prod-refresh\.yml/u, 'promote-prod workflow must accept operational-prod-refresh as a baseline source');
+  assert.match(promoteProdWorkflow, /listWorkflowRunArtifacts/u, 'promote-prod workflow must inspect upstream run artifacts through the GitHub Actions artifacts API');
+  assert.match(promoteProdWorkflow, /baseline_artifact_name/u, 'promote-prod workflow must resolve the exact upstream baseline artifact name');
+  assert.match(promoteProdWorkflow, /baseline_input_kind/u, 'promote-prod workflow must distinguish record baselines from current-state snapshot baselines');
+  assert.match(promoteProdWorkflow, /baseline_input_path/u, 'promote-prod workflow must persist the baseline artifact payload path');
+  assert.match(promoteProdWorkflow, /baseline_record_name/u, 'promote-prod workflow must retain the expected baseline record filename for raw current-state recovery');
   assert.match(promoteProdWorkflow, /--baseline-record/u, 'promote-prod workflow must consume a baseline record');
   assert.match(promoteProdWorkflow, /--candidate-manifest/u, 'promote-prod workflow must consume the reviewed candidate manifest');
   assert.match(promoteProdWorkflow, /--promotion-id/u, 'promote-prod workflow must persist an explicit promotion id');
@@ -4611,7 +5464,20 @@ test('production workflow YAMLs stay aligned with the prod automation CLI contra
   assert.match(promoteProdWorkflow, /dispatch-request\.json/u, 'promote-prod raw state must retain the requested candidate and baseline inputs');
   assert.match(promoteProdWorkflow, /id:\s+runs[\s\S]*?continue-on-error:\s+true/u, 'promote-prod must preserve raw state when upstream run resolution fails');
   assert.match(promoteProdWorkflow, /id:\s+download_candidate[\s\S]*?continue-on-error:\s+true/u, 'promote-prod must preserve raw state when candidate download fails');
+  assert.match(promoteProdWorkflow, /id:\s+download_candidate[\s\S]*?merge-multiple:\s+true/u, 'promote-prod must flatten the candidate artifact download so manifest paths resolve deterministically');
   assert.match(promoteProdWorkflow, /id:\s+download_baseline[\s\S]*?continue-on-error:\s+true/u, 'promote-prod must preserve raw state when baseline download fails');
+  assert.match(promoteProdWorkflow, /id:\s+download_baseline[\s\S]*?merge-multiple:\s+true/u, 'promote-prod must flatten the baseline artifact download so record and current-state paths resolve deterministically');
+  assert.match(promoteProdWorkflow, /id:\s+resolve_baseline_input[\s\S]*?continue-on-error:\s+true/u, 'promote-prod must preserve raw state when current-state baseline normalization fails');
+  assert.match(promoteProdWorkflow, /baseline-resolution\.json/u, 'promote-prod must retain the resolved baseline input details in raw artifacts');
+  assert.match(promoteProdWorkflow, /state\/promote\/current-production-state\.json/u, 'promote-prod must be able to recover from a prior promote-prod current-state blocker snapshot');
+  assert.match(promoteProdWorkflow, /node packages\/testing\/src\/cli\.mjs prod-raw-state-stage/u, 'promote-prod must stage an exact raw-state upload bundle before artifact upload');
+  assert.match(promoteProdWorkflow, /path:\s+\$\{\{\s*steps\.stage_raw_state\.outputs\.upload_root\s*\}\}/u, 'promote-prod must upload the staged raw-state root without mutating blocker evidence');
+  assert.match(promoteProdWorkflow, /current-production-state-disposition\.json/u, 'promote-prod raw artifacts must retain an explicit disposition record for stale current-production-state handling');
+  assert.match(promoteProdWorkflow, /state\/operational-refresh\/current-production-state\.json/u, 'promote-prod must be able to recover from a prior operational-prod-refresh current-state blocker snapshot');
+  assert.match(promoteProdWorkflow, /prod-baseline-resolve/u, 'promote-prod must resolve embedded raw-artifact baseline paths before normalizing current-state blockers');
+  assert.match(promoteProdWorkflow, /--baseline-record-name/u, 'promote-prod must pass the expected embedded baseline record filename into the resolver');
+  assert.match(promoteProdWorkflow, /node packages\/testing\/src\/cli\.mjs prod-current-state-failure-validate/u, 'promote-prod final gate must validate failure-side current-state artifacts with the dedicated CLI contract');
+  assert.match(promoteProdWorkflow, /elif \[ ! -f "\$\{\{\s*steps\.paths\.outputs\.state_root\s*\}\}\/promote\/current-production-state\.json" \]; then/u, 'promote-prod final gate must fail when neither a usable canonical snapshot nor a disposition sidecar survives');
   assert.match(promoteProdWorkflow, /id:\s+candidate[\s\S]*?continue-on-error:\s+true/u, 'promote-prod must preserve raw state when candidate sha resolution fails');
   assert.match(promoteProdWorkflow, /id:\s+checkout_candidate[\s\S]*?continue-on-error:\s+true/u, 'promote-prod must preserve raw state when candidate checkout fails');
   assert.match(promoteProdWorkflow, /id:\s+require_candidate_checkout_match[\s\S]*?continue-on-error:\s+true/u, 'promote-prod must preserve raw state when candidate checkout validation fails');
@@ -4623,7 +5489,19 @@ test('production workflow YAMLs stay aligned with the prod automation CLI contra
   assert.match(operationalRefreshWorkflow, /\.github\/workflows\/operational-prod-refresh\.yml/u, 'operational-prod-refresh must permit its own prior runs as future baseline sources');
   assert.match(operationalRefreshWorkflow, /\.github\/workflows\/promote-prod\.yml/u, 'operational-prod-refresh must accept promote-prod as a baseline source');
   assert.match(operationalRefreshWorkflow, /\.github\/workflows\/prod-install\.yml/u, 'operational-prod-refresh must accept prod-install as a baseline source');
+  assert.match(operationalRefreshWorkflow, /listWorkflowRunArtifacts/u, 'operational-prod-refresh must inspect upstream run artifacts through the GitHub Actions artifacts API');
+  assert.match(operationalRefreshWorkflow, /baseline_artifact_name/u, 'operational-prod-refresh must resolve the exact upstream baseline artifact name');
+  assert.match(operationalRefreshWorkflow, /baseline_input_kind/u, 'operational-prod-refresh must distinguish record baselines from current-state snapshot baselines');
+  assert.match(operationalRefreshWorkflow, /baseline_input_path/u, 'operational-prod-refresh must persist the baseline artifact payload path');
+  assert.match(operationalRefreshWorkflow, /baseline_record_name/u, 'operational-prod-refresh must retain the expected baseline record filename for raw current-state recovery');
+  assert.match(operationalRefreshWorkflow, /state\/promote\/current-production-state\.json/u, 'operational-prod-refresh must be able to recover from a prior promote-prod current-state blocker snapshot');
+  assert.match(operationalRefreshWorkflow, /node packages\/testing\/src\/cli\.mjs prod-raw-state-stage/u, 'operational-prod-refresh must stage an exact raw-state upload bundle before artifact upload');
+  assert.match(operationalRefreshWorkflow, /path:\s+\$\{\{\s*steps\.stage_raw_state\.outputs\.upload_root\s*\}\}/u, 'operational-prod-refresh must upload the staged raw-state root without mutating blocker evidence');
+  assert.match(operationalRefreshWorkflow, /current-production-state-disposition\.json/u, 'operational-prod-refresh raw artifacts must retain an explicit disposition record for stale current-production-state handling');
+  assert.match(operationalRefreshWorkflow, /state\/operational-refresh\/current-production-state\.json/u, 'operational-prod-refresh must be able to recover from a prior operational refresh current-state blocker snapshot');
   assert.match(operationalRefreshWorkflow, /--baseline-record/u, 'operational-prod-refresh workflow must consume a baseline record');
+  assert.match(operationalRefreshWorkflow, /prod-baseline-resolve/u, 'operational-prod-refresh must resolve embedded raw-artifact baseline paths before normalizing current-state blockers');
+  assert.match(operationalRefreshWorkflow, /--baseline-record-name/u, 'operational-prod-refresh must pass the expected embedded baseline record filename into the resolver');
   assert.match(operationalRefreshWorkflow, /--promotion-id/u, 'operational-prod-refresh workflow must persist an explicit promotion id');
   assert.match(operationalRefreshWorkflow, /--reason/u, 'operational-prod-refresh workflow must persist the operational reason');
   assert.match(operationalRefreshWorkflow, /--blocked-by-open-questions/u, 'operational-prod-refresh workflow must persist the blocker list');
@@ -4637,7 +5515,12 @@ test('production workflow YAMLs stay aligned with the prod automation CLI contra
   assert.match(operationalRefreshWorkflow, /dispatch-request\.json/u, 'operational-prod-refresh raw state must retain the requested baseline and unblock inputs');
   assert.match(operationalRefreshWorkflow, /id:\s+baseline_run[\s\S]*?continue-on-error:\s+true/u, 'operational-prod-refresh must preserve raw state when baseline run resolution fails');
   assert.match(operationalRefreshWorkflow, /id:\s+download_baseline[\s\S]*?continue-on-error:\s+true/u, 'operational-prod-refresh must preserve raw state when baseline download fails');
+  assert.match(operationalRefreshWorkflow, /id:\s+download_baseline[\s\S]*?merge-multiple:\s+true/u, 'operational-prod-refresh must flatten the baseline artifact download so recovered baseline paths resolve deterministically');
+  assert.match(operationalRefreshWorkflow, /id:\s+resolve_baseline_input[\s\S]*?continue-on-error:\s+true/u, 'operational-prod-refresh must preserve raw state when current-state baseline normalization fails');
+  assert.match(operationalRefreshWorkflow, /baseline-resolution\.json/u, 'operational-prod-refresh must retain the resolved baseline input details in raw artifacts');
   assert.match(operationalRefreshWorkflow, /id:\s+operational_refresh[\s\S]*?continue-on-error:\s+true/u, 'operational-prod-refresh must preserve raw state before failing closed');
+  assert.match(operationalRefreshWorkflow, /node packages\/testing\/src\/cli\.mjs prod-current-state-failure-validate/u, 'operational-prod-refresh final gate must validate failure-side current-state artifacts with the dedicated CLI contract');
+  assert.match(operationalRefreshWorkflow, /elif \[ ! -f "\$\{\{\s*steps\.paths\.outputs\.state_root\s*\}\}\/operational-refresh\/current-production-state\.json" \]; then/u, 'operational-prod-refresh final gate must fail when neither a usable canonical snapshot nor a disposition sidecar survives');
   assert.match(operationalRefreshWorkflow, /prod-operational-refresh-raw-state-/u, 'operational-prod-refresh must upload a dedicated raw-state artifact');
 
   assert.match(rollbackProdWorkflow, /node packages\/testing\/src\/cli\.mjs prod-rollback/u, 'rollback-prod workflow must invoke the prod-rollback CLI entry');

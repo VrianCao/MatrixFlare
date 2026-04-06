@@ -659,6 +659,51 @@
 * consumer 在 replay `requested_rollback_handle` 前，必须先证明当前 Cloudflare prod identity 仍等于 source `ProdPromotionRecord.current_deployment_identity`；否则该 rollback request 必须 fail-closed。
 * consumer 在用于审计前，必须额外验证 `origin_repository` 等于当前仓库。
 
+### 5.26 `ProdCurrentStateSnapshot`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `schema_version` | integer | 固定为 `1` |
+| `artifact_id` | string | 固定为 `prod_current_state_snapshot` |
+| `source_environment` | string | 固定为 `prod` |
+| `origin_repository` | string | 非空 GitHub `owner/repo` slug；必须是生成该 snapshot 的 workflow 所在仓库 |
+| `origin_run_id` | string | 非空；必须与 `origin_run_uri` 对应 |
+| `origin_run_attempt` | integer | 正整数 |
+| `origin_run_uri` | string | GitHub Actions run URL；必须回链当前生成该 raw blocker artifact 的 workflow run |
+| `workers_subdomain` | string | 非空 account-owned workers.dev subdomain |
+| `access` | object | 至少包含 `protected_ops_url`，且必须是当前 prod ops ingress 的 HTTPS URL |
+| `observed_at` | string | RFC 3339 UTC |
+| `baseline_record` | object | 至少包含 `artifact_id`,`origin_run_uri`,`deployment_identity`；`artifact_id` 允许 `prod_install_record`,`prod_promotion_record`,`prod_current_state_snapshot` |
+| `baseline_match` | object | 至少包含 `matches`,`mismatched_fields`,`problems` |
+| `workers` | object | 对每个 prod worker 至少包含 `script_name`,`url`,`deployment_id`,`worker_version_id`,`worker_version_tag`；当该 snapshot 需要被后续 promote/refresh 作为 baseline 消费时，这些字段不得省略 |
+| `current_deployment_observation` | object | 至少包含 `environment_id = prod`、`current_deployment_identity`、以及每个 worker 的原始 Cloudflare observation |
+
+附加规则：
+
+* 该 snapshot 是 raw blocker artifact，不是 success promotion/install record；它只能证明“某次 prod automation fail-closed 前观测到的 live current state”。
+* 当 `current_deployment_observation.current_deployment_identity` 缺失、不可归一化、或 `workers` 无法形成单版本 baseline 时，该 snapshot 仍必须保留供诊断，但不得被后续 workflow 当作可用 baseline。
+* 后续 `promote-prod` / `operational-prod-refresh` 只有在再次回读 live Cloudflare prod identity 并证明其仍与该 snapshot 的 `current_deployment_identity` 完全一致时，才允许把它当作 baseline 输入；任何 stale snapshot 或 repository mismatch 都必须 fail-closed。
+
+### 5.27 `ProdCurrentStateDisposition`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `schema_version` | integer | 固定为 `1` |
+| `artifact_id` | string | 固定为 `prod_current_state_disposition` |
+| `observed_at` | string | RFC 3339 UTC |
+| `current_state_path` | string | 非空 basename；当前 canonical current-state 文件名，固定为 `current-production-state.json` |
+| `disposition` | string | 只允许 `refreshed`、`quarantined`、`removed`、`refresh_failed` |
+| `pre_failure_snapshot_path` | string or null | 若 `disposition = quarantined` 则必须为非空 basename，且固定为 `pre-failure-current-production-state.json`；否则必须为 `null` |
+| `canonical_snapshot_removed` | boolean | 当且仅当 `disposition = removed` 时为 `true` |
+| `refresh_error` | string or null | `disposition = refreshed` 时必须为 `null`；否则必须为非空人类可读错误 |
+
+附加规则：
+
+* 该 sidecar 只用于证明 canonical `current-production-state.json` 在 post-mutation refresh 失败后没有继续被当作 truthful baseline；它不是 baseline，不得被任何 consumer 当作 deployment identity 输入。
+* `disposition = refreshed` 表示 canonical path 已被新的 live revalidated snapshot 原子替换；此时 consumer 仍必须去读取对应的 `ProdCurrentStateSnapshot`，不能只看 disposition sidecar。
+* `disposition = quarantined` 表示原 canonical snapshot 已移出 canonical path 并降格为 `pre-failure-current-production-state.json`；consumer 必须把该文件视为 pre-failure forensic artifact，而不是 live current state。
+* `disposition = removed` 或 `refresh_failed` 都意味着 canonical current-state snapshot 不可用；后续 recovery 必须重新获取 live blocker artifact，而不是沿用旧路径。
+
 ## 6. 内部 RPC 与异步作业 Payload
 
 * 除显式采用 stream 或 locator 的契约外，任何内部 RPC request/response 的普通 serialized payload 都必须小于等于 `32 MiB`；更大的数据必须分页、分段或外置到 R2 后只传 locator。引用：`CF-WKR-023`。
