@@ -4317,6 +4317,9 @@ test('production baseline input resolver finds the embedded baseline record befo
   });
   const snapshot = {
     observed_at: typedSnapshot.observed_at,
+    access: {
+      protected_ops_url: typedSnapshot.access.protected_ops_url,
+    },
     baseline_record: typedSnapshot.baseline_record,
     baseline_match: typedSnapshot.baseline_match,
     current_deployment_observation: typedSnapshot.current_deployment_observation,
@@ -4346,6 +4349,43 @@ test('production baseline input resolver finds the embedded baseline record befo
       requireUsableBaseline: true,
     }),
     { valid: true, error: null },
+  );
+});
+
+test('production baseline input resolver rejects legacy current-state blockers that omit protected ops ingress even when the embedded baseline record retains it', async () => {
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-prod-baseline-missing-embedded-ops-url-'));
+  const downloadRoot = path.join(workspaceRoot, 'downloaded', 'baseline');
+  const rawSnapshotPath = path.join(downloadRoot, 'state', 'operational-refresh', 'current-production-state.json');
+  const embeddedBaselineRecordPath = path.join(downloadRoot, 'recovered', 'upstream', 'prod-install-record.json');
+  const normalizedOutputPath = path.join(workspaceRoot, 'state', 'normalized-baseline', 'current-production-state.json');
+  const baselineRecord = buildProdInstallRecordFixture();
+  const typedSnapshot = buildProdCurrentStateSnapshotFixture({
+    runId: '24033537026',
+  });
+  const snapshot = {
+    observed_at: typedSnapshot.observed_at,
+    baseline_record: typedSnapshot.baseline_record,
+    baseline_match: typedSnapshot.baseline_match,
+    current_deployment_observation: typedSnapshot.current_deployment_observation,
+  };
+
+  await fs.mkdir(path.dirname(rawSnapshotPath), { recursive: true });
+  await fs.mkdir(path.dirname(embeddedBaselineRecordPath), { recursive: true });
+  await fs.writeFile(rawSnapshotPath, `${JSON.stringify(snapshot, null, 2)}\n`);
+  await fs.writeFile(embeddedBaselineRecordPath, `${JSON.stringify(baselineRecord, null, 2)}\n`);
+
+  await assert.rejects(
+    () => resolveProductionBaselineInputArtifact({
+      downloadRoot,
+      baselineInputKind: 'current_state',
+      baselineInputPath: 'state/operational-refresh/current-production-state.json',
+      baselineRecordName: 'prod-install-record.json',
+      normalizedOutputPath,
+      originRunIdentity: buildProducerRunIdentityFixture({
+        runId: '24033537026',
+      }),
+    }),
+    /legacy prod current state snapshot access must be an object/u,
   );
 });
 
@@ -4664,6 +4704,9 @@ test('production baseline input resolver accepts embedded baseline records that 
   });
   const snapshot = {
     observed_at: '2026-04-06T13:25:40.017Z',
+    access: {
+      protected_ops_url: 'https://matrix-ops-worker-prod.matrixflare.workers.dev',
+    },
     baseline_record: {
       artifact_id: embeddedBaselineRecord.artifact_id,
       origin_run_uri: embeddedBaselineRecord.origin_run_uri,
@@ -4696,10 +4739,65 @@ test('production baseline input resolver accepts embedded baseline records that 
   assert.equal(resolved.raw_baseline_input_path, rawSnapshotPath);
   assert.equal(resolved.baseline_record_path, embeddedBaselineRecordPath);
   const normalizedSnapshot = JSON.parse(await fs.readFile(normalizedOutputPath, 'utf8'));
+  assert.deepEqual(
+    validateProdCurrentStateSnapshot(normalizedSnapshot, {
+      requireUsableBaseline: true,
+    }),
+    { valid: true, error: null },
+  );
   assert.equal(normalizedSnapshot.origin_run_id, blockerRunIdentity.origin_run_id);
   assert.equal(normalizedSnapshot.origin_run_uri, blockerRunIdentity.origin_run_uri);
+  assert.equal(normalizedSnapshot.access.protected_ops_url, 'https://matrix-ops-worker-prod.matrixflare.workers.dev');
   assert.equal(normalizedSnapshot.baseline_record.origin_run_uri, embeddedBaselineRecord.origin_run_uri);
   assert.deepEqual(normalizedSnapshot.baseline_record.deployment_identity, embeddedBaselineRecord.current_deployment_identity);
+});
+
+test('production baseline input resolver rejects legacy snapshots that do not retain protected prod ops ingress metadata', async () => {
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-prod-baseline-missing-ops-url-'));
+  const downloadRoot = path.join(workspaceRoot, 'downloaded', 'baseline');
+  const rawSnapshotPath = path.join(downloadRoot, 'state', 'operational-refresh', 'current-production-state.json');
+  const embeddedBaselineRecordPath = path.join(downloadRoot, 'downloaded', 'baseline', 'prod-promotion-record.json');
+  const normalizedOutputPath = path.join(workspaceRoot, 'state', 'normalized-baseline', 'current-production-state.json');
+  const embeddedBaselineRecord = buildProdPromotionRecordFixture({
+    runId: '24019281851',
+    promotedAt: '2026-04-06T04:55:43.000Z',
+  });
+  const blockerRunIdentity = buildProducerRunIdentityFixture({
+    runId: '24033551396',
+  });
+  const snapshot = {
+    observed_at: '2026-04-06T13:25:40.017Z',
+    baseline_record: {
+      artifact_id: embeddedBaselineRecord.artifact_id,
+      origin_run_uri: embeddedBaselineRecord.origin_run_uri,
+      deployment_identity: embeddedBaselineRecord.current_deployment_identity,
+    },
+    baseline_match: {
+      matches: false,
+      mismatched_fields: ['deployment_ids', 'worker_version_ids'],
+      problems: [],
+    },
+    current_deployment_observation: buildProdCurrentStateSnapshotFixture({
+      runId: blockerRunIdentity.origin_run_id,
+    }).current_deployment_observation,
+  };
+
+  await fs.mkdir(path.dirname(rawSnapshotPath), { recursive: true });
+  await fs.mkdir(path.dirname(embeddedBaselineRecordPath), { recursive: true });
+  await fs.writeFile(rawSnapshotPath, `${JSON.stringify(snapshot, null, 2)}\n`);
+  await fs.writeFile(embeddedBaselineRecordPath, `${JSON.stringify(embeddedBaselineRecord, null, 2)}\n`);
+
+  await assert.rejects(
+    () => resolveProductionBaselineInputArtifact({
+      downloadRoot,
+      baselineInputKind: 'current_state',
+      baselineInputPath: 'state/operational-refresh/current-production-state.json',
+      baselineRecordName: 'prod-promotion-record.json',
+      normalizedOutputPath,
+      originRunIdentity: blockerRunIdentity,
+    }),
+    /legacy prod current state snapshot access must be an object/u,
+  );
 });
 
 test('production baseline input resolver rejects embedded baseline records that do not match the legacy snapshot baseline lineage', async () => {
@@ -4708,8 +4806,14 @@ test('production baseline input resolver rejects embedded baseline records that 
   const rawSnapshotPath = path.join(downloadRoot, 'state', 'operational-refresh', 'current-production-state.json');
   const embeddedBaselineRecordPath = path.join(downloadRoot, 'recovered', 'upstream', 'prod-install-record.json');
   const normalizedOutputPath = path.join(workspaceRoot, 'state', 'normalized-baseline', 'current-production-state.json');
+  const typedSnapshot = buildProdCurrentStateSnapshotFixture({
+    runId: '24033537035',
+  });
   const snapshot = {
     observed_at: '2026-04-06T14:00:00.000Z',
+    access: {
+      protected_ops_url: typedSnapshot.access.protected_ops_url,
+    },
     baseline_record: {
       artifact_id: 'prod_install_record',
       origin_run_uri: buildGitHubRunUrl('VrianCao/MatrixFlare', '24033537035'),
@@ -4724,9 +4828,7 @@ test('production baseline input resolver rejects embedded baseline records that 
       mismatched_fields: ['gateway-worker'],
       problems: [],
     },
-    current_deployment_observation: buildProdCurrentStateSnapshotFixture({
-      runId: '24033537035',
-    }).current_deployment_observation,
+    current_deployment_observation: typedSnapshot.current_deployment_observation,
   };
   const embeddedBaselineRecord = buildProdInstallRecordFixture({
     runId: '24033537036',
@@ -4756,6 +4858,9 @@ test('legacy prod current-state snapshots can be normalized into the current rec
   const snapshot = buildProdCurrentStateSnapshotFixture();
   const legacySnapshot = {
     observed_at: snapshot.observed_at,
+    access: {
+      protected_ops_url: snapshot.access.protected_ops_url,
+    },
     baseline_record: snapshot.baseline_record,
     baseline_match: snapshot.baseline_match,
     current_deployment_observation: snapshot.current_deployment_observation,
@@ -4780,6 +4885,31 @@ test('legacy prod current-state snapshots can be normalized into the current rec
   });
   assert.equal(normalized.origin_run_id, '24033537026');
   assert.equal(normalized.workers['ops-worker'].script_name, 'matrix-ops-worker-prod');
+});
+
+test('legacy prod current-state snapshot normalization rejects explicit protected_ops_url values that do not match the current prod ops-worker host', () => {
+  const snapshot = buildProdCurrentStateSnapshotFixture();
+  const legacySnapshot = {
+    observed_at: snapshot.observed_at,
+    access: {
+      protected_ops_url: 'https://example.com/not-prod',
+    },
+    baseline_record: snapshot.baseline_record,
+    baseline_match: snapshot.baseline_match,
+    current_deployment_observation: snapshot.current_deployment_observation,
+  };
+
+  assert.throws(
+    () => normalizeProdCurrentStateSnapshot(legacySnapshot, {
+      baselineRecord: buildProdInstallRecordFixture({
+        runId: '24000789563',
+      }),
+      originRunIdentity: buildProducerRunIdentityFixture({
+        runId: '24033537026',
+      }),
+    }),
+    /prod current state snapshot access\.protected_ops_url must match the current prod ops-worker host/u,
+  );
 });
 
 test('production automation validators fail closed on missing rollback data and wrong promotion shape', () => {
@@ -5211,6 +5341,36 @@ test('usable production current state snapshots validate as baseline-capable art
   );
 });
 
+test('production current state snapshots built from promotion baselines require an explicit protected ops URL and validate once runtime supplies it', () => {
+  const promotionRecord = buildProdPromotionRecordFixture();
+  const currentObservation = buildProdCurrentStateObservationFixture();
+  const originRunIdentity = buildProducerRunIdentityFixture({ runId: '24033537029' });
+
+  assert.throws(
+    () => buildProductionCurrentStateSnapshot({
+      baselineRecord: promotionRecord,
+      currentObservation,
+      originRunIdentity,
+    }),
+    /prod current state snapshot access\.protected_ops_url must be non-empty/u,
+  );
+
+  const snapshot = buildProductionCurrentStateSnapshot({
+    baselineRecord: promotionRecord,
+    currentObservation,
+    originRunIdentity,
+    protectedOpsUrl: buildProdInstallRecordFixture().access.protected_ops_url,
+  });
+
+  assert.deepEqual(
+    validateProdCurrentStateSnapshot(snapshot, {
+      expectedGitHubRepository: 'VrianCao/MatrixFlare',
+      requireUsableBaseline: true,
+    }),
+    { valid: true, error: null },
+  );
+});
+
 test('production current state snapshots cannot be consumed as baselines without full worker closure metadata', () => {
   const snapshot = structuredClone(buildProdCurrentStateSnapshotFixture());
   delete snapshot.workers['gateway-worker'];
@@ -5399,8 +5559,8 @@ test('production automation runtime paths persist current-production-state block
   );
   assert.match(
     source,
-    /async function writeProductionCurrentStateSnapshot\(\{[\s\S]*?const temporaryOutputPath = path\.join\([\s\S]*?await fs\.writeFile\(temporaryOutputPath, stableJson\(snapshot\)\);\s+await fs\.rename\(temporaryOutputPath, outputPath\);[\s\S]*?await fs\.rm\(temporaryOutputPath, \{ force: true \}\);/su,
-    'prod recovery helpers must replace current-production-state.json atomically so partial writes cannot masquerade as a valid blocker snapshot',
+    /async function writeProductionCurrentStateSnapshot\(\{[\s\S]*?const snapshot = buildProductionCurrentStateSnapshot\(\{\s+baselineRecord,\s+currentObservation,\s+originRunIdentity,\s+protectedOpsUrl: resolveRuntimeProductionCurrentStateProtectedOpsUrl\(baselineRecord\),[\s\S]*?const temporaryOutputPath = path\.join\([\s\S]*?await fs\.writeFile\(temporaryOutputPath, stableJson\(snapshot\)\);\s+await fs\.rename\(temporaryOutputPath, outputPath\);[\s\S]*?await fs\.rm\(temporaryOutputPath, \{ force: true \}\);/su,
+    'prod recovery helpers must derive a truthful prod ops ingress before atomically persisting current-production-state.json so partial writes cannot masquerade as a valid blocker snapshot',
   );
   assert.match(
     source,
