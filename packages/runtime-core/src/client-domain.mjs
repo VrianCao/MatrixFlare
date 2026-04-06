@@ -10,6 +10,25 @@ const textEncoder = new TextEncoder();
 export const SYNC_TOKEN_VERSION = 2;
 export const DEFAULT_SYNC_TIMEOUT_MS = 0;
 export const MAX_SYNC_TIMEOUT_MS = 30_000;
+export const SUPPORTED_MATRIX_CLIENT_SPEC_VERSIONS = Object.freeze([
+  'v1.1',
+  'v1.2',
+  'v1.3',
+  'v1.4',
+  'v1.5',
+  'v1.6',
+  'v1.7',
+  'v1.8',
+  'v1.9',
+  'v1.10',
+  'v1.11',
+  'v1.12',
+  'v1.13',
+  'v1.14',
+  'v1.15',
+  'v1.16',
+  'v1.17',
+]);
 export const MAX_PROFILE_KEY_BYTES = 255;
 export const MAX_PROFILE_DOCUMENT_BYTES = 64 * 1024;
 export const MAX_PUSH_RULES_PER_USER = 256;

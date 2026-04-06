@@ -40,17 +40,34 @@ test('requirement register contains canonical governance and architecture rows',
 
 test('wildcard expansion resolves pinned Matrix v1.17 route families', async () => {
   const analysis = await analyzeRepository(repoRoot);
-  const loginFamily = analysis.wildcardRouteExpansion.find(
-    (entry) => entry.if_id === 'IF-CS-005' && entry.route_pattern === '/_matrix/client/*/login',
+  const pushRulesRoot = analysis.wildcardRouteExpansion.find(
+    (entry) => entry.if_id === 'IF-CS-018' && entry.route_pattern === '/_matrix/client/*/pushrules/',
   );
-  assert.ok(loginFamily);
-  assert.deepEqual(loginFamily.expanded_paths, ['/_matrix/client/v3/login']);
+  assert.ok(pushRulesRoot);
+  assert.deepEqual(pushRulesRoot.expanded_paths, ['/_matrix/client/v3/pushrules/']);
 
   const publicRoomsFamily = analysis.wildcardRouteExpansion.find(
     (entry) => entry.if_id === 'IF-CS-052' && entry.route_pattern === '/_matrix/client/*/publicRooms',
   );
   assert.ok(publicRoomsFamily);
   assert.ok(publicRoomsFamily.expanded_paths.includes('/_matrix/client/v3/publicRooms'));
+});
+
+test('explicit alias contracts pin login and register-availability route sets', async () => {
+  const analysis = await analyzeRepository(repoRoot);
+  const loginContract = analysis.definitionsById.get('IF-CS-005');
+  assert.ok(loginContract);
+  assert.equal(
+    loginContract.columns['Route / Family'],
+    '`GET /_matrix/client/r0/login`, `GET /_matrix/client/v1/login`, `GET /_matrix/client/v3/login`',
+  );
+
+  const registerAvailabilityContract = analysis.definitionsById.get('IF-CS-009');
+  assert.ok(registerAvailabilityContract);
+  assert.equal(
+    registerAvailabilityContract.columns['Route / Family'],
+    '`GET /_matrix/client/r0/register/available`, `GET /_matrix/client/v1/register/available`, `GET /_matrix/client/v3/register/available`',
+  );
 });
 
 test('wildcard expansion preserves canonical trailing-slash routes and excludes example pollution', async () => {
@@ -71,8 +88,8 @@ test('wildcard expansion rejects route families that place "*" outside the Matri
   await replaceInFile(
     tempRoot,
     'spec/framework/23-interface-contract-catalog.md',
-    '`GET /_matrix/client/*/login`',
-    '`GET /_matrix/client/v3/*/login`',
+    '`GET /_matrix/client/*/pushrules/`',
+    '`GET /_matrix/client/v3/*/pushrules/`',
   );
 
   const analysis = await analyzeRepository(tempRoot);
@@ -81,7 +98,7 @@ test('wildcard expansion rejects route families that place "*" outside the Matri
     analysis.issues.some(
       (issue) =>
         issue.code === 'wildcard_route_invalid_pattern' &&
-        issue.message.includes('/_matrix/client/v3/*/login'),
+        issue.message.includes('/_matrix/client/v3/*/pushrules/'),
     ),
   );
 });

@@ -14,6 +14,7 @@ import {
   loadWorkerRuntimeConfig,
   snapshotTelemetry,
 } from '../../../packages/runtime-core/src/index.mjs';
+import { SUPPORTED_MATRIX_CLIENT_SPEC_VERSIONS } from '../../../packages/runtime-core/src/client-domain.mjs';
 import {
   createGatewayPhase04Rig,
   createGatewayVersionSkewRig,
@@ -126,7 +127,15 @@ test('Phase 08 gateway abuse guard classifies L1 surfaces and enforces IP limits
   const cases = [
     ['GET', '/_matrix/client/versions', 'public-entry', 'gateway_public_entry'],
     ['GET', '/_matrix/client/v3/login', 'public-entry', 'gateway_public_entry'],
+    ['GET', '/_matrix/client/r0/login', 'public-entry', 'gateway_public_entry'],
+    ['GET', '/_matrix/client/v1/login', 'public-entry', 'gateway_public_entry'],
+    ['GET', '/_matrix/client/r0/register/available', 'public-entry', 'gateway_public_entry'],
+    ['GET', '/_matrix/client/v1/register/available', 'public-entry', 'gateway_public_entry'],
     ['POST', '/_matrix/client/v3/login', 'login', 'gateway_login'],
+    ['POST', '/_matrix/client/r0/login', 'login', 'gateway_login'],
+    ['POST', '/_matrix/client/v1/login', 'login', 'gateway_login'],
+    ['POST', '/_matrix/client/r0/register', 'register', 'gateway_register'],
+    ['POST', '/_matrix/client/v1/register', 'register', 'gateway_register'],
     ['POST', '/_matrix/client/v3/search', 'search', 'gateway_search'],
     ['GET', '/_matrix/client/v3/publicRooms', 'search', 'gateway_search'],
     ['GET', '/_matrix/client/v3/rooms/!room:matrix.example.test/hierarchy', 'search', 'gateway_search'],
@@ -231,7 +240,7 @@ test('Phase 08 gateway telemetry does not crash when process.cpuUsage is unavail
   assert.equal(versionsResponse.status, 200);
   const versionsBody = await versionsResponse.json();
   assert.deepEqual(versionsBody, {
-    versions: ['v1.17'],
+    versions: SUPPORTED_MATRIX_CLIENT_SPEC_VERSIONS,
     unstable_features: {},
   });
 

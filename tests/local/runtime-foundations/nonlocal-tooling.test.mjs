@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
+import { SUPPORTED_MATRIX_CLIENT_SPEC_VERSIONS } from '../../../packages/runtime-core/src/client-domain.mjs';
 import {
   buildProdCostSnapshotProvenance,
   buildProdInstallRecord,
@@ -202,7 +203,7 @@ function buildEnvironmentAttestationFixture(environmentName, runTimestamp, {
     ? 'tests/integration/test-cs-001.test.mjs'
     : `tests/${environmentName}/test-cs-001.test.mjs`;
   const readinessSteps = [
-    { step: 'versions', ok: true, detail: { versions_count: 1 } },
+    { step: 'versions', ok: true, detail: { versions_count: SUPPORTED_MATRIX_CLIENT_SPEC_VERSIONS.length } },
     { step: 'public_rooms', ok: true, detail: { chunk_length: 0 } },
     { step: 'register_challenge', ok: true, detail: { session_present: true, flows_count: 1 } },
     { step: 'register_complete', ok: true, detail: { user_id_present: true, access_token_present: true } },
@@ -336,7 +337,7 @@ function buildProductionReadinessProbeFixture(overrides = {}) {
         duration_ms: 30000,
         ok: true,
         steps: [
-          { step: 'versions', ok: true, detail: { versions_count: 1 } },
+          { step: 'versions', ok: true, detail: { versions_count: SUPPORTED_MATRIX_CLIENT_SPEC_VERSIONS.length } },
           { step: 'public_rooms', ok: true, detail: { chunk_length: 0 } },
           { step: 'register_complete', ok: true, detail: { user_id_present: true, access_token_present: true } },
           { step: 'media_create', ok: true, detail: { content_uri_present: true } },
@@ -394,7 +395,7 @@ function buildReadinessProbeFixture(environmentName, {
   failureDetail = { status: 500, error: 'transient deploy window' },
 } = {}) {
   const successSteps = [
-    { step: 'versions', ok: true, detail: { versions_count: 1 } },
+    { step: 'versions', ok: true, detail: { versions_count: SUPPORTED_MATRIX_CLIENT_SPEC_VERSIONS.length } },
     { step: 'public_rooms', ok: true, detail: { chunk_length: 0 } },
     { step: 'register_challenge', ok: true, detail: { session_present: true, flows_count: 1 } },
     { step: 'register_complete', ok: true, detail: { user_id_present: true, access_token_present: true } },
@@ -425,7 +426,7 @@ function buildReadinessProbeFixture(environmentName, {
       duration_ms: 2000,
       ok: false,
       steps: [
-        { step: 'versions', ok: true, detail: { versions_count: 1 } },
+        { step: 'versions', ok: true, detail: { versions_count: SUPPORTED_MATRIX_CLIENT_SPEC_VERSIONS.length } },
         { step: 'public_rooms', ok: true, detail: { chunk_length: 0 } },
         { step: failureStepName, ok: false, detail: failureDetail },
       ],
@@ -1430,11 +1431,11 @@ test('non-local deployment readiness retries with fresh per-attempt registration
     '/_matrix/media/v3/create',
   ];
   const responses = [
-    new Response(JSON.stringify({ versions: ['v1.17'] }), { status: 200, headers: { 'content-type': 'application/json' } }),
+    new Response(JSON.stringify({ versions: SUPPORTED_MATRIX_CLIENT_SPEC_VERSIONS }), { status: 200, headers: { 'content-type': 'application/json' } }),
     new Response(JSON.stringify({ chunk: [] }), { status: 200, headers: { 'content-type': 'application/json' } }),
     new Response(JSON.stringify({ flows: [{ stages: ['m.login.dummy'] }], session: 'uia-1' }), { status: 401, headers: { 'content-type': 'application/json' } }),
     new Response(JSON.stringify({ errcode: 'M_UNKNOWN', error: 'transient deploy window' }), { status: 500, headers: { 'content-type': 'application/json' } }),
-    new Response(JSON.stringify({ versions: ['v1.17'] }), { status: 200, headers: { 'content-type': 'application/json' } }),
+    new Response(JSON.stringify({ versions: SUPPORTED_MATRIX_CLIENT_SPEC_VERSIONS }), { status: 200, headers: { 'content-type': 'application/json' } }),
     new Response(JSON.stringify({ chunk: [] }), { status: 200, headers: { 'content-type': 'application/json' } }),
     new Response(JSON.stringify({ flows: [{ stages: ['m.login.dummy'] }], session: 'uia-2' }), { status: 401, headers: { 'content-type': 'application/json' } }),
     new Response(JSON.stringify({ user_id: '@ready:example.test', access_token: 'atk.ready' }), { status: 200, headers: { 'content-type': 'application/json' } }),
@@ -1568,7 +1569,7 @@ test('non-local deployment readiness probes authenticated ops health when Access
         },
       });
       if (requestUrl.pathname === '/_matrix/client/versions') {
-        return new Response(JSON.stringify({ versions: ['v1.17'] }), {
+        return new Response(JSON.stringify({ versions: SUPPORTED_MATRIX_CLIENT_SPEC_VERSIONS }), {
           status: 200,
           headers: { 'content-type': 'application/json' },
         });
@@ -1680,7 +1681,7 @@ test('non-local deployment readiness reuses the same ops rebuild idempotency key
       const requestUrl = new URL(String(url));
       const headers = new Headers(init.headers ?? {});
       if (requestUrl.pathname === '/_matrix/client/versions') {
-        return new Response(JSON.stringify({ versions: ['v1.17'] }), {
+        return new Response(JSON.stringify({ versions: SUPPORTED_MATRIX_CLIENT_SPEC_VERSIONS }), {
           status: 200,
           headers: { 'content-type': 'application/json' },
         });

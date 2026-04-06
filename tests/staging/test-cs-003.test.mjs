@@ -31,6 +31,33 @@ async function requestAs(harness, accessToken, pathname, {
   });
 }
 
+async function createSharedRoom(harness, ownerAccessToken, inviteeUserId, body = {}) {
+  const response = await requestAs(harness, ownerAccessToken, '/_matrix/client/v3/createRoom', {
+    method: 'POST',
+    json: {
+      invite: [inviteeUserId],
+      ...body,
+    },
+  });
+  assert.equal(response.response.status, 200);
+  return response.payload.room_id;
+}
+
+async function enableMegolmRoom(harness, accessToken, roomId) {
+  const response = await requestAs(
+    harness,
+    accessToken,
+    `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/state/m.room.encryption`,
+    {
+      method: 'PUT',
+      json: {
+        algorithm: 'm.megolm.v1.aes-sha2',
+      },
+    },
+  );
+  assert.equal(response.response.status, 200);
+}
+
 test('TEST-CS-003 staging covers device CRUD, route-bound UIA delete flows, and session revocation', async (context) => {
   const harness = requireRemoteHarnessContext(context, 'staging');
   if (harness == null) {
@@ -295,6 +322,137 @@ test('TEST-CS-003 staging covers to-device idempotency and transport via /sync',
   await expectMatrixError(retryDifferentPayload, 409, 'M_CONFLICT');
 });
 
+test('TEST-CS-003 staging covers /keys/changes for shared-room peer changes and leave detection', async (context) => {
+  const harness = requireRemoteHarnessContext(context, 'staging');
+  if (harness == null) {
+    return;
+  }
+
+  const alice = await registerUser(harness, {
+    usernamePrefix: 'cs3-staging-kca',
+    password: 'phase08-cs3-staging-password-4',
+    deviceId: 'CS3KCALICE',
+  });
+  const bob = await registerUser(harness, {
+    usernamePrefix: 'cs3-staging-kcb',
+    password: 'phase08-cs3-staging-password-5',
+    deviceId: 'CS3KCBOB',
+  });
+
+  const roomId = await createSharedRoom(harness, alice.access_token, bob.user_id);
+  await enableMegolmRoom(harness, alice.access_token, roomId);
+
+  const bobJoin = await requestAs(harness, bob.access_token, `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/join`, {
+    method: 'POST',
+    json: {},
+  });
+  assert.equal(bobJoin.response.status, 200);
+
+  const bobBaselineSync = await syncRequest(harness, bob.access_token);
+
+  const aliceUpload = await requestAs(harness, alice.access_token, '/_matrix/client/v3/keys/upload', {
+    method: 'POST',
+    json: {
+      device_keys: {
+        user_id: alice.user_id,
+        device_id: 'CS3KCALICE',
+        algorithms: ['m.olm.v1.curve25519-aes-sha256'],
+        keys: {
+          'curve25519:CS3KCALICE': 'staging-peer-curve',
+          'ed25519:CS3KCALICE': 'staging-peer-ed',
+        },
+        signatures: {},
+      },
+    },
+  });
+  assert.equal(aliceUpload.response.status, 200);
+
+  const bobAfterAliceChange = await syncRequest(
+    harness,
+    bob.access_token,
+    `since=${encodeURIComponent(bobBaselineSync.next_batch)}&timeout=0`,
+  );
+  assert.deepEqual(bobAfterAliceChange.device_lists?.changed, [alice.user_id]);
+
+  const bobKeysChanges = await requestAs(
+    harness,
+    bob.access_token,
+    `/_matrix/client/v3/keys/changes?from=${encodeURIComponent(bobBaselineSync.next_batch)}&to=${encodeURIComponent(bobAfterAliceChange.next_batch)}`,
+  );
+  assert.equal(bobKeysChanges.response.status, 200);
+  assert.deepEqual(bobKeysChanges.payload, {
+    changed: [alice.user_id],
+    left: [],
+  });
+
+  const bobTabletLogin = await loginWithPassword(harness, {
+    user: bob.username,
+    password: 'phase08-cs3-staging-password-5',
+    deviceId: 'CS3KCBOBTAB',
+  });
+  assert.equal(bobTabletLogin.response.status, 200);
+  const bobTabletSync = await syncRequest(harness, bobTabletLogin.payload.access_token);
+
+  const bobKeysChangesCrossDevice = await requestAs(
+    harness,
+    bob.access_token,
+    `/_matrix/client/v3/keys/changes?from=${encodeURIComponent(bobBaselineSync.next_batch)}&to=${encodeURIComponent(bobTabletSync.next_batch)}`,
+  );
+  await expectMatrixError(bobKeysChangesCrossDevice, 400, 'M_INVALID_PARAM');
+
+  const aliceBaselineForBobLeave = await syncRequest(harness, alice.access_token);
+  const bobLeave = await requestAs(harness, bob.access_token, `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/leave`, {
+    method: 'POST',
+    json: {},
+  });
+  assert.equal(bobLeave.response.status, 200);
+
+  const aliceAfterBobLeave = await syncRequest(
+    harness,
+    alice.access_token,
+    `since=${encodeURIComponent(aliceBaselineForBobLeave.next_batch)}&timeout=0`,
+  );
+  assert.deepEqual(aliceAfterBobLeave.device_lists?.left, [bob.user_id]);
+
+  const aliceKeysChangesAfterLeave = await requestAs(
+    harness,
+    alice.access_token,
+    `/_matrix/client/v3/keys/changes?from=${encodeURIComponent(aliceBaselineForBobLeave.next_batch)}&to=${encodeURIComponent(aliceAfterBobLeave.next_batch)}`,
+  );
+  assert.equal(aliceKeysChangesAfterLeave.response.status, 200);
+  assert.deepEqual(aliceKeysChangesAfterLeave.payload, {
+    changed: [],
+    left: [bob.user_id],
+  });
+
+  const plainRoomId = await createSharedRoom(harness, alice.access_token, bob.user_id, {
+    name: 'staging-plain-room-negative-device-lists',
+  });
+  const bobPlainJoin = await requestAs(harness, bob.access_token, `/_matrix/client/v3/rooms/${encodeURIComponent(plainRoomId)}/join`, {
+    method: 'POST',
+    json: {},
+  });
+  assert.equal(bobPlainJoin.response.status, 200);
+
+  const alicePlainBaseline = await syncRequest(
+    harness,
+    alice.access_token,
+    `since=${encodeURIComponent(aliceAfterBobLeave.next_batch)}&timeout=0`,
+  );
+  const bobPlainLeave = await requestAs(harness, bob.access_token, `/_matrix/client/v3/rooms/${encodeURIComponent(plainRoomId)}/leave`, {
+    method: 'POST',
+    json: {},
+  });
+  assert.equal(bobPlainLeave.response.status, 200);
+
+  const aliceAfterPlainLeave = await syncRequest(
+    harness,
+    alice.access_token,
+    `since=${encodeURIComponent(alicePlainBaseline.next_batch)}&timeout=0`,
+  );
+  assert.deepEqual(aliceAfterPlainLeave.device_lists?.left ?? [], []);
+});
+
 test('TEST-CS-003 staging covers key upload/query/claim, cross-signing, signatures, and /sync device truth', async (context) => {
   const harness = requireRemoteHarnessContext(context, 'staging');
   if (harness == null) {
@@ -376,6 +534,38 @@ test('TEST-CS-003 staging covers key upload/query/claim, cross-signing, signatur
     signed_curve25519: 1,
   });
   assert.deepEqual(aliceAfterKeyUpload.device_unused_fallback_key_types, ['signed_curve25519']);
+
+  const keysChangesAfterUpload = await requestAs(
+    harness,
+    alice.access_token,
+    `/_matrix/client/v3/keys/changes?from=${encodeURIComponent(aliceInitialSync.next_batch)}&to=${encodeURIComponent(aliceAfterKeyUpload.next_batch)}`,
+  );
+  assert.equal(keysChangesAfterUpload.response.status, 200);
+  assert.deepEqual(keysChangesAfterUpload.payload, {
+    changed: [alice.user_id],
+    left: [],
+  });
+
+  const keysChangesMissingTo = await requestAs(
+    harness,
+    alice.access_token,
+    `/_matrix/client/v3/keys/changes?from=${encodeURIComponent(aliceInitialSync.next_batch)}`,
+  );
+  await expectMatrixError(keysChangesMissingTo, 400, 'M_MISSING_PARAM');
+
+  const keysChangesInverted = await requestAs(
+    harness,
+    alice.access_token,
+    `/_matrix/client/v3/keys/changes?from=${encodeURIComponent(aliceAfterKeyUpload.next_batch)}&to=${encodeURIComponent(aliceInitialSync.next_batch)}`,
+  );
+  await expectMatrixError(keysChangesInverted, 400, 'M_INVALID_PARAM');
+
+  const keysChangesFutureTo = await requestAs(
+    harness,
+    alice.access_token,
+    `/_matrix/client/v3/keys/changes?from=${encodeURIComponent(aliceInitialSync.next_batch)}&to=${encodeURIComponent(`${aliceAfterKeyUpload.next_batch}future`)}`,
+  );
+  await expectMatrixError(keysChangesFutureTo, 400, 'M_INVALID_PARAM');
 
   const queryAliceKeys = await requestAs(harness, alice.access_token, '/_matrix/client/v3/keys/query', {
     method: 'POST',

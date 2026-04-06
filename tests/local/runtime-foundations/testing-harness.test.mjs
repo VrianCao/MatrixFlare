@@ -36,6 +36,7 @@ import {
 import {
   listProductionRateLimitNamespaces,
 } from '../../../packages/testing/src/cloudflare-resources.mjs';
+import { SUPPORTED_MATRIX_CLIENT_SPEC_VERSIONS } from '../../../packages/runtime-core/src/client-domain.mjs';
 import {
   assertPathsDoNotExist,
   writeGovernanceEvidence,
@@ -205,7 +206,7 @@ function buildValidPreReleaseCostObservation(runTimestamp, overrides = {}) {
 function buildValidEnvironmentReport(environmentName, runTimestamp, overrides = {}) {
   const directory = getTestEnvironmentDefinition(environmentName).directory;
   const readinessSteps = [
-    { step: 'versions', ok: true, detail: { versions_count: 1 } },
+    { step: 'versions', ok: true, detail: { versions_count: SUPPORTED_MATRIX_CLIENT_SPEC_VERSIONS.length } },
     { step: 'public_rooms', ok: true, detail: { chunk_length: 0 } },
     { step: 'register_challenge', ok: true, detail: { session_present: true, flows_count: 1 } },
     { step: 'register_complete', ok: true, detail: { user_id_present: true, access_token_present: true } },
@@ -597,7 +598,7 @@ function buildValidProdReadinessProbe(overrides = {}) {
         duration_ms: 30000,
         ok: true,
         steps: [
-          { step: 'versions', ok: true, detail: { versions_count: 1 } },
+          { step: 'versions', ok: true, detail: { versions_count: SUPPORTED_MATRIX_CLIENT_SPEC_VERSIONS.length } },
           { step: 'public_rooms', ok: true, detail: { chunk_length: 0 } },
           { step: 'register_complete', ok: true, detail: { user_id_present: true, access_token_present: true } },
           { step: 'media_create', ok: true, detail: { content_uri_present: true } },
@@ -7785,6 +7786,72 @@ test('staging security suite fails closed when the non-local environment is sele
       () => supportModule.requireRemoteHarnessContext({ skip() {} }, 'staging'),
       /Remote staging harness requires MATRIX_REMOTE_BASE_URL/,
     );
+  } finally {
+    for (const [key, value] of Object.entries(savedEnvironment)) {
+      if (value == null) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+  }
+});
+
+test('ci-integration suite fails closed when the non-local environment is selected without a remote harness', async () => {
+  const supportModule = await import(`${pathToFileURL(path.join(repoRoot, 'tests/integration/support.mjs')).href}?cacheBust=${Date.now()}-${Math.random()}`);
+  const savedEnvironment = {
+    MATRIX_TEST_ENVIRONMENT: process.env.MATRIX_TEST_ENVIRONMENT,
+    MATRIX_REMOTE_BASE_URL: process.env.MATRIX_REMOTE_BASE_URL,
+    MATRIX_REMOTE_SERVER_NAME: process.env.MATRIX_REMOTE_SERVER_NAME,
+    MATRIX_AGGREGATE_LOCAL_NONLOCAL_SKIP: process.env.MATRIX_AGGREGATE_LOCAL_NONLOCAL_SKIP,
+  };
+  try {
+    process.env.MATRIX_TEST_ENVIRONMENT = 'ci-integration';
+    delete process.env.MATRIX_REMOTE_BASE_URL;
+    delete process.env.MATRIX_REMOTE_SERVER_NAME;
+    delete process.env.MATRIX_AGGREGATE_LOCAL_NONLOCAL_SKIP;
+
+    assert.throws(
+      () => supportModule.requireRemoteHarnessContext({ skip() {} }, 'ci-integration'),
+      /Remote ci-integration harness requires MATRIX_REMOTE_BASE_URL/,
+    );
+  } finally {
+    for (const [key, value] of Object.entries(savedEnvironment)) {
+      if (value == null) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+  }
+});
+
+test('ci-integration suite skips cleanly during aggregate local runs when no remote harness is configured', async () => {
+  const supportModule = await import(`${pathToFileURL(path.join(repoRoot, 'tests/integration/support.mjs')).href}?cacheBust=${Date.now()}-${Math.random()}`);
+  const savedEnvironment = {
+    MATRIX_TEST_ENVIRONMENT: process.env.MATRIX_TEST_ENVIRONMENT,
+    MATRIX_REMOTE_BASE_URL: process.env.MATRIX_REMOTE_BASE_URL,
+    MATRIX_REMOTE_SERVER_NAME: process.env.MATRIX_REMOTE_SERVER_NAME,
+    MATRIX_AGGREGATE_LOCAL_NONLOCAL_SKIP: process.env.MATRIX_AGGREGATE_LOCAL_NONLOCAL_SKIP,
+  };
+  const skipCalls = [];
+
+  try {
+    process.env.MATRIX_TEST_ENVIRONMENT = 'ci-integration';
+    delete process.env.MATRIX_REMOTE_BASE_URL;
+    delete process.env.MATRIX_REMOTE_SERVER_NAME;
+    process.env.MATRIX_AGGREGATE_LOCAL_NONLOCAL_SKIP = 'true';
+
+    const harness = supportModule.requireRemoteHarnessContext({
+      skip(message) {
+        skipCalls.push(message);
+      },
+    }, 'ci-integration');
+
+    assert.equal(harness, null);
+    assert.deepEqual(skipCalls, [
+      'Remote ci-integration harness requires MATRIX_REMOTE_BASE_URL and MATRIX_REMOTE_SERVER_NAME',
+    ]);
   } finally {
     for (const [key, value] of Object.entries(savedEnvironment)) {
       if (value == null) {

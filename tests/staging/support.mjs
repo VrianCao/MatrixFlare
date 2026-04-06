@@ -86,6 +86,7 @@ export async function request(harness, pathname, {
   headers = {},
   json = undefined,
   body = undefined,
+  responseType = 'auto',
 } = {}) {
   const requestHeaders = new Headers(headers);
   if (json !== undefined && !requestHeaders.has('content-type')) {
@@ -101,9 +102,18 @@ export async function request(harness, pathname, {
       : {}),
   });
   const contentType = response.headers.get('content-type') ?? '';
-  const payload = contentType.includes('application/json')
-    ? await response.json()
-    : await response.text();
+  let payload;
+  if (responseType === 'bytes') {
+    payload = Buffer.from(await response.arrayBuffer());
+  } else if (responseType === 'json') {
+    payload = await response.json();
+  } else if (responseType === 'text') {
+    payload = await response.text();
+  } else {
+    payload = contentType.includes('application/json')
+      ? await response.json()
+      : await response.text();
+  }
   return {
     response,
     payload,
@@ -183,8 +193,9 @@ async function createRegisterChallenge(harness, {
   username,
   password,
   deviceId,
+  registerPath = '/_matrix/client/v3/register',
 }) {
-  const result = await request(harness, '/_matrix/client/v3/register', {
+  const result = await request(harness, registerPath, {
     method: 'POST',
     json: {
       username,
@@ -201,14 +212,16 @@ export async function registerUser(harness, {
   usernamePrefix,
   password = DEFAULT_PASSWORD,
   deviceId = 'DEVICE1',
+  registerPath = '/_matrix/client/v3/register',
 } = {}) {
   const username = uniqueToken(usernamePrefix);
   const challenge = await createRegisterChallenge(harness, {
     username,
     password,
     deviceId,
+    registerPath,
   });
-  const result = await request(harness, '/_matrix/client/v3/register', {
+  const result = await request(harness, registerPath, {
     method: 'POST',
     json: {
       username,
@@ -233,8 +246,9 @@ export async function loginWithPassword(harness, {
   user,
   password = DEFAULT_PASSWORD,
   deviceId = null,
+  loginPath = '/_matrix/client/v3/login',
 }) {
-  return request(harness, '/_matrix/client/v3/login', {
+  return request(harness, loginPath, {
     method: 'POST',
     json: {
       type: 'm.login.password',

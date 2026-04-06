@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
+import { createStoredFilterEnvelope } from '../../../packages/runtime-core/src/client-domain.mjs';
 import { createGatewayPhase04Rig } from './support.mjs';
 
 async function expectMatrixError(response, status, errcode) {
@@ -923,6 +924,72 @@ test('Phase 05 account data, filters, sync waiting, and room account-data deltas
   const wokenSync = await wokenSyncResponse.json();
   assert.equal('account_data' in wokenSync, false);
   assert.notEqual(wokenSync.next_batch, incrementalSync.next_batch);
+});
+
+test('Phase 05 /sync since tokens remain valid when the caller switches between inline and stored filters', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, {
+    username: 'alice',
+    password: 'correct horse battery staple',
+    deviceId: 'ALICEPHONE',
+  });
+
+  const inlineFilter = {
+    room: {
+      state: {
+        lazy_load_members: true,
+      },
+      timeline: {
+        limit: 8,
+      },
+    },
+  };
+  const inlineSync = await syncRequest(
+    rig,
+    alice.access_token,
+    `filter=${encodeURIComponent(JSON.stringify(inlineFilter))}`,
+  );
+
+  const storedFilter = createStoredFilterEnvelope(inlineFilter);
+  const storeFilter = await rig.gatewayFetch('/_matrix/client/v3/user/@alice:matrix.example.test/filter', {
+    method: 'POST',
+    headers: rig.authHeaders(alice.access_token),
+    json: inlineFilter,
+  });
+  assert.equal(storeFilter.status, 200);
+  assert.deepEqual(await storeFilter.json(), {
+    filter_id: storedFilter.filter_id,
+  });
+
+  const storedSync = await syncRequest(
+    rig,
+    alice.access_token,
+    `since=${encodeURIComponent(inlineSync.next_batch)}&filter=${encodeURIComponent(storedFilter.filter_id)}`,
+  );
+  assert.equal(typeof storedSync.next_batch, 'string');
+
+  const inlineRetry = await syncRequest(
+    rig,
+    alice.access_token,
+    `since=${encodeURIComponent(storedSync.next_batch)}&filter=${encodeURIComponent(JSON.stringify(inlineFilter))}`,
+  );
+  assert.equal(typeof inlineRetry.next_batch, 'string');
+
+  const broaderFilter = {
+    room: {
+      timeline: {
+        limit: 16,
+      },
+    },
+  };
+  const switchedFilterSync = await syncRequest(
+    rig,
+    alice.access_token,
+    `since=${encodeURIComponent(inlineRetry.next_batch)}&filter=${encodeURIComponent(JSON.stringify(broaderFilter))}`,
+  );
+  assert.equal(typeof switchedFilterSync.next_batch, 'string');
 });
 
 test('Phase 05 room fanout projections surface timeline and unread counts through /sync', async (t) => {

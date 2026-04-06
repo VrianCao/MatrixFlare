@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
 import test from 'node:test';
 
+import { SUPPORTED_MATRIX_CLIENT_SPEC_VERSIONS } from '../../../packages/runtime-core/src/client-domain.mjs';
 import { parseSessionRootKeyRing } from '../../../packages/runtime-core/src/user-identity.mjs';
 import { createGatewayPhase04Rig } from './support.mjs';
 
@@ -50,8 +51,9 @@ async function createRegisterChallenge(rig, {
   username,
   password,
   deviceId = 'DEVICE1',
+  registerPath = '/_matrix/client/v3/register',
 } = {}) {
-  const challengeResponse = await rig.gatewayFetch('/_matrix/client/v3/register', {
+  const challengeResponse = await rig.gatewayFetch(registerPath, {
     method: 'POST',
     json: {
       username,
@@ -66,8 +68,8 @@ async function createRegisterChallenge(rig, {
   return challengeBody;
 }
 
-async function createEmptyRegisterChallenge(rig) {
-  const challengeResponse = await rig.gatewayFetch('/_matrix/client/v3/register', {
+async function createEmptyRegisterChallenge(rig, registerPath = '/_matrix/client/v3/register') {
+  const challengeResponse = await rig.gatewayFetch(registerPath, {
     method: 'POST',
     json: {},
   });
@@ -84,13 +86,15 @@ async function registerViaUia(rig, {
   username,
   password,
   deviceId = 'DEVICE1',
+  registerPath = '/_matrix/client/v3/register',
 } = {}) {
   const challengeBody = await createRegisterChallenge(rig, {
     username,
     password,
     deviceId,
+    registerPath,
   });
-  const registerResponse = await rig.gatewayFetch('/_matrix/client/v3/register', {
+  const registerResponse = await rig.gatewayFetch(registerPath, {
     method: 'POST',
     json: {
       username,
@@ -110,8 +114,9 @@ async function loginWithPassword(rig, {
   user,
   password,
   deviceId = null,
+  loginPath = '/_matrix/client/v3/login',
 } = {}) {
-  const response = await rig.gatewayFetch('/_matrix/client/v3/login', {
+  const response = await rig.gatewayFetch(loginPath, {
     method: 'POST',
     json: {
       type: 'm.login.password',
@@ -125,6 +130,24 @@ async function loginWithPassword(rig, {
   });
   return response;
 }
+
+const REGISTER_ALIAS_PATHS = Object.freeze([
+  '/_matrix/client/r0/register',
+  '/_matrix/client/v1/register',
+  '/_matrix/client/v3/register',
+]);
+
+const REGISTER_AVAILABILITY_ALIAS_PATHS = Object.freeze([
+  '/_matrix/client/r0/register/available',
+  '/_matrix/client/v1/register/available',
+  '/_matrix/client/v3/register/available',
+]);
+
+const LOGIN_ALIAS_PATHS = Object.freeze([
+  '/_matrix/client/r0/login',
+  '/_matrix/client/v1/login',
+  '/_matrix/client/v3/login',
+]);
 
 test('Phase 04 discovery surfaces return spec-aligned truth', async (t) => {
   const rig = createGatewayPhase04Rig();
@@ -148,8 +171,29 @@ test('Phase 04 discovery surfaces return spec-aligned truth', async (t) => {
   const versions = await rig.gatewayFetch('/_matrix/client/versions');
   assert.equal(versions.status, 200);
   assert.deepEqual(await versions.json(), {
-    versions: ['v1.17'],
+    versions: SUPPORTED_MATRIX_CLIENT_SPEC_VERSIONS,
     unstable_features: {},
+  });
+
+  const loginFlows = await rig.gatewayFetch('/_matrix/client/v3/login');
+  assert.equal(loginFlows.status, 200);
+  assert.equal(loginFlows.headers.get('cache-control'), 'public, max-age=60');
+  assert.deepEqual(await loginFlows.json(), {
+    flows: [{ type: 'm.login.password' }],
+  });
+
+  const loginFlowsR0 = await rig.gatewayFetch('/_matrix/client/r0/login');
+  assert.equal(loginFlowsR0.status, 200);
+  assert.equal(loginFlowsR0.headers.get('cache-control'), 'public, max-age=60');
+  assert.deepEqual(await loginFlowsR0.json(), {
+    flows: [{ type: 'm.login.password' }],
+  });
+
+  const loginFlowsV1 = await rig.gatewayFetch('/_matrix/client/v1/login');
+  assert.equal(loginFlowsV1.status, 200);
+  assert.equal(loginFlowsV1.headers.get('cache-control'), 'public, max-age=60');
+  assert.deepEqual(await loginFlowsV1.json(), {
+    flows: [{ type: 'm.login.password' }],
   });
 
   const registerFlows = await rig.gatewayFetch('/_matrix/client/v3/register');
@@ -183,12 +227,23 @@ test('Phase 04 discovery surfaces return spec-aligned truth', async (t) => {
   assert.equal(availabilityR0.headers.get('cache-control'), 'no-store');
   assert.deepEqual(await availabilityR0.json(), { available: true });
 
+  const availabilityV1 = await rig.gatewayFetch('/_matrix/client/v1/register/available?username=alice');
+  assert.equal(availabilityV1.status, 200);
+  assert.equal(availabilityV1.headers.get('cache-control'), 'no-store');
+  assert.deepEqual(await availabilityV1.json(), { available: true });
+
   const tokenValidity = await rig.gatewayFetch('/_matrix/client/v1/register/m.login.registration_token/validity?token=bogus');
   assert.equal(tokenValidity.status, 200);
   assert.deepEqual(await tokenValidity.json(), { valid: false });
 
   const emptyRegisterChallenge = await createEmptyRegisterChallenge(rig);
   assert.equal(typeof emptyRegisterChallenge.session, 'string');
+
+  const emptyRegisterChallengeR0 = await createEmptyRegisterChallenge(rig, '/_matrix/client/r0/register');
+  assert.equal(typeof emptyRegisterChallengeR0.session, 'string');
+
+  const emptyRegisterChallengeV1 = await createEmptyRegisterChallenge(rig, '/_matrix/client/v1/register');
+  assert.equal(typeof emptyRegisterChallengeV1.session, 'string');
 });
 
 test('Phase 04 discovery and login surfaces serve browser CORS and preflight truth', async (t) => {
@@ -213,6 +268,15 @@ test('Phase 04 discovery and login surfaces serve browser CORS and preflight tru
   assert.equal(loginFlows.status, 200);
   assert.equal(loginFlows.headers.get('access-control-allow-origin'), browserOrigin);
   assert.match(loginFlows.headers.get('vary') ?? '', /Origin/i);
+
+  const loginFlowsCompatibility = await rig.gatewayFetch('/_matrix/client/r0/login', {
+    headers: {
+      origin: browserOrigin,
+    },
+  });
+  assert.equal(loginFlowsCompatibility.status, 200);
+  assert.equal(loginFlowsCompatibility.headers.get('access-control-allow-origin'), browserOrigin);
+  assert.match(loginFlowsCompatibility.headers.get('vary') ?? '', /Origin/i);
 
   const registerFlows = await rig.gatewayFetch('/_matrix/client/v3/register', {
     headers: {
@@ -261,6 +325,92 @@ test('Phase 04 discovery and login surfaces serve browser CORS and preflight tru
   });
   assert.equal(missingUsername.status, 400);
   assert.equal(missingUsername.headers.get('access-control-allow-origin'), browserOrigin);
+
+  const legacyMediaConfig = await rig.gatewayFetch('/_matrix/media/v3/config', {
+    headers: {
+      origin: browserOrigin,
+      authorization: 'Bearer browser-cors-probe',
+    },
+  });
+  assert.equal(legacyMediaConfig.status, 401);
+  assert.equal(legacyMediaConfig.headers.get('access-control-allow-origin'), browserOrigin);
+
+  const legacyMediaPreflight = await rig.gatewayFetch('/_matrix/media/v3/config', {
+    method: 'OPTIONS',
+    headers: {
+      origin: browserOrigin,
+      'access-control-request-method': 'GET',
+      'access-control-request-headers': 'authorization',
+    },
+  });
+  assert.equal(legacyMediaPreflight.status, 204);
+  assert.equal(legacyMediaPreflight.headers.get('access-control-allow-origin'), browserOrigin);
+  assert.equal(legacyMediaPreflight.headers.get('access-control-allow-headers'), 'authorization');
+  assert.match(legacyMediaPreflight.headers.get('access-control-allow-methods') ?? '', /\bGET\b/);
+  assert.match(legacyMediaPreflight.headers.get('vary') ?? '', /Origin/i);
+  assert.match(legacyMediaPreflight.headers.get('vary') ?? '', /Access-Control-Request-Headers/i);
+});
+
+test('Phase 04 compatibility aliases preserve register availability, UIA, and session parity across r0/v1/v3', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const compatibilityUsers = [];
+  for (const [index, registerPath] of REGISTER_ALIAS_PATHS.entries()) {
+    const username = `compat-user-${index}`;
+    const password = `compat-password-${index}`;
+    const deviceId = `COMPATREG${index}`;
+    const registration = await registerViaUia(rig, {
+      username,
+      password,
+      deviceId,
+      registerPath,
+    });
+    assert.equal(registration.user_id, `@${username}:matrix.example.test`);
+    assert.equal(registration.device_id, deviceId);
+    compatibilityUsers.push({ username, password, userId: registration.user_id });
+
+    for (const availabilityPath of REGISTER_AVAILABILITY_ALIAS_PATHS) {
+      const availability = await rig.gatewayFetch(`${availabilityPath}?username=${username}`);
+      await expectMatrixError(availability, 400, 'M_USER_IN_USE');
+    }
+  }
+
+  for (const [userIndex, compatibilityUser] of compatibilityUsers.entries()) {
+    for (const [loginIndex, loginPath] of LOGIN_ALIAS_PATHS.entries()) {
+      const deviceId = `COMPATLOG${userIndex}${loginIndex}`;
+      const login = await loginWithPassword(rig, {
+        user: compatibilityUser.username,
+        password: compatibilityUser.password,
+        deviceId,
+        loginPath,
+      });
+      assert.equal(login.status, 200);
+      const loginBody = await login.json();
+      assert.equal(loginBody.user_id, compatibilityUser.userId);
+      assert.equal(loginBody.device_id, deviceId);
+      assert.equal(typeof loginBody.access_token, 'string');
+      assert.equal(typeof loginBody.refresh_token, 'string');
+    }
+  }
+
+  for (const loginPath of LOGIN_ALIAS_PATHS) {
+    const wrongPasswordLogin = await loginWithPassword(rig, {
+      user: compatibilityUsers[0].username,
+      password: 'definitely-not-the-password',
+      loginPath,
+    });
+    await expectMatrixError(wrongPasswordLogin, 403, 'M_FORBIDDEN');
+
+    const unsupportedLoginType = await rig.gatewayFetch(loginPath, {
+      method: 'POST',
+      json: {
+        type: 'm.login.token',
+        token: 'disabled-flow-token',
+      },
+    });
+    await expectMatrixError(unsupportedLoginType, 400, 'M_UNKNOWN');
+  }
 });
 
 test('Phase 04 session lifecycle covers register, login, refresh, logout, whoami, and capabilities', async (t) => {
@@ -277,6 +427,7 @@ test('Phase 04 session lifecycle covers register, login, refresh, logout, whoami
     username: 'alice',
     password: 'correct horse battery staple',
     deviceId: 'ALICEPHONE',
+    registerPath: '/_matrix/client/r0/register',
   });
   const registrationRequest = {
     username: 'alice',
@@ -287,7 +438,7 @@ test('Phase 04 session lifecycle covers register, login, refresh, logout, whoami
       session: registrationChallenge.session,
     },
   };
-  const registrationResponse = await rig.gatewayFetch('/_matrix/client/v3/register', {
+  const registrationResponse = await rig.gatewayFetch('/_matrix/client/r0/register', {
     method: 'POST',
     json: registrationRequest,
   });
@@ -298,7 +449,7 @@ test('Phase 04 session lifecycle covers register, login, refresh, logout, whoami
   assert.equal(typeof registration.access_token, 'string');
   assert.equal(typeof registration.refresh_token, 'string');
 
-  const registrationRetry = await rig.gatewayFetch('/_matrix/client/v3/register', {
+  const registrationRetry = await rig.gatewayFetch('/_matrix/client/r0/register', {
     method: 'POST',
     json: registrationRequest,
   });
@@ -313,7 +464,7 @@ test('Phase 04 session lifecycle covers register, login, refresh, logout, whoami
       v1: { secret_text: 'phase04-session-root-v1' },
     },
   });
-  const registrationRetryAfterKeyRotation = await rig.gatewayFetch('/_matrix/client/v3/register', {
+  const registrationRetryAfterKeyRotation = await rig.gatewayFetch('/_matrix/client/r0/register', {
     method: 'POST',
     json: registrationRequest,
   });
@@ -367,7 +518,7 @@ test('Phase 04 session lifecycle covers register, login, refresh, logout, whoami
     assert.equal('access_token' in envelope, false);
   }
 
-  const unsupportedLoginType = await rig.gatewayFetch('/_matrix/client/v3/login', {
+  const unsupportedLoginType = await rig.gatewayFetch('/_matrix/client/v1/login', {
     method: 'POST',
     json: {
       type: 'm.login.token',
@@ -379,6 +530,7 @@ test('Phase 04 session lifecycle covers register, login, refresh, logout, whoami
   const wrongPasswordLogin = await loginWithPassword(rig, {
     user: 'alice',
     password: 'incorrect password',
+    loginPath: '/_matrix/client/v1/login',
   });
   await expectMatrixError(wrongPasswordLogin, 403, 'M_FORBIDDEN');
 
@@ -424,6 +576,7 @@ test('Phase 04 session lifecycle covers register, login, refresh, logout, whoami
     user: '@alice:matrix.example.test',
     password: 'correct horse battery staple',
     deviceId: 'ALICELAPTOP',
+    loginPath: '/_matrix/client/r0/login',
   });
   assert.equal(loginAgain.status, 200);
   const loginAgainBody = await loginAgain.json();

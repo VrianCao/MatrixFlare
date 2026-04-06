@@ -45,6 +45,67 @@ test('TEST-CS-002 staging covers filter lifecycle plus /sync limited, full_state
   const roomId = room.room_id;
   await joinRoom(harness, bob.access_token, roomId);
   await joinRoom(harness, carol.access_token, roomId);
+  const preTokenMessage = await putAuthenticated(
+    harness,
+    alice.access_token,
+    roomPath(roomId, '/send/m.room.message/cs2-staging-cinny-pretoken'),
+    {
+      msgtype: 'm.text',
+      body: 'phase08 cs2 staging cinny pre-token',
+    },
+  );
+  assert.equal(preTokenMessage.response.status, 200);
+
+  const cinnyInlineFilter = {
+    room: {
+      state: {
+        lazy_load_members: true,
+      },
+      timeline: {
+        limit: 8,
+      },
+    },
+  };
+  const cinnyStoredFilter = await uploadFilter(harness, bob.access_token, bob.user_id, {
+    room: {
+      state: {
+        lazy_load_members: true,
+      },
+    },
+  });
+  const cinnyInitialSync = await syncRequest(
+    harness,
+    bob.access_token,
+    `filter=${encodeURIComponent(JSON.stringify(cinnyInlineFilter))}&use_state_after=true`,
+  );
+  assert.equal(typeof cinnyInitialSync.next_batch, 'string');
+  const postTokenMessage = await putAuthenticated(
+    harness,
+    alice.access_token,
+    roomPath(roomId, '/send/m.room.message/cs2-staging-cinny-posttoken'),
+    {
+      msgtype: 'm.text',
+      body: 'phase08 cs2 staging cinny post-token',
+    },
+  );
+  assert.equal(postTokenMessage.response.status, 200);
+  const cinnyStoredSync = await syncRequest(
+    harness,
+    bob.access_token,
+    `since=${encodeURIComponent(cinnyInitialSync.next_batch)}&filter=${encodeURIComponent(cinnyStoredFilter.filter_id)}&use_state_after=true`,
+  );
+  assert.equal(typeof cinnyStoredSync.next_batch, 'string');
+  const cinnyStoredRoom = getJoinedRoomEntry(cinnyStoredSync, roomId);
+  assert.ok(cinnyStoredRoom);
+  assert.deepEqual(
+    cinnyStoredRoom.timeline?.events?.map((event) => event.event_id),
+    [postTokenMessage.payload.event_id],
+  );
+  assert.equal(
+    cinnyStoredRoom.timeline?.events?.some((event) => event.event_id === preTokenMessage.payload.event_id),
+    false,
+  );
+  assert.ok(!('state' in cinnyStoredRoom));
 
   const storedFilter = await uploadFilter(harness, bob.access_token, bob.user_id, {
     account_data: {
