@@ -378,11 +378,13 @@
 ### 04.03 实现注册 / 登录 / 刷新 / 注销 / whoami
 
 - [x] 完成 `IF-CS-010`~`IF-CS-014`。
-  Spec refs: `30` 4.2, 4.3, 4.6, 4.7; `25` `FLOW-CS-REGISTER`,`FLOW-CS-LOGIN`,`FLOW-CS-REFRESH`
+  Spec refs: `30` 4.2, 4.3, 4.6, 4.7, 4.8; `25` `FLOW-CS-REGISTER`,`FLOW-CS-LOGIN`,`FLOW-CS-REFRESH`
   产出:
   对应 handlers、`UserDO` command path、幂等与错误模型。
   完成标准:
   无半创建、无半 session、refresh 重放可判失效。
+  当前状态:
+  `/_matrix/client/{r0,v1,v3}/login`、`/_matrix/client/{r0,v1,v3}/register` 与 `/_matrix/client/{r0,v1,v3}/register/available` 现已按同一 password / dummy truth 收口；`TEST-CS-001` / `EVID-CS-001` 也已同步抬高为逐别名锁定 `/.well-known/matrix/client`、`/_matrix/client/versions`、discovery / availability truth、`Cache-Control` 真值、browser `Origin` + `OPTIONS` preflight、anonymous public-entry live `429 M_LIMIT_EXCEEDED`、初始 UIA challenge、成功 registration/login、错误模型，以及 `access_token` / `refresh_token` issuance 与 `device_id` 副作用 parity 的 gate；同时 `TEST-GOV-001` 本地治理检查也显式钉住 `IF-CS-005`,`IF-CS-009`,`IF-CS-067`,`IF-CS-010`,`IF-CS-011` 的 route-set，避免 compatibility alias drift 被便利性绿灯漏掉。
 
 ### 04.04 实现共享 UIA 模型、密码变更、账户停用
 

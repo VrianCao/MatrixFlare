@@ -40,17 +40,75 @@ test('requirement register contains canonical governance and architecture rows',
 
 test('wildcard expansion resolves pinned Matrix v1.17 route families', async () => {
   const analysis = await analyzeRepository(repoRoot);
-  const loginFamily = analysis.wildcardRouteExpansion.find(
-    (entry) => entry.if_id === 'IF-CS-005' && entry.route_pattern === '/_matrix/client/*/login',
+  const pushRulesRoot = analysis.wildcardRouteExpansion.find(
+    (entry) => entry.if_id === 'IF-CS-018' && entry.route_pattern === '/_matrix/client/*/pushrules/',
   );
-  assert.ok(loginFamily);
-  assert.deepEqual(loginFamily.expanded_paths, ['/_matrix/client/v3/login']);
+  assert.ok(pushRulesRoot);
+  assert.deepEqual(pushRulesRoot.expanded_paths, ['/_matrix/client/v3/pushrules/']);
 
   const publicRoomsFamily = analysis.wildcardRouteExpansion.find(
     (entry) => entry.if_id === 'IF-CS-052' && entry.route_pattern === '/_matrix/client/*/publicRooms',
   );
   assert.ok(publicRoomsFamily);
   assert.ok(publicRoomsFamily.expanded_paths.includes('/_matrix/client/v3/publicRooms'));
+});
+
+test('explicit alias contracts pin compatibility login/register route sets', async () => {
+  const analysis = await analyzeRepository(repoRoot);
+  const loginContract = analysis.definitionsById.get('IF-CS-005');
+  assert.ok(loginContract);
+  assert.equal(
+    loginContract.columns['Route / Family'],
+    '`GET /_matrix/client/r0/login`, `GET /_matrix/client/v1/login`, `GET /_matrix/client/v3/login`',
+  );
+
+  const registerAvailabilityContract = analysis.definitionsById.get('IF-CS-009');
+  assert.ok(registerAvailabilityContract);
+  assert.equal(
+    registerAvailabilityContract.columns['Route / Family'],
+    '`GET /_matrix/client/r0/register/available`, `GET /_matrix/client/v1/register/available`, `GET /_matrix/client/v3/register/available`',
+  );
+
+  const registerDiscoveryContract = analysis.definitionsById.get('IF-CS-067');
+  assert.ok(registerDiscoveryContract);
+  assert.equal(
+    registerDiscoveryContract.columns['Route / Family'],
+    '`GET /_matrix/client/r0/register`, `GET /_matrix/client/v1/register`, `GET /_matrix/client/v3/register`',
+  );
+
+  const registerWriteContract = analysis.definitionsById.get('IF-CS-010');
+  assert.ok(registerWriteContract);
+  assert.equal(
+    registerWriteContract.columns['Route / Family'],
+    '`POST /_matrix/client/r0/register`, `POST /_matrix/client/v1/register`, `POST /_matrix/client/v3/register`',
+  );
+
+  const loginWriteContract = analysis.definitionsById.get('IF-CS-011');
+  assert.ok(loginWriteContract);
+  assert.equal(
+    loginWriteContract.columns['Route / Family'],
+    '`POST /_matrix/client/r0/login`, `POST /_matrix/client/v1/login`, `POST /_matrix/client/v3/login`',
+  );
+});
+
+test('missing compatibility alias route lock definitions fail governance analysis', async () => {
+  const tempRoot = await makeTempRepo();
+  await replaceInFile(
+    tempRoot,
+    'spec/framework/23-interface-contract-catalog.md',
+    '| `IF-CS-011` | HTTP | client | `gateway-worker` | `POST /_matrix/client/r0/login`, `POST /_matrix/client/v1/login`, `POST /_matrix/client/v3/login` | login auth | `LoginRequest` / `LoginResponse` | request fingerprint | retryable before session create | Matrix errcode | `30` | `DATA-USER-001`,`DATA-USER-002`,`DATA-USER-017` | `FLOW-CS-LOGIN` |',
+    '| `IF-CS-111` | HTTP | client | `gateway-worker` | `POST /_matrix/client/r0/login`, `POST /_matrix/client/v1/login`, `POST /_matrix/client/v3/login` | login auth | `LoginRequest` / `LoginResponse` | request fingerprint | retryable before session create | Matrix errcode | `30` | `DATA-USER-001`,`DATA-USER-002`,`DATA-USER-017` | `FLOW-CS-LOGIN` |',
+  );
+
+  const analysis = await analyzeRepository(tempRoot);
+  assert.equal(analysis.valid, false);
+  assert.ok(
+    analysis.issues.some(
+      (issue) =>
+        issue.code === 'missing_compatibility_alias_route_lock' &&
+        issue.message.includes('IF-CS-011'),
+    ),
+  );
 });
 
 test('wildcard expansion preserves canonical trailing-slash routes and excludes example pollution', async () => {
@@ -71,8 +129,8 @@ test('wildcard expansion rejects route families that place "*" outside the Matri
   await replaceInFile(
     tempRoot,
     'spec/framework/23-interface-contract-catalog.md',
-    '`GET /_matrix/client/*/login`',
-    '`GET /_matrix/client/v3/*/login`',
+    '`GET /_matrix/client/*/pushrules/`',
+    '`GET /_matrix/client/v3/*/pushrules/`',
   );
 
   const analysis = await analyzeRepository(tempRoot);
@@ -81,7 +139,7 @@ test('wildcard expansion rejects route families that place "*" outside the Matri
     analysis.issues.some(
       (issue) =>
         issue.code === 'wildcard_route_invalid_pattern' &&
-        issue.message.includes('/_matrix/client/v3/*/login'),
+        issue.message.includes('/_matrix/client/v3/*/pushrules/'),
     ),
   );
 });
@@ -160,6 +218,8 @@ test('governance evidence writer emits required EVID-GOV-001 artifacts', async (
     'artifacts/expanded-source-ids.json',
     'artifacts/wildcard-route-expansion.csv',
     'artifacts/wildcard-route-expansion.json',
+    'artifacts/compatibility-alias-route-locks.csv',
+    'artifacts/compatibility-alias-route-locks.json',
   ];
 
   for (const relativePath of expectedFiles) {
@@ -171,6 +231,8 @@ test('governance evidence writer emits required EVID-GOV-001 artifacts', async (
   assert.match(summary, /code_version\.git_commit:/);
   assert.match(summary, /data_version\.analysis_sha256:/);
   assert.match(summary, /## Expanded Source IDs/);
+  assert.match(summary, /## Compatibility Alias Route Locks/);
+  assert.match(summary, /`IF-CS-011` -> `POST \/_matrix\/client\/r0\/login`/);
   assert.match(summary, /`REQ-ARCH-001`/);
 });
 
@@ -190,8 +252,10 @@ test('governance evidence writer still emits fail evidence when pinned Matrix sn
   await fs.access(path.join(evidenceRoot, 'artifacts/traceability-matrix.json'));
   await fs.access(path.join(evidenceRoot, 'artifacts/expanded-source-ids.json'));
   await fs.access(path.join(evidenceRoot, 'artifacts/wildcard-route-expansion.json'));
+  await fs.access(path.join(evidenceRoot, 'artifacts/compatibility-alias-route-locks.json'));
 
   const summary = await fs.readFile(path.join(evidenceRoot, 'summary.md'), 'utf8');
   assert.match(summary, /- status: fail/);
   assert.match(summary, /matrix_route_catalog_unavailable/);
+  assert.match(summary, /## Compatibility Alias Route Locks/);
 });

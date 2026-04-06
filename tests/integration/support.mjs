@@ -104,8 +104,9 @@ async function createRegisterChallenge(harness, {
   username,
   password,
   deviceId,
+  registerPath = '/_matrix/client/v3/register',
 }) {
-  const result = await request(harness, '/_matrix/client/v3/register', {
+  const result = await request(harness, registerPath, {
     method: 'POST',
     json: {
       username,
@@ -122,14 +123,16 @@ export async function registerUser(harness, {
   usernamePrefix,
   password = DEFAULT_PASSWORD,
   deviceId = 'DEVICE1',
+  registerPath = '/_matrix/client/v3/register',
 } = {}) {
   const username = uniqueToken(usernamePrefix);
   const challenge = await createRegisterChallenge(harness, {
     username,
     password,
     deviceId,
+    registerPath,
   });
-  const result = await request(harness, '/_matrix/client/v3/register', {
+  const result = await request(harness, registerPath, {
     method: 'POST',
     json: {
       username,
@@ -154,8 +157,9 @@ export async function loginWithPassword(harness, {
   user,
   password = DEFAULT_PASSWORD,
   deviceId = null,
+  loginPath = '/_matrix/client/v3/login',
 }) {
-  return request(harness, '/_matrix/client/v3/login', {
+  return request(harness, loginPath, {
     method: 'POST',
     json: {
       type: 'm.login.password',

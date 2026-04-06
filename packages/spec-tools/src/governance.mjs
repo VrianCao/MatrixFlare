@@ -51,6 +51,14 @@ const MATRIX_SNAPSHOT_FILES = [
   'research/sources/matrix-v1.17-application-service-api.html',
 ];
 
+const COMPATIBILITY_ALIAS_ROUTE_LOCK_IDS = Object.freeze([
+  'IF-CS-005',
+  'IF-CS-009',
+  'IF-CS-067',
+  'IF-CS-010',
+  'IF-CS-011',
+]);
+
 const ROUTE_MARKER_RE =
   /<span class="http-api-method">([^<]+)<\/span>\s*<span class="(?:endpoint-path|endpoint(?: [^"]*)?)">([^<]+)<\/span>/g;
 
@@ -554,6 +562,28 @@ function buildRequirementRegisterMap(requirementRegister) {
     registerMap.set(row.req_id, row);
   }
   return registerMap;
+}
+
+function buildCompatibilityAliasRouteLocks(definitionsById, issues) {
+  return COMPATIBILITY_ALIAS_ROUTE_LOCK_IDS.map((id) => {
+    const definition = definitionsById.get(id);
+    if (!definition) {
+      issues.push({
+        severity: 'error',
+        code: 'missing_compatibility_alias_route_lock',
+        file: 'spec/framework/23-interface-contract-catalog.md',
+        line: 1,
+        message: `Compatibility alias route lock definition ${id} is missing from the interface contract catalog`,
+      });
+      return null;
+    }
+    return {
+      if_id: definition.id,
+      source_file: definition.file,
+      source_line: definition.line,
+      route_family: definition.columns['Route / Family'] ?? '',
+    };
+  }).filter((row) => row != null);
 }
 
 function expandCanonicalReference(id, definitionsById, requirementRegisterMap) {
@@ -1447,6 +1477,7 @@ export async function analyzeRepository(repoRoot = getRepoRoot()) {
     });
   }
   const wildcardRouteExpansion = buildWildcardRouteExpansion(definitions, matrixRouteCatalog, issues);
+  const compatibilityAliasRouteLocks = buildCompatibilityAliasRouteLocks(definitionsById, issues);
   const expandedSourceIds = collectExpandedSourceIds(fieldInventory, 'EVID-GOV-001');
 
   await validateCloudflareSnapshots(repoRoot, definitions, issues);
@@ -1463,6 +1494,7 @@ export async function analyzeRepository(repoRoot = getRepoRoot()) {
     requirement_register_count: requirementRegister.length,
     traceability_edge_count: traceabilityMatrix.length,
     wildcard_route_family_count: wildcardRouteExpansion.length,
+    compatibility_alias_route_lock_count: compatibilityAliasRouteLocks.length,
     expanded_source_ids_count: expandedSourceIds.expandedSourceIds.length,
     issue_count: issues.length,
   };
@@ -1484,6 +1516,7 @@ export async function analyzeRepository(repoRoot = getRepoRoot()) {
     requirementTraceabilityEntries,
     traceabilityMatrix,
     wildcardRouteExpansion,
+    compatibilityAliasRouteLocks,
     matrixRouteCatalog,
     expandedSourceIds,
     issues: issues.sort((a, b) => {
@@ -1544,6 +1577,7 @@ function collectDataVersionContext(analysis) {
   const traceabilityMatrixJson = stableJson(analysis.traceabilityMatrix);
   const expandedSourceIdsJson = stableJson(analysis.expandedSourceIds);
   const wildcardRouteExpansionJson = stableJson(analysis.wildcardRouteExpansion);
+  const compatibilityAliasRouteLocksJson = stableJson(analysis.compatibilityAliasRouteLocks);
   const analysisSnapshotJson = stableJson({
     summary: analysis.summary,
     issues: analysis.issues,
@@ -1551,6 +1585,7 @@ function collectDataVersionContext(analysis) {
     traceability_matrix: analysis.traceabilityMatrix,
     expanded_source_ids: analysis.expandedSourceIds,
     wildcard_route_expansion: analysis.wildcardRouteExpansion,
+    compatibility_alias_route_locks: analysis.compatibilityAliasRouteLocks,
   });
   return {
     analysis_sha256: sha256Hex(analysisSnapshotJson),
@@ -1558,6 +1593,7 @@ function collectDataVersionContext(analysis) {
     traceability_matrix_sha256: sha256Hex(traceabilityMatrixJson),
     expanded_source_ids_sha256: sha256Hex(expandedSourceIdsJson),
     wildcard_route_expansion_sha256: sha256Hex(wildcardRouteExpansionJson),
+    compatibility_alias_route_locks_sha256: sha256Hex(compatibilityAliasRouteLocksJson),
   };
 }
 
@@ -1591,6 +1627,12 @@ export async function writeGovernanceEvidence(repoRoot = getRepoRoot(), options 
     methods: row.methods,
     expanded_paths: row.expanded_paths.join(' | '),
     expanded_routes: row.expanded_routes.join(' | '),
+  }));
+  const compatibilityAliasCsvRows = analysis.compatibilityAliasRouteLocks.map((row) => ({
+    if_id: row.if_id,
+    source_file: row.source_file,
+    source_line: String(row.source_line),
+    route_family: row.route_family,
   }));
 
   await Promise.all([
@@ -1666,6 +1708,23 @@ export async function writeGovernanceEvidence(repoRoot = getRepoRoot(), options 
       ]),
     ),
     fs.writeFile(
+      path.join(artifactsDir, 'compatibility-alias-route-locks.json'),
+      stableJson({
+        generated_at: generatedAt,
+        row_count: analysis.compatibilityAliasRouteLocks.length,
+        rows: analysis.compatibilityAliasRouteLocks,
+      }),
+    ),
+    fs.writeFile(
+      path.join(artifactsDir, 'compatibility-alias-route-locks.csv'),
+      toCsv(compatibilityAliasCsvRows, [
+        'if_id',
+        'source_file',
+        'source_line',
+        'route_family',
+      ]),
+    ),
+    fs.writeFile(
       path.join(artifactsDir, 'governance-summary.json'),
       stableJson({
         generated_at: generatedAt,
@@ -1674,6 +1733,7 @@ export async function writeGovernanceEvidence(repoRoot = getRepoRoot(), options 
         data_version: dataVersion,
         summary: analysis.summary,
         expanded_source_ids: analysis.expandedSourceIds,
+        compatibility_alias_route_locks: analysis.compatibilityAliasRouteLocks,
         issues: analysis.issues,
       }),
     ),
@@ -1696,6 +1756,7 @@ export async function writeGovernanceEvidence(repoRoot = getRepoRoot(), options 
     `- data_version.traceability_matrix_sha256: \`${dataVersion.traceability_matrix_sha256}\``,
     `- data_version.expanded_source_ids_sha256: \`${dataVersion.expanded_source_ids_sha256}\``,
     `- data_version.wildcard_route_expansion_sha256: \`${dataVersion.wildcard_route_expansion_sha256}\``,
+    `- data_version.compatibility_alias_route_locks_sha256: \`${dataVersion.compatibility_alias_route_locks_sha256}\``,
     '',
     '## Scope',
     '',
@@ -1712,6 +1773,8 @@ export async function writeGovernanceEvidence(repoRoot = getRepoRoot(), options 
     '- `artifacts/expanded-source-ids.json`',
     '- `artifacts/wildcard-route-expansion.csv`',
     '- `artifacts/wildcard-route-expansion.json`',
+    '- `artifacts/compatibility-alias-route-locks.csv`',
+    '- `artifacts/compatibility-alias-route-locks.json`',
     '- `artifacts/governance-summary.json`',
     '',
     '## Summary',
@@ -1721,6 +1784,7 @@ export async function writeGovernanceEvidence(repoRoot = getRepoRoot(), options 
     `- traceability_edge_count: ${analysis.summary.traceability_edge_count}`,
     `- expanded_source_ids_count: ${analysis.summary.expanded_source_ids_count}`,
     `- wildcard_route_family_count: ${analysis.summary.wildcard_route_family_count}`,
+    `- compatibility_alias_route_lock_count: ${analysis.summary.compatibility_alias_route_lock_count}`,
     `- issue_count: ${analysis.summary.issue_count}`,
   ];
 
@@ -1729,6 +1793,15 @@ export async function writeGovernanceEvidence(repoRoot = getRepoRoot(), options 
   summaryLines.push('');
   summaryLines.push(
     analysis.expandedSourceIds.expandedSourceIds.map((id) => `- \`${id}\``).join('\n'),
+  );
+
+  summaryLines.push('');
+  summaryLines.push('## Compatibility Alias Route Locks');
+  summaryLines.push('');
+  summaryLines.push(
+    analysis.compatibilityAliasRouteLocks
+      .map((row) => `- \`${row.if_id}\` -> ${row.route_family}`)
+      .join('\n'),
   );
 
   if (analysis.issues.length > 0) {
