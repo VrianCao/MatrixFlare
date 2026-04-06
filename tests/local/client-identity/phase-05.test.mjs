@@ -51,6 +51,45 @@ async function syncRequest(rig, accessToken, query = '') {
   return response.json();
 }
 
+test('Phase 05 authenticated sync serves browser CORS and preflight truth', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const registration = await registerUser(rig, {
+    username: 'browser-sync-user',
+    password: 'phase05-browser-sync-password',
+    deviceId: 'BROWSERSYNC',
+  });
+
+  const browserOrigin = 'https://app.element.io';
+  const browserSync = await rig.gatewayFetch('/_matrix/client/v3/sync?timeout=0', {
+    headers: {
+      ...rig.authHeaders(registration.access_token),
+      origin: browserOrigin,
+    },
+  });
+  assert.equal(browserSync.status, 200);
+  assert.equal(browserSync.headers.get('access-control-allow-origin'), browserOrigin);
+  assert.match(browserSync.headers.get('vary') ?? '', /Origin/i);
+  const browserSyncBody = await browserSync.json();
+  assert.equal(typeof browserSyncBody.next_batch, 'string');
+
+  const browserSyncPreflight = await rig.gatewayFetch('/_matrix/client/v3/sync?timeout=0', {
+    method: 'OPTIONS',
+    headers: {
+      origin: browserOrigin,
+      'access-control-request-method': 'GET',
+      'access-control-request-headers': 'authorization',
+    },
+  });
+  assert.equal(browserSyncPreflight.status, 204);
+  assert.equal(browserSyncPreflight.headers.get('access-control-allow-origin'), browserOrigin);
+  assert.equal(browserSyncPreflight.headers.get('access-control-allow-headers'), 'authorization');
+  assert.match(browserSyncPreflight.headers.get('access-control-allow-methods') ?? '', /\bGET\b/);
+  assert.match(browserSyncPreflight.headers.get('vary') ?? '', /Origin/i);
+  assert.match(browserSyncPreflight.headers.get('vary') ?? '', /Access-Control-Request-Headers/i);
+});
+
 function roomPath(roomId, suffix = '') {
   return `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}${suffix}`;
 }

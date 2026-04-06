@@ -432,6 +432,56 @@ test('TEST-CS-001 ci-integration covers discovery, session lifecycle, and capabi
     'm.set_displayname': { enabled: true },
   });
 
+  const browserAuthenticatedHeaders = {
+    ...authHeaders(alice.access_token),
+    origin: browserOrigin,
+  };
+  const browserCapabilities = await request(harness, '/_matrix/client/v3/capabilities', {
+    headers: browserAuthenticatedHeaders,
+  });
+  assert.equal(browserCapabilities.response.status, 200);
+  assert.equal(browserCapabilities.response.headers.get('access-control-allow-origin'), browserOrigin);
+  assert.match(browserCapabilities.response.headers.get('vary') ?? '', /Origin/i);
+  assert.deepEqual(browserCapabilities.payload?.capabilities, capabilities.payload?.capabilities);
+
+  const browserCapabilitiesPreflight = await request(harness, '/_matrix/client/v3/capabilities', {
+    method: 'OPTIONS',
+    headers: {
+      origin: browserOrigin,
+      'access-control-request-method': 'GET',
+      'access-control-request-headers': 'authorization',
+    },
+  });
+  assert.equal(browserCapabilitiesPreflight.response.status, 204);
+  assert.equal(browserCapabilitiesPreflight.response.headers.get('access-control-allow-origin'), browserOrigin);
+  assert.equal(browserCapabilitiesPreflight.response.headers.get('access-control-allow-headers'), 'authorization');
+  assert.match(browserCapabilitiesPreflight.response.headers.get('access-control-allow-methods') ?? '', /\bGET\b/);
+  assert.match(browserCapabilitiesPreflight.response.headers.get('vary') ?? '', /Origin/i);
+  assert.match(browserCapabilitiesPreflight.response.headers.get('vary') ?? '', /Access-Control-Request-Headers/i);
+
+  const browserSync = await request(harness, '/_matrix/client/v3/sync?timeout=0', {
+    headers: browserAuthenticatedHeaders,
+  });
+  assert.equal(browserSync.response.status, 200);
+  assert.equal(browserSync.response.headers.get('access-control-allow-origin'), browserOrigin);
+  assert.match(browserSync.response.headers.get('vary') ?? '', /Origin/i);
+  assert.equal(typeof browserSync.payload?.next_batch, 'string');
+
+  const browserSyncPreflight = await request(harness, '/_matrix/client/v3/sync?timeout=0', {
+    method: 'OPTIONS',
+    headers: {
+      origin: browserOrigin,
+      'access-control-request-method': 'GET',
+      'access-control-request-headers': 'authorization',
+    },
+  });
+  assert.equal(browserSyncPreflight.response.status, 204);
+  assert.equal(browserSyncPreflight.response.headers.get('access-control-allow-origin'), browserOrigin);
+  assert.equal(browserSyncPreflight.response.headers.get('access-control-allow-headers'), 'authorization');
+  assert.match(browserSyncPreflight.response.headers.get('access-control-allow-methods') ?? '', /\bGET\b/);
+  assert.match(browserSyncPreflight.response.headers.get('vary') ?? '', /Origin/i);
+  assert.match(browserSyncPreflight.response.headers.get('vary') ?? '', /Access-Control-Request-Headers/i);
+
   const whoAmI = await getAuthenticated(harness, alice.access_token, '/_matrix/client/v3/account/whoami');
   assert.equal(whoAmI.response.status, 200);
   assert.equal(whoAmI.payload?.user_id, alice.user_id);
