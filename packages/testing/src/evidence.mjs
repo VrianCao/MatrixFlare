@@ -5120,10 +5120,11 @@ function validateEnvironmentRunReadinessProbe(reportLabel, readinessProbe, expec
     !isPlainObject(versionsStep?.detail)
     || versionsStep.detail.versions_count !== CLIENT_DISCOVERY_VERSION_COUNT
     || versionsStep.detail.browser_compatible_version_ladder !== true
+    || versionsStep.detail.browser_compatible_cors !== true
   ) {
     return {
       valid: false,
-      error: `${reportLabel} readiness_probe final versions step must prove the browser-compatible version ladder`,
+      error: `${reportLabel} readiness_probe final versions step must prove the browser-compatible version ladder and CORS headers`,
     };
   }
   if (readinessProbe.last_error !== null) {
@@ -6520,6 +6521,26 @@ function buildApplicableSourceIds(definition, expandedSourceIds) {
   return expandedSourceIds.filter((sourceId) => !excluded.has(sourceId));
 }
 
+function resolveExternalAttestationReuseContextError({
+  expectedGitHubRepository,
+  expectedGitCommit,
+  trackedWorktreeDirty,
+} = {}) {
+  if (!isNonEmptyString(expectedGitHubRepository)) {
+    return 'cannot validate external attestations against the current repository; resolve git origin or set GITHUB_REPOSITORY';
+  }
+  if (!isNonEmptyString(expectedGitCommit)) {
+    return 'cannot validate external attestations against the current HEAD commit; resolve git HEAD before reusing external evidence';
+  }
+  if (trackedWorktreeDirty === true) {
+    return 'current checkout has tracked modifications; external attestations may only be reused from a clean tracked worktree';
+  }
+  if (trackedWorktreeDirty !== false) {
+    return 'cannot determine whether the current checkout has tracked modifications; external attestations may only be reused from a clean tracked worktree';
+  }
+  return null;
+}
+
 export async function collectManualArtifactResults(definition, repoRoot, manualArtifacts = {}, runTimestamp, {
   expectedGitHubRepository = null,
   expectedGitCommit = null,
@@ -6535,6 +6556,13 @@ export async function collectManualArtifactResults(definition, repoRoot, manualA
     const providedPath = resolvedPath == null ? null : normalizePathForMarkdown(path.relative(repoRoot, resolvedPath));
     const expectedEnvironmentName = resolveEnvironmentNameForArtifactId(artifactRequirement.artifact_id);
     const requiresExternalEvidence = requiresExternalManualArtifactEvidence(artifactRequirement.artifact_id);
+    const externalEvidenceContextError = requiresExternalEvidence
+      ? resolveExternalAttestationReuseContextError({
+        expectedGitHubRepository: resolvedExpectedGitHubRepository,
+        expectedGitCommit,
+        trackedWorktreeDirty,
+      })
+      : null;
     const harnessReadiness = expectedEnvironmentName == null
       ? null
       : await assessNonLocalEnvironmentHarnessReadiness(expectedEnvironmentName, repoRoot, {
@@ -6620,9 +6648,9 @@ export async function collectManualArtifactResults(definition, repoRoot, manualA
           valid = false;
           validation_error = `${expectedEnvironmentName} harness is not environment-backed: ${harnessReadiness.reason}`;
         }
-        if (valid && trackedWorktreeDirty === true) {
+        if (valid && externalEvidenceContextError != null) {
           valid = false;
-          validation_error = 'current checkout has tracked modifications; external attestations may only be reused from a clean tracked worktree';
+          validation_error = externalEvidenceContextError;
         }
         if (valid) {
           attestation_kind = parsedPayload.attestation_kind ?? null;
