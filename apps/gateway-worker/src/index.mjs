@@ -1719,12 +1719,37 @@ async function handleRegister(request, env) {
   if (body instanceof Response) {
     return body;
   }
+  const auth = body.auth;
+  const username = body.username;
+  let hintedLocalpart = null;
+  if (typeof username === 'string' && username.trim().length > 0) {
+    try {
+      hintedLocalpart = normalizeLocalUserIdentifier(username, env.MATRIX_SERVER_NAME);
+    } catch {
+      hintedLocalpart = null;
+    }
+  }
+  const targetUserId = hintedLocalpart
+    ? buildLocalUserId(hintedLocalpart, env.MATRIX_SERVER_NAME)
+    : null;
+
+  if (!auth || auth.type !== 'm.login.dummy' || typeof auth.session !== 'string') {
+    return buildUiaChallengeResponse(env, 'register', 'POST', targetUserId);
+  }
+
+  const uiaPayload = verifyRouteBoundUia(env, auth.session, 'register', 'POST');
+  if (!uiaPayload) {
+    return buildUiaChallengeResponse(env, 'register', 'POST', targetUserId);
+  }
+  if (uiaPayload.auth_subject_hint && targetUserId && uiaPayload.auth_subject_hint !== targetUserId) {
+    return matrixErrorResponse(403, 'M_FORBIDDEN', 'UIA session subject binding mismatch');
+  }
+
   const registrationTokens = getRegistrationTokenSet(env);
   if (registrationTokens.size > 0 && !registrationTokens.has(body.registration_token ?? '')) {
     return matrixErrorResponse(403, 'M_FORBIDDEN', 'Registration token is invalid');
   }
 
-  const username = body.username;
   if (typeof username !== 'string' || username.trim().length === 0) {
     return matrixErrorResponse(400, 'M_MISSING_PARAM', 'username is required');
   }
@@ -1735,18 +1760,7 @@ async function handleRegister(request, env) {
   } catch {
     return matrixErrorResponse(400, 'M_INVALID_USERNAME', 'The requested username is not valid');
   }
-  const targetUserId = buildLocalUserId(localpart, env.MATRIX_SERVER_NAME);
-
-  const auth = body.auth;
-  if (!auth || auth.type !== 'm.login.dummy' || typeof auth.session !== 'string') {
-    return buildUiaChallengeResponse(env, 'register', 'POST', targetUserId);
-  }
-
-  const uiaPayload = verifyRouteBoundUia(env, auth.session, 'register', 'POST');
-  if (!uiaPayload) {
-    return buildUiaChallengeResponse(env, 'register', 'POST', targetUserId);
-  }
-  if (uiaPayload.auth_subject_hint && uiaPayload.auth_subject_hint !== targetUserId) {
+  if (uiaPayload.auth_subject_hint && uiaPayload.auth_subject_hint !== buildLocalUserId(localpart, env.MATRIX_SERVER_NAME)) {
     return matrixErrorResponse(403, 'M_FORBIDDEN', 'UIA session subject binding mismatch');
   }
 

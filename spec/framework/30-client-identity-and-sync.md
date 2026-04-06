@@ -123,6 +123,7 @@
 * `GET /_matrix/client/*/register` 必须存在，作为 registration discovery compatibility surface 返回当前真实支持的 registration UIA stages；当 homeserver 当前不允许 registration 时，必须返回 `403 M_FORBIDDEN`。
 * `GET /_matrix/client/*/register` 只能宣告当前真实实现的 registration UIA stage；当前基线只允许宣告 `m.login.dummy`。registration token policy 若存在，必须继续由 `POST /register` 的 policy enforcement 与 `GET /register/m.login.registration_token/validity` 真值承担，不得被误宣告成已实现的 UIA stage。
 * `GET /_matrix/client/*/register` 不得被 shared edge cache、browser cache 或其它跨请求缓存当作可陈旧结果复用；响应必须使用 `no-store` 语义。
+* `POST /_matrix/client/*/register` 在缺少或未完成 UIA 时，必须优先返回 route-bound `401` challenge，而不是先因为缺少 `username`、`password` 或 `registration_token` 之类的请求字段返回 `400/403`；这条顺序约束是为了兼容先用空请求探测 registration options 的客户端。
 * `GET /_matrix/client/*/register/available` 必须存在，并只根据当前 registration policy、MXID grammar 与本地账户真值裁决可用性；不得读取可陈旧目录索引替代 `DATA-USER-017`。
 * `GET /_matrix/client/*/register/available` 不得被 shared edge cache、browser cache 或其它跨请求缓存当作可陈旧结果复用；响应必须使用 `no-store` 语义，最多只允许同一请求链路内的局部 memoization。
 * `GET /_matrix/client/v1/register/m.login.registration_token/validity` 必须存在；当 homeserver 当前不允许 registration 时，必须返回 `403 M_FORBIDDEN`；否则必须返回 `200 { valid: boolean }`，并对未知或当前无效 token 返回 `valid = false`。
