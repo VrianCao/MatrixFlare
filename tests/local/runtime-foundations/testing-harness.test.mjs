@@ -37,6 +37,10 @@ import {
   listProductionRateLimitNamespaces,
 } from '../../../packages/testing/src/cloudflare-resources.mjs';
 import {
+  CLIENT_DISCOVERY_VERSIONS,
+  summarizeClientDiscoveryVersionPayload,
+} from '../../../packages/testing/src/client-discovery.mjs';
+import {
   assertPathsDoNotExist,
   writeGovernanceEvidence,
 } from '../../../packages/spec-tools/src/governance.mjs';
@@ -49,11 +53,15 @@ const DEFAULT_TEST_GITHUB_REPOSITORY = typeof process.env.GITHUB_REPOSITORY === 
 const FOREIGN_TEST_GITHUB_REPOSITORY = DEFAULT_TEST_GITHUB_REPOSITORY === 'example/other'
   ? 'example/matrix'
   : 'example/other';
+const DEFAULT_TEST_GIT_COMMIT = '0123456789abcdef0123456789abcdef01234567';
 const ENVIRONMENT_MANUAL_ARTIFACT_IDS = Object.freeze({
   'ci-integration': 'ci_integration_run_report',
   staging: 'staging_run_report',
   'pre-release': 'pre_release_run_report',
 });
+const CLIENT_DISCOVERY_VERSION_STEP_DETAIL = Object.freeze(
+  summarizeClientDiscoveryVersionPayload({ versions: CLIENT_DISCOVERY_VERSIONS }),
+);
 
 function buildExpectedCloudflareResources(environmentName) {
   if (environmentName === 'prod') {
@@ -205,7 +213,7 @@ function buildValidPreReleaseCostObservation(runTimestamp, overrides = {}) {
 function buildValidEnvironmentReport(environmentName, runTimestamp, overrides = {}) {
   const directory = getTestEnvironmentDefinition(environmentName).directory;
   const readinessSteps = [
-    { step: 'versions', ok: true, detail: { versions_count: 1 } },
+    { step: 'versions', ok: true, detail: CLIENT_DISCOVERY_VERSION_STEP_DETAIL },
     { step: 'public_rooms', ok: true, detail: { chunk_length: 0 } },
     { step: 'register_challenge', ok: true, detail: { session_present: true, flows_count: 1 } },
     { step: 'register_complete', ok: true, detail: { user_id_present: true, access_token_present: true } },
@@ -239,6 +247,7 @@ function buildValidEnvironmentReport(environmentName, runTimestamp, overrides = 
     log_artifact: `https://example.invalid/logs/${environmentName}/${runTimestamp}.txt`,
     executed_by: 'ci-runner',
     reviewed_by: 'release-reviewer',
+    git_commit: DEFAULT_TEST_GIT_COMMIT,
     source_run_uri: `https://example.invalid/runs/${environmentName}/${runTimestamp}`,
     topology_kind: `cloudflare-${environmentName}`,
     cloudflare_resources: buildExpectedCloudflareResources(environmentName),
@@ -597,7 +606,7 @@ function buildValidProdReadinessProbe(overrides = {}) {
         duration_ms: 30000,
         ok: true,
         steps: [
-          { step: 'versions', ok: true, detail: { versions_count: 1 } },
+          { step: 'versions', ok: true, detail: CLIENT_DISCOVERY_VERSION_STEP_DETAIL },
           { step: 'public_rooms', ok: true, detail: { chunk_length: 0 } },
           { step: 'register_complete', ok: true, detail: { user_id_present: true, access_token_present: true } },
           { step: 'media_create', ok: true, detail: { content_uri_present: true } },
@@ -1551,6 +1560,19 @@ test('manual artifact payload validation requires structured non-local reports a
   assert.deepEqual(
     validateManualArtifactPayload('staging_run_report', {
       ...validStagingReport,
+      git_commit: 'not-a-git-commit',
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'environment run report must include git_commit as a 40-character lowercase git sha',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('staging_run_report', {
+      ...validStagingReport,
       log_artifact: './local.log',
     }, {
       runTimestamp,
@@ -1662,6 +1684,29 @@ test('manual artifact payload validation requires structured non-local reports a
     {
       valid: false,
       error: 'environment run report must include readiness_probe',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('staging_run_report', {
+      ...validStagingReport,
+      readiness_probe: {
+        ...validStagingReport.readiness_probe,
+        attempts: [{
+          ...validStagingReport.readiness_probe.attempts[0],
+          steps: validStagingReport.readiness_probe.attempts[0].steps.map((step) => (
+            step.step === 'versions'
+              ? { ...step, detail: { versions_count: 1, browser_compatible_version_ladder: false } }
+              : step
+          )),
+        }],
+      },
+    }, {
+      runTimestamp,
+    }),
+    {
+      valid: false,
+      error: 'environment run report readiness_probe final versions step must prove the browser-compatible version ladder',
     },
   );
 
@@ -5386,6 +5431,79 @@ test('manual artifact collection resolves the current repository from GITHUB_REP
       process.env.GITHUB_REPOSITORY = previousRepository;
     }
   }
+});
+
+test('manual artifact collection rejects environment attestations from a different git commit', async () => {
+  const runTimestamp = '20260331T141607Z';
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-testing-harness-foreign-commit-'));
+  const testFile = path.join(tempRoot, 'tests', 'pre-release', 'remote.test.mjs');
+  const externalDir = path.join(tempRoot, 'external');
+  const reportPath = path.join(externalDir, 'pre-release.json');
+
+  await fs.mkdir(path.dirname(testFile), { recursive: true });
+  await fs.mkdir(externalDir, { recursive: true });
+  await fs.writeFile(testFile, 'export const remote = true;\n');
+  await fs.writeFile(
+    reportPath,
+    JSON.stringify(buildValidEnvironmentAttestation('pre-release', runTimestamp, {
+      git_commit: '89abcdef0123456789abcdef0123456789abcdef',
+    }), null, 2),
+  );
+
+  const results = await collectManualArtifactResults(
+    getL1EvidenceDefinition('EVID-OPS-001'),
+    tempRoot,
+    {
+      pre_release_run_report: path.relative(tempRoot, reportPath),
+    },
+    runTimestamp,
+    {
+      expectedGitHubRepository: DEFAULT_TEST_GITHUB_REPOSITORY,
+      expectedGitCommit: DEFAULT_TEST_GIT_COMMIT,
+    },
+  );
+
+  assert.equal(results.length, 1);
+  assert.equal(results[0].valid, false);
+  assert.equal(results[0].validation_error, 'attestation bundle payload git_commit must match the current HEAD commit');
+});
+
+test('manual artifact collection rejects external attestations when the current checkout has tracked modifications', async () => {
+  const runTimestamp = '20260331T141607Z';
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-testing-harness-dirty-checkout-'));
+  const testFile = path.join(tempRoot, 'tests', 'pre-release', 'remote.test.mjs');
+  const externalDir = path.join(tempRoot, 'external');
+  const reportPath = path.join(externalDir, 'pre-release.json');
+
+  await fs.mkdir(path.dirname(testFile), { recursive: true });
+  await fs.mkdir(externalDir, { recursive: true });
+  await fs.writeFile(testFile, 'export const remote = true;\n');
+  await fs.writeFile(
+    reportPath,
+    JSON.stringify(buildValidEnvironmentAttestation(
+      'pre-release',
+      runTimestamp,
+      buildSingleFileEnvironmentReportOverrides('tests/pre-release/remote.test.mjs'),
+    ), null, 2),
+  );
+
+  const results = await collectManualArtifactResults(
+    getL1EvidenceDefinition('EVID-OPS-001'),
+    tempRoot,
+    {
+      pre_release_run_report: path.relative(tempRoot, reportPath),
+    },
+    runTimestamp,
+    {
+      expectedGitHubRepository: DEFAULT_TEST_GITHUB_REPOSITORY,
+      expectedGitCommit: DEFAULT_TEST_GIT_COMMIT,
+      trackedWorktreeDirty: true,
+    },
+  );
+
+  assert.equal(results.length, 1);
+  assert.equal(results[0].valid, false);
+  assert.equal(results[0].validation_error, 'current checkout has tracked modifications; external attestations may only be reused from a clean tracked worktree');
 });
 
 test('manual artifact collection rejects attestations that do not share one GitHub Actions run and attempt', async () => {

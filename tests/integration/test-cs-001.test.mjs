@@ -37,6 +37,27 @@ const LOGIN_ALIAS_PATHS = Object.freeze([
   '/_matrix/client/v3/login',
 ]);
 
+const CLIENT_DISCOVERY_VERSIONS = Object.freeze([
+  'r0.6.1',
+  'v1.1',
+  'v1.2',
+  'v1.3',
+  'v1.4',
+  'v1.5',
+  'v1.6',
+  'v1.7',
+  'v1.8',
+  'v1.9',
+  'v1.10',
+  'v1.11',
+  'v1.12',
+  'v1.13',
+  'v1.14',
+  'v1.15',
+  'v1.16',
+  'v1.17',
+]);
+
 function assertCacheControl(result, expectedValue) {
   assert.equal(result.response.headers.get('cache-control'), expectedValue);
 }
@@ -90,7 +111,7 @@ test('TEST-CS-001 ci-integration covers discovery, session lifecycle, and capabi
   const versions = await request(harness, '/_matrix/client/versions');
   assert.equal(versions.response.status, 200);
   assert.deepEqual(versions.payload, {
-    versions: ['v1.17'],
+    versions: [...CLIENT_DISCOVERY_VERSIONS],
     unstable_features: {},
   });
 
@@ -111,6 +132,10 @@ test('TEST-CS-001 ci-integration covers discovery, session lifecycle, and capabi
   assert.equal(browserVersions.response.status, 200);
   assert.equal(browserVersions.response.headers.get('access-control-allow-origin'), 'https://app.element.io');
   assert.match(browserVersions.response.headers.get('vary') ?? '', /Origin/i);
+  assert.deepEqual(browserVersions.payload, {
+    versions: [...CLIENT_DISCOVERY_VERSIONS],
+    unstable_features: {},
+  });
 
   const browserClientWellKnownPreflight = await request(harness, '/.well-known/matrix/client', {
     method: 'OPTIONS',

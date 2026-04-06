@@ -54,6 +54,8 @@
 * `/.well-known/matrix/client`、`/_matrix/client/versions` 与 `/_matrix/client/*` 在收到合法 browser `Origin` 时，实际响应必须返回一致的 CORS allow-origin 语义，避免 Web client 因跨域读取被阻断。
 * 对这些同一路由族所需的 `OPTIONS` preflight，`gateway-worker` 必须直接返回 `2xx/204` CORS 响应；不得把预检请求落到 route-specific `M_UNRECOGNIZED` 或 plain-text `404`。
 * 该要求只适用于公开 Matrix client ingress；不得借此把受保护的 `/_ops` 或其它非 Matrix 管理面扩大成 browser-readable public surface。
+* `GET /_matrix/client/versions` 必须返回 pinned Matrix `v1.17`，并同时保留当前 browser-client 兼容所需的 cumulative stable version ladder：至少包括 `r0.6.1` 与 `v1.1` 到 `v1.17`。只返回最新 pinned stable version 会让当前官方 browser client baseline 把 homeserver 误判为“不满足最低 API 版本”。
+* 该 ladder 的语义受 [DEC-0007](/root/Matrix/spec/decisions/DEC-0007.md) 约束：它是 browser compatibility discovery contract，而不是对全部历史 stable optional surfaces 的无条件启用声明；stub-only / unsupported truth 仍由对应 `MX-*`、`IF-*`、`TEST-*`、`EVID-*` 与 `DEC-0001` 控制。
 
 ## 3. 用户、设备与会话模型
 

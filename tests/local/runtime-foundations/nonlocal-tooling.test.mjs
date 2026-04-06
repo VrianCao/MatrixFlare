@@ -52,8 +52,17 @@ import {
   validateManualArtifactPayload,
 } from '../../../packages/testing/src/evidence.mjs';
 import {
+  CLIENT_DISCOVERY_VERSIONS,
+  summarizeClientDiscoveryVersionPayload,
+} from '../../../packages/testing/src/client-discovery.mjs';
+import {
   GATEWAY_RATE_LIMIT_BINDING_DEFINITIONS,
 } from '../../../packages/runtime-core/src/abuse-guard.mjs';
+
+const CLIENT_DISCOVERY_VERSION_STEP_DETAIL = Object.freeze(
+  summarizeClientDiscoveryVersionPayload({ versions: CLIENT_DISCOVERY_VERSIONS }),
+);
+const DEFAULT_TEST_GIT_COMMIT = '0123456789abcdef0123456789abcdef01234567';
 
 function buildDeploymentSummaryFixture(environmentName) {
   const plan = buildNonLocalEnvironmentPlan(environmentName, {
@@ -202,7 +211,7 @@ function buildEnvironmentAttestationFixture(environmentName, runTimestamp, {
     ? 'tests/integration/test-cs-001.test.mjs'
     : `tests/${environmentName}/test-cs-001.test.mjs`;
   const readinessSteps = [
-    { step: 'versions', ok: true, detail: { versions_count: 1 } },
+    { step: 'versions', ok: true, detail: CLIENT_DISCOVERY_VERSION_STEP_DETAIL },
     { step: 'public_rooms', ok: true, detail: { chunk_length: 0 } },
     { step: 'register_challenge', ok: true, detail: { session_present: true, flows_count: 1 } },
     { step: 'register_complete', ok: true, detail: { user_id_present: true, access_token_present: true } },
@@ -265,6 +274,7 @@ function buildEnvironmentAttestationFixture(environmentName, runTimestamp, {
       log_artifact: `https://example.invalid/logs/${environmentName}/${runTimestamp}.txt`,
       executed_by: 'ci-runner',
       reviewed_by: 'release-reviewer',
+      git_commit: DEFAULT_TEST_GIT_COMMIT,
       source_run_uri: resolvedSourceRunUri,
       topology_kind: `cloudflare-${environmentName}`,
       cloudflare_resources: environmentName === 'ci-integration'
@@ -336,7 +346,7 @@ function buildProductionReadinessProbeFixture(overrides = {}) {
         duration_ms: 30000,
         ok: true,
         steps: [
-          { step: 'versions', ok: true, detail: { versions_count: 1 } },
+          { step: 'versions', ok: true, detail: CLIENT_DISCOVERY_VERSION_STEP_DETAIL },
           { step: 'public_rooms', ok: true, detail: { chunk_length: 0 } },
           { step: 'register_complete', ok: true, detail: { user_id_present: true, access_token_present: true } },
           { step: 'media_create', ok: true, detail: { content_uri_present: true } },
@@ -394,7 +404,7 @@ function buildReadinessProbeFixture(environmentName, {
   failureDetail = { status: 500, error: 'transient deploy window' },
 } = {}) {
   const successSteps = [
-    { step: 'versions', ok: true, detail: { versions_count: 1 } },
+    { step: 'versions', ok: true, detail: CLIENT_DISCOVERY_VERSION_STEP_DETAIL },
     { step: 'public_rooms', ok: true, detail: { chunk_length: 0 } },
     { step: 'register_challenge', ok: true, detail: { session_present: true, flows_count: 1 } },
     { step: 'register_complete', ok: true, detail: { user_id_present: true, access_token_present: true } },
@@ -425,7 +435,7 @@ function buildReadinessProbeFixture(environmentName, {
       duration_ms: 2000,
       ok: false,
       steps: [
-        { step: 'versions', ok: true, detail: { versions_count: 1 } },
+        { step: 'versions', ok: true, detail: CLIENT_DISCOVERY_VERSION_STEP_DETAIL },
         { step: 'public_rooms', ok: true, detail: { chunk_length: 0 } },
         { step: failureStepName, ok: false, detail: failureDetail },
       ],
@@ -1430,11 +1440,11 @@ test('non-local deployment readiness retries with fresh per-attempt registration
     '/_matrix/media/v3/create',
   ];
   const responses = [
-    new Response(JSON.stringify({ versions: ['v1.17'] }), { status: 200, headers: { 'content-type': 'application/json' } }),
+    new Response(JSON.stringify({ versions: [...CLIENT_DISCOVERY_VERSIONS] }), { status: 200, headers: { 'content-type': 'application/json' } }),
     new Response(JSON.stringify({ chunk: [] }), { status: 200, headers: { 'content-type': 'application/json' } }),
     new Response(JSON.stringify({ flows: [{ stages: ['m.login.dummy'] }], session: 'uia-1' }), { status: 401, headers: { 'content-type': 'application/json' } }),
     new Response(JSON.stringify({ errcode: 'M_UNKNOWN', error: 'transient deploy window' }), { status: 500, headers: { 'content-type': 'application/json' } }),
-    new Response(JSON.stringify({ versions: ['v1.17'] }), { status: 200, headers: { 'content-type': 'application/json' } }),
+    new Response(JSON.stringify({ versions: [...CLIENT_DISCOVERY_VERSIONS] }), { status: 200, headers: { 'content-type': 'application/json' } }),
     new Response(JSON.stringify({ chunk: [] }), { status: 200, headers: { 'content-type': 'application/json' } }),
     new Response(JSON.stringify({ flows: [{ stages: ['m.login.dummy'] }], session: 'uia-2' }), { status: 401, headers: { 'content-type': 'application/json' } }),
     new Response(JSON.stringify({ user_id: '@ready:example.test', access_token: 'atk.ready' }), { status: 200, headers: { 'content-type': 'application/json' } }),
@@ -1531,6 +1541,35 @@ test('non-local deployment readiness fails closed when representative HTTP paths
   assert.deepEqual(delayCalls, []);
 });
 
+test('non-local deployment readiness fails closed when /versions lacks the browser-compatible ladder', async () => {
+  const remoteHarnessEnv = {
+    MATRIX_REMOTE_BASE_URL: 'https://matrix-gateway-worker-ci-integration.matrixflare.workers.dev',
+    MATRIX_REMOTE_SERVER_NAME: 'matrix-gateway-worker-ci-integration.matrixflare.workers.dev',
+  };
+
+  const readiness = await waitForNonLocalDeploymentReadiness('ci-integration', remoteHarnessEnv, {
+    maxAttempts: 1,
+    fetchImpl: async (url) => {
+      const requestUrl = new URL(String(url));
+      assert.equal(`${requestUrl.pathname}${requestUrl.search}`, '/_matrix/client/versions');
+      return new Response(JSON.stringify({
+        versions: ['v1.17'],
+        unstable_features: {},
+      }), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+        },
+      });
+    },
+  });
+
+  assert.equal(readiness.ready, false);
+  assert.equal(readiness.attempt_count, 1);
+  assert.equal(readiness.attempts[0].failure.step_name, 'versions');
+  assert.match(readiness.last_error, /versions/);
+});
+
 test('non-local deployment readiness refuses to probe staging without an Access session payload', async () => {
   await assert.rejects(
     () => waitForNonLocalDeploymentReadiness('staging', {
@@ -1568,7 +1607,7 @@ test('non-local deployment readiness probes authenticated ops health when Access
         },
       });
       if (requestUrl.pathname === '/_matrix/client/versions') {
-        return new Response(JSON.stringify({ versions: ['v1.17'] }), {
+        return new Response(JSON.stringify({ versions: [...CLIENT_DISCOVERY_VERSIONS] }), {
           status: 200,
           headers: { 'content-type': 'application/json' },
         });
@@ -1680,7 +1719,7 @@ test('non-local deployment readiness reuses the same ops rebuild idempotency key
       const requestUrl = new URL(String(url));
       const headers = new Headers(init.headers ?? {});
       if (requestUrl.pathname === '/_matrix/client/versions') {
-        return new Response(JSON.stringify({ versions: ['v1.17'] }), {
+        return new Response(JSON.stringify({ versions: [...CLIENT_DISCOVERY_VERSIONS] }), {
           status: 200,
           headers: { 'content-type': 'application/json' },
         });

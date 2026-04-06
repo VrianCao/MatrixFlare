@@ -364,7 +364,7 @@
   完成标准:
   discoverability truth 与当前启用能力完全一致。
   当前状态:
-  `gateway-worker` 现在会对 `/.well-known/matrix/client`、`/_matrix/client/versions` 与 `/_matrix/client/*` 的 browser `Origin` 请求统一附加 CORS 响应头，并在 `OPTIONS` preflight 时直接返回 `204`，不再把标准浏览器预检请求误落到 `M_UNRECOGNIZED`。
+  `gateway-worker` 现在会对 `/.well-known/matrix/client`、`/_matrix/client/versions` 与 `/_matrix/client/*` 的 browser `Origin` 请求统一附加 CORS 响应头，并在 `OPTIONS` preflight 时直接返回 `204`，不再把标准浏览器预检请求误落到 `M_UNRECOGNIZED`；同时 `/_matrix/client/versions` 也已从“只返回 `v1.17`”修正为 browser-client 可接受的 cumulative stable ladder（至少 `r0.6.1` 与 `v1.1` 到 `v1.17`），避免当前官方 Matrix browser client 把 homeserver 误判为“不满足最低 API 版本”。该修正的解释边界现由 `DEC-0007` 固定：这是 browser compatibility discovery contract，不等于放宽 `DEC-0001` 的 stub-only / unsupported product boundary。
 
 ### 04.02 实现 Access/Refresh token 真相与 session 解析
 
