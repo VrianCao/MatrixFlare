@@ -30,6 +30,7 @@ import {
   createEnvironmentWranglerConfig,
   fetchWorkerDeploymentState,
   observeProductionCurrentCloudflareState,
+  observeProductionInstallTopologyState,
   resolveClosedProdBillingWindow,
   resolveFreshCloudflareIdentity,
   resolvePreDeployWorkerDeploymentState,
@@ -71,6 +72,12 @@ const CLIENT_DISCOVERY_VERSION_STEP_DETAIL = Object.freeze(
   },
 );
 const DEFAULT_TEST_GIT_COMMIT = '0123456789abcdef0123456789abcdef01234567';
+
+function normalizeCloudflareResourceSnapshot(snapshot) {
+  return Object.fromEntries(
+    Object.entries(snapshot).map(([key, values]) => [key, [...values].sort()]),
+  );
+}
 
 function buildDeploymentSummaryFixture(environmentName) {
   const plan = buildNonLocalEnvironmentPlan(environmentName, {
@@ -383,7 +390,8 @@ function buildDeploymentIdentityValidationFixture(environmentName, rolloutSkewPr
   return {
     validated_at: '2026-04-01T16:00:00.000Z',
     cloudflare_resources: {
-      ratelimit_namespaces: plan.cloudflare_resources.ratelimit_namespaces,
+      ...plan.cloudflare_resources,
+      r2_buckets: [...plan.cloudflare_resources.r2_buckets, plan.artifact_bucket_name].sort(),
     },
     workers: {
       'jobs-worker': {
@@ -1031,6 +1039,13 @@ test('fresh Cloudflare identities must be newly observed and unique', () => {
   );
 });
 
+test('fresh Cloudflare identity resolution deduplicates repeated new observations before checking uniqueness', () => {
+  assert.equal(
+    resolveFreshCloudflareIdentity(['dep-old'], ['dep-new', 'dep-new', 'dep-old'], 'deployment id'),
+    'dep-new',
+  );
+});
+
 test('worker deployment state summary keeps only the latest active deployment version set', () => {
   const summary = summarizeWorkerDeploymentState({
     deployments: [
@@ -1318,7 +1333,7 @@ test('deployment summary Cloudflare revalidation checks every worker against the
       const workerAlias = scriptName.split('-')[1];
       return {
         latest_active_deployment_id: `dep-${workerAlias}`,
-        active_worker_version_ids: [`ver-${workerAlias}`, 'ver-older'],
+        active_worker_version_ids: [`ver-${workerAlias}`],
       };
     },
     fetchWorkerBindingStateImpl: async ({ scriptName }) => ({
@@ -1334,16 +1349,114 @@ test('deployment summary Cloudflare revalidation checks every worker against the
     { accountId: 'cf-account', apiToken: 'cf-token', scriptName: 'matrix-gateway-worker-staging' },
   ]);
   assert.equal(validation.workers['jobs-worker'].latest_active_deployment_id, 'dep-jobs');
-  assert.deepEqual(validation.workers['gateway-worker'].active_worker_version_ids, ['ver-gateway', 'ver-older']);
+  assert.deepEqual(validation.workers['gateway-worker'].active_worker_version_ids, ['ver-gateway']);
   assert.deepEqual(
     validation.workers['gateway-worker'].ratelimit_namespace_ids,
     deploymentSummary.cloudflare_resources.ratelimit_namespaces,
   );
   assert.deepEqual(
-    validation.cloudflare_resources.ratelimit_namespaces,
-    deploymentSummary.cloudflare_resources.ratelimit_namespaces,
+    validation.cloudflare_resources,
+    normalizeCloudflareResourceSnapshot(deploymentSummary.cloudflare_resources),
   );
   assert.match(validation.validated_at, /^\d{4}-\d{2}-\d{2}T/);
+});
+
+test('deployment summary Cloudflare revalidation rejects unexpected extra active worker versions outside rollout validation', async () => {
+  const deploymentSummary = buildDeploymentSummaryFixture('staging');
+
+  await assert.rejects(
+    () => validateDeploymentSummaryAgainstCurrentCloudflareState(deploymentSummary, {
+      accountId: 'cf-account',
+      apiToken: 'cf-token',
+      fetchWorkerDeploymentStateImpl: async ({ scriptName }) => {
+        const workerAlias = scriptName.split('-')[1];
+        return {
+          latest_active_deployment_id: `dep-${workerAlias}`,
+          active_worker_version_ids: [`ver-${workerAlias}`, 'ver-older'],
+        };
+      },
+      fetchWorkerBindingStateImpl: async ({ scriptName }) => ({
+        ratelimit_namespace_ids: scriptName === deploymentSummary.workers['gateway-worker'].script_name
+          ? deploymentSummary.cloudflare_resources.ratelimit_namespaces
+          : [],
+      }),
+    }),
+    /active_worker_version_ids must exactly match the latest active Cloudflare deployment/,
+  );
+});
+
+test('deployment summary Cloudflare revalidation allows the pre-release rollout gateway to expose exactly the baseline and candidate versions', async () => {
+  const deploymentSummary = buildDeploymentSummaryFixture('pre-release');
+  const rolloutScopedSummary = structuredClone(deploymentSummary);
+  rolloutScopedSummary.workers['gateway-worker'] = {
+    ...rolloutScopedSummary.workers['gateway-worker'],
+    deployment_id: 'dual-deployment-1',
+    expected_active_worker_version_ids: ['gateway-candidate-v2', 'gateway-baseline-v1'],
+  };
+
+  const validation = await validateDeploymentSummaryAgainstCurrentCloudflareState(rolloutScopedSummary, {
+    accountId: 'cf-account',
+    apiToken: 'cf-token',
+    fetchWorkerDeploymentStateImpl: async ({ scriptName }) => {
+      const workerAlias = scriptName.split('-')[1];
+      if (scriptName === rolloutScopedSummary.workers['gateway-worker'].script_name) {
+        return {
+          latest_active_deployment_id: 'dual-deployment-1',
+          active_worker_version_ids: ['gateway-baseline-v1', 'gateway-candidate-v2'],
+        };
+      }
+      return {
+        latest_active_deployment_id: `dep-${workerAlias}`,
+        active_worker_version_ids: [`ver-${workerAlias}`],
+      };
+    },
+    fetchWorkerBindingStateImpl: async ({ scriptName }) => ({
+      ratelimit_namespace_ids: scriptName === rolloutScopedSummary.workers['gateway-worker'].script_name
+        ? rolloutScopedSummary.cloudflare_resources.ratelimit_namespaces
+        : [],
+    }),
+  });
+
+  assert.deepEqual(
+    validation.workers['gateway-worker'].active_worker_version_ids,
+    ['gateway-baseline-v1', 'gateway-candidate-v2'],
+  );
+});
+
+test('deployment summary Cloudflare revalidation rejects duplicate active worker version ids during pre-release rollout validation', async () => {
+  const deploymentSummary = buildDeploymentSummaryFixture('pre-release');
+  const rolloutScopedSummary = structuredClone(deploymentSummary);
+  rolloutScopedSummary.workers['gateway-worker'] = {
+    ...rolloutScopedSummary.workers['gateway-worker'],
+    deployment_id: 'dual-deployment-1',
+    expected_active_worker_version_ids: ['gateway-candidate-v2', 'gateway-baseline-v1'],
+  };
+
+  await assert.rejects(
+    () => validateDeploymentSummaryAgainstCurrentCloudflareState(rolloutScopedSummary, {
+      accountId: 'cf-account',
+      apiToken: 'cf-token',
+      fetchWorkerDeploymentStateImpl: async ({ scriptName }) => {
+        const workerAlias = scriptName.split('-')[1];
+        if (scriptName === rolloutScopedSummary.workers['gateway-worker'].script_name) {
+          return {
+            latest_active_deployment_id: 'dual-deployment-1',
+            active_worker_version_ids: ['gateway-baseline-v1', 'gateway-candidate-v2', 'gateway-candidate-v2'],
+          };
+        }
+        return {
+          latest_active_deployment_id: `dep-${workerAlias}`,
+          active_worker_version_ids: [`ver-${workerAlias}`],
+        };
+      },
+      fetchWorkerBindingStateImpl: async ({ scriptName }) => ({
+        ratelimit_namespace_ids: scriptName === rolloutScopedSummary.workers['gateway-worker'].script_name
+          ? rolloutScopedSummary.cloudflare_resources.ratelimit_namespaces
+          : [],
+      }),
+    }),
+    /must not expose duplicate active_worker_version_ids/,
+  );
 });
 
 test('deployment summary Cloudflare revalidation rejects ratelimit namespace drift from the deployed worker bindings', async () => {
@@ -1367,6 +1480,37 @@ test('deployment summary Cloudflare revalidation rejects ratelimit namespace dri
       }),
     }),
     /cloudflare_resources\.ratelimit_namespaces must match currently deployed Cloudflare ratelimit namespace bindings on gateway-worker/,
+  );
+});
+
+test('deployment summary Cloudflare revalidation rejects resource snapshots that drift from the fixed environment topology', async () => {
+  const deploymentSummary = buildDeploymentSummaryFixture('staging');
+  deploymentSummary.cloudflare_resources = {
+    ...deploymentSummary.cloudflare_resources,
+    queues: [
+      ...deploymentSummary.cloudflare_resources.queues,
+      'matrix-unexpected-queue-staging',
+    ],
+  };
+
+  await assert.rejects(
+    () => validateDeploymentSummaryAgainstCurrentCloudflareState(deploymentSummary, {
+      accountId: 'cf-account',
+      apiToken: 'cf-token',
+      fetchWorkerDeploymentStateImpl: async ({ scriptName }) => {
+        const workerAlias = scriptName.split('-')[1];
+        return {
+          latest_active_deployment_id: `dep-${workerAlias}`,
+          active_worker_version_ids: [`ver-${workerAlias}`],
+        };
+      },
+      fetchWorkerBindingStateImpl: async ({ scriptName }) => ({
+        ratelimit_namespace_ids: scriptName === deploymentSummary.workers['gateway-worker'].script_name
+          ? buildDeploymentSummaryFixture('staging').cloudflare_resources.ratelimit_namespaces
+          : [],
+      }),
+    }),
+    /cloudflare_resources\.queues must match the fixed environment topology/,
   );
 });
 
@@ -1672,7 +1816,7 @@ test('latest active Cloudflare deployment identity validation rejects stale or m
       ...workerSummary,
       worker_version_id: 'ver-old',
     }, currentDeploymentState),
-    /deployment workers\.gateway-worker\.worker_version_id is not part of the latest active Cloudflare deployment/,
+    /deployment workers\.gateway-worker\.active_worker_version_ids must exactly match the latest active Cloudflare deployment/,
   );
 });
 
@@ -4294,6 +4438,120 @@ test('production current state snapshot retains partially successful Cloudflare 
   assert.equal(
     snapshot.current_deployment_observation.workers['ops-worker'].raw_cloudflare_api_results.versions,
     null,
+  );
+});
+
+test('observeProductionInstallTopologyState retains raw Cloudflare worker state for active-topology install blockers', async () => {
+  const originalFetch = globalThis.fetch;
+
+  try {
+    globalThis.fetch = async (url) => {
+      const pathname = new URL(String(url)).pathname;
+      if (pathname.includes('/workers/scripts/matrix-jobs-worker-prod/deployments')) {
+        return new Response(JSON.stringify({
+          success: true,
+          result: {
+            deployments: [
+              { id: 'jobs-prod-deployment-v1', versions: [{ version_id: 'jobs@prod-v1' }] },
+            ],
+          },
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      if (pathname.includes('/workers/scripts/matrix-jobs-worker-prod/versions')) {
+        return new Response(JSON.stringify({
+          success: true,
+          result: {
+            items: [
+              { id: 'jobs@prod-v1', annotations: { workers_tag: 'mx-jw-d-prod1' } },
+            ],
+          },
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      if (pathname.includes('/workers/scripts/matrix-ops-worker-prod/')) {
+        return new Response(JSON.stringify({
+          success: false,
+          errors: [{ message: 'This Worker does not exist on your account.' }],
+        }), { status: 404, headers: { 'content-type': 'application/json' } });
+      }
+      if (pathname.includes('/workers/scripts/matrix-gateway-worker-prod/deployments')) {
+        return new Response(JSON.stringify({
+          success: true,
+          result: {
+            deployments: [
+              { id: 'gateway-prod-deployment-v1', versions: [{ version_id: 'gateway@prod-v1' }] },
+            ],
+          },
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      if (pathname.includes('/workers/scripts/matrix-gateway-worker-prod/versions')) {
+        return new Response(JSON.stringify({
+          success: true,
+          result: {
+            items: [
+              { id: 'gateway@prod-v1', annotations: { workers_tag: 'mx-gw-d-prod1' } },
+            ],
+          },
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      throw new Error(`Unexpected Cloudflare API request in test: ${pathname}`);
+    };
+
+    const observation = await observeProductionInstallTopologyState({
+      accountId: 'cf-account',
+      apiToken: 'cf-token',
+    });
+
+    assert.deepEqual(observation.problems, []);
+    assert.deepEqual(
+      observation.active_workers.map((entry) => entry.script_name),
+      ['matrix-jobs-worker-prod', 'matrix-gateway-worker-prod'],
+    );
+    assert.equal(observation.workers['jobs-worker'].latest_active_deployment_id, 'jobs-prod-deployment-v1');
+    assert.deepEqual(
+      observation.workers['jobs-worker'].raw_cloudflare_api_results.deployments.deployments,
+      [{ id: 'jobs-prod-deployment-v1', versions: [{ version_id: 'jobs@prod-v1' }] }],
+    );
+    assert.equal(observation.workers['ops-worker'].latest_active_deployment_id, null);
+    assert.deepEqual(observation.workers['ops-worker'].deployment_ids, []);
+    assert.equal(observation.workers['ops-worker'].raw_cloudflare_api_results, null);
+    assert.equal(observation.workers['gateway-worker'].latest_active_deployment_id, 'gateway-prod-deployment-v1');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('production automation runtime paths persist current-production-state blocker snapshots before guard failures', async () => {
+  const source = await fs.readFile(new URL('../../../packages/testing/src/nonlocal.mjs', import.meta.url), 'utf8');
+
+  assert.match(
+    source,
+    /const currentStateSnapshotPath = path\.join\(resolvedWorkingRoot, 'current-production-state\.json'\);\s+await assertProductionTopologyInstallAllowed\(\{\s+accountId,\s+apiToken,\s+observedStatePath: currentStateSnapshotPath,/su,
+    'prod-install must capture current-production-state.json before the active-topology guard can fail closed',
+  );
+  assert.match(
+    source,
+    /export async function promoteProductionEnvironment[\s\S]*?const currentStateSnapshotPath = path\.join\(resolvedWorkingRoot, 'current-production-state\.json'\);\s+const currentObservation = await observeProductionCurrentCloudflareState\(resolvedBaselineRecord,[\s\S]*?await writeProductionCurrentStateSnapshot\(\{\s+baselineRecord: resolvedBaselineRecord,\s+currentObservation,\s+outputPath: currentStateSnapshotPath,[\s\S]*?assertProductionBaselineMatchesCurrentIdentity\(resolvedBaselineRecord, currentIdentity, \{\s+observedStatePath: currentStateSnapshotPath,/su,
+    'promote-prod must persist current-production-state.json before failing closed on baseline/current drift',
+  );
+  assert.match(
+    source,
+    /export async function operationalRefreshProductionEnvironment[\s\S]*?const currentStateSnapshotPath = path\.join\(resolvedWorkingRoot, 'current-production-state\.json'\);\s+const currentObservation = await observeProductionCurrentCloudflareState\(resolvedBaselineRecord,[\s\S]*?await writeProductionCurrentStateSnapshot\(\{\s+baselineRecord: resolvedBaselineRecord,\s+currentObservation,\s+outputPath: currentStateSnapshotPath,[\s\S]*?assertProductionBaselineMatchesCurrentIdentity\(resolvedBaselineRecord, currentIdentity, \{\s+observedStatePath: currentStateSnapshotPath,/su,
+    'operational-prod-refresh must persist current-production-state.json before failing closed on baseline/current drift',
+  );
+  assert.match(
+    source,
+    /const currentStateSnapshotPath = path\.join\(resolvedWorkingRoot, 'current-production-state\.json'\);\s+const currentObservation = await observeProductionCurrentCloudflareState\(promotionRecord,/su,
+    'rollback-prod must observe current production state before checking promotionRecord drift',
+  );
+  assert.match(
+    source,
+    /await writeProductionCurrentStateSnapshot\(\{\s+baselineRecord: promotionRecord,\s+currentObservation,\s+outputPath: currentStateSnapshotPath,/su,
+    'rollback-prod must persist current-production-state.json before failing closed on current-state drift',
+  );
+  assert.match(
+    source,
+    /assertProductionRecordedIdentityMatchesCurrent\(\s+promotionRecord\.current_deployment_identity,\s+currentIdentity,\s+'promotionRecord\.current_deployment_identity',\s+\{\s+observedStatePath: currentStateSnapshotPath,/su,
+    'rollback-prod drift guard must mention the retained current-production-state artifact',
   );
 });
 
