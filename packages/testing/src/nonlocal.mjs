@@ -402,6 +402,10 @@ function buildWorkersDevHost(scriptName, workersSubdomain) {
   return `${scriptName}.${normalizeWorkersSubdomain(workersSubdomain)}.workers.dev`;
 }
 
+function buildProductionProtectedOpsUrl(workersSubdomain) {
+  return `https://${buildWorkersDevHost(buildProductionWorkerScriptName('ops-worker'), workersSubdomain)}`;
+}
+
 function isDisallowedLocalHostname(hostname) {
   if (!isNonEmptyString(hostname)) {
     return true;
@@ -5566,6 +5570,7 @@ export function buildProductionCurrentStateSnapshot({
   baselineRecord,
   currentObservation,
   originRunIdentity,
+  protectedOpsUrl = null,
 }) {
   const resolvedBaselineRecord = validateProductionBaselineRecord(baselineRecord);
   const originRunValidation = validateProducerRunIdentity(originRunIdentity, 'originRunIdentity');
@@ -5583,6 +5588,17 @@ export function buildProductionCurrentStateSnapshot({
       mismatched_fields: Object.freeze(['current_deployment_identity_unavailable']),
     }
     : summarizeProductionBaselineIdentityMatch(baselineIdentity, currentObservation.current_deployment_identity);
+  const candidateProtectedOpsUrl = protectedOpsUrl ?? resolvedBaselineRecord.access?.protected_ops_url ?? '';
+  if (!isNonEmptyString(candidateProtectedOpsUrl)) {
+    throw new TypeError('prod current state snapshot access.protected_ops_url must be non-empty');
+  }
+  const parsedProtectedOpsUrl = parseAbsoluteHttpsUrl(
+    candidateProtectedOpsUrl,
+    'prod current state snapshot access.protected_ops_url',
+  );
+  if (parsedProtectedOpsUrl.host !== buildWorkersDevHost(buildProductionWorkerScriptName('ops-worker'), workersSubdomain)) {
+    throw new TypeError('prod current state snapshot access.protected_ops_url must match the current prod ops-worker host');
+  }
   return Object.freeze({
     schema_version: 1,
     artifact_id: 'prod_current_state_snapshot',
@@ -5593,7 +5609,7 @@ export function buildProductionCurrentStateSnapshot({
     origin_run_uri: originRunIdentity.origin_run_uri,
     workers_subdomain: workersSubdomain,
     access: Object.freeze({
-      protected_ops_url: resolvedBaselineRecord.access?.protected_ops_url ?? '',
+      protected_ops_url: candidateProtectedOpsUrl,
     }),
     observed_at: currentObservation.observed_at ?? new Date().toISOString(),
     baseline_record: Object.freeze({
@@ -5613,6 +5629,18 @@ export function buildProductionCurrentStateSnapshot({
   });
 }
 
+function resolveRuntimeProductionCurrentStateProtectedOpsUrl(baselineRecord) {
+  const resolvedBaselineRecord = validateProductionBaselineRecord(baselineRecord);
+  if (isNonEmptyString(resolvedBaselineRecord.access?.protected_ops_url)) {
+    return resolvedBaselineRecord.access.protected_ops_url;
+  }
+  const workersSubdomain = extractBaselineWorkersSubdomain(resolvedBaselineRecord);
+  if (!isNonEmptyString(workersSubdomain)) {
+    throw new TypeError('baselineRecord must retain a usable workers_subdomain to derive prod current state snapshot access.protected_ops_url');
+  }
+  return buildProductionProtectedOpsUrl(workersSubdomain);
+}
+
 async function writeProductionCurrentStateSnapshot({
   baselineRecord,
   currentObservation,
@@ -5623,6 +5651,7 @@ async function writeProductionCurrentStateSnapshot({
     baselineRecord,
     currentObservation,
     originRunIdentity,
+    protectedOpsUrl: resolveRuntimeProductionCurrentStateProtectedOpsUrl(baselineRecord),
   });
   await fs.mkdir(path.dirname(outputPath), { recursive: true });
   const temporaryOutputPath = path.join(
@@ -6925,7 +6954,6 @@ function looksLikeTypedProdCurrentStateSnapshot(payload) {
     || 'origin_run_attempt' in payload
     || 'origin_run_uri' in payload
     || 'workers_subdomain' in payload
-    || 'access' in payload
     || 'workers' in payload
   );
 }
@@ -7389,6 +7417,18 @@ function validateLegacyProdCurrentStateSnapshot(payload, {
       error: null,
     };
   }
+  if (!isPlainObject(payload.access)) {
+    return {
+      valid: false,
+      error: 'legacy prod current state snapshot access must be an object',
+    };
+  }
+  if (!isNonEmptyString(payload.access.protected_ops_url)) {
+    return {
+      valid: false,
+      error: 'legacy prod current state snapshot access.protected_ops_url must be non-empty',
+    };
+  }
   return validateProductionDeploymentIdentity(
     payload.current_deployment_observation.current_deployment_identity,
     'legacy prod current state snapshot current_deployment_observation.current_deployment_identity',
@@ -7654,6 +7694,12 @@ export function normalizeProdCurrentStateSnapshot(snapshot, {
   if (!isPlainObject(snapshot)) {
     throw new TypeError('prod current state snapshot must be an object');
   }
+  const legacyValidation = validateLegacyProdCurrentStateSnapshot(snapshot, {
+    requireUsableBaseline: true,
+  });
+  if (!legacyValidation.valid) {
+    throw new TypeError(legacyValidation.error);
+  }
   if (!isPlainObject(snapshot.current_deployment_observation) || snapshot.current_deployment_observation.environment_id !== PRODUCTION_ENVIRONMENT_NAME) {
     throw new TypeError('legacy prod current state snapshot current_deployment_observation must target prod');
   }
@@ -7675,6 +7721,7 @@ export function normalizeProdCurrentStateSnapshot(snapshot, {
     baselineRecord: resolvedBaselineRecord,
     currentObservation: snapshot.current_deployment_observation,
     originRunIdentity,
+    protectedOpsUrl: snapshot.access?.protected_ops_url ?? null,
   });
 }
 
@@ -7959,6 +8006,13 @@ export async function resolveProductionBaselineInputArtifact({
       baselineRecord: JSON.parse(await fs.readFile(baselineRecordPath, 'utf8')),
       originRunIdentity,
     });
+  }
+  const normalizedSnapshotValidation = validateProdCurrentStateSnapshot(normalizedSnapshot, {
+    expectedOriginRunIdentity: originRunIdentity,
+    requireUsableBaseline: true,
+  });
+  if (!normalizedSnapshotValidation.valid) {
+    throw new TypeError(`resolved current-state baseline input is invalid: ${normalizedSnapshotValidation.error}`);
   }
   const resolvedNormalizedOutputPath = path.resolve(normalizedOutputPath);
   await fs.mkdir(path.dirname(resolvedNormalizedOutputPath), { recursive: true });
