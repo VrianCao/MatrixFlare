@@ -7418,7 +7418,8 @@ function validateLegacyProdCurrentStateSnapshot(payload, {
       error: null,
     };
   }
-  if (payload.access == null) {
+  const hasExplicitAccessField = Object.prototype.hasOwnProperty.call(payload, 'access');
+  if (!hasExplicitAccessField) {
     if (baselineRecord == null) {
       return {
         valid: false,
@@ -7433,19 +7434,16 @@ function validateLegacyProdCurrentStateSnapshot(payload, {
         error: `legacy prod current state snapshot missing access.protected_ops_url and embedded baselineRecord cannot derive it: ${error.message}`,
       };
     }
-  } else {
-    if (!isPlainObject(payload.access)) {
-      return {
-        valid: false,
-        error: 'legacy prod current state snapshot access must be an object',
-      };
-    }
-    if (!isNonEmptyString(payload.access.protected_ops_url)) {
-      return {
-        valid: false,
-        error: 'legacy prod current state snapshot access.protected_ops_url must be non-empty',
-      };
-    }
+  } else if (!isPlainObject(payload.access)) {
+    return {
+      valid: false,
+      error: 'legacy prod current state snapshot access must be an object',
+    };
+  } else if (!isNonEmptyString(payload.access.protected_ops_url)) {
+    return {
+      valid: false,
+      error: 'legacy prod current state snapshot access.protected_ops_url must be non-empty',
+    };
   }
   return validateProductionDeploymentIdentity(
     payload.current_deployment_observation.current_deployment_identity,

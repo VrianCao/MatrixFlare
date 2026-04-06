@@ -5014,6 +5014,38 @@ test('legacy prod current-state snapshot normalization derives protected prod op
   assert.equal(normalized.origin_run_id, '24033537032');
 });
 
+test('legacy prod current-state snapshot normalization rejects explicit null access metadata even when the baseline could derive prod ops ingress', () => {
+  const baselineRecord = buildProdPromotionRecordFixture();
+  const snapshot = buildProdCurrentStateSnapshotFixture({
+    runId: '24033537031',
+  });
+  const legacySnapshot = {
+    observed_at: snapshot.observed_at,
+    access: null,
+    baseline_record: {
+      artifact_id: baselineRecord.artifact_id,
+      origin_run_uri: baselineRecord.origin_run_uri,
+      deployment_identity: baselineRecord.current_deployment_identity,
+    },
+    baseline_match: {
+      matches: false,
+      mismatched_fields: ['deployment_ids', 'worker_version_ids'],
+      problems: [],
+    },
+    current_deployment_observation: snapshot.current_deployment_observation,
+  };
+
+  assert.throws(
+    () => normalizeProdCurrentStateSnapshot(legacySnapshot, {
+      baselineRecord,
+      originRunIdentity: buildProducerRunIdentityFixture({
+        runId: '24033537032',
+      }),
+    }),
+    /legacy prod current state snapshot access must be an object/u,
+  );
+});
+
 test('legacy prod current-state snapshot normalization rejects explicit protected_ops_url values that do not match the current prod ops-worker host', () => {
   const snapshot = buildProdCurrentStateSnapshotFixture();
   const legacySnapshot = {
