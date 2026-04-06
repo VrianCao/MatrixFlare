@@ -9,12 +9,96 @@ import {
   joinRoom,
   postAuthenticated,
   putAuthenticated,
+  request,
   registerUser,
   requireRemoteHarnessContext,
   roomPath,
   syncRequest,
   uploadFilter,
 } from './support.mjs';
+
+test('TEST-CS-002 staging keeps browser-origin /sync auth, preflight, and held long-poll behavior stable', async (context) => {
+  const harness = requireRemoteHarnessContext(context, 'staging');
+  if (harness == null) {
+    return;
+  }
+
+  const alice = await registerUser(harness, {
+    usernamePrefix: 'cs2-staging-browser-sync',
+    password: 'phase08-cs2-staging-password-browser',
+    deviceId: 'CS2STGBROWSER',
+  });
+  const browserOrigin = 'https://app.cinny.in';
+
+  const browserSyncWithoutToken = await request(harness, '/_matrix/client/v3/sync?timeout=0', {
+    headers: {
+      origin: browserOrigin,
+    },
+  });
+  await expectMatrixError(browserSyncWithoutToken, 401, 'M_MISSING_TOKEN');
+  assert.equal(browserSyncWithoutToken.response.headers.get('access-control-allow-origin'), browserOrigin);
+  assert.match(browserSyncWithoutToken.response.headers.get('vary') ?? '', /Origin/i);
+
+  const browserSync = await request(harness, '/_matrix/client/v3/sync?timeout=0', {
+    headers: {
+      ...authHeaders(alice.access_token),
+      origin: browserOrigin,
+    },
+  });
+  assert.equal(browserSync.response.status, 200);
+  assert.equal(browserSync.response.headers.get('access-control-allow-origin'), browserOrigin);
+  assert.match(browserSync.response.headers.get('vary') ?? '', /Origin/i);
+  assert.equal(typeof browserSync.payload?.next_batch, 'string');
+
+  const browserSyncPreflight = await request(harness, '/_matrix/client/v3/sync?timeout=0', {
+    method: 'OPTIONS',
+    headers: {
+      origin: browserOrigin,
+      'access-control-request-method': 'GET',
+      'access-control-request-headers': 'authorization',
+    },
+  });
+  assert.equal(browserSyncPreflight.response.status, 204);
+  assert.equal(browserSyncPreflight.response.headers.get('access-control-allow-origin'), browserOrigin);
+  assert.equal(browserSyncPreflight.response.headers.get('access-control-allow-headers'), 'authorization');
+  assert.match(browserSyncPreflight.response.headers.get('access-control-allow-methods') ?? '', /\bGET\b/);
+  assert.match(browserSyncPreflight.response.headers.get('vary') ?? '', /Origin/i);
+  assert.match(browserSyncPreflight.response.headers.get('vary') ?? '', /Access-Control-Request-Headers/i);
+
+  const pendingSync = request(
+    harness,
+    `/_matrix/client/v3/sync?since=${encodeURIComponent(browserSync.payload.next_batch)}&timeout=1000`,
+    {
+      headers: {
+        ...authHeaders(alice.access_token),
+        origin: browserOrigin,
+      },
+    },
+  );
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const wakeWrite = await putAuthenticated(
+    harness,
+    alice.access_token,
+    `/_matrix/client/v3/user/${encodeURIComponent(alice.user_id)}/account_data/com.example.browser.syncwake`,
+    {
+      tick: 1,
+    },
+  );
+  assert.equal(wakeWrite.response.status, 200);
+  const wokenSync = await pendingSync;
+  assert.equal(wokenSync.response.status, 200);
+  assert.equal(wokenSync.response.headers.get('access-control-allow-origin'), browserOrigin);
+  assert.match(wokenSync.response.headers.get('vary') ?? '', /Origin/i);
+  assert.notEqual(wokenSync.payload?.next_batch, browserSync.payload.next_batch);
+  assert.deepEqual(wokenSync.payload?.account_data?.events, [
+    {
+      type: 'com.example.browser.syncwake',
+      content: {
+        tick: 1,
+      },
+    },
+  ]);
+});
 
 test('TEST-CS-002 staging covers filter lifecycle plus /sync limited, full_state, use_state_after, include_leave, and lazy-load semantics', async (context) => {
   const harness = requireRemoteHarnessContext(context, 'staging');

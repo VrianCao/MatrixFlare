@@ -436,6 +436,15 @@ test('TEST-CS-001 ci-integration covers discovery, session lifecycle, and capabi
     ...authHeaders(alice.access_token),
     origin: browserOrigin,
   };
+  const browserCapabilitiesWithoutToken = await request(harness, '/_matrix/client/v3/capabilities', {
+    headers: {
+      origin: browserOrigin,
+    },
+  });
+  await expectMatrixError(browserCapabilitiesWithoutToken, 401, 'M_MISSING_TOKEN');
+  assert.equal(browserCapabilitiesWithoutToken.response.headers.get('access-control-allow-origin'), browserOrigin);
+  assert.match(browserCapabilitiesWithoutToken.response.headers.get('vary') ?? '', /Origin/i);
+
   const browserCapabilities = await request(harness, '/_matrix/client/v3/capabilities', {
     headers: browserAuthenticatedHeaders,
   });

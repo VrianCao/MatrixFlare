@@ -216,6 +216,24 @@
   `spec/framework/44-verification-and-evidence-register.md`
   [`TODO.md`](/root/Matrix/TODO.md)
 
+### 11. browser-authenticated `GET /capabilities` 与 `GET /sync` 若缺显式 CORS/preflight/held-long-poll coverage，真实 Web client 会在浏览器层断连
+
+- [x] `CS-GAP-011` 为 browser-authenticated `/capabilities` 与 `/sync` 补齐显式 CORS / preflight / long-poll closure。
+  Official basis:
+  官方 Matrix Web client 会以浏览器 `fetch()` 形态对 authenticated `/_matrix/client/*` 路由发起带 `Origin` 的请求；当请求带 `Authorization` 时，浏览器还会先发 `OPTIONS` preflight。对于 `/sync`，真实客户端还会走 `timeout > 0` 的 held long-poll，而不是只用 `timeout=0` 的立即返回路径。
+  Historical pre-closure status:
+  本地 broad CORS contract 已写成 `/_matrix/client/*` 都应可被浏览器读取，但此前显式 browser regression coverage 主要集中在 discovery/login/register 与 media config。`GET /_matrix/client/v3/capabilities` 与 `GET /_matrix/client/v3/sync` 缺少 browser-origin negative-auth 与 held-long-poll truth 的 dedicated assertions，因此真实浏览器一旦命中这些路径，仍可能表现为 `Connection Lost!`，而本地门禁继续为绿。
+  Closure delivered:
+  已把 local/staging regression tests 补到 browser-origin `GET/OPTIONS /capabilities` 与 `/sync` 的 authenticated / unauthenticated truth，其中 `/sync` 还显式覆盖 `timeout > 0` held long-poll 被用户流更新唤醒后的 CORS 行为；同时 `43/44` 也已把这条 `/sync` browser proof 重新接回 owning 的 `TEST-CS-002` / `EVID-CS-002` 证据线，不再只停留在 `TEST-CS-001` 的附带 coverage。
+  Artifact targets:
+  `spec/framework/43-testing-and-compliance.md`
+  `spec/framework/44-verification-and-evidence-register.md`
+  `tests/local/client-identity/phase-04.test.mjs`
+  `tests/local/client-identity/phase-05.test.mjs`
+  `tests/staging/test-cs-002.test.mjs`
+  `tests/integration/test-cs-001.test.mjs`
+  `tests/staging/test-cs-001.test.mjs`
+
 ## Execution Rule
 
 当上述任一项真正进入主线补全时，必须在同一变更集中同步：

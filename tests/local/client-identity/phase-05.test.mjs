@@ -51,7 +51,7 @@ async function syncRequest(rig, accessToken, query = '') {
   return response.json();
 }
 
-test('Phase 05 authenticated sync serves browser CORS and preflight truth', async (t) => {
+test('Phase 05 browser-origin /sync keeps auth, CORS, preflight, and long-poll truth aligned', async (t) => {
   const rig = createGatewayPhase04Rig();
   t.after(() => rig.close());
 
@@ -62,6 +62,15 @@ test('Phase 05 authenticated sync serves browser CORS and preflight truth', asyn
   });
 
   const browserOrigin = 'https://app.element.io';
+  const browserSyncWithoutToken = await rig.gatewayFetch('/_matrix/client/v3/sync?timeout=0', {
+    headers: {
+      origin: browserOrigin,
+    },
+  });
+  await expectMatrixError(browserSyncWithoutToken, 401, 'M_MISSING_TOKEN');
+  assert.equal(browserSyncWithoutToken.headers.get('access-control-allow-origin'), browserOrigin);
+  assert.match(browserSyncWithoutToken.headers.get('vary') ?? '', /Origin/i);
+
   const browserSync = await rig.gatewayFetch('/_matrix/client/v3/sync?timeout=0', {
     headers: {
       ...rig.authHeaders(registration.access_token),
@@ -88,6 +97,42 @@ test('Phase 05 authenticated sync serves browser CORS and preflight truth', asyn
   assert.match(browserSyncPreflight.headers.get('access-control-allow-methods') ?? '', /\bGET\b/);
   assert.match(browserSyncPreflight.headers.get('vary') ?? '', /Origin/i);
   assert.match(browserSyncPreflight.headers.get('vary') ?? '', /Access-Control-Request-Headers/i);
+
+  const pendingBrowserSync = rig.gatewayFetch(
+    `/_matrix/client/v3/sync?since=${encodeURIComponent(browserSyncBody.next_batch)}&timeout=1000`,
+    {
+      headers: {
+        ...rig.authHeaders(registration.access_token),
+        origin: browserOrigin,
+      },
+    },
+  );
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const wakeWrite = await rig.gatewayFetch(
+    `/_matrix/client/v3/user/${encodeURIComponent('@browser-sync-user:matrix.example.test')}/account_data/com.example.browser.syncwake`,
+    {
+      method: 'PUT',
+      headers: rig.authHeaders(registration.access_token),
+      json: {
+        tick: 1,
+      },
+    },
+  );
+  assert.equal(wakeWrite.status, 200);
+  const browserLongPollResponse = await pendingBrowserSync;
+  assert.equal(browserLongPollResponse.status, 200);
+  assert.equal(browserLongPollResponse.headers.get('access-control-allow-origin'), browserOrigin);
+  assert.match(browserLongPollResponse.headers.get('vary') ?? '', /Origin/i);
+  const browserLongPollBody = await browserLongPollResponse.json();
+  assert.notEqual(browserLongPollBody.next_batch, browserSyncBody.next_batch);
+  assert.deepEqual(browserLongPollBody.account_data?.events, [
+    {
+      type: 'com.example.browser.syncwake',
+      content: {
+        tick: 1,
+      },
+    },
+  ]);
 });
 
 function roomPath(roomId, suffix = '') {

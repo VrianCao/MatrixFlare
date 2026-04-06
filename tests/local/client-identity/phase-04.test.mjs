@@ -569,6 +569,15 @@ test('Phase 04 session lifecycle covers register, login, refresh, logout, whoami
   });
 
   const browserOrigin = 'https://app.element.io';
+  const browserCapabilitiesWithoutToken = await rig.gatewayFetch('/_matrix/client/v3/capabilities', {
+    headers: {
+      origin: browserOrigin,
+    },
+  });
+  await expectMatrixError(browserCapabilitiesWithoutToken, 401, 'M_MISSING_TOKEN');
+  assert.equal(browserCapabilitiesWithoutToken.headers.get('access-control-allow-origin'), browserOrigin);
+  assert.match(browserCapabilitiesWithoutToken.headers.get('vary') ?? '', /Origin/i);
+
   const browserCapabilities = await rig.gatewayFetch('/_matrix/client/v3/capabilities', {
     headers: {
       ...rig.authHeaders(registration.access_token),
