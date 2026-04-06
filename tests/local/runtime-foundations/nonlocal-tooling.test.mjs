@@ -4311,9 +4311,7 @@ test('production baseline input resolver finds the embedded baseline record befo
   const rawSnapshotPath = path.join(downloadRoot, 'state', 'operational-refresh', 'current-production-state.json');
   const embeddedBaselineRecordPath = path.join(downloadRoot, 'recovered', 'upstream', 'prod-install-record.json');
   const normalizedOutputPath = path.join(workspaceRoot, 'state', 'normalized-baseline', 'current-production-state.json');
-  const baselineRecord = buildProdInstallRecordFixture({
-    runId: '24033537026',
-  });
+  const baselineRecord = buildProdInstallRecordFixture();
   const typedSnapshot = buildProdCurrentStateSnapshotFixture({
     runId: '24033537026',
   });
@@ -4651,7 +4649,60 @@ test('production baseline input resolver binds record baselines to the selected 
   );
 });
 
-test('production baseline input resolver rejects embedded baseline records that do not match the selected upstream run identity', async () => {
+test('production baseline input resolver accepts embedded baseline records that match the legacy snapshot baseline lineage even when the blocker run id differs', async () => {
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-prod-baseline-embedded-lineage-'));
+  const downloadRoot = path.join(workspaceRoot, 'downloaded', 'baseline');
+  const rawSnapshotPath = path.join(downloadRoot, 'state', 'operational-refresh', 'current-production-state.json');
+  const embeddedBaselineRecordPath = path.join(downloadRoot, 'downloaded', 'baseline', 'prod-promotion-record.json');
+  const normalizedOutputPath = path.join(workspaceRoot, 'state', 'normalized-baseline', 'current-production-state.json');
+  const embeddedBaselineRecord = buildProdPromotionRecordFixture({
+    runId: '24019281851',
+    promotedAt: '2026-04-06T04:55:43.000Z',
+  });
+  const blockerRunIdentity = buildProducerRunIdentityFixture({
+    runId: '24033551396',
+  });
+  const snapshot = {
+    observed_at: '2026-04-06T13:25:40.017Z',
+    baseline_record: {
+      artifact_id: embeddedBaselineRecord.artifact_id,
+      origin_run_uri: embeddedBaselineRecord.origin_run_uri,
+      deployment_identity: embeddedBaselineRecord.current_deployment_identity,
+    },
+    baseline_match: {
+      matches: false,
+      mismatched_fields: ['deployment_ids', 'worker_version_ids'],
+      problems: [],
+    },
+    current_deployment_observation: buildProdCurrentStateSnapshotFixture({
+      runId: blockerRunIdentity.origin_run_id,
+    }).current_deployment_observation,
+  };
+
+  await fs.mkdir(path.dirname(rawSnapshotPath), { recursive: true });
+  await fs.mkdir(path.dirname(embeddedBaselineRecordPath), { recursive: true });
+  await fs.writeFile(rawSnapshotPath, `${JSON.stringify(snapshot, null, 2)}\n`);
+  await fs.writeFile(embeddedBaselineRecordPath, `${JSON.stringify(embeddedBaselineRecord, null, 2)}\n`);
+
+  const resolved = await resolveProductionBaselineInputArtifact({
+    downloadRoot,
+    baselineInputKind: 'current_state',
+    baselineInputPath: 'state/operational-refresh/current-production-state.json',
+    baselineRecordName: 'prod-promotion-record.json',
+    normalizedOutputPath,
+    originRunIdentity: blockerRunIdentity,
+  });
+
+  assert.equal(resolved.raw_baseline_input_path, rawSnapshotPath);
+  assert.equal(resolved.baseline_record_path, embeddedBaselineRecordPath);
+  const normalizedSnapshot = JSON.parse(await fs.readFile(normalizedOutputPath, 'utf8'));
+  assert.equal(normalizedSnapshot.origin_run_id, blockerRunIdentity.origin_run_id);
+  assert.equal(normalizedSnapshot.origin_run_uri, blockerRunIdentity.origin_run_uri);
+  assert.equal(normalizedSnapshot.baseline_record.origin_run_uri, embeddedBaselineRecord.origin_run_uri);
+  assert.deepEqual(normalizedSnapshot.baseline_record.deployment_identity, embeddedBaselineRecord.current_deployment_identity);
+});
+
+test('production baseline input resolver rejects embedded baseline records that do not match the legacy snapshot baseline lineage', async () => {
   const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-prod-baseline-embedded-origin-'));
   const downloadRoot = path.join(workspaceRoot, 'downloaded', 'baseline');
   const rawSnapshotPath = path.join(downloadRoot, 'state', 'operational-refresh', 'current-production-state.json');
@@ -4697,7 +4748,7 @@ test('production baseline input resolver rejects embedded baseline records that 
         runId: '24033537035',
       }),
     }),
-    /baselineRecord is invalid: prod install record\.origin_run_id must match expectedOriginRunIdentity\.origin_run_id/u,
+    /legacy prod current state snapshot baseline_record\.origin_run_uri must match embedded baselineRecord\.origin_run_uri/u,
   );
 });
 
@@ -4717,7 +4768,7 @@ test('legacy prod current-state snapshots can be normalized into the current rec
 
   const normalized = normalizeProdCurrentStateSnapshot(legacySnapshot, {
     baselineRecord: buildProdInstallRecordFixture({
-      runId: '24033537026',
+      runId: '24000789563',
     }),
     originRunIdentity: buildProducerRunIdentityFixture({
       runId: '24033537026',

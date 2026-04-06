@@ -5192,6 +5192,50 @@ function isLegacyProdCurrentStateSnapshot(record) {
     && isPlainObject(record.current_deployment_observation);
 }
 
+function validateLegacyProdCurrentStateBaselineLineage(snapshotBaselineRecord, baselineRecord) {
+  if (!isPlainObject(snapshotBaselineRecord)) {
+    return {
+      valid: false,
+      error: 'legacy prod current state snapshot baseline_record must be an object',
+    };
+  }
+  if (snapshotBaselineRecord.artifact_id !== baselineRecord.artifact_id) {
+    return {
+      valid: false,
+      error: 'legacy prod current state snapshot baseline_record.artifact_id must match embedded baselineRecord.artifact_id',
+    };
+  }
+  const expectedOriginRunUri = baselineRecord.origin_run_uri ?? baselineRecord.baseline_record?.origin_run_uri ?? null;
+  if (snapshotBaselineRecord.origin_run_uri !== expectedOriginRunUri) {
+    return {
+      valid: false,
+      error: 'legacy prod current state snapshot baseline_record.origin_run_uri must match embedded baselineRecord.origin_run_uri',
+    };
+  }
+  const baselineIdentityValidation = validateProductionDeploymentIdentity(
+    snapshotBaselineRecord.deployment_identity,
+    'legacy prod current state snapshot baseline_record.deployment_identity',
+  );
+  if (!baselineIdentityValidation.valid) {
+    return baselineIdentityValidation;
+  }
+  const expectedBaselineIdentity = extractBaselineDeploymentIdentity(baselineRecord);
+  const comparison = summarizeProductionBaselineIdentityMatch(
+    snapshotBaselineRecord.deployment_identity,
+    expectedBaselineIdentity,
+  );
+  if (!comparison.matches) {
+    return {
+      valid: false,
+      error: `legacy prod current state snapshot baseline_record ${comparison.mismatched_fields.join(' and ')} must match embedded baselineRecord.deployment_identity`,
+    };
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
 function summarizeProductionBaselineIdentityMatch(baselineIdentity, currentIdentity) {
   const mismatchedFields = [];
   if (JSON.stringify(baselineIdentity?.deployment_ids ?? []) !== JSON.stringify(currentIdentity?.deployment_ids ?? [])) {
@@ -7618,8 +7662,15 @@ export function normalizeProdCurrentStateSnapshot(snapshot, {
     throw new TypeError(`legacy prod current state snapshot normalization requires a valid originRunIdentity: ${originRunValidation.error}`);
   }
   const resolvedBaselineRecord = validateProductionBaselineRecord(baselineRecord, {
-    expectedOriginRunIdentity: originRunIdentity,
+    expectedGitHubRepository: originRunIdentity.origin_repository,
   });
+  const baselineLineageValidation = validateLegacyProdCurrentStateBaselineLineage(
+    snapshot.baseline_record,
+    resolvedBaselineRecord,
+  );
+  if (!baselineLineageValidation.valid) {
+    throw new TypeError(baselineLineageValidation.error);
+  }
   return buildProductionCurrentStateSnapshot({
     baselineRecord: resolvedBaselineRecord,
     currentObservation: snapshot.current_deployment_observation,
