@@ -6,13 +6,15 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { SUPPORTED_MATRIX_CLIENT_SPEC_VERSIONS } from '../../../packages/runtime-core/src/client-domain.mjs';
 import {
   buildProdCostSnapshotProvenance,
   buildProdInstallRecord,
   buildProdPromotionRecord,
+  buildProductionCurrentStateSnapshot,
   buildProdRollbackRecord,
   buildPreReleaseRolloutVersionSpecs,
+  buildProductionGatewayRolloutReadinessOptions,
+  buildProductionWorkerPromotionReadinessOptions,
   buildEnvironmentRunProvenance,
   buildGitHubRunUrl,
   buildNonLocalEnvironmentPlan,
@@ -27,6 +29,8 @@ import {
   captureProdCostSnapshot,
   createEnvironmentWranglerConfig,
   fetchWorkerDeploymentState,
+  observeProductionCurrentCloudflareState,
+  observeProductionInstallTopologyState,
   resolveClosedProdBillingWindow,
   resolveFreshCloudflareIdentity,
   resolvePreDeployWorkerDeploymentState,
@@ -41,6 +45,7 @@ import {
   validateReleaseCandidateManifest,
   validateRemoteHarnessEnvironmentVariables,
   waitForNonLocalDeploymentReadiness,
+  waitForProductionDeploymentReadiness,
   writeProdCostSnapshotProvenance,
   writeProdCostSnapshotAttestation,
   writeEnvironmentWranglerConfig,
@@ -53,8 +58,26 @@ import {
   validateManualArtifactPayload,
 } from '../../../packages/testing/src/evidence.mjs';
 import {
+  CLIENT_DISCOVERY_VERSIONS,
+  summarizeClientDiscoveryVersionPayload,
+} from '../../../packages/testing/src/client-discovery.mjs';
+import {
   GATEWAY_RATE_LIMIT_BINDING_DEFINITIONS,
 } from '../../../packages/runtime-core/src/abuse-guard.mjs';
+
+const CLIENT_DISCOVERY_VERSION_STEP_DETAIL = Object.freeze(
+  {
+    ...summarizeClientDiscoveryVersionPayload({ versions: CLIENT_DISCOVERY_VERSIONS }),
+    browser_compatible_cors: true,
+  },
+);
+const DEFAULT_TEST_GIT_COMMIT = '0123456789abcdef0123456789abcdef01234567';
+
+function normalizeCloudflareResourceSnapshot(snapshot) {
+  return Object.fromEntries(
+    Object.entries(snapshot).map(([key, values]) => [key, [...values].sort()]),
+  );
+}
 
 function buildDeploymentSummaryFixture(environmentName) {
   const plan = buildNonLocalEnvironmentPlan(environmentName, {
@@ -203,7 +226,7 @@ function buildEnvironmentAttestationFixture(environmentName, runTimestamp, {
     ? 'tests/integration/test-cs-001.test.mjs'
     : `tests/${environmentName}/test-cs-001.test.mjs`;
   const readinessSteps = [
-    { step: 'versions', ok: true, detail: { versions_count: SUPPORTED_MATRIX_CLIENT_SPEC_VERSIONS.length } },
+    { step: 'versions', ok: true, detail: CLIENT_DISCOVERY_VERSION_STEP_DETAIL },
     { step: 'public_rooms', ok: true, detail: { chunk_length: 0 } },
     { step: 'register_challenge', ok: true, detail: { session_present: true, flows_count: 1 } },
     { step: 'register_complete', ok: true, detail: { user_id_present: true, access_token_present: true } },
@@ -266,6 +289,7 @@ function buildEnvironmentAttestationFixture(environmentName, runTimestamp, {
       log_artifact: `https://example.invalid/logs/${environmentName}/${runTimestamp}.txt`,
       executed_by: 'ci-runner',
       reviewed_by: 'release-reviewer',
+      git_commit: DEFAULT_TEST_GIT_COMMIT,
       source_run_uri: resolvedSourceRunUri,
       topology_kind: `cloudflare-${environmentName}`,
       cloudflare_resources: environmentName === 'ci-integration'
@@ -337,7 +361,7 @@ function buildProductionReadinessProbeFixture(overrides = {}) {
         duration_ms: 30000,
         ok: true,
         steps: [
-          { step: 'versions', ok: true, detail: { versions_count: SUPPORTED_MATRIX_CLIENT_SPEC_VERSIONS.length } },
+          { step: 'versions', ok: true, detail: CLIENT_DISCOVERY_VERSION_STEP_DETAIL },
           { step: 'public_rooms', ok: true, detail: { chunk_length: 0 } },
           { step: 'register_complete', ok: true, detail: { user_id_present: true, access_token_present: true } },
           { step: 'media_create', ok: true, detail: { content_uri_present: true } },
@@ -366,7 +390,8 @@ function buildDeploymentIdentityValidationFixture(environmentName, rolloutSkewPr
   return {
     validated_at: '2026-04-01T16:00:00.000Z',
     cloudflare_resources: {
-      ratelimit_namespaces: plan.cloudflare_resources.ratelimit_namespaces,
+      ...plan.cloudflare_resources,
+      r2_buckets: [...plan.cloudflare_resources.r2_buckets, plan.artifact_bucket_name].sort(),
     },
     workers: {
       'jobs-worker': {
@@ -395,7 +420,7 @@ function buildReadinessProbeFixture(environmentName, {
   failureDetail = { status: 500, error: 'transient deploy window' },
 } = {}) {
   const successSteps = [
-    { step: 'versions', ok: true, detail: { versions_count: SUPPORTED_MATRIX_CLIENT_SPEC_VERSIONS.length } },
+    { step: 'versions', ok: true, detail: CLIENT_DISCOVERY_VERSION_STEP_DETAIL },
     { step: 'public_rooms', ok: true, detail: { chunk_length: 0 } },
     { step: 'register_challenge', ok: true, detail: { session_present: true, flows_count: 1 } },
     { step: 'register_complete', ok: true, detail: { user_id_present: true, access_token_present: true } },
@@ -426,7 +451,7 @@ function buildReadinessProbeFixture(environmentName, {
       duration_ms: 2000,
       ok: false,
       steps: [
-        { step: 'versions', ok: true, detail: { versions_count: SUPPORTED_MATRIX_CLIENT_SPEC_VERSIONS.length } },
+        { step: 'versions', ok: true, detail: CLIENT_DISCOVERY_VERSION_STEP_DETAIL },
         { step: 'public_rooms', ok: true, detail: { chunk_length: 0 } },
         { step: failureStepName, ok: false, detail: failureDetail },
       ],
@@ -1014,6 +1039,13 @@ test('fresh Cloudflare identities must be newly observed and unique', () => {
   );
 });
 
+test('fresh Cloudflare identity resolution deduplicates repeated new observations before checking uniqueness', () => {
+  assert.equal(
+    resolveFreshCloudflareIdentity(['dep-old'], ['dep-new', 'dep-new', 'dep-old'], 'deployment id'),
+    'dep-new',
+  );
+});
+
 test('worker deployment state summary keeps only the latest active deployment version set', () => {
   const summary = summarizeWorkerDeploymentState({
     deployments: [
@@ -1043,6 +1075,252 @@ test('worker deployment state summary keeps only the latest active deployment ve
   assert.deepEqual(summary.worker_version_ids, ['ver-current', 'ver-old', 'ver-archived']);
 });
 
+test('fetchWorkerDeploymentState can retain raw Cloudflare payloads for blocker artifacts', async () => {
+  const originalFetch = globalThis.fetch;
+
+  try {
+    globalThis.fetch = async (url) => {
+      const pathname = new URL(String(url)).pathname;
+      if (pathname.endsWith('/deployments')) {
+        return new Response(JSON.stringify({
+          success: true,
+          result: {
+            deployments: [
+              {
+                id: 'dep-current',
+                versions: [
+                  { version_id: 'ver-current' },
+                ],
+              },
+            ],
+          },
+        }), {
+          status: 200,
+          headers: {
+            'content-type': 'application/json',
+          },
+        });
+      }
+      return new Response(JSON.stringify({
+        success: true,
+        result: {
+          items: [
+            { id: 'ver-current', annotations: { workers_tag: 'mx-gw-d-prod2' } },
+            { id: 'ver-old', annotations: { workers_tag: 'mx-gw-d-prod1' } },
+          ],
+        },
+      }), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+        },
+      });
+    };
+
+    const state = await fetchWorkerDeploymentState({
+      accountId: 'cf-account',
+      apiToken: 'cf-token',
+      scriptName: 'matrix-gateway-worker-prod',
+      includeRawPayload: true,
+    });
+    assert.equal(state.latest_active_deployment_id, 'dep-current');
+    assert.deepEqual(state.active_worker_version_ids, ['ver-current']);
+    assert.deepEqual(state.raw_payloads, {
+      deployments: {
+        deployments: [
+          {
+            id: 'dep-current',
+            versions: [
+              { version_id: 'ver-current' },
+            ],
+          },
+        ],
+      },
+      versions: {
+        items: [
+          { id: 'ver-current', annotations: { workers_tag: 'mx-gw-d-prod2' } },
+          { id: 'ver-old', annotations: { workers_tag: 'mx-gw-d-prod1' } },
+        ],
+      },
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('fetchWorkerDeploymentState preserves successful raw Cloudflare payloads when the sibling endpoint fails', async () => {
+  const originalFetch = globalThis.fetch;
+
+  try {
+    globalThis.fetch = async (url) => {
+      const pathname = new URL(String(url)).pathname;
+      if (pathname.endsWith('/deployments')) {
+        return new Response(JSON.stringify({
+          success: true,
+          result: {
+            deployments: [
+              {
+                id: 'dep-current',
+                versions: [
+                  { version_id: 'ver-current' },
+                ],
+              },
+            ],
+          },
+        }), {
+          status: 200,
+          headers: {
+            'content-type': 'application/json',
+          },
+        });
+      }
+      return new Response(JSON.stringify({
+        success: false,
+        errors: [
+          { message: 'versions API temporarily unavailable' },
+        ],
+      }), {
+        status: 500,
+        headers: {
+          'content-type': 'application/json',
+        },
+      });
+    };
+
+    await assert.rejects(
+      () => fetchWorkerDeploymentState({
+        accountId: 'cf-account',
+        apiToken: 'cf-token',
+        scriptName: 'matrix-gateway-worker-prod',
+        includeRawPayload: true,
+      }),
+      (error) => {
+        assert.match(error.message, /versions API temporarily unavailable/u);
+        assert.deepEqual(error.partial_raw_payloads, {
+          deployments: {
+            deployments: [
+              {
+                id: 'dep-current',
+                versions: [
+                  { version_id: 'ver-current' },
+                ],
+              },
+            ],
+          },
+          versions: null,
+        });
+        return true;
+      },
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('observeProductionCurrentCloudflareState retains partial raw backreads on mixed-success worker failures', async () => {
+  const originalFetch = globalThis.fetch;
+
+  try {
+    globalThis.fetch = async (url) => {
+      const pathname = new URL(String(url)).pathname;
+      if (pathname.includes('/workers/scripts/matrix-jobs-worker-prod/deployments')) {
+        return new Response(JSON.stringify({
+          success: true,
+          result: {
+            deployments: [
+              { id: 'jobs-prod-deployment-v1', versions: [{ version_id: 'jobs@prod-v1' }] },
+            ],
+          },
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      if (pathname.includes('/workers/scripts/matrix-jobs-worker-prod/versions')) {
+        return new Response(JSON.stringify({
+          success: true,
+          result: {
+            items: [
+              { id: 'jobs@prod-v1', annotations: { workers_tag: 'mx-jw-d-prod1' } },
+            ],
+          },
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      if (pathname.includes('/workers/scripts/matrix-ops-worker-prod/deployments')) {
+        return new Response(JSON.stringify({
+          success: true,
+          result: {
+            deployments: [
+              { id: 'ops-prod-deployment-v2', versions: [{ version_id: 'ops@prod-v2' }] },
+            ],
+          },
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      if (pathname.includes('/workers/scripts/matrix-ops-worker-prod/versions')) {
+        return new Response(JSON.stringify({
+          success: false,
+          errors: [
+            { message: 'versions API temporarily unavailable' },
+          ],
+        }), { status: 500, headers: { 'content-type': 'application/json' } });
+      }
+      if (pathname.includes('/workers/scripts/matrix-gateway-worker-prod/deployments')) {
+        return new Response(JSON.stringify({
+          success: true,
+          result: {
+            deployments: [
+              { id: 'gateway-prod-deployment-v1', versions: [{ version_id: 'gateway@prod-v1' }] },
+            ],
+          },
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      if (pathname.includes('/workers/scripts/matrix-gateway-worker-prod/versions')) {
+        return new Response(JSON.stringify({
+          success: true,
+          result: {
+            items: [
+              { id: 'gateway@prod-v1', annotations: { workers_tag: 'mx-gw-d-prod1' } },
+            ],
+          },
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      throw new Error(`Unexpected Cloudflare API request in test: ${pathname}`);
+    };
+
+    const baselineRecord = buildProdInstallRecord({
+      releaseCommitSha: '0123456789abcdef0123456789abcdef01234567',
+      provisionedEnvironment: buildProductionProvisioningFixture(),
+      deploymentSummary: buildProductionDeploymentSummaryFixture(),
+      originRunIdentity: buildProducerRunIdentityFixture(),
+      installId: 'install-prod-topology-v1',
+      installedAt: '2026-04-05T04:55:43.000Z',
+    });
+
+    const observation = await observeProductionCurrentCloudflareState(baselineRecord, {
+      accountId: 'cf-account',
+      apiToken: 'cf-token',
+    });
+
+    assert.equal(observation.current_deployment_identity, null);
+    assert.match(observation.problems[0], /matrix-ops-worker-prod/u);
+    assert.equal(observation.workers['ops-worker'].latest_active_deployment_id, 'ops-prod-deployment-v2');
+    assert.deepEqual(observation.workers['ops-worker'].deployment_ids, ['ops-prod-deployment-v2']);
+    assert.deepEqual(observation.workers['ops-worker'].active_worker_version_ids, ['ops@prod-v2']);
+    assert.deepEqual(observation.workers['ops-worker'].worker_version_ids, []);
+    assert.deepEqual(observation.workers['ops-worker'].raw_cloudflare_api_results, {
+      deployments: {
+        deployments: [
+          { id: 'ops-prod-deployment-v2', versions: [{ version_id: 'ops@prod-v2' }] },
+        ],
+      },
+      versions: null,
+    });
+    assert.match(
+      observation.workers['ops-worker'].error.message,
+      /versions API temporarily unavailable/u,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('deployment summary Cloudflare revalidation checks every worker against the latest active identity', async () => {
   const deploymentSummary = buildDeploymentSummaryFixture('staging');
   const observedScripts = [];
@@ -1055,7 +1333,7 @@ test('deployment summary Cloudflare revalidation checks every worker against the
       const workerAlias = scriptName.split('-')[1];
       return {
         latest_active_deployment_id: `dep-${workerAlias}`,
-        active_worker_version_ids: [`ver-${workerAlias}`, 'ver-older'],
+        active_worker_version_ids: [`ver-${workerAlias}`],
       };
     },
     fetchWorkerBindingStateImpl: async ({ scriptName }) => ({
@@ -1071,16 +1349,114 @@ test('deployment summary Cloudflare revalidation checks every worker against the
     { accountId: 'cf-account', apiToken: 'cf-token', scriptName: 'matrix-gateway-worker-staging' },
   ]);
   assert.equal(validation.workers['jobs-worker'].latest_active_deployment_id, 'dep-jobs');
-  assert.deepEqual(validation.workers['gateway-worker'].active_worker_version_ids, ['ver-gateway', 'ver-older']);
+  assert.deepEqual(validation.workers['gateway-worker'].active_worker_version_ids, ['ver-gateway']);
   assert.deepEqual(
     validation.workers['gateway-worker'].ratelimit_namespace_ids,
     deploymentSummary.cloudflare_resources.ratelimit_namespaces,
   );
   assert.deepEqual(
-    validation.cloudflare_resources.ratelimit_namespaces,
-    deploymentSummary.cloudflare_resources.ratelimit_namespaces,
+    validation.cloudflare_resources,
+    normalizeCloudflareResourceSnapshot(deploymentSummary.cloudflare_resources),
   );
   assert.match(validation.validated_at, /^\d{4}-\d{2}-\d{2}T/);
+});
+
+test('deployment summary Cloudflare revalidation rejects unexpected extra active worker versions outside rollout validation', async () => {
+  const deploymentSummary = buildDeploymentSummaryFixture('staging');
+
+  await assert.rejects(
+    () => validateDeploymentSummaryAgainstCurrentCloudflareState(deploymentSummary, {
+      accountId: 'cf-account',
+      apiToken: 'cf-token',
+      fetchWorkerDeploymentStateImpl: async ({ scriptName }) => {
+        const workerAlias = scriptName.split('-')[1];
+        return {
+          latest_active_deployment_id: `dep-${workerAlias}`,
+          active_worker_version_ids: [`ver-${workerAlias}`, 'ver-older'],
+        };
+      },
+      fetchWorkerBindingStateImpl: async ({ scriptName }) => ({
+        ratelimit_namespace_ids: scriptName === deploymentSummary.workers['gateway-worker'].script_name
+          ? deploymentSummary.cloudflare_resources.ratelimit_namespaces
+          : [],
+      }),
+    }),
+    /active_worker_version_ids must exactly match the latest active Cloudflare deployment/,
+  );
+});
+
+test('deployment summary Cloudflare revalidation allows the pre-release rollout gateway to expose exactly the baseline and candidate versions', async () => {
+  const deploymentSummary = buildDeploymentSummaryFixture('pre-release');
+  const rolloutScopedSummary = structuredClone(deploymentSummary);
+  rolloutScopedSummary.workers['gateway-worker'] = {
+    ...rolloutScopedSummary.workers['gateway-worker'],
+    deployment_id: 'dual-deployment-1',
+    expected_active_worker_version_ids: ['gateway-candidate-v2', 'gateway-baseline-v1'],
+  };
+
+  const validation = await validateDeploymentSummaryAgainstCurrentCloudflareState(rolloutScopedSummary, {
+    accountId: 'cf-account',
+    apiToken: 'cf-token',
+    fetchWorkerDeploymentStateImpl: async ({ scriptName }) => {
+      const workerAlias = scriptName.split('-')[1];
+      if (scriptName === rolloutScopedSummary.workers['gateway-worker'].script_name) {
+        return {
+          latest_active_deployment_id: 'dual-deployment-1',
+          active_worker_version_ids: ['gateway-baseline-v1', 'gateway-candidate-v2'],
+        };
+      }
+      return {
+        latest_active_deployment_id: `dep-${workerAlias}`,
+        active_worker_version_ids: [`ver-${workerAlias}`],
+      };
+    },
+    fetchWorkerBindingStateImpl: async ({ scriptName }) => ({
+      ratelimit_namespace_ids: scriptName === rolloutScopedSummary.workers['gateway-worker'].script_name
+        ? rolloutScopedSummary.cloudflare_resources.ratelimit_namespaces
+        : [],
+    }),
+  });
+
+  assert.deepEqual(
+    validation.workers['gateway-worker'].active_worker_version_ids,
+    ['gateway-baseline-v1', 'gateway-candidate-v2'],
+  );
+});
+
+test('deployment summary Cloudflare revalidation rejects duplicate active worker version ids during pre-release rollout validation', async () => {
+  const deploymentSummary = buildDeploymentSummaryFixture('pre-release');
+  const rolloutScopedSummary = structuredClone(deploymentSummary);
+  rolloutScopedSummary.workers['gateway-worker'] = {
+    ...rolloutScopedSummary.workers['gateway-worker'],
+    deployment_id: 'dual-deployment-1',
+    expected_active_worker_version_ids: ['gateway-candidate-v2', 'gateway-baseline-v1'],
+  };
+
+  await assert.rejects(
+    () => validateDeploymentSummaryAgainstCurrentCloudflareState(rolloutScopedSummary, {
+      accountId: 'cf-account',
+      apiToken: 'cf-token',
+      fetchWorkerDeploymentStateImpl: async ({ scriptName }) => {
+        const workerAlias = scriptName.split('-')[1];
+        if (scriptName === rolloutScopedSummary.workers['gateway-worker'].script_name) {
+          return {
+            latest_active_deployment_id: 'dual-deployment-1',
+            active_worker_version_ids: ['gateway-baseline-v1', 'gateway-candidate-v2', 'gateway-candidate-v2'],
+          };
+        }
+        return {
+          latest_active_deployment_id: `dep-${workerAlias}`,
+          active_worker_version_ids: [`ver-${workerAlias}`],
+        };
+      },
+      fetchWorkerBindingStateImpl: async ({ scriptName }) => ({
+        ratelimit_namespace_ids: scriptName === rolloutScopedSummary.workers['gateway-worker'].script_name
+          ? rolloutScopedSummary.cloudflare_resources.ratelimit_namespaces
+          : [],
+      }),
+    }),
+    /must not expose duplicate active_worker_version_ids/,
+  );
 });
 
 test('deployment summary Cloudflare revalidation rejects ratelimit namespace drift from the deployed worker bindings', async () => {
@@ -1104,6 +1480,37 @@ test('deployment summary Cloudflare revalidation rejects ratelimit namespace dri
       }),
     }),
     /cloudflare_resources\.ratelimit_namespaces must match currently deployed Cloudflare ratelimit namespace bindings on gateway-worker/,
+  );
+});
+
+test('deployment summary Cloudflare revalidation rejects resource snapshots that drift from the fixed environment topology', async () => {
+  const deploymentSummary = buildDeploymentSummaryFixture('staging');
+  deploymentSummary.cloudflare_resources = {
+    ...deploymentSummary.cloudflare_resources,
+    queues: [
+      ...deploymentSummary.cloudflare_resources.queues,
+      'matrix-unexpected-queue-staging',
+    ],
+  };
+
+  await assert.rejects(
+    () => validateDeploymentSummaryAgainstCurrentCloudflareState(deploymentSummary, {
+      accountId: 'cf-account',
+      apiToken: 'cf-token',
+      fetchWorkerDeploymentStateImpl: async ({ scriptName }) => {
+        const workerAlias = scriptName.split('-')[1];
+        return {
+          latest_active_deployment_id: `dep-${workerAlias}`,
+          active_worker_version_ids: [`ver-${workerAlias}`],
+        };
+      },
+      fetchWorkerBindingStateImpl: async ({ scriptName }) => ({
+        ratelimit_namespace_ids: scriptName === deploymentSummary.workers['gateway-worker'].script_name
+          ? buildDeploymentSummaryFixture('staging').cloudflare_resources.ratelimit_namespaces
+          : [],
+      }),
+    }),
+    /cloudflare_resources\.queues must match the fixed environment topology/,
   );
 });
 
@@ -1409,7 +1816,7 @@ test('latest active Cloudflare deployment identity validation rejects stale or m
       ...workerSummary,
       worker_version_id: 'ver-old',
     }, currentDeploymentState),
-    /deployment workers\.gateway-worker\.worker_version_id is not part of the latest active Cloudflare deployment/,
+    /deployment workers\.gateway-worker\.active_worker_version_ids must exactly match the latest active Cloudflare deployment/,
   );
 });
 
@@ -1431,11 +1838,25 @@ test('non-local deployment readiness retries with fresh per-attempt registration
     '/_matrix/media/v3/create',
   ];
   const responses = [
-    new Response(JSON.stringify({ versions: SUPPORTED_MATRIX_CLIENT_SPEC_VERSIONS }), { status: 200, headers: { 'content-type': 'application/json' } }),
+    new Response(JSON.stringify({ versions: [...CLIENT_DISCOVERY_VERSIONS] }), {
+      status: 200,
+      headers: {
+        'content-type': 'application/json',
+        'access-control-allow-origin': 'https://app.element.io',
+        vary: 'Origin',
+      },
+    }),
     new Response(JSON.stringify({ chunk: [] }), { status: 200, headers: { 'content-type': 'application/json' } }),
     new Response(JSON.stringify({ flows: [{ stages: ['m.login.dummy'] }], session: 'uia-1' }), { status: 401, headers: { 'content-type': 'application/json' } }),
     new Response(JSON.stringify({ errcode: 'M_UNKNOWN', error: 'transient deploy window' }), { status: 500, headers: { 'content-type': 'application/json' } }),
-    new Response(JSON.stringify({ versions: SUPPORTED_MATRIX_CLIENT_SPEC_VERSIONS }), { status: 200, headers: { 'content-type': 'application/json' } }),
+    new Response(JSON.stringify({ versions: [...CLIENT_DISCOVERY_VERSIONS] }), {
+      status: 200,
+      headers: {
+        'content-type': 'application/json',
+        'access-control-allow-origin': 'https://app.element.io',
+        vary: 'Origin',
+      },
+    }),
     new Response(JSON.stringify({ chunk: [] }), { status: 200, headers: { 'content-type': 'application/json' } }),
     new Response(JSON.stringify({ flows: [{ stages: ['m.login.dummy'] }], session: 'uia-2' }), { status: 401, headers: { 'content-type': 'application/json' } }),
     new Response(JSON.stringify({ user_id: '@ready:example.test', access_token: 'atk.ready' }), { status: 200, headers: { 'content-type': 'application/json' } }),
@@ -1532,6 +1953,194 @@ test('non-local deployment readiness fails closed when representative HTTP paths
   assert.deepEqual(delayCalls, []);
 });
 
+test('non-local deployment readiness fails closed when /versions lacks the browser-compatible ladder', async () => {
+  const remoteHarnessEnv = {
+    MATRIX_REMOTE_BASE_URL: 'https://matrix-gateway-worker-ci-integration.matrixflare.workers.dev',
+    MATRIX_REMOTE_SERVER_NAME: 'matrix-gateway-worker-ci-integration.matrixflare.workers.dev',
+  };
+
+  const readiness = await waitForNonLocalDeploymentReadiness('ci-integration', remoteHarnessEnv, {
+    maxAttempts: 1,
+    fetchImpl: async (url) => {
+      const requestUrl = new URL(String(url));
+      assert.equal(`${requestUrl.pathname}${requestUrl.search}`, '/_matrix/client/versions');
+      return new Response(JSON.stringify({
+        versions: ['v1.17'],
+        unstable_features: {},
+      }), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+        },
+      });
+    },
+  });
+
+  assert.equal(readiness.ready, false);
+  assert.equal(readiness.attempt_count, 1);
+  assert.equal(readiness.attempts[0].failure.step_name, 'versions');
+  assert.match(readiness.last_error, /versions/);
+});
+
+test('non-local deployment readiness fails closed when /versions lacks browser CORS headers', async () => {
+  const remoteHarnessEnv = {
+    MATRIX_REMOTE_BASE_URL: 'https://matrix-gateway-worker-ci-integration.matrixflare.workers.dev',
+    MATRIX_REMOTE_SERVER_NAME: 'matrix-gateway-worker-ci-integration.matrixflare.workers.dev',
+  };
+
+  const readiness = await waitForNonLocalDeploymentReadiness('ci-integration', remoteHarnessEnv, {
+    maxAttempts: 1,
+    fetchImpl: async (url) => {
+      const requestUrl = new URL(String(url));
+      assert.equal(`${requestUrl.pathname}${requestUrl.search}`, '/_matrix/client/versions');
+      assert.equal(requestUrl.search, '');
+      return new Response(JSON.stringify({
+        versions: CLIENT_DISCOVERY_VERSIONS,
+        unstable_features: {},
+      }), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+        },
+      });
+    },
+  });
+
+  assert.equal(readiness.ready, false);
+  assert.equal(readiness.attempt_count, 1);
+  assert.equal(readiness.attempts[0].failure.step_name, 'versions');
+  assert.deepEqual(readiness.attempts[0].failure.detail, {
+    status: 200,
+    versions_count: CLIENT_DISCOVERY_VERSIONS.length,
+    browser_compatible_version_ladder: true,
+    browser_compatible_cors: false,
+  });
+});
+
+test('production readiness can defer the browser-compatible version ladder until gateway rollout', async () => {
+  const requestLog = [];
+  const readiness = await waitForProductionDeploymentReadiness({
+    MATRIX_REMOTE_BASE_URL: 'https://matrix-gateway-worker-prod.matrixflare.workers.dev',
+    MATRIX_REMOTE_SERVER_NAME: 'matrix-gateway-worker-prod.matrixflare.workers.dev',
+    MATRIX_REMOTE_OPS_BASE_URL: 'https://matrix-ops-worker-prod.matrixflare.workers.dev',
+    MATRIX_REMOTE_OPS_ACCESS_CLIENT_ID: 'service-token-id.access',
+    MATRIX_REMOTE_OPS_ACCESS_CLIENT_SECRET: 'service-token-secret',
+  }, {
+    maxAttempts: 1,
+    requireBrowserCompatibleVersionLadder: false,
+    fetchImpl: async (url, init = {}) => {
+      const requestUrl = new URL(String(url));
+      requestLog.push({
+        pathname: requestUrl.pathname,
+        search: requestUrl.search,
+        headers: new Headers(init.headers),
+      });
+      if (requestUrl.pathname === '/_matrix/client/versions') {
+        return new Response(JSON.stringify({
+          versions: ['v1.17'],
+          unstable_features: {},
+        }), {
+          status: 200,
+          headers: {
+            'content-type': 'application/json',
+            'access-control-allow-origin': 'https://app.element.io',
+            vary: 'Origin',
+          },
+        });
+      }
+      if (requestUrl.pathname === '/_matrix/client/v3/publicRooms') {
+        return new Response(JSON.stringify({ chunk: [] }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (requestUrl.pathname === '/_matrix/client/v3/register') {
+        const body = JSON.parse(init.body);
+        if (body.auth == null) {
+          return new Response(JSON.stringify({
+            session: 'session-1',
+            flows: [{ stages: ['m.login.dummy'] }],
+          }), {
+            status: 401,
+            headers: { 'content-type': 'application/json' },
+          });
+        }
+        return new Response(JSON.stringify({
+          user_id: '@probe:matrixflare.test',
+          access_token: 'probe-access-token',
+        }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (requestUrl.pathname === '/_matrix/client/v3/sync') {
+        return new Response(JSON.stringify({ next_batch: 'batch-1' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (requestUrl.pathname === '/_matrix/media/v3/create') {
+        return new Response(JSON.stringify({ content_uri: 'mxc://matrixflare.test/media' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (requestUrl.pathname === '/_ops/v1/healthz') {
+        return new Response(JSON.stringify({ service: 'ops-worker', status: 'ok' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (requestUrl.pathname === '/_ops/v1/rebuilds') {
+        const idempotencyKey = new Headers(init.headers).get('Idempotency-Key');
+        return new Response(JSON.stringify({
+          job_id: 'job-1',
+          job_type: 'rebuild',
+          state: 'accepted',
+          idempotency_key_echo: idempotencyKey,
+        }), {
+          status: 202,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      throw new Error(`Unexpected request ${requestUrl.pathname}${requestUrl.search}`);
+    },
+  });
+
+  assert.equal(readiness.ready, true);
+  assert.equal(readiness.attempts[0].steps[0].step, 'versions');
+  assert.deepEqual(readiness.attempts[0].steps[0].detail, {
+    versions_count: 1,
+    browser_compatible_version_ladder: false,
+    browser_compatible_cors: true,
+  });
+  assert.equal(requestLog[0].headers.get('origin'), 'https://app.element.io');
+});
+
+test('production worker promotion readiness only requires the browser-compatible ladder for gateway-worker', () => {
+  assert.deepEqual(buildProductionWorkerPromotionReadinessOptions('jobs-worker'), {
+    requireBrowserCompatibleVersionLadder: false,
+  });
+  assert.deepEqual(buildProductionWorkerPromotionReadinessOptions('ops-worker'), {
+    requireBrowserCompatibleVersionLadder: false,
+  });
+  assert.deepEqual(buildProductionWorkerPromotionReadinessOptions('gateway-worker'), {
+    requireBrowserCompatibleVersionLadder: true,
+  });
+});
+
+test('production gateway rollout readiness only requires the browser-compatible ladder at 100 percent', () => {
+  assert.deepEqual(buildProductionGatewayRolloutReadinessOptions(10), {
+    requireBrowserCompatibleVersionLadder: false,
+  });
+  assert.deepEqual(buildProductionGatewayRolloutReadinessOptions(50), {
+    requireBrowserCompatibleVersionLadder: false,
+  });
+  assert.deepEqual(buildProductionGatewayRolloutReadinessOptions(100), {
+    requireBrowserCompatibleVersionLadder: true,
+  });
+});
+
 test('non-local deployment readiness refuses to probe staging without an Access session payload', async () => {
   await assert.rejects(
     () => waitForNonLocalDeploymentReadiness('staging', {
@@ -1569,9 +2178,14 @@ test('non-local deployment readiness probes authenticated ops health when Access
         },
       });
       if (requestUrl.pathname === '/_matrix/client/versions') {
-        return new Response(JSON.stringify({ versions: SUPPORTED_MATRIX_CLIENT_SPEC_VERSIONS }), {
+        assert.equal(headers.get('origin'), 'https://app.element.io');
+        return new Response(JSON.stringify({ versions: [...CLIENT_DISCOVERY_VERSIONS] }), {
           status: 200,
-          headers: { 'content-type': 'application/json' },
+          headers: {
+            'content-type': 'application/json',
+            'access-control-allow-origin': 'https://app.element.io',
+            vary: 'Origin',
+          },
         });
       }
       if (requestUrl.pathname === '/_matrix/client/v3/publicRooms') {
@@ -1681,9 +2295,14 @@ test('non-local deployment readiness reuses the same ops rebuild idempotency key
       const requestUrl = new URL(String(url));
       const headers = new Headers(init.headers ?? {});
       if (requestUrl.pathname === '/_matrix/client/versions') {
-        return new Response(JSON.stringify({ versions: SUPPORTED_MATRIX_CLIENT_SPEC_VERSIONS }), {
+        assert.equal(headers.get('origin'), 'https://app.element.io');
+        return new Response(JSON.stringify({ versions: [...CLIENT_DISCOVERY_VERSIONS] }), {
           status: 200,
-          headers: { 'content-type': 'application/json' },
+          headers: {
+            'content-type': 'application/json',
+            'access-control-allow-origin': 'https://app.element.io',
+            vary: 'Origin',
+          },
         });
       }
       if (requestUrl.pathname === '/_matrix/client/v3/publicRooms') {
@@ -3602,6 +4221,338 @@ test('production automation builders fail closed on missing reviewed candidate o
     valid: true,
     error: null,
   });
+});
+
+test('production current state snapshot records baseline drift with observed Cloudflare worker state', () => {
+  const baselineRecord = buildProdInstallRecord({
+    releaseCommitSha: '0123456789abcdef0123456789abcdef01234567',
+    provisionedEnvironment: buildProductionProvisioningFixture(),
+    deploymentSummary: buildProductionDeploymentSummaryFixture(),
+    originRunIdentity: buildProducerRunIdentityFixture(),
+    installId: 'install-prod-topology-v1',
+    installedAt: '2026-04-05T04:55:43.000Z',
+  });
+
+  const snapshot = buildProductionCurrentStateSnapshot({
+    baselineRecord,
+    currentObservation: {
+      observed_at: '2026-04-06T08:28:40.000Z',
+      environment_id: 'prod',
+      current_deployment_identity: {
+        environment_id: 'prod',
+        deployment_ids: ['jobs-prod-deployment-v2', 'ops-prod-deployment-v1', 'gateway-prod-deployment-v1'],
+        worker_version_ids: ['jobs@prod-v2', 'ops@prod-v1', 'gateway@prod-v1'],
+      },
+      problems: [],
+      workers: {
+        'jobs-worker': {
+          worker_name: 'jobs-worker',
+          script_name: 'matrix-jobs-worker-prod',
+          latest_active_deployment_id: 'jobs-prod-deployment-v2',
+          deployment_ids: ['jobs-prod-deployment-v2', 'jobs-prod-deployment-v1'],
+          active_worker_version_ids: ['jobs@prod-v2'],
+          worker_version_ids: ['jobs@prod-v2', 'jobs@prod-v1'],
+          raw_cloudflare_api_results: {
+            deployments: {
+              deployments: [
+                { id: 'jobs-prod-deployment-v2', versions: [{ version_id: 'jobs@prod-v2' }] },
+              ],
+            },
+            versions: {
+              items: [
+                { id: 'jobs@prod-v2', annotations: { workers_tag: 'mx-jw-d-prod2' } },
+              ],
+            },
+          },
+          error: null,
+        },
+        'ops-worker': {
+          worker_name: 'ops-worker',
+          script_name: 'matrix-ops-worker-prod',
+          latest_active_deployment_id: 'ops-prod-deployment-v1',
+          deployment_ids: ['ops-prod-deployment-v1'],
+          active_worker_version_ids: ['ops@prod-v1'],
+          worker_version_ids: ['ops@prod-v1'],
+          raw_cloudflare_api_results: null,
+          error: null,
+        },
+        'gateway-worker': {
+          worker_name: 'gateway-worker',
+          script_name: 'matrix-gateway-worker-prod',
+          latest_active_deployment_id: 'gateway-prod-deployment-v1',
+          deployment_ids: ['gateway-prod-deployment-v1'],
+          active_worker_version_ids: ['gateway@prod-v1'],
+          worker_version_ids: ['gateway@prod-v1'],
+          raw_cloudflare_api_results: null,
+          error: null,
+        },
+      },
+    },
+  });
+
+  assert.equal(snapshot.baseline_record.artifact_id, 'prod_install_record');
+  assert.equal(snapshot.baseline_match.matches, false);
+  assert.deepEqual(snapshot.baseline_match.mismatched_fields, ['deployment_ids', 'worker_version_ids']);
+  assert.deepEqual(snapshot.baseline_match.problems, []);
+  assert.equal(
+    snapshot.current_deployment_observation.workers['jobs-worker'].raw_cloudflare_api_results.deployments.deployments[0].id,
+    'jobs-prod-deployment-v2',
+  );
+});
+
+test('production current state snapshot stays fail-closed when current identity cannot be normalized', () => {
+  const baselineRecord = buildProdInstallRecord({
+    releaseCommitSha: '0123456789abcdef0123456789abcdef01234567',
+    provisionedEnvironment: buildProductionProvisioningFixture(),
+    deploymentSummary: buildProductionDeploymentSummaryFixture(),
+    originRunIdentity: buildProducerRunIdentityFixture(),
+    installId: 'install-prod-topology-v1',
+    installedAt: '2026-04-05T04:55:43.000Z',
+  });
+
+  const snapshot = buildProductionCurrentStateSnapshot({
+    baselineRecord,
+    currentObservation: {
+      observed_at: '2026-04-06T08:28:40.000Z',
+      environment_id: 'prod',
+      current_deployment_identity: null,
+      problems: ['Cloudflare must expose exactly one active worker version id for matrix-gateway-worker-prod before production promotion'],
+      workers: {
+        'jobs-worker': {
+          worker_name: 'jobs-worker',
+          script_name: 'matrix-jobs-worker-prod',
+          latest_active_deployment_id: 'jobs-prod-deployment-v2',
+          deployment_ids: ['jobs-prod-deployment-v2'],
+          active_worker_version_ids: ['jobs@prod-v2'],
+          worker_version_ids: ['jobs@prod-v2'],
+          raw_cloudflare_api_results: null,
+          error: null,
+        },
+        'ops-worker': {
+          worker_name: 'ops-worker',
+          script_name: 'matrix-ops-worker-prod',
+          latest_active_deployment_id: 'ops-prod-deployment-v2',
+          deployment_ids: ['ops-prod-deployment-v2'],
+          active_worker_version_ids: ['ops@prod-v2'],
+          worker_version_ids: ['ops@prod-v2'],
+          raw_cloudflare_api_results: null,
+          error: null,
+        },
+        'gateway-worker': {
+          worker_name: 'gateway-worker',
+          script_name: 'matrix-gateway-worker-prod',
+          latest_active_deployment_id: 'gateway-prod-deployment-v2',
+          deployment_ids: ['gateway-prod-deployment-v2'],
+          active_worker_version_ids: ['gateway@prod-v2', 'gateway@prod-v1'],
+          worker_version_ids: ['gateway@prod-v2', 'gateway@prod-v1'],
+          raw_cloudflare_api_results: null,
+          error: null,
+        },
+      },
+    },
+  });
+
+  assert.equal(snapshot.baseline_match.matches, false);
+  assert.deepEqual(snapshot.baseline_match.mismatched_fields, ['current_deployment_identity_unavailable']);
+  assert.deepEqual(snapshot.baseline_match.problems, [
+    'Cloudflare must expose exactly one active worker version id for matrix-gateway-worker-prod before production promotion',
+  ]);
+});
+
+test('production current state snapshot retains partially successful Cloudflare backreads on normalization failure', () => {
+  const baselineRecord = buildProdInstallRecord({
+    releaseCommitSha: '0123456789abcdef0123456789abcdef01234567',
+    provisionedEnvironment: buildProductionProvisioningFixture(),
+    deploymentSummary: buildProductionDeploymentSummaryFixture(),
+    originRunIdentity: buildProducerRunIdentityFixture(),
+    installId: 'install-prod-topology-v1',
+    installedAt: '2026-04-05T04:55:43.000Z',
+  });
+
+  const snapshot = buildProductionCurrentStateSnapshot({
+    baselineRecord,
+    currentObservation: {
+      observed_at: '2026-04-06T08:28:40.000Z',
+      environment_id: 'prod',
+      current_deployment_identity: null,
+      problems: ['Failed to observe current Cloudflare state for matrix-ops-worker-prod: Cloudflare API GET /workers/scripts/matrix-ops-worker-prod/versions failed: versions API temporarily unavailable'],
+      workers: {
+        'jobs-worker': {
+          worker_name: 'jobs-worker',
+          script_name: 'matrix-jobs-worker-prod',
+          latest_active_deployment_id: 'jobs-prod-deployment-v1',
+          deployment_ids: ['jobs-prod-deployment-v1'],
+          active_worker_version_ids: ['jobs@prod-v1'],
+          worker_version_ids: ['jobs@prod-v1'],
+          raw_cloudflare_api_results: null,
+          error: null,
+        },
+        'ops-worker': {
+          worker_name: 'ops-worker',
+          script_name: 'matrix-ops-worker-prod',
+          latest_active_deployment_id: 'ops-prod-deployment-v2',
+          deployment_ids: ['ops-prod-deployment-v2'],
+          active_worker_version_ids: ['ops@prod-v2'],
+          worker_version_ids: [],
+          raw_cloudflare_api_results: {
+            deployments: {
+              deployments: [
+                { id: 'ops-prod-deployment-v2', versions: [{ version_id: 'ops@prod-v2' }] },
+              ],
+            },
+            versions: null,
+          },
+          error: {
+            message: 'Cloudflare API GET /workers/scripts/matrix-ops-worker-prod/versions failed: versions API temporarily unavailable',
+            response_status: 500,
+          },
+        },
+        'gateway-worker': {
+          worker_name: 'gateway-worker',
+          script_name: 'matrix-gateway-worker-prod',
+          latest_active_deployment_id: 'gateway-prod-deployment-v1',
+          deployment_ids: ['gateway-prod-deployment-v1'],
+          active_worker_version_ids: ['gateway@prod-v1'],
+          worker_version_ids: ['gateway@prod-v1'],
+          raw_cloudflare_api_results: null,
+          error: null,
+        },
+      },
+    },
+  });
+
+  assert.equal(snapshot.baseline_match.matches, false);
+  assert.deepEqual(snapshot.baseline_match.mismatched_fields, ['current_deployment_identity_unavailable']);
+  assert.equal(
+    snapshot.current_deployment_observation.workers['ops-worker'].raw_cloudflare_api_results.deployments.deployments[0].id,
+    'ops-prod-deployment-v2',
+  );
+  assert.equal(
+    snapshot.current_deployment_observation.workers['ops-worker'].latest_active_deployment_id,
+    'ops-prod-deployment-v2',
+  );
+  assert.deepEqual(
+    snapshot.current_deployment_observation.workers['ops-worker'].active_worker_version_ids,
+    ['ops@prod-v2'],
+  );
+  assert.equal(
+    snapshot.current_deployment_observation.workers['ops-worker'].raw_cloudflare_api_results.versions,
+    null,
+  );
+});
+
+test('observeProductionInstallTopologyState retains raw Cloudflare worker state for active-topology install blockers', async () => {
+  const originalFetch = globalThis.fetch;
+
+  try {
+    globalThis.fetch = async (url) => {
+      const pathname = new URL(String(url)).pathname;
+      if (pathname.includes('/workers/scripts/matrix-jobs-worker-prod/deployments')) {
+        return new Response(JSON.stringify({
+          success: true,
+          result: {
+            deployments: [
+              { id: 'jobs-prod-deployment-v1', versions: [{ version_id: 'jobs@prod-v1' }] },
+            ],
+          },
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      if (pathname.includes('/workers/scripts/matrix-jobs-worker-prod/versions')) {
+        return new Response(JSON.stringify({
+          success: true,
+          result: {
+            items: [
+              { id: 'jobs@prod-v1', annotations: { workers_tag: 'mx-jw-d-prod1' } },
+            ],
+          },
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      if (pathname.includes('/workers/scripts/matrix-ops-worker-prod/')) {
+        return new Response(JSON.stringify({
+          success: false,
+          errors: [{ message: 'This Worker does not exist on your account.' }],
+        }), { status: 404, headers: { 'content-type': 'application/json' } });
+      }
+      if (pathname.includes('/workers/scripts/matrix-gateway-worker-prod/deployments')) {
+        return new Response(JSON.stringify({
+          success: true,
+          result: {
+            deployments: [
+              { id: 'gateway-prod-deployment-v1', versions: [{ version_id: 'gateway@prod-v1' }] },
+            ],
+          },
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      if (pathname.includes('/workers/scripts/matrix-gateway-worker-prod/versions')) {
+        return new Response(JSON.stringify({
+          success: true,
+          result: {
+            items: [
+              { id: 'gateway@prod-v1', annotations: { workers_tag: 'mx-gw-d-prod1' } },
+            ],
+          },
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      throw new Error(`Unexpected Cloudflare API request in test: ${pathname}`);
+    };
+
+    const observation = await observeProductionInstallTopologyState({
+      accountId: 'cf-account',
+      apiToken: 'cf-token',
+    });
+
+    assert.deepEqual(observation.problems, []);
+    assert.deepEqual(
+      observation.active_workers.map((entry) => entry.script_name),
+      ['matrix-jobs-worker-prod', 'matrix-gateway-worker-prod'],
+    );
+    assert.equal(observation.workers['jobs-worker'].latest_active_deployment_id, 'jobs-prod-deployment-v1');
+    assert.deepEqual(
+      observation.workers['jobs-worker'].raw_cloudflare_api_results.deployments.deployments,
+      [{ id: 'jobs-prod-deployment-v1', versions: [{ version_id: 'jobs@prod-v1' }] }],
+    );
+    assert.equal(observation.workers['ops-worker'].latest_active_deployment_id, null);
+    assert.deepEqual(observation.workers['ops-worker'].deployment_ids, []);
+    assert.equal(observation.workers['ops-worker'].raw_cloudflare_api_results, null);
+    assert.equal(observation.workers['gateway-worker'].latest_active_deployment_id, 'gateway-prod-deployment-v1');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('production automation runtime paths persist current-production-state blocker snapshots before guard failures', async () => {
+  const source = await fs.readFile(new URL('../../../packages/testing/src/nonlocal.mjs', import.meta.url), 'utf8');
+
+  assert.match(
+    source,
+    /const currentStateSnapshotPath = path\.join\(resolvedWorkingRoot, 'current-production-state\.json'\);\s+await assertProductionTopologyInstallAllowed\(\{\s+accountId,\s+apiToken,\s+observedStatePath: currentStateSnapshotPath,/su,
+    'prod-install must capture current-production-state.json before the active-topology guard can fail closed',
+  );
+  assert.match(
+    source,
+    /export async function promoteProductionEnvironment[\s\S]*?const currentStateSnapshotPath = path\.join\(resolvedWorkingRoot, 'current-production-state\.json'\);\s+const currentObservation = await observeProductionCurrentCloudflareState\(resolvedBaselineRecord,[\s\S]*?await writeProductionCurrentStateSnapshot\(\{\s+baselineRecord: resolvedBaselineRecord,\s+currentObservation,\s+outputPath: currentStateSnapshotPath,[\s\S]*?assertProductionBaselineMatchesCurrentIdentity\(resolvedBaselineRecord, currentIdentity, \{\s+observedStatePath: currentStateSnapshotPath,/su,
+    'promote-prod must persist current-production-state.json before failing closed on baseline/current drift',
+  );
+  assert.match(
+    source,
+    /export async function operationalRefreshProductionEnvironment[\s\S]*?const currentStateSnapshotPath = path\.join\(resolvedWorkingRoot, 'current-production-state\.json'\);\s+const currentObservation = await observeProductionCurrentCloudflareState\(resolvedBaselineRecord,[\s\S]*?await writeProductionCurrentStateSnapshot\(\{\s+baselineRecord: resolvedBaselineRecord,\s+currentObservation,\s+outputPath: currentStateSnapshotPath,[\s\S]*?assertProductionBaselineMatchesCurrentIdentity\(resolvedBaselineRecord, currentIdentity, \{\s+observedStatePath: currentStateSnapshotPath,/su,
+    'operational-prod-refresh must persist current-production-state.json before failing closed on baseline/current drift',
+  );
+  assert.match(
+    source,
+    /const currentStateSnapshotPath = path\.join\(resolvedWorkingRoot, 'current-production-state\.json'\);\s+const currentObservation = await observeProductionCurrentCloudflareState\(promotionRecord,/su,
+    'rollback-prod must observe current production state before checking promotionRecord drift',
+  );
+  assert.match(
+    source,
+    /await writeProductionCurrentStateSnapshot\(\{\s+baselineRecord: promotionRecord,\s+currentObservation,\s+outputPath: currentStateSnapshotPath,/su,
+    'rollback-prod must persist current-production-state.json before failing closed on current-state drift',
+  );
+  assert.match(
+    source,
+    /assertProductionRecordedIdentityMatchesCurrent\(\s+promotionRecord\.current_deployment_identity,\s+currentIdentity,\s+'promotionRecord\.current_deployment_identity',\s+\{\s+observedStatePath: currentStateSnapshotPath,/su,
+    'rollback-prod drift guard must mention the retained current-production-state artifact',
+  );
 });
 
 test('production workflow YAMLs stay aligned with the prod automation CLI contract', async () => {

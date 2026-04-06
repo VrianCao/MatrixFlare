@@ -2,6 +2,7 @@ import { createHmac } from 'node:crypto';
 
 import { createCanonicalFilterHash } from './fingerprints.mjs';
 import { normalizeInteger, normalizeString } from './persistence-common.mjs';
+import { DEFAULT_ROOM_VERSION, SUPPORTED_ROOM_VERSIONS } from './room-domain.mjs';
 import { observeMetric, setGaugeMetric } from './telemetry.mjs';
 import { parseSessionRootKeyRing } from './user-identity.mjs';
 
@@ -414,11 +415,19 @@ export function validateProfileFieldValue(keyName, value) {
 }
 
 export function buildProfileCapabilities() {
+  const roomVersions = {};
+  for (const roomVersion of SUPPORTED_ROOM_VERSIONS) {
+    roomVersions[roomVersion] = 'stable';
+  }
   return {
     'm.change_password': { enabled: true },
     'm.3pid_changes': { enabled: false },
     'm.get_login_token': { enabled: false },
     'm.profile_fields': { enabled: true },
+    'm.room_versions': {
+      default: DEFAULT_ROOM_VERSION,
+      available: roomVersions,
+    },
     'm.set_avatar_url': { enabled: true },
     'm.set_displayname': { enabled: true },
   };

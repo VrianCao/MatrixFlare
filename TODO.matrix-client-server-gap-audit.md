@@ -198,6 +198,24 @@
   `spec/framework/44-verification-and-evidence-register.md`
   [`TODO.md`](/root/Matrix/TODO.md)
 
+### 10. `GET /capabilities` 若省略 `m.room_versions`，当前 browser client 会回退到 legacy room version `1`
+
+- [x] `CS-GAP-010` 为 `m.room_versions` capability truth 建立本地显式覆盖。
+  Official basis:
+  官方 Matrix `v1.17` Client-Server API 在 capabilities section 明确给出 `m.room_versions`，用于告知客户端默认 room version 与可用 room version 集合。
+  Historical pre-closure status:
+  本地 `GET /_matrix/client/*/capabilities` 曾只返回 `m.change_password`、`m.3pid_changes`、`m.get_login_token`、`m.profile_fields`、`m.set_avatar_url`、`m.set_displayname`，没有显式暴露 `m.room_versions`。真实 browser E2E 因此在 `createRoom` 时退回到 legacy room version `1`，并收到 `400 Unsupported room version: 1`。
+  Closure delivered:
+  已把 `12/23/30/31/43/44`、`TODO.md`、本地 `phase-04` 测试以及 `CI + staging` dedicated canonical `TEST-CS-001` 断言同步补到 `m.room_versions.default = 12` 且 `available.{11,12} = stable`；`packages/runtime-core/src/client-domain.mjs` 现也按 room-domain truth 生成该 capability，避免 browser client 因 capability 缺失回退到不受支持的 room version。
+  Artifact targets:
+  `spec/framework/12-matrix-protocol-compliance-profile.md`
+  `spec/framework/23-interface-contract-catalog.md`
+  `spec/framework/30-client-identity-and-sync.md`
+  `spec/framework/31-room-processing-and-room-versions.md`
+  `spec/framework/43-testing-and-compliance.md`
+  `spec/framework/44-verification-and-evidence-register.md`
+  [`TODO.md`](/root/Matrix/TODO.md)
+
 ## Execution Rule
 
 当上述任一项真正进入主线补全时，必须在同一变更集中同步：

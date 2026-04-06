@@ -2,9 +2,29 @@ import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
 import test from 'node:test';
 
-import { SUPPORTED_MATRIX_CLIENT_SPEC_VERSIONS } from '../../../packages/runtime-core/src/client-domain.mjs';
 import { parseSessionRootKeyRing } from '../../../packages/runtime-core/src/user-identity.mjs';
 import { createGatewayPhase04Rig } from './support.mjs';
+
+const CLIENT_DISCOVERY_VERSIONS = Object.freeze([
+  'r0.6.1',
+  'v1.1',
+  'v1.2',
+  'v1.3',
+  'v1.4',
+  'v1.5',
+  'v1.6',
+  'v1.7',
+  'v1.8',
+  'v1.9',
+  'v1.10',
+  'v1.11',
+  'v1.12',
+  'v1.13',
+  'v1.14',
+  'v1.15',
+  'v1.16',
+  'v1.17',
+]);
 
 async function expectMatrixError(response, status, errcode) {
   assert.equal(response.status, status);
@@ -171,7 +191,7 @@ test('Phase 04 discovery surfaces return spec-aligned truth', async (t) => {
   const versions = await rig.gatewayFetch('/_matrix/client/versions');
   assert.equal(versions.status, 200);
   assert.deepEqual(await versions.json(), {
-    versions: SUPPORTED_MATRIX_CLIENT_SPEC_VERSIONS,
+    versions: [...CLIENT_DISCOVERY_VERSIONS],
     unstable_features: {},
   });
 
@@ -259,6 +279,10 @@ test('Phase 04 discovery and login surfaces serve browser CORS and preflight tru
   assert.equal(versions.status, 200);
   assert.equal(versions.headers.get('access-control-allow-origin'), browserOrigin);
   assert.match(versions.headers.get('vary') ?? '', /Origin/i);
+  assert.deepEqual(await versions.json(), {
+    versions: [...CLIENT_DISCOVERY_VERSIONS],
+    unstable_features: {},
+  });
 
   const loginFlows = await rig.gatewayFetch('/_matrix/client/v3/login', {
     headers: {
@@ -287,6 +311,15 @@ test('Phase 04 discovery and login surfaces serve browser CORS and preflight tru
   assert.equal(registerFlows.headers.get('access-control-allow-origin'), browserOrigin);
   assert.match(registerFlows.headers.get('vary') ?? '', /Origin/i);
 
+  const registerFlowsV1 = await rig.gatewayFetch('/_matrix/client/v1/register', {
+    headers: {
+      origin: browserOrigin,
+    },
+  });
+  assert.equal(registerFlowsV1.status, 200);
+  assert.equal(registerFlowsV1.headers.get('access-control-allow-origin'), browserOrigin);
+  assert.match(registerFlowsV1.headers.get('vary') ?? '', /Origin/i);
+
   const clientWellKnown = await rig.gatewayFetch('/.well-known/matrix/client', {
     headers: {
       origin: browserOrigin,
@@ -294,6 +327,22 @@ test('Phase 04 discovery and login surfaces serve browser CORS and preflight tru
   });
   assert.equal(clientWellKnown.status, 200);
   assert.equal(clientWellKnown.headers.get('access-control-allow-origin'), browserOrigin);
+  assert.match(clientWellKnown.headers.get('vary') ?? '', /Origin/i);
+
+  const clientWellKnownPreflight = await rig.gatewayFetch('/.well-known/matrix/client', {
+    method: 'OPTIONS',
+    headers: {
+      origin: browserOrigin,
+      'access-control-request-method': 'GET',
+      'access-control-request-headers': 'x-matrix-client',
+    },
+  });
+  assert.equal(clientWellKnownPreflight.status, 204);
+  assert.equal(clientWellKnownPreflight.headers.get('access-control-allow-origin'), browserOrigin);
+  assert.equal(clientWellKnownPreflight.headers.get('access-control-allow-headers'), 'x-matrix-client');
+  assert.match(clientWellKnownPreflight.headers.get('access-control-allow-methods') ?? '', /\bGET\b/);
+  assert.match(clientWellKnownPreflight.headers.get('vary') ?? '', /Origin/i);
+  assert.match(clientWellKnownPreflight.headers.get('vary') ?? '', /Access-Control-Request-Headers/i);
 
   const serverWellKnown = await rig.gatewayFetch('/.well-known/matrix/server', {
     headers: {
@@ -302,6 +351,21 @@ test('Phase 04 discovery and login surfaces serve browser CORS and preflight tru
   });
   assert.equal(serverWellKnown.status, 200);
   assert.equal(serverWellKnown.headers.get('access-control-allow-origin'), null);
+
+  const versionsPreflight = await rig.gatewayFetch('/_matrix/client/versions', {
+    method: 'OPTIONS',
+    headers: {
+      origin: browserOrigin,
+      'access-control-request-method': 'GET',
+      'access-control-request-headers': 'x-matrix-client',
+    },
+  });
+  assert.equal(versionsPreflight.status, 204);
+  assert.equal(versionsPreflight.headers.get('access-control-allow-origin'), browserOrigin);
+  assert.equal(versionsPreflight.headers.get('access-control-allow-headers'), 'x-matrix-client');
+  assert.match(versionsPreflight.headers.get('access-control-allow-methods') ?? '', /\bGET\b/);
+  assert.match(versionsPreflight.headers.get('vary') ?? '', /Origin/i);
+  assert.match(versionsPreflight.headers.get('vary') ?? '', /Access-Control-Request-Headers/i);
 
   const preflight = await rig.gatewayFetch('/_matrix/client/v3/login', {
     method: 'OPTIONS',
@@ -318,37 +382,32 @@ test('Phase 04 discovery and login surfaces serve browser CORS and preflight tru
   assert.match(preflight.headers.get('vary') ?? '', /Origin/i);
   assert.match(preflight.headers.get('vary') ?? '', /Access-Control-Request-Headers/i);
 
-  const missingUsername = await rig.gatewayFetch('/_matrix/client/v3/register/available', {
-    headers: {
-      origin: browserOrigin,
-    },
-  });
-  assert.equal(missingUsername.status, 400);
-  assert.equal(missingUsername.headers.get('access-control-allow-origin'), browserOrigin);
+  for (const availabilityPath of REGISTER_AVAILABILITY_ALIAS_PATHS) {
+    const availability = await rig.gatewayFetch(`${availabilityPath}?username=browser-check`, {
+      headers: {
+        origin: browserOrigin,
+      },
+    });
+    assert.equal(availability.status, 200);
+    assert.equal(availability.headers.get('access-control-allow-origin'), browserOrigin);
+    assert.match(availability.headers.get('vary') ?? '', /Origin/i);
+    assert.deepEqual(await availability.json(), { available: true });
+  }
 
-  const legacyMediaConfig = await rig.gatewayFetch('/_matrix/media/v3/config', {
-    headers: {
-      origin: browserOrigin,
-      authorization: 'Bearer browser-cors-probe',
-    },
-  });
-  assert.equal(legacyMediaConfig.status, 401);
-  assert.equal(legacyMediaConfig.headers.get('access-control-allow-origin'), browserOrigin);
-
-  const legacyMediaPreflight = await rig.gatewayFetch('/_matrix/media/v3/config', {
+  const availabilityPreflight = await rig.gatewayFetch('/_matrix/client/v1/register/available', {
     method: 'OPTIONS',
     headers: {
       origin: browserOrigin,
       'access-control-request-method': 'GET',
-      'access-control-request-headers': 'authorization',
+      'access-control-request-headers': 'x-matrix-client',
     },
   });
-  assert.equal(legacyMediaPreflight.status, 204);
-  assert.equal(legacyMediaPreflight.headers.get('access-control-allow-origin'), browserOrigin);
-  assert.equal(legacyMediaPreflight.headers.get('access-control-allow-headers'), 'authorization');
-  assert.match(legacyMediaPreflight.headers.get('access-control-allow-methods') ?? '', /\bGET\b/);
-  assert.match(legacyMediaPreflight.headers.get('vary') ?? '', /Origin/i);
-  assert.match(legacyMediaPreflight.headers.get('vary') ?? '', /Access-Control-Request-Headers/i);
+  assert.equal(availabilityPreflight.status, 204);
+  assert.equal(availabilityPreflight.headers.get('access-control-allow-origin'), browserOrigin);
+  assert.equal(availabilityPreflight.headers.get('access-control-allow-headers'), 'x-matrix-client');
+  assert.match(availabilityPreflight.headers.get('access-control-allow-methods') ?? '', /\bGET\b/);
+  assert.match(availabilityPreflight.headers.get('vary') ?? '', /Origin/i);
+  assert.match(availabilityPreflight.headers.get('vary') ?? '', /Access-Control-Request-Headers/i);
 });
 
 test('Phase 04 compatibility aliases preserve register availability, UIA, and session parity across r0/v1/v3', async (t) => {
@@ -497,6 +556,13 @@ test('Phase 04 session lifecycle covers register, login, refresh, logout, whoami
       'm.3pid_changes': { enabled: false },
       'm.get_login_token': { enabled: false },
       'm.profile_fields': { enabled: true },
+      'm.room_versions': {
+        default: '12',
+        available: {
+          '11': 'stable',
+          '12': 'stable',
+        },
+      },
       'm.set_avatar_url': { enabled: true },
       'm.set_displayname': { enabled: true },
     },

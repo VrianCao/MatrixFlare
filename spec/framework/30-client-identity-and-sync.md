@@ -54,7 +54,8 @@
 * `/.well-known/matrix/client`、`/_matrix/client/versions`、`/_matrix/client/*`，以及 browser-readable 的 `/_matrix/media/*` 兼容 surface，在收到合法 browser `Origin` 时都必须返回一致的 CORS allow-origin 语义，避免 Web client 因跨域读取被阻断。
 * 对这些路由族所需的 `OPTIONS` preflight，`gateway-worker` 必须直接返回 `2xx/204` CORS 响应；不得把预检请求落到 route-specific `M_UNRECOGNIZED`、plain-text `404` 或 auth gate。
 * 该要求只适用于公开 Matrix client ingress；不得借此把受保护的 `/_ops` 或其它非 Matrix 管理面扩大成 browser-readable public surface。
-* `GET /_matrix/client/versions` 必须枚举当前 profile 真正宣称支持的稳定版本阶梯；当前 `L1-L3` 基线为 `v1.1`~`v1.17`，不得只返回 bare latest version，因为当前 browser SDK 会对该数组做 exact-match homeserver validation。
+* `GET /_matrix/client/versions` 必须返回 pinned Matrix `v1.17`，并同时保留当前 browser-client 兼容所需的 cumulative stable version ladder：至少包括 `r0.6.1` 与 `v1.1` 到 `v1.17`。只返回最新 pinned stable version 会让当前官方 browser client baseline 把 homeserver 误判为“不满足最低 API 版本”。
+* 该 ladder 的语义受 [DEC-0007](/root/Matrix/spec/decisions/DEC-0007.md) 约束：它是 browser compatibility discovery contract，而不是对全部历史 stable optional surfaces 的无条件启用声明；stub-only / unsupported truth 仍由对应 `MX-*`、`IF-*`、`TEST-*`、`EVID-*` 与 `DEC-0001` 控制。
 
 ## 3. 用户、设备与会话模型
 
@@ -184,9 +185,15 @@
 
 ### 4.7 注销
 
-* `logout` 只撤销当前 session。
-* `logout/all` 撤销全部 session，并强制后续 access token 失效。
+* `POST /_matrix/client/*/logout` 只撤销当前 session。
+* `POST /_matrix/client/*/logout/all` 撤销全部 session，并强制后续 access token 失效。
 * 注销不删除 device；设备删除是单独操作。
+
+### 4.8 `whoami`
+
+* `GET /_matrix/client/*/account/whoami` 必须返回当前 access token 绑定的 `user_id`，并在存在 device 绑定时返回与该 session 真值一致的 `device_id`。
+* `whoami` 必须与 `IF-INT-USER-001` / `STATE-USER-SESSION` 使用同一 session 权威路径，不得在 `gateway-worker` 本地缓存或推断主体真值。
+* 当 access token 已失效、被 `logout`/`logout/all` 撤销，或其所属账户已停用时，`whoami` 必须返回与同一 session 解析路径一致的鉴权失败，而不是继续泄露旧主体。
 
 ## 5. 能力声明、Device Management、Profile、账号数据、Push Rules、To-Device 与 Presence
 
@@ -199,6 +206,7 @@
 * 当 `MX-CS-005` 默认关闭时，`GET /_matrix/client/*/capabilities` 必须显式返回 `m.3pid_changes.enabled = false`，避免客户端按“未列出即默认可改”误判。
 * 当 `MX-CS-003` 默认关闭时，`GET /_matrix/client/*/capabilities` 必须显式返回 `m.get_login_token.enabled = false`。
 * `m.profile_fields`、`m.set_avatar_url`、`m.set_displayname`、room versions 等 capability 不得“宣称支持但写路径拒绝”。
+* `GET /_matrix/client/*/capabilities` 在 `L1-L3` 下必须显式返回 `m.room_versions`，且至少包含 `default = 12` 与 `available.{11,12} = stable`。省略该 capability 会让当前 browser client 回退到 legacy room-version 默认值，并把新建房间错误地请求为 room version `1`。
 * stored filters 的权威表是 `DATA-USER-014`。
 * filter 创建时必须按 [22-data-consistency-and-routing.md](/root/Matrix/spec/framework/22-data-consistency-and-routing.md) 的非事件 JSON canonicalization 规则处理 JSON，再生成稳定 hash 和 `filter_id`；`filter_id` 不得以 `{` 开头。
 * `GET /_matrix/client/*/sync` 的 `filter` 查询参数必须按首字符解释：若首字符是 `{`，则视为 inline JSON filter string；否则视为此前创建的 stored `filter_id`。
@@ -494,7 +502,7 @@ membership 到 `/sync` bucket 的映射必须固定为：
 
 | Capability | Public IF | Internal IF | Primary Data |
 | --- | --- | --- | --- |
-| register availability + register/login/logout/refresh | `IF-CS-009`,`IF-CS-010`,`IF-CS-011`,`IF-CS-012`,`IF-CS-013` | `IF-INT-USER-001` | `DATA-USER-001`,`DATA-USER-017`,`DATA-ID-006` |
+| register discovery/availability + login discovery/exchange + logout/refresh/whoami | `IF-CS-005`,`IF-CS-009`,`IF-CS-010`,`IF-CS-011`,`IF-CS-012`,`IF-CS-013`,`IF-CS-014`,`IF-CS-067` | `IF-INT-USER-001` | `DATA-USER-001`,`DATA-USER-017`,`DATA-ID-006` |
 | password change / deactivate | `IF-CS-006`,`IF-CS-008` | `IF-INT-USER-001` | `DATA-ID-006`,`DATA-USER-001`,`DATA-USER-017` |
 | registration/password-reset requestToken bootstrap | `IF-CS-007` | none | `none` |
 | capabilities / filters | `IF-CS-002`,`IF-CS-003`,`IF-CS-004` | none | `DATA-USER-014` |

@@ -19,7 +19,26 @@ import {
   syncRequest,
 } from './support.mjs';
 
-const EXPECTED_MATRIX_CLIENT_SPEC_VERSIONS = Object.freeze([
+const REGISTER_ALIAS_PATHS = Object.freeze([
+  '/_matrix/client/r0/register',
+  '/_matrix/client/v1/register',
+  '/_matrix/client/v3/register',
+]);
+
+const REGISTER_AVAILABILITY_ALIAS_PATHS = Object.freeze([
+  '/_matrix/client/r0/register/available',
+  '/_matrix/client/v1/register/available',
+  '/_matrix/client/v3/register/available',
+]);
+
+const LOGIN_ALIAS_PATHS = Object.freeze([
+  '/_matrix/client/r0/login',
+  '/_matrix/client/v1/login',
+  '/_matrix/client/v3/login',
+]);
+
+const CLIENT_DISCOVERY_VERSIONS = Object.freeze([
+  'r0.6.1',
   'v1.1',
   'v1.2',
   'v1.3',
@@ -39,23 +58,35 @@ const EXPECTED_MATRIX_CLIENT_SPEC_VERSIONS = Object.freeze([
   'v1.17',
 ]);
 
-const REGISTER_ALIAS_PATHS = Object.freeze([
-  '/_matrix/client/r0/register',
-  '/_matrix/client/v1/register',
-  '/_matrix/client/v3/register',
-]);
+function assertCacheControl(result, expectedValue) {
+  assert.equal(result.response.headers.get('cache-control'), expectedValue);
+}
 
-const REGISTER_AVAILABILITY_ALIAS_PATHS = Object.freeze([
-  '/_matrix/client/r0/register/available',
-  '/_matrix/client/v1/register/available',
-  '/_matrix/client/v3/register/available',
-]);
+async function exhaustPublicEntryLimiter(harness, seedPath) {
+  let limited = null;
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    const probe = await request(harness, seedPath);
+    if (probe.response.status === 429) {
+      limited = probe;
+      break;
+    }
+    assert.equal(probe.response.status, 200);
+  }
+  assert.notEqual(limited, null, `Expected anonymous public-entry limiter to yield 429 for ${seedPath}`);
+  await expectMatrixError(limited, 429, 'M_LIMIT_EXCEEDED');
+  return limited;
+}
 
-const LOGIN_ALIAS_PATHS = Object.freeze([
-  '/_matrix/client/r0/login',
-  '/_matrix/client/v1/login',
-  '/_matrix/client/v3/login',
-]);
+async function assertEventuallyAnonymousPublicEntryLimited(harness, pathname) {
+  return eventually(async () => {
+    const probe = await request(harness, pathname);
+    await expectMatrixError(probe, 429, 'M_LIMIT_EXCEEDED');
+    return probe;
+  }, {
+    attempts: 8,
+    delayMs: 250,
+  });
+}
 
 test('TEST-CS-001 staging covers discovery, session lifecycle, and capability truth', async (context) => {
   const harness = requireRemoteHarnessContext(context, 'staging');
@@ -80,7 +111,7 @@ test('TEST-CS-001 staging covers discovery, session lifecycle, and capability tr
   const versions = await request(harness, '/_matrix/client/versions');
   assert.equal(versions.response.status, 200);
   assert.deepEqual(versions.payload, {
-    versions: EXPECTED_MATRIX_CLIENT_SPEC_VERSIONS,
+    versions: [...CLIENT_DISCOVERY_VERSIONS],
     unstable_features: {},
   });
 
@@ -99,36 +130,72 @@ test('TEST-CS-001 staging covers discovery, session lifecycle, and capability tr
     },
   });
   assert.equal(browserVersions.response.status, 200);
-  assert.deepEqual(browserVersions.payload, {
-    versions: EXPECTED_MATRIX_CLIENT_SPEC_VERSIONS,
-    unstable_features: {},
-  });
   assert.equal(browserVersions.response.headers.get('access-control-allow-origin'), 'https://app.element.io');
   assert.match(browserVersions.response.headers.get('vary') ?? '', /Origin/i);
+  assert.deepEqual(browserVersions.payload, {
+    versions: [...CLIENT_DISCOVERY_VERSIONS],
+    unstable_features: {},
+  });
+
+  const browserClientWellKnownPreflight = await request(harness, '/.well-known/matrix/client', {
+    method: 'OPTIONS',
+    headers: {
+      origin: 'https://app.element.io',
+      'access-control-request-method': 'GET',
+      'access-control-request-headers': 'x-matrix-client',
+    },
+  });
+  assert.equal(browserClientWellKnownPreflight.response.status, 204);
+  assert.equal(browserClientWellKnownPreflight.response.headers.get('access-control-allow-origin'), 'https://app.element.io');
+  assert.equal(browserClientWellKnownPreflight.response.headers.get('access-control-allow-headers'), 'x-matrix-client');
+  assert.match(browserClientWellKnownPreflight.response.headers.get('access-control-allow-methods') ?? '', /\bGET\b/);
+  assert.match(browserClientWellKnownPreflight.response.headers.get('vary') ?? '', /Origin/i);
+  assert.match(browserClientWellKnownPreflight.response.headers.get('vary') ?? '', /Access-Control-Request-Headers/i);
+
+  const browserVersionsPreflight = await request(harness, '/_matrix/client/versions', {
+    method: 'OPTIONS',
+    headers: {
+      origin: 'https://app.element.io',
+      'access-control-request-method': 'GET',
+      'access-control-request-headers': 'x-matrix-client',
+    },
+  });
+  assert.equal(browserVersionsPreflight.response.status, 204);
+  assert.equal(browserVersionsPreflight.response.headers.get('access-control-allow-origin'), 'https://app.element.io');
+  assert.equal(browserVersionsPreflight.response.headers.get('access-control-allow-headers'), 'x-matrix-client');
+  assert.match(browserVersionsPreflight.response.headers.get('access-control-allow-methods') ?? '', /\bGET\b/);
+  assert.match(browserVersionsPreflight.response.headers.get('vary') ?? '', /Origin/i);
+  assert.match(browserVersionsPreflight.response.headers.get('vary') ?? '', /Access-Control-Request-Headers/i);
 
   const availableLocalpart = `cs1-stg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`.toLowerCase();
   const loginFlows = await request(harness, '/_matrix/client/v3/login');
   assert.equal(loginFlows.response.status, 200);
+  assertCacheControl(loginFlows, 'public, max-age=60');
   assert.deepEqual(loginFlows.payload?.flows, [{ type: 'm.login.password' }]);
 
   const loginFlowsR0 = await request(harness, '/_matrix/client/r0/login');
   assert.equal(loginFlowsR0.response.status, 200);
+  assertCacheControl(loginFlowsR0, 'public, max-age=60');
   assert.deepEqual(loginFlowsR0.payload?.flows, [{ type: 'm.login.password' }]);
 
   const loginFlowsV1 = await request(harness, '/_matrix/client/v1/login');
   assert.equal(loginFlowsV1.response.status, 200);
+  assertCacheControl(loginFlowsV1, 'public, max-age=60');
   assert.deepEqual(loginFlowsV1.payload?.flows, [{ type: 'm.login.password' }]);
 
   const registerFlows = await request(harness, '/_matrix/client/v3/register');
   assert.equal(registerFlows.response.status, 200);
+  assertCacheControl(registerFlows, 'no-store');
   assert.deepEqual(registerFlows.payload?.flows, [{ stages: ['m.login.dummy'] }]);
 
   const registerFlowsCompatibility = await request(harness, '/_matrix/client/r0/register');
   assert.equal(registerFlowsCompatibility.response.status, 200);
+  assertCacheControl(registerFlowsCompatibility, 'no-store');
   assert.deepEqual(registerFlowsCompatibility.payload?.flows, [{ stages: ['m.login.dummy'] }]);
 
   const registerFlowsV1 = await request(harness, '/_matrix/client/v1/register');
   assert.equal(registerFlowsV1.response.status, 200);
+  assertCacheControl(registerFlowsV1, 'no-store');
   assert.deepEqual(registerFlowsV1.payload?.flows, [{ stages: ['m.login.dummy'] }]);
 
   for (const availabilityPath of REGISTER_AVAILABILITY_ALIAS_PATHS) {
@@ -137,6 +204,7 @@ test('TEST-CS-001 staging covers discovery, session lifecycle, and capability tr
       `${availabilityPath}?username=${encodeURIComponent(availableLocalpart)}`,
     );
     assert.equal(availabilityBefore.response.status, 200);
+    assertCacheControl(availabilityBefore, 'no-store');
     assert.deepEqual(availabilityBefore.payload, { available: true });
   }
 
@@ -167,6 +235,7 @@ test('TEST-CS-001 staging covers discovery, session lifecycle, and capability tr
       },
     });
     assert.equal(browserLoginFlows.response.status, 200);
+    assertCacheControl(browserLoginFlows, 'public, max-age=60');
     assert.equal(browserLoginFlows.response.headers.get('access-control-allow-origin'), browserOrigin);
     assert.match(browserLoginFlows.response.headers.get('vary') ?? '', /Origin/i);
   }
@@ -178,8 +247,26 @@ test('TEST-CS-001 staging covers discovery, session lifecycle, and capability tr
       },
     });
     assert.equal(browserRegisterFlows.response.status, 200);
+    assertCacheControl(browserRegisterFlows, 'no-store');
     assert.equal(browserRegisterFlows.response.headers.get('access-control-allow-origin'), browserOrigin);
     assert.match(browserRegisterFlows.response.headers.get('vary') ?? '', /Origin/i);
+  }
+
+  for (const availabilityPath of REGISTER_AVAILABILITY_ALIAS_PATHS) {
+    const browserRegisterAvailability = await request(
+      harness,
+      `${availabilityPath}?username=${encodeURIComponent(availableLocalpart)}`,
+      {
+        headers: {
+          origin: browserOrigin,
+        },
+      },
+    );
+    assert.equal(browserRegisterAvailability.response.status, 200);
+    assertCacheControl(browserRegisterAvailability, 'no-store');
+    assert.equal(browserRegisterAvailability.response.headers.get('access-control-allow-origin'), browserOrigin);
+    assert.match(browserRegisterAvailability.response.headers.get('vary') ?? '', /Origin/i);
+    assert.deepEqual(browserRegisterAvailability.payload, { available: true });
   }
 
   const browserRegisterPreflight = await request(harness, '/_matrix/client/v3/register', {
@@ -196,6 +283,21 @@ test('TEST-CS-001 staging covers discovery, session lifecycle, and capability tr
   assert.match(browserRegisterPreflight.response.headers.get('access-control-allow-methods') ?? '', /\bPOST\b/);
   assert.match(browserRegisterPreflight.response.headers.get('vary') ?? '', /Origin/i);
   assert.match(browserRegisterPreflight.response.headers.get('vary') ?? '', /Access-Control-Request-Headers/i);
+
+  const browserAvailabilityPreflight = await request(harness, '/_matrix/client/v1/register/available', {
+    method: 'OPTIONS',
+    headers: {
+      origin: browserOrigin,
+      'access-control-request-method': 'GET',
+      'access-control-request-headers': 'x-matrix-client',
+    },
+  });
+  assert.equal(browserAvailabilityPreflight.response.status, 204);
+  assert.equal(browserAvailabilityPreflight.response.headers.get('access-control-allow-origin'), browserOrigin);
+  assert.equal(browserAvailabilityPreflight.response.headers.get('access-control-allow-headers'), 'x-matrix-client');
+  assert.match(browserAvailabilityPreflight.response.headers.get('access-control-allow-methods') ?? '', /\bGET\b/);
+  assert.match(browserAvailabilityPreflight.response.headers.get('vary') ?? '', /Origin/i);
+  assert.match(browserAvailabilityPreflight.response.headers.get('vary') ?? '', /Access-Control-Request-Headers/i);
 
   const browserLoginPreflight = await request(harness, '/_matrix/client/r0/login', {
     method: 'OPTIONS',
@@ -229,6 +331,31 @@ test('TEST-CS-001 staging covers discovery, session lifecycle, and capability tr
   }
 
   for (const compatibilityUser of compatibilityUsers) {
+    const compatibilityWhoAmI = await getAuthenticated(
+      harness,
+      compatibilityUser.access_token,
+      '/_matrix/client/v3/account/whoami',
+    );
+    assert.equal(compatibilityWhoAmI.response.status, 200);
+    assert.equal(compatibilityWhoAmI.payload?.user_id, compatibilityUser.user_id);
+    assert.equal(compatibilityWhoAmI.payload?.device_id, compatibilityUser.device_id);
+
+    const refreshedCompatibilitySession = await refreshSession(harness, compatibilityUser.refresh_token);
+    assert.equal(refreshedCompatibilitySession.response.status, 200);
+    assert.equal(typeof refreshedCompatibilitySession.payload?.access_token, 'string');
+    assert.equal(typeof refreshedCompatibilitySession.payload?.refresh_token, 'string');
+    assert.notEqual(refreshedCompatibilitySession.payload.access_token, compatibilityUser.access_token);
+    assert.notEqual(refreshedCompatibilitySession.payload.refresh_token, compatibilityUser.refresh_token);
+
+    const refreshedCompatibilityWhoAmI = await getAuthenticated(
+      harness,
+      refreshedCompatibilitySession.payload.access_token,
+      '/_matrix/client/v3/account/whoami',
+    );
+    assert.equal(refreshedCompatibilityWhoAmI.response.status, 200);
+    assert.equal(refreshedCompatibilityWhoAmI.payload?.user_id, compatibilityUser.user_id);
+    assert.equal(refreshedCompatibilityWhoAmI.payload?.device_id, compatibilityUser.device_id);
+
     for (const availabilityPath of REGISTER_AVAILABILITY_ALIAS_PATHS) {
       const availabilityAfterCompatibility = await request(
         harness,
@@ -250,6 +377,8 @@ test('TEST-CS-001 staging covers discovery, session lifecycle, and capability tr
       assert.equal(compatibilityLogin.response.status, 200);
       assert.equal(compatibilityLogin.payload?.user_id, compatibilityUser.user_id);
       assert.equal(compatibilityLogin.payload?.device_id, deviceId);
+      assert.equal(typeof compatibilityLogin.payload?.access_token, 'string');
+      assert.equal(typeof compatibilityLogin.payload?.refresh_token, 'string');
     }
   }
 
@@ -292,6 +421,13 @@ test('TEST-CS-001 staging covers discovery, session lifecycle, and capability tr
     'm.3pid_changes': { enabled: false },
     'm.get_login_token': { enabled: false },
     'm.profile_fields': { enabled: true },
+    'm.room_versions': {
+      default: '12',
+      available: {
+        '11': 'stable',
+        '12': 'stable',
+      },
+    },
     'm.set_avatar_url': { enabled: true },
     'm.set_displayname': { enabled: true },
   });
@@ -337,6 +473,21 @@ test('TEST-CS-001 staging covers discovery, session lifecycle, and capability tr
 
   const afterLogoutAll = await getAuthenticated(harness, loginAgain.payload.access_token, '/_matrix/client/v3/account/whoami');
   await expectMatrixError(afterLogoutAll, 401, 'M_UNKNOWN_TOKEN');
+
+  const publicEntryProbeLocalpart = `cs1-staging-public-entry-${Date.now().toString(36)}`.toLowerCase();
+  await exhaustPublicEntryLimiter(harness, '/_matrix/client/r0/login');
+  for (const loginPath of LOGIN_ALIAS_PATHS) {
+    await assertEventuallyAnonymousPublicEntryLimited(harness, loginPath);
+  }
+  for (const registerPath of REGISTER_ALIAS_PATHS) {
+    await assertEventuallyAnonymousPublicEntryLimited(harness, registerPath);
+  }
+  for (const availabilityPath of REGISTER_AVAILABILITY_ALIAS_PATHS) {
+    await assertEventuallyAnonymousPublicEntryLimited(
+      harness,
+      `${availabilityPath}?username=${encodeURIComponent(publicEntryProbeLocalpart)}`,
+    );
+  }
 });
 
 test('TEST-CS-001 staging covers password-change UIA branches and deactivation', async (context) => {

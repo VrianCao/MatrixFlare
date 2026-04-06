@@ -14,4 +14,6 @@
   * `artifacts/expanded-source-ids.json`
   * `artifacts/wildcard-route-expansion.csv`
   * `artifacts/wildcard-route-expansion.json`
+  * `artifacts/compatibility-alias-route-locks.csv`
+  * `artifacts/compatibility-alias-route-locks.json`
 * 若治理检查失败，也必须保留失败证据

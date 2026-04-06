@@ -36,6 +36,11 @@ import {
   getTestEnvironmentDirectory,
   getReleaseGateTestFiles,
 } from './bootstrap.mjs';
+import {
+  CLIENT_DISCOVERY_BROWSER_ORIGIN,
+  hasClientDiscoveryBrowserCors,
+  summarizeClientDiscoveryVersionPayload,
+} from './client-discovery.mjs';
 
 const NON_LOCAL_ENVIRONMENT_NAMES = Object.freeze([
   'ci-integration',
@@ -114,6 +119,24 @@ const RFC3339_UTC_TIMESTAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?
 const GIT_SHA1_RE = /^[a-f0-9]{40}$/;
 let githubActionsOidcIdentityPromise = null;
 let githubActionsJwksPromise = null;
+
+export function buildProductionWorkerPromotionReadinessOptions(workerName) {
+  if (!WORKER_DEPLOYMENT_ORDER.includes(workerName)) {
+    throw new RangeError(`Unsupported production worker "${workerName}"`);
+  }
+  return Object.freeze({
+    requireBrowserCompatibleVersionLadder: workerName === 'gateway-worker',
+  });
+}
+
+export function buildProductionGatewayRolloutReadinessOptions(percentage) {
+  if (!Number.isInteger(percentage) || percentage <= 0 || percentage > 100) {
+    throw new RangeError('production gateway rollout percentage must be an integer between 1 and 100');
+  }
+  return Object.freeze({
+    requireBrowserCompatibleVersionLadder: percentage === 100,
+  });
+}
 
 function assertNonLocalEnvironmentName(environmentName) {
   if (!NON_LOCAL_ENVIRONMENT_NAMES.includes(environmentName)) {
@@ -1954,6 +1977,7 @@ export async function fetchWorkerDeploymentState({
   apiToken,
   scriptName,
   allowMissingScript = false,
+  includeRawPayload = false,
 }) {
   const fetchResults = await Promise.allSettled([
     callCloudflareApi({
@@ -1970,14 +1994,78 @@ export async function fetchWorkerDeploymentState({
   const failures = fetchResults.filter((result) => result.status === 'rejected');
   if (failures.length > 0) {
     if (allowMissingScript) {
-      return resolvePreDeployWorkerDeploymentState(scriptName, fetchResults);
+      const resolved = resolvePreDeployWorkerDeploymentState(scriptName, fetchResults);
+      if (!includeRawPayload) {
+        return resolved;
+      }
+      return Object.freeze({
+        ...resolved,
+        raw_payloads: null,
+      });
+    }
+    if (includeRawPayload) {
+      attachPartialWorkerDeploymentRawPayloads(failures[0].reason, fetchResults);
     }
     throw failures[0].reason;
   }
   const [deploymentsPayload, versionsPayload] = fetchResults.map((result) => result.value);
-  return summarizeWorkerDeploymentState({
+  const summary = summarizeWorkerDeploymentState({
     deployments: extractArrayResult(deploymentsPayload.result, ['deployments']),
     versions: extractArrayResult(versionsPayload.result, ['items', 'versions']),
+  });
+  if (!includeRawPayload) {
+    return summary;
+  }
+  return Object.freeze({
+    ...summary,
+    raw_payloads: Object.freeze({
+      deployments: structuredCloneJson(deploymentsPayload.result),
+      versions: structuredCloneJson(versionsPayload.result),
+    }),
+  });
+}
+
+function buildPartialWorkerDeploymentRawPayloads(fetchResults) {
+  if (!Array.isArray(fetchResults) || fetchResults.length !== 2) {
+    return null;
+  }
+  const payloads = Object.freeze({
+    deployments: fetchResults[0]?.status === 'fulfilled'
+      ? structuredCloneJson(fetchResults[0].value?.result ?? null)
+      : null,
+    versions: fetchResults[1]?.status === 'fulfilled'
+      ? structuredCloneJson(fetchResults[1].value?.result ?? null)
+      : null,
+  });
+  return payloads.deployments == null && payloads.versions == null
+    ? null
+    : payloads;
+}
+
+function attachPartialWorkerDeploymentRawPayloads(error, fetchResults) {
+  const partialRawPayloads = buildPartialWorkerDeploymentRawPayloads(fetchResults);
+  if (partialRawPayloads == null || error == null || typeof error !== 'object') {
+    return;
+  }
+  Object.defineProperty(error, 'partial_raw_payloads', {
+    value: partialRawPayloads,
+    enumerable: true,
+    configurable: true,
+  });
+}
+
+function summarizeWorkerDeploymentRawPayloads(rawPayloads) {
+  if (rawPayloads == null || typeof rawPayloads !== 'object') {
+    return null;
+  }
+  const deployments = rawPayloads.deployments ?? null;
+  const versions = rawPayloads.versions ?? null;
+  if (deployments == null && versions == null) {
+    return null;
+  }
+  return summarizeWorkerDeploymentState({
+    deployments: extractArrayResult(deployments, ['deployments']),
+    versions: extractArrayResult(versions, ['items', 'versions']),
   });
 }
 
@@ -3239,13 +3327,69 @@ export function resolvePreDeployWorkerDeploymentState(scriptName, fetchResults) 
 export function resolveFreshCloudflareIdentity(previousIds, currentIds, label) {
   const previousSet = new Set(previousIds);
   const nextIds = currentIds.filter((candidate) => !previousSet.has(candidate));
-  if (nextIds.length === 1) {
-    return nextIds[0];
+  const uniqueNextIds = [...new Set(nextIds)];
+  if (uniqueNextIds.length === 1) {
+    return uniqueNextIds[0];
   }
-  if (nextIds.length === 0) {
+  if (uniqueNextIds.length === 0) {
     throw new Error(`Unable to resolve a fresh ${label} from Cloudflare; rerun refused to reuse an existing identity`);
   }
   throw new Error(`Unable to resolve a unique fresh ${label} from Cloudflare`);
+}
+
+function expectedActiveWorkerVersionIdsForValidation(workerSummary) {
+  if (!Array.isArray(workerSummary?.expected_active_worker_version_ids)) {
+    return [workerSummary?.worker_version_id];
+  }
+  if (
+    workerSummary.expected_active_worker_version_ids.length === 0
+    || !workerSummary.expected_active_worker_version_ids.every((entry) => isNonEmptyString(entry))
+  ) {
+    throw new TypeError('deployment worker expected_active_worker_version_ids must be a non-empty string array when present');
+  }
+  const normalized = sortUniqueStringArray(workerSummary.expected_active_worker_version_ids);
+  if (normalized.length !== workerSummary.expected_active_worker_version_ids.length) {
+    throw new TypeError('deployment worker expected_active_worker_version_ids must not contain duplicates');
+  }
+  return normalized;
+}
+
+function validateNamedCloudflareResourceSnapshot(resources, expectedResources, label) {
+  if (!isPlainObject(resources)) {
+    throw new TypeError(`${label} must be an object`);
+  }
+  const validatedResources = {};
+  for (const [key, expectedValues] of Object.entries(expectedResources)) {
+    if (!isNonEmptyStringArray(resources[key])) {
+      throw new TypeError(`${label}.${key} must be a non-empty string array`);
+    }
+    const declaredValues = sortUniqueStringArray(resources[key]);
+    if (declaredValues.length !== resources[key].length) {
+      throw new TypeError(`${label}.${key} must not contain duplicates`);
+    }
+    const normalizedExpectedValues = sortUniqueStringArray(expectedValues);
+    if (
+      declaredValues.length !== normalizedExpectedValues.length
+      || declaredValues.some((entry, index) => entry !== normalizedExpectedValues[index])
+    ) {
+      throw new TypeError(`${label}.${key} must match the fixed environment topology`);
+    }
+    validatedResources[key] = Object.freeze([...normalizedExpectedValues]);
+  }
+  return Object.freeze(validatedResources);
+}
+
+function buildExpectedEnvironmentCloudflareResources(environmentName, workersSubdomain = null) {
+  const plan = buildNonLocalEnvironmentPlan(environmentName, {
+    workersSubdomain,
+  });
+  return Object.freeze({
+    ...plan.cloudflare_resources,
+    r2_buckets: Object.freeze(sortUniqueStringArray([
+      ...plan.cloudflare_resources.r2_buckets,
+      plan.artifact_bucket_name,
+    ])),
+  });
 }
 
 export function validateLatestActiveCloudflareWorkerIdentity(workerName, workerSummary, currentDeploymentState) {
@@ -3258,8 +3402,26 @@ export function validateLatestActiveCloudflareWorkerIdentity(workerName, workerS
   if (currentDeploymentState.latest_active_deployment_id !== workerSummary.deployment_id) {
     throw new TypeError(`deployment workers.${workerName}.deployment_id is not the latest active Cloudflare deployment for ${workerSummary.script_name}`);
   }
-  if (!currentDeploymentState.active_worker_version_ids.includes(workerSummary.worker_version_id)) {
-    throw new TypeError(`deployment workers.${workerName}.worker_version_id is not part of the latest active Cloudflare deployment for ${workerSummary.script_name}`);
+  if (
+    !Array.isArray(currentDeploymentState.active_worker_version_ids)
+    || !currentDeploymentState.active_worker_version_ids.every((entry) => isNonEmptyString(entry))
+  ) {
+    throw new TypeError(`current Cloudflare deployment state for ${workerName} must expose active_worker_version_ids`);
+  }
+  const expectedActiveWorkerVersionIds = expectedActiveWorkerVersionIdsForValidation(workerSummary);
+  const normalizedActiveWorkerVersionIds = sortUniqueStringArray(currentDeploymentState.active_worker_version_ids);
+  if (normalizedActiveWorkerVersionIds.length !== currentDeploymentState.active_worker_version_ids.length) {
+    throw new TypeError(
+      `current Cloudflare deployment state for ${workerName} must not expose duplicate active_worker_version_ids`,
+    );
+  }
+  if (
+    normalizedActiveWorkerVersionIds.length !== expectedActiveWorkerVersionIds.length
+    || normalizedActiveWorkerVersionIds.some((entry, index) => entry !== expectedActiveWorkerVersionIds[index])
+  ) {
+    throw new TypeError(
+      `deployment workers.${workerName}.active_worker_version_ids must exactly match the latest active Cloudflare deployment for ${workerSummary.script_name}`,
+    );
   }
 }
 
@@ -3290,9 +3452,14 @@ export async function validateDeploymentSummaryAgainstCurrentCloudflareState(dep
   if (!isPlainObject(deploymentSummary.cloudflare_resources)) {
     throw new TypeError('deployment summary cloudflare_resources must be an object');
   }
-  if (!isNonEmptyStringArray(deploymentSummary.cloudflare_resources.ratelimit_namespaces)) {
-    throw new TypeError('deployment summary cloudflare_resources.ratelimit_namespaces must be a non-empty string array');
-  }
+  const validatedCloudflareResources = validateNamedCloudflareResourceSnapshot(
+    deploymentSummary.cloudflare_resources,
+    buildExpectedEnvironmentCloudflareResources(
+      deploymentSummary.environment_name,
+      deploymentSummary.workers_subdomain ?? null,
+    ),
+    'deployment summary cloudflare_resources',
+  );
 
   const workers = {};
   for (const workerName of WORKER_DEPLOYMENT_ORDER) {
@@ -3328,17 +3495,12 @@ export async function validateDeploymentSummaryAgainstCurrentCloudflareState(dep
       ]),
     });
   }
-  const declaredRateLimitNamespaces = [...deploymentSummary.cloudflare_resources.ratelimit_namespaces];
-  const normalizedDeclaredRateLimitNamespaces = sortUniqueStringArray(declaredRateLimitNamespaces);
-  if (normalizedDeclaredRateLimitNamespaces.length !== declaredRateLimitNamespaces.length) {
-    throw new TypeError('deployment summary cloudflare_resources.ratelimit_namespaces must not contain duplicates');
-  }
   const observedGatewayRateLimitNamespaces = Object.freeze(sortUniqueStringArray(
     workers['gateway-worker']?.ratelimit_namespace_ids ?? [],
   ));
   if (
-    normalizedDeclaredRateLimitNamespaces.length !== observedGatewayRateLimitNamespaces.length
-    || normalizedDeclaredRateLimitNamespaces.some((namespaceId, index) => namespaceId !== observedGatewayRateLimitNamespaces[index])
+    validatedCloudflareResources.ratelimit_namespaces.length !== observedGatewayRateLimitNamespaces.length
+    || validatedCloudflareResources.ratelimit_namespaces.some((namespaceId, index) => namespaceId !== observedGatewayRateLimitNamespaces[index])
   ) {
     throw new TypeError('deployment summary cloudflare_resources.ratelimit_namespaces must match currently deployed Cloudflare ratelimit namespace bindings on gateway-worker');
   }
@@ -3355,6 +3517,7 @@ export async function validateDeploymentSummaryAgainstCurrentCloudflareState(dep
     validated_at: new Date().toISOString(),
     workers: Object.freeze(workers),
     cloudflare_resources: Object.freeze({
+      ...validatedCloudflareResources,
       ratelimit_namespaces: observedGatewayRateLimitNamespaces,
     }),
   });
@@ -3935,9 +4098,7 @@ async function requestRemoteHarnessJson(remoteHarnessEnv, pathname, {
 
 function summarizeReadinessProbeStepDetail(stepName, payload) {
   if (stepName === 'versions') {
-    return {
-      versions_count: Array.isArray(payload?.versions) ? payload.versions.length : 0,
-    };
+    return summarizeClientDiscoveryVersionPayload(payload);
   }
   if (stepName === 'public_rooms') {
     return {
@@ -4011,6 +4172,22 @@ function summarizeReadinessProbeFailureDetail(response, payload) {
   return detail;
 }
 
+function summarizeVersionsReadinessProbeDetail(response, payload, {
+  browserOrigin = CLIENT_DISCOVERY_BROWSER_ORIGIN,
+} = {}) {
+  return {
+    ...summarizeClientDiscoveryVersionPayload(payload),
+    browser_compatible_cors: hasClientDiscoveryBrowserCors(response, browserOrigin),
+  };
+}
+
+function summarizeVersionsReadinessProbeFailureDetail(response, payload, options = {}) {
+  return {
+    status: response?.status ?? null,
+    ...summarizeVersionsReadinessProbeDetail(response, payload, options),
+  };
+}
+
 function buildReadinessProbeRunSeed(environmentName) {
   return [
     environmentName,
@@ -4069,6 +4246,7 @@ async function runNonLocalReadinessProbeAttempt(environmentName, remoteHarnessEn
   fetchImpl = globalThis.fetch,
   probeCredentials = null,
   probeRunSeed = null,
+  requireBrowserCompatibleVersionLadder = true,
 } = {}) {
   const steps = [];
   const readinessProbeCredentials = isPlainObject(probeCredentials)
@@ -4096,16 +4274,33 @@ async function runNonLocalReadinessProbeAttempt(environmentName, remoteHarnessEn
 
   try {
     const versions = await requestRemoteHarnessJson(remoteHarnessEnv, '/_matrix/client/versions', {
+      headers: {
+        origin: CLIENT_DISCOVERY_BROWSER_ORIGIN,
+      },
       fetchImpl,
     });
-    if (versions.response.status !== 200 || !Array.isArray(versions.payload?.versions)) {
+    const versionsDetail = summarizeVersionsReadinessProbeDetail(versions.response, versions.payload);
+    if (
+      versions.response.status !== 200
+      || !Array.isArray(versions.payload?.versions)
+      || versionsDetail.browser_compatible_cors !== true
+      || (requireBrowserCompatibleVersionLadder && versionsDetail.browser_compatible_version_ladder !== true)
+    ) {
+      steps.push(createReadinessProbeStep(
+        'versions',
+        false,
+        summarizeVersionsReadinessProbeFailureDetail(versions.response, versions.payload),
+      ));
       return {
         ok: false,
         steps,
-        failure: recordFailure('versions', versions.response, versions.payload),
+        failure: createReadinessProbeFailure(
+          'versions',
+          summarizeVersionsReadinessProbeFailureDetail(versions.response, versions.payload),
+        ),
       };
     }
-    recordSuccess('versions', versions.payload);
+    steps.push(createReadinessProbeStep('versions', true, versionsDetail));
 
     const publicRooms = await requestRemoteHarnessJson(remoteHarnessEnv, '/_matrix/client/v3/publicRooms?limit=1', {
       fetchImpl,
@@ -4302,6 +4497,7 @@ async function waitForDeploymentReadinessInternal(environmentName, remoteHarness
   initialDelayMs = NON_LOCAL_READINESS_INITIAL_DELAY_MS,
   maxDelayMs = NON_LOCAL_READINESS_MAX_DELAY_MS,
   sleepImpl = null,
+  requireBrowserCompatibleVersionLadder = true,
 } = {}) {
   const normalizedEnvironmentName = assertDeployableEnvironmentName(environmentName);
   const validatedRemoteHarnessEnv = validateRemoteHarnessEnvironmentVariables(remoteHarnessEnv);
@@ -4314,6 +4510,9 @@ async function waitForDeploymentReadinessInternal(environmentName, remoteHarness
   }
   if (!Number.isInteger(maxDelayMs) || maxDelayMs < initialDelayMs) {
     throw new RangeError('maxDelayMs must be an integer greater than or equal to initialDelayMs');
+  }
+  if (typeof requireBrowserCompatibleVersionLadder !== 'boolean') {
+    throw new TypeError('requireBrowserCompatibleVersionLadder must be boolean');
   }
 
   const startedAt = new Date().toISOString();
@@ -4331,6 +4530,7 @@ async function waitForDeploymentReadinessInternal(environmentName, remoteHarness
       {
         fetchImpl,
         probeRunSeed,
+        requireBrowserCompatibleVersionLadder,
       },
     );
     const delayBeforeNextAttemptMs = attemptResult.ok || attemptIndex === maxAttempts
@@ -4966,14 +5166,96 @@ function extractBaselineWorkersSubdomain(record) {
   return record.rollback_handle?.workers_subdomain ?? null;
 }
 
-function assertProductionBaselineMatchesCurrentIdentity(record, currentIdentity) {
+function summarizeProductionBaselineIdentityMatch(baselineIdentity, currentIdentity) {
+  const mismatchedFields = [];
+  if (JSON.stringify(baselineIdentity?.deployment_ids ?? []) !== JSON.stringify(currentIdentity?.deployment_ids ?? [])) {
+    mismatchedFields.push('deployment_ids');
+  }
+  if (JSON.stringify(baselineIdentity?.worker_version_ids ?? []) !== JSON.stringify(currentIdentity?.worker_version_ids ?? [])) {
+    mismatchedFields.push('worker_version_ids');
+  }
+  return Object.freeze({
+    matches: mismatchedFields.length === 0,
+    mismatched_fields: Object.freeze(mismatchedFields),
+  });
+}
+
+function assertProductionBaselineMatchesCurrentIdentity(record, currentIdentity, {
+  observedStatePath = null,
+} = {}) {
   const baselineIdentity = extractBaselineDeploymentIdentity(record);
-  if (JSON.stringify(baselineIdentity.deployment_ids) !== JSON.stringify(currentIdentity.deployment_ids)) {
-    throw new Error('baselineRecord deployment_ids do not match the current Cloudflare production deployment state');
+  const comparison = summarizeProductionBaselineIdentityMatch(baselineIdentity, currentIdentity);
+  if (!comparison.matches) {
+    const qualifier = observedStatePath == null
+      ? ''
+      : `; observed current production state retained at ${observedStatePath}`;
+    throw new Error(
+      `baselineRecord ${comparison.mismatched_fields.join(' and ')} do not match the current Cloudflare production deployment state${qualifier}`,
+    );
   }
-  if (JSON.stringify(baselineIdentity.worker_version_ids) !== JSON.stringify(currentIdentity.worker_version_ids)) {
-    throw new Error('baselineRecord worker_version_ids do not match the current Cloudflare production deployment state');
+}
+
+function buildSerializableErrorDetail(error) {
+  const responseStatus = Number(error?.response_status ?? Number.NaN);
+  return Object.freeze({
+    message: error instanceof Error ? error.message : String(error),
+    response_status: Number.isFinite(responseStatus) ? responseStatus : null,
+    partial_raw_payloads: error?.partial_raw_payloads == null
+      ? null
+      : Object.freeze({
+        deployments: structuredCloneJson(error.partial_raw_payloads.deployments),
+        versions: structuredCloneJson(error.partial_raw_payloads.versions),
+      }),
+  });
+}
+
+function buildProductionCurrentStateWorkerObservation(workerName, scriptName, state, {
+  error = null,
+  rawPayloads = state?.raw_payloads ?? error?.partial_raw_payloads ?? null,
+} = {}) {
+  const summarizedState = state ?? summarizeWorkerDeploymentRawPayloads(rawPayloads);
+  return Object.freeze({
+    worker_name: workerName,
+    script_name: scriptName,
+    latest_active_deployment_id: summarizedState?.latest_active_deployment_id ?? null,
+    deployment_ids: Object.freeze(Array.isArray(summarizedState?.deployment_ids) ? [...summarizedState.deployment_ids] : []),
+    active_worker_version_ids: Object.freeze(Array.isArray(summarizedState?.active_worker_version_ids) ? [...summarizedState.active_worker_version_ids] : []),
+    worker_version_ids: Object.freeze(Array.isArray(summarizedState?.worker_version_ids) ? [...summarizedState.worker_version_ids] : []),
+    raw_cloudflare_api_results: rawPayloads == null
+      ? null
+      : Object.freeze({
+        deployments: structuredCloneJson(rawPayloads.deployments),
+        versions: structuredCloneJson(rawPayloads.versions),
+      }),
+    error,
+  });
+}
+
+function buildProductionInstallTopologyStateSnapshot(currentObservation) {
+  if (!isPlainObject(currentObservation) || currentObservation.environment_id !== PRODUCTION_ENVIRONMENT_NAME) {
+    throw new TypeError('currentObservation must be a production install-topology observation');
   }
+  return Object.freeze({
+    observed_at: currentObservation.observed_at ?? new Date().toISOString(),
+    expected_state: 'unbootstrapped',
+    problems: Object.freeze(Array.isArray(currentObservation.problems) ? [...currentObservation.problems] : []),
+    active_workers: Object.freeze(
+      Array.isArray(currentObservation.active_workers)
+        ? currentObservation.active_workers.map((entry) => structuredCloneJson(entry))
+        : [],
+    ),
+    workers: structuredCloneJson(currentObservation.workers ?? {}),
+  });
+}
+
+async function writeProductionInstallTopologyStateSnapshot({
+  currentObservation,
+  outputPath,
+}) {
+  const snapshot = buildProductionInstallTopologyStateSnapshot(currentObservation);
+  await fs.mkdir(path.dirname(outputPath), { recursive: true });
+  await fs.writeFile(outputPath, stableJson(snapshot));
+  return snapshot;
 }
 
 function cloneProductionDeploymentSummary(baselineRecord, provisionedEnvironment = null) {
@@ -5060,34 +5342,150 @@ async function deployProductionWorkerVersion(workerName, configPath, versionSpec
   };
 }
 
-async function buildProductionDeploymentIdentityFromCurrentCloudflareState(baselineRecord, {
+export async function observeProductionCurrentCloudflareState(baselineRecord, {
   accountId,
   apiToken,
 } = {}) {
+  const workerObservations = {};
   const deploymentIds = [];
   const workerVersionIds = [];
+  const problems = [];
   for (const workerName of WORKER_DEPLOYMENT_ORDER) {
     const scriptName = baselineRecord.workers?.[workerName]?.script_name ?? buildProductionWorkerScriptName(workerName);
-    const state = await fetchWorkerDeploymentState({
-      accountId,
-      apiToken,
-      scriptName,
-      allowMissingScript: false,
-    });
-    if (!isNonEmptyString(state.latest_active_deployment_id)) {
-      throw new Error(`Cloudflare did not expose an active deployment id for ${scriptName}`);
+    try {
+      const state = await fetchWorkerDeploymentState({
+        accountId,
+        apiToken,
+        scriptName,
+        allowMissingScript: false,
+        includeRawPayload: true,
+      });
+      workerObservations[workerName] = buildProductionCurrentStateWorkerObservation(workerName, scriptName, state);
+      if (!isNonEmptyString(state.latest_active_deployment_id)) {
+        problems.push(`Cloudflare did not expose an active deployment id for ${scriptName}`);
+        continue;
+      }
+      if (!Array.isArray(state.active_worker_version_ids) || state.active_worker_version_ids.length !== 1) {
+        problems.push(`Cloudflare must expose exactly one active worker version id for ${scriptName} before production promotion`);
+        continue;
+      }
+      deploymentIds.push(state.latest_active_deployment_id);
+      workerVersionIds.push(state.active_worker_version_ids[0]);
+    } catch (error) {
+      const errorDetail = buildSerializableErrorDetail(error);
+      workerObservations[workerName] = buildProductionCurrentStateWorkerObservation(workerName, scriptName, null, {
+        error: errorDetail,
+        rawPayloads: errorDetail.partial_raw_payloads,
+      });
+      problems.push(`Failed to observe current Cloudflare state for ${scriptName}: ${error.message}`);
     }
-    if (!Array.isArray(state.active_worker_version_ids) || state.active_worker_version_ids.length !== 1) {
-      throw new Error(`Cloudflare must expose exactly one active worker version id for ${scriptName} before gradual production rollout`);
-    }
-    deploymentIds.push(state.latest_active_deployment_id);
-    workerVersionIds.push(state.active_worker_version_ids[0]);
   }
-  return {
+  const currentDeploymentIdentity = problems.length === 0
+    ? Object.freeze({
+      environment_id: PRODUCTION_ENVIRONMENT_NAME,
+      deployment_ids: Object.freeze(deploymentIds),
+      worker_version_ids: Object.freeze(workerVersionIds),
+    })
+    : null;
+  return Object.freeze({
+    observed_at: new Date().toISOString(),
     environment_id: PRODUCTION_ENVIRONMENT_NAME,
-    deployment_ids: deploymentIds,
-    worker_version_ids: workerVersionIds,
-  };
+    current_deployment_identity: currentDeploymentIdentity,
+    problems: Object.freeze(problems),
+    workers: Object.freeze(workerObservations),
+  });
+}
+
+export async function observeProductionInstallTopologyState({
+  accountId,
+  apiToken,
+} = {}) {
+  const workerObservations = {};
+  const activeWorkers = [];
+  const problems = [];
+  for (const workerName of WORKER_DEPLOYMENT_ORDER) {
+    const scriptName = buildProductionWorkerScriptName(workerName);
+    try {
+      const state = await fetchWorkerDeploymentState({
+        accountId,
+        apiToken,
+        scriptName,
+        allowMissingScript: true,
+        includeRawPayload: true,
+      });
+      workerObservations[workerName] = buildProductionCurrentStateWorkerObservation(workerName, scriptName, state);
+      if (!isNonEmptyString(state.latest_active_deployment_id)) {
+        continue;
+      }
+      activeWorkers.push(Object.freeze({
+        worker_name: workerName,
+        script_name: scriptName,
+        latest_active_deployment_id: state.latest_active_deployment_id,
+        active_worker_version_ids: Object.freeze(
+          Array.isArray(state.active_worker_version_ids) ? [...state.active_worker_version_ids] : [],
+        ),
+      }));
+    } catch (error) {
+      const errorDetail = buildSerializableErrorDetail(error);
+      workerObservations[workerName] = buildProductionCurrentStateWorkerObservation(workerName, scriptName, null, {
+        error: errorDetail,
+        rawPayloads: errorDetail.partial_raw_payloads,
+      });
+      problems.push(`Failed to observe current Cloudflare state for ${scriptName}: ${error.message}`);
+    }
+  }
+  return Object.freeze({
+    observed_at: new Date().toISOString(),
+    environment_id: PRODUCTION_ENVIRONMENT_NAME,
+    problems: Object.freeze(problems),
+    active_workers: Object.freeze(activeWorkers),
+    workers: Object.freeze(workerObservations),
+  });
+}
+
+export function buildProductionCurrentStateSnapshot({
+  baselineRecord,
+  currentObservation,
+}) {
+  const resolvedBaselineRecord = validateProductionBaselineRecord(baselineRecord);
+  if (!isPlainObject(currentObservation) || currentObservation.environment_id !== PRODUCTION_ENVIRONMENT_NAME) {
+    throw new TypeError('currentObservation must be a production current-state observation');
+  }
+  const baselineIdentity = extractBaselineDeploymentIdentity(resolvedBaselineRecord);
+  const comparison = currentObservation.current_deployment_identity == null
+    ? {
+      matches: false,
+      mismatched_fields: Object.freeze(['current_deployment_identity_unavailable']),
+    }
+    : summarizeProductionBaselineIdentityMatch(baselineIdentity, currentObservation.current_deployment_identity);
+  return Object.freeze({
+    observed_at: currentObservation.observed_at ?? new Date().toISOString(),
+    baseline_record: Object.freeze({
+      artifact_id: resolvedBaselineRecord.artifact_id,
+      origin_run_uri: resolvedBaselineRecord.origin_run_uri,
+      deployment_identity: structuredCloneJson(baselineIdentity),
+    }),
+    baseline_match: Object.freeze({
+      matches: comparison.matches,
+      mismatched_fields: Object.freeze([...comparison.mismatched_fields]),
+      problems: Object.freeze(Array.isArray(currentObservation.problems) ? [...currentObservation.problems] : []),
+    }),
+    current_deployment_observation: structuredCloneJson(currentObservation),
+  });
+}
+
+async function writeProductionCurrentStateSnapshot({
+  baselineRecord,
+  currentObservation,
+  outputPath,
+}) {
+  const snapshot = buildProductionCurrentStateSnapshot({
+    baselineRecord,
+    currentObservation,
+  });
+  await fs.mkdir(path.dirname(outputPath), { recursive: true });
+  await fs.writeFile(outputPath, stableJson(snapshot));
+  return snapshot;
 }
 
 export async function startPreReleaseGatewayRollout(environmentName, {
@@ -5302,9 +5700,11 @@ export async function installProductionTopology({
     accountId,
     apiToken,
   });
+  const currentStateSnapshotPath = path.join(resolvedWorkingRoot, 'current-production-state.json');
   await assertProductionTopologyInstallAllowed({
     accountId,
     apiToken,
+    observedStatePath: currentStateSnapshotPath,
   });
   const deploymentSummary = await deployProductionEnvironment({
     repoRoot,
@@ -5402,11 +5802,25 @@ export async function promoteProductionEnvironment({
     accountId,
     apiToken,
   });
-  const currentIdentity = await buildProductionDeploymentIdentityFromCurrentCloudflareState(resolvedBaselineRecord, {
+  const currentStateSnapshotPath = path.join(resolvedWorkingRoot, 'current-production-state.json');
+  const currentObservation = await observeProductionCurrentCloudflareState(resolvedBaselineRecord, {
     accountId,
     apiToken,
   });
-  assertProductionBaselineMatchesCurrentIdentity(resolvedBaselineRecord, currentIdentity);
+  await writeProductionCurrentStateSnapshot({
+    baselineRecord: resolvedBaselineRecord,
+    currentObservation,
+    outputPath: currentStateSnapshotPath,
+  });
+  if (currentObservation.current_deployment_identity == null) {
+    throw new Error(
+      `current Cloudflare production deployment state could not be normalized; observed current production state retained at ${currentStateSnapshotPath}: ${currentObservation.problems.join('; ')}`,
+    );
+  }
+  const currentIdentity = currentObservation.current_deployment_identity;
+  assertProductionBaselineMatchesCurrentIdentity(resolvedBaselineRecord, currentIdentity, {
+    observedStatePath: currentStateSnapshotPath,
+  });
   const currentDeploymentSummary = cloneProductionDeploymentSummary(resolvedBaselineRecord, provisionedEnvironment);
   for (const workerName of WORKER_DEPLOYMENT_ORDER) {
     updateProductionDeploymentSummaryWorker(currentDeploymentSummary, provisionedEnvironment.plan, workerName, {
@@ -5465,6 +5879,7 @@ export async function promoteProductionEnvironment({
           buildRemoteHarnessEnvironmentVariables(provisionedEnvironment.plan),
           accessSession,
         ),
+        buildProductionWorkerPromotionReadinessOptions(workerName),
       );
       migrationReadinessChecks[migrationReadinessFieldNames[workerName]] = readinessProbe;
       if (!readinessProbe.ready) {
@@ -5559,6 +5974,7 @@ export async function promoteProductionEnvironment({
       buildRemoteHarnessEnvironmentVariables(provisionedEnvironment.plan),
       accessSession,
     ),
+    buildProductionWorkerPromotionReadinessOptions('jobs-worker'),
   );
   if (!jobsReadiness.ready) {
     throw new Error(`Production jobs-worker readiness probe failed: ${jobsReadiness.last_error}`);
@@ -5595,6 +6011,7 @@ export async function promoteProductionEnvironment({
       buildRemoteHarnessEnvironmentVariables(provisionedEnvironment.plan),
       accessSession,
     ),
+    buildProductionWorkerPromotionReadinessOptions('ops-worker'),
   );
   if (!opsReadiness.ready) {
     throw new Error(`Production ops-worker readiness probe failed: ${opsReadiness.last_error}`);
@@ -5642,6 +6059,7 @@ export async function promoteProductionEnvironment({
         buildRemoteHarnessEnvironmentVariables(provisionedEnvironment.plan),
         accessSession,
       ),
+      buildProductionGatewayRolloutReadinessOptions(percentage),
     );
     gatewayRolloutSteps.push({
       percentage,
@@ -5773,29 +6191,28 @@ export async function rollbackProductionEnvironment({
     accountId,
     apiToken,
   });
+  const currentStateSnapshotPath = path.join(resolvedWorkingRoot, 'current-production-state.json');
+  const currentObservation = await observeProductionCurrentCloudflareState(promotionRecord, {
+    accountId,
+    apiToken,
+  });
+  await writeProductionCurrentStateSnapshot({
+    baselineRecord: promotionRecord,
+    currentObservation,
+    outputPath: currentStateSnapshotPath,
+  });
+  if (currentObservation.current_deployment_identity == null) {
+    throw new Error(
+      `current Cloudflare production deployment state could not be normalized; observed current production state retained at ${currentStateSnapshotPath}: ${currentObservation.problems.join('; ')}`,
+    );
+  }
   const currentDeploymentSummary = {
     environment_name: PRODUCTION_ENVIRONMENT_NAME,
     workers: {},
   };
-  const currentIdentity = {
-    environment_id: PRODUCTION_ENVIRONMENT_NAME,
-    deployment_ids: [],
-    worker_version_ids: [],
-  };
+  const currentIdentity = currentObservation.current_deployment_identity;
   for (const workerName of WORKER_DEPLOYMENT_ORDER) {
-    const currentState = await fetchWorkerDeploymentState({
-      accountId,
-      apiToken,
-      scriptName: provisionedEnvironment.plan.worker_scripts[workerName],
-    });
-    if (!isNonEmptyString(currentState.latest_active_deployment_id)) {
-      throw new Error(`Cloudflare did not expose an active deployment id for ${provisionedEnvironment.plan.worker_scripts[workerName]} before rollback`);
-    }
-    if (!Array.isArray(currentState.active_worker_version_ids) || currentState.active_worker_version_ids.length !== 1) {
-      throw new Error(`Cloudflare must expose exactly one active worker version id for ${provisionedEnvironment.plan.worker_scripts[workerName]} before rollback`);
-    }
-    currentIdentity.deployment_ids.push(currentState.latest_active_deployment_id);
-    currentIdentity.worker_version_ids.push(currentState.active_worker_version_ids[0]);
+    const currentState = currentObservation.workers[workerName];
     updateProductionDeploymentSummaryWorker(currentDeploymentSummary, provisionedEnvironment.plan, workerName, {
       deploymentId: currentState.latest_active_deployment_id,
       workerVersionId: currentState.active_worker_version_ids[0],
@@ -5806,6 +6223,9 @@ export async function rollbackProductionEnvironment({
     promotionRecord.current_deployment_identity,
     currentIdentity,
     'promotionRecord.current_deployment_identity',
+    {
+      observedStatePath: currentStateSnapshotPath,
+    },
   );
   const workerResults = {};
   for (const workerName of WORKER_DEPLOYMENT_ORDER) {
@@ -6146,37 +6566,46 @@ function validateProducerRunIdentity(originRunIdentity, label = 'origin run iden
   };
 }
 
-function assertProductionRecordedIdentityMatchesCurrent(expectedIdentity, currentIdentity, label) {
+function assertProductionRecordedIdentityMatchesCurrent(expectedIdentity, currentIdentity, label, {
+  observedStatePath = null,
+} = {}) {
+  const qualifier = observedStatePath == null
+    ? ''
+    : `; observed current production state retained at ${observedStatePath}`;
   if (JSON.stringify(expectedIdentity?.deployment_ids ?? []) !== JSON.stringify(currentIdentity?.deployment_ids ?? [])) {
-    throw new Error(`${label} deployment_ids do not match the current Cloudflare production deployment state`);
+    throw new Error(`${label} deployment_ids do not match the current Cloudflare production deployment state${qualifier}`);
   }
   if (JSON.stringify(expectedIdentity?.worker_version_ids ?? []) !== JSON.stringify(currentIdentity?.worker_version_ids ?? [])) {
-    throw new Error(`${label} worker_version_ids do not match the current Cloudflare production deployment state`);
+    throw new Error(`${label} worker_version_ids do not match the current Cloudflare production deployment state${qualifier}`);
   }
 }
 
 async function assertProductionTopologyInstallAllowed({
   accountId,
   apiToken,
+  observedStatePath = null,
 } = {}) {
-  const workerStates = await Promise.all(WORKER_DEPLOYMENT_ORDER.map(async (workerName) => {
-    const scriptName = buildProductionWorkerScriptName(workerName);
-    const state = await fetchWorkerDeploymentState({
-      accountId,
-      apiToken,
-      scriptName,
-      allowMissingScript: true,
+  const currentObservation = await observeProductionInstallTopologyState({
+    accountId,
+    apiToken,
+  });
+  if (observedStatePath != null) {
+    await writeProductionInstallTopologyStateSnapshot({
+      currentObservation,
+      outputPath: observedStatePath,
     });
-    return {
-      worker_name: workerName,
-      script_name: scriptName,
-      state,
-    };
-  }));
-  const activeWorkers = workerStates.filter((entry) => isNonEmptyString(entry.state.latest_active_deployment_id));
-  if (activeWorkers.length > 0) {
+  }
+  const qualifier = observedStatePath == null
+    ? ''
+    : `; observed current production state retained at ${observedStatePath}`;
+  if (currentObservation.problems.length > 0) {
     throw new Error(
-      `prod-install only supports an unbootstrapped production topology; current Cloudflare production workers already expose active deployments (${activeWorkers.map((entry) => entry.script_name).join(', ')}), use promote-prod instead`,
+      `current Cloudflare production deployment state could not be normalized${qualifier}: ${currentObservation.problems.join('; ')}`,
+    );
+  }
+  if (currentObservation.active_workers.length > 0) {
+    throw new Error(
+      `prod-install only supports an unbootstrapped production topology; current Cloudflare production workers already expose active deployments (${currentObservation.active_workers.map((entry) => entry.script_name).join(', ')}), use promote-prod instead${qualifier}`,
     );
   }
 }
@@ -6615,11 +7044,25 @@ export async function operationalRefreshProductionEnvironment({
     accountId,
     apiToken,
   });
-  const currentIdentity = await buildProductionDeploymentIdentityFromCurrentCloudflareState(resolvedBaselineRecord, {
+  const currentStateSnapshotPath = path.join(resolvedWorkingRoot, 'current-production-state.json');
+  const currentObservation = await observeProductionCurrentCloudflareState(resolvedBaselineRecord, {
     accountId,
     apiToken,
   });
-  assertProductionBaselineMatchesCurrentIdentity(resolvedBaselineRecord, currentIdentity);
+  await writeProductionCurrentStateSnapshot({
+    baselineRecord: resolvedBaselineRecord,
+    currentObservation,
+    outputPath: currentStateSnapshotPath,
+  });
+  if (currentObservation.current_deployment_identity == null) {
+    throw new Error(
+      `current Cloudflare production deployment state could not be normalized; observed current production state retained at ${currentStateSnapshotPath}: ${currentObservation.problems.join('; ')}`,
+    );
+  }
+  const currentIdentity = currentObservation.current_deployment_identity;
+  assertProductionBaselineMatchesCurrentIdentity(resolvedBaselineRecord, currentIdentity, {
+    observedStatePath: currentStateSnapshotPath,
+  });
   const currentDeploymentSummary = cloneProductionDeploymentSummary(resolvedBaselineRecord, provisionedEnvironment);
   for (const workerName of WORKER_DEPLOYMENT_ORDER) {
     updateProductionDeploymentSummaryWorker(currentDeploymentSummary, provisionedEnvironment.plan, workerName, {
@@ -6661,6 +7104,7 @@ export async function operationalRefreshProductionEnvironment({
       buildRemoteHarnessEnvironmentVariables(provisionedEnvironment.plan),
       accessSession,
     ),
+    buildProductionWorkerPromotionReadinessOptions('jobs-worker'),
   );
   if (!jobsReadiness.ready) {
     throw new Error(`Operational prod refresh jobs-worker readiness probe failed: ${jobsReadiness.last_error}`);
@@ -6697,6 +7141,7 @@ export async function operationalRefreshProductionEnvironment({
       buildRemoteHarnessEnvironmentVariables(provisionedEnvironment.plan),
       accessSession,
     ),
+    buildProductionWorkerPromotionReadinessOptions('ops-worker'),
   );
   if (!opsReadiness.ready) {
     throw new Error(`Operational prod refresh ops-worker readiness probe failed: ${opsReadiness.last_error}`);
@@ -6744,6 +7189,7 @@ export async function operationalRefreshProductionEnvironment({
         buildRemoteHarnessEnvironmentVariables(provisionedEnvironment.plan),
         accessSession,
       ),
+      buildProductionGatewayRolloutReadinessOptions(percentage),
     );
     gatewayRolloutSteps.push({
       percentage,
@@ -7003,6 +7449,10 @@ function buildSuiteDeploymentSummaryForValidation(deploymentSummary, rolloutStat
   suiteDeploymentSummary.workers['gateway-worker'] = {
     ...suiteDeploymentSummary.workers['gateway-worker'],
     deployment_id: rolloutState.dual_version_deployment_id,
+    expected_active_worker_version_ids: [
+      rolloutState.baseline_gateway_version_id,
+      rolloutState.candidate_gateway_version_id,
+    ],
   };
   return suiteDeploymentSummary;
 }
@@ -7044,6 +7494,8 @@ export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
   await requireGitHubActionsExecutionImpl('runEnvironmentBackedSuite', {
     expectedEnvironmentName: normalizedEnvironmentName,
   });
+  const currentRepository = await resolveCurrentGitHubRepository(repoRoot);
+  const currentHeadSha = await resolveCurrentGitCommitSha(repoRoot);
   const readiness = await assessNonLocalEnvironmentHarnessReadinessImpl(normalizedEnvironmentName, repoRoot, {
     getRequiredTestFilesImpl,
   });
@@ -7102,10 +7554,9 @@ export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
   if (!isPlainObject(cloudflareResources)) {
     throw new TypeError('deployment summary cloudflare_resources must be an object');
   }
-  const validatedCloudflareResources = structuredCloneJson(cloudflareResources);
-  validatedCloudflareResources.ratelimit_namespaces = [
-    ...deploymentIdentityValidation.before_readiness.cloudflare_resources.ratelimit_namespaces,
-  ];
+  const validatedCloudflareResources = structuredCloneJson(
+    deploymentIdentityValidation.before_readiness.cloudflare_resources,
+  );
   const files = readiness.test_files.map((file) => path.join(repoRoot, file));
   const startedAt = new Date().toISOString();
   const startedMs = Date.now();
@@ -7136,9 +7587,9 @@ export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
       accountId,
       apiToken,
     });
-    validatedCloudflareResources.ratelimit_namespaces = [
-      ...deploymentIdentityValidation.before_suite.cloudflare_resources.ratelimit_namespaces,
-    ];
+    Object.assign(validatedCloudflareResources, structuredCloneJson(
+      deploymentIdentityValidation.before_suite.cloudflare_resources,
+    ));
     exitCode = await new Promise((resolve) => {
       const child = spawnImpl(process.execPath, commandArgs, {
         cwd: repoRoot,
@@ -7238,7 +7689,9 @@ export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
     log_artifact: logArtifact,
     executed_by: executedBy,
     reviewed_by: reviewedBy,
+    source_repository: currentRepository,
     source_run_uri: sourceRunUri,
+    git_commit: currentHeadSha,
     topology_kind: topologyKind,
     cloudflare_resources: validatedCloudflareResources,
     rollout_skew_probe: rolloutSkewProbe,

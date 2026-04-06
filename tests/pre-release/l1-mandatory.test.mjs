@@ -9,6 +9,10 @@ import {
   requestJson,
   requireRemoteHarnessContext,
 } from '../shared/nonlocal/support.mjs';
+import {
+  CLIENT_DISCOVERY_BROWSER_ORIGIN,
+  CLIENT_DISCOVERY_VERSIONS,
+} from '../../packages/testing/src/client-discovery.mjs';
 
 test('pre-release harness drives deployed gateway smoke paths without importing local suites', async (context) => {
   const harness = requireRemoteHarnessContext(context, 'pre-release');
@@ -16,9 +20,18 @@ test('pre-release harness drives deployed gateway smoke paths without importing 
     return;
   }
 
-  const versions = await requestJson(harness, '/_matrix/client/versions');
+  const versions = await requestJson(harness, '/_matrix/client/versions', {
+    headers: {
+      origin: CLIENT_DISCOVERY_BROWSER_ORIGIN,
+    },
+  });
   assert.equal(versions.response.status, 200);
-  assert.ok(Array.isArray(versions.payload?.versions));
+  assert.deepEqual(versions.payload, {
+    versions: [...CLIENT_DISCOVERY_VERSIONS],
+    unstable_features: {},
+  });
+  assert.equal(versions.response.headers.get('access-control-allow-origin'), CLIENT_DISCOVERY_BROWSER_ORIGIN);
+  assert.match(versions.response.headers.get('vary') ?? '', /Origin/i);
 
   const alice = await registerUser(harness, {
     usernamePrefix: 'pre-release-alice',

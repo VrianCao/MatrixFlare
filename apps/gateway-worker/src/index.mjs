@@ -49,7 +49,6 @@ import {
   normalizeSyncTimeout,
   parseSyncToken,
   registerSyncWaiter,
-  SUPPORTED_MATRIX_CLIENT_SPEC_VERSIONS,
 } from '../../../packages/runtime-core/src/client-domain.mjs';
 import {
   DEFAULT_ROOM_VERSION,
@@ -105,6 +104,26 @@ const STUB_ROUTE_MATCHERS = Object.freeze([
   { methods: ['GET'], pattern: /^\/_matrix\/client\/v3\/initialSync$/ },
   { methods: ['GET'], pattern: /^\/_matrix\/client\/v3\/rooms\/[^/]+\/initialSync$/ },
   { methods: ['GET'], pattern: /^\/_matrix\/client\/v1\/auth_metadata$/ },
+]);
+const CLIENT_DISCOVERY_VERSIONS = Object.freeze([
+  'r0.6.1',
+  'v1.1',
+  'v1.2',
+  'v1.3',
+  'v1.4',
+  'v1.5',
+  'v1.6',
+  'v1.7',
+  'v1.8',
+  'v1.9',
+  'v1.10',
+  'v1.11',
+  'v1.12',
+  'v1.13',
+  'v1.14',
+  'v1.15',
+  'v1.16',
+  'v1.17',
 ]);
 const CLIENT_REGISTER_DISCOVERY_PATTERN = /^\/_matrix\/client\/(?:r0|v1|v3)\/register$/;
 const CLIENT_REGISTER_AVAILABILITY_PATTERN = /^\/_matrix\/client\/(?:r0|v1|v3)\/register\/available$/;
@@ -4902,7 +4921,7 @@ async function handleRequest(request, env) {
 
       if (pathname === '/_matrix/client/versions' && method === 'GET') {
         return jsonResponse({
-          versions: SUPPORTED_MATRIX_CLIENT_SPEC_VERSIONS,
+          versions: CLIENT_DISCOVERY_VERSIONS,
           unstable_features: {},
         });
       }

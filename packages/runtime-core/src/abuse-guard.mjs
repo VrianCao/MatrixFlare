@@ -169,8 +169,8 @@ export function classifyGatewayRequest(method, pathname) {
   }
   if (/^\/_matrix\/client\/(?:r0|v1|v3)\/register$/.test(pathname)) {
     return {
-      route_family: 'register',
-      gateway_policy_id: method === 'POST' ? 'gateway_register' : null,
+      route_family: method === 'GET' ? 'public-entry' : 'register',
+      gateway_policy_id: method === 'POST' ? 'gateway_register' : method === 'GET' ? 'gateway_public_entry' : null,
     };
   }
   if (/^\/_matrix\/client\/(?:r0|v1|v3)\/login$/.test(pathname)) {

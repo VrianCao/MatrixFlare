@@ -9,6 +9,10 @@ import {
   requestJson,
   requireRemoteHarnessContext,
 } from '../shared/nonlocal/support.mjs';
+import {
+  CLIENT_DISCOVERY_BROWSER_ORIGIN,
+  CLIENT_DISCOVERY_VERSIONS,
+} from '../../packages/testing/src/client-discovery.mjs';
 
 test('ci-integration harness drives remote client and room smoke paths against a deployed environment', async (context) => {
   const harness = requireRemoteHarnessContext(context, 'ci-integration');
@@ -16,9 +20,18 @@ test('ci-integration harness drives remote client and room smoke paths against a
     return;
   }
 
-  const versions = await requestJson(harness, '/_matrix/client/versions');
+  const versions = await requestJson(harness, '/_matrix/client/versions', {
+    headers: {
+      origin: CLIENT_DISCOVERY_BROWSER_ORIGIN,
+    },
+  });
   assert.equal(versions.response.status, 200);
-  assert.ok(Array.isArray(versions.payload?.versions));
+  assert.deepEqual(versions.payload, {
+    versions: [...CLIENT_DISCOVERY_VERSIONS],
+    unstable_features: {},
+  });
+  assert.equal(versions.response.headers.get('access-control-allow-origin'), CLIENT_DISCOVERY_BROWSER_ORIGIN);
+  assert.match(versions.response.headers.get('vary') ?? '', /Origin/i);
 
   const loginFlows = await requestJson(harness, '/_matrix/client/v3/login');
   assert.equal(loginFlows.response.status, 200);
