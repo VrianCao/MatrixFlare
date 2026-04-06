@@ -4352,7 +4352,7 @@ test('production baseline input resolver finds the embedded baseline record befo
   );
 });
 
-test('production baseline input resolver rejects legacy current-state blockers that omit protected ops ingress even when the embedded baseline record retains it', async () => {
+test('production baseline input resolver derives protected prod ops ingress from an embedded install baseline when a legacy snapshot omits access metadata', async () => {
   const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-prod-baseline-missing-embedded-ops-url-'));
   const downloadRoot = path.join(workspaceRoot, 'downloaded', 'baseline');
   const rawSnapshotPath = path.join(downloadRoot, 'state', 'operational-refresh', 'current-production-state.json');
@@ -4374,18 +4374,29 @@ test('production baseline input resolver rejects legacy current-state blockers t
   await fs.writeFile(rawSnapshotPath, `${JSON.stringify(snapshot, null, 2)}\n`);
   await fs.writeFile(embeddedBaselineRecordPath, `${JSON.stringify(baselineRecord, null, 2)}\n`);
 
-  await assert.rejects(
-    () => resolveProductionBaselineInputArtifact({
-      downloadRoot,
-      baselineInputKind: 'current_state',
-      baselineInputPath: 'state/operational-refresh/current-production-state.json',
-      baselineRecordName: 'prod-install-record.json',
-      normalizedOutputPath,
-      originRunIdentity: buildProducerRunIdentityFixture({
-        runId: '24033537026',
-      }),
+  const resolved = await resolveProductionBaselineInputArtifact({
+    downloadRoot,
+    baselineInputKind: 'current_state',
+    baselineInputPath: 'state/operational-refresh/current-production-state.json',
+    baselineRecordName: 'prod-install-record.json',
+    normalizedOutputPath,
+    originRunIdentity: buildProducerRunIdentityFixture({
+      runId: '24033537026',
     }),
-    /legacy prod current state snapshot access must be an object/u,
+  });
+
+  assert.equal(resolved.raw_baseline_input_path, rawSnapshotPath);
+  assert.equal(resolved.baseline_record_path, embeddedBaselineRecordPath);
+  const normalizedSnapshot = JSON.parse(await fs.readFile(normalizedOutputPath, 'utf8'));
+  assert.deepEqual(
+    validateProdCurrentStateSnapshot(normalizedSnapshot, {
+      requireUsableBaseline: true,
+    }),
+    { valid: true, error: null },
+  );
+  assert.equal(
+    normalizedSnapshot.access.protected_ops_url,
+    baselineRecord.access.protected_ops_url,
   );
 });
 
@@ -4773,7 +4784,7 @@ test('production baseline input resolver accepts embedded baseline records that 
   assert.deepEqual(normalizedSnapshot.baseline_record.deployment_identity, embeddedBaselineRecord.current_deployment_identity);
 });
 
-test('production baseline input resolver rejects legacy snapshots that do not retain protected prod ops ingress metadata', async () => {
+test('production baseline input resolver derives protected prod ops ingress from the embedded baseline when a legacy snapshot omits access metadata', async () => {
   const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-prod-baseline-missing-ops-url-'));
   const downloadRoot = path.join(workspaceRoot, 'downloaded', 'baseline');
   const rawSnapshotPath = path.join(downloadRoot, 'state', 'operational-refresh', 'current-production-state.json');
@@ -4808,6 +4819,66 @@ test('production baseline input resolver rejects legacy snapshots that do not re
   await fs.writeFile(rawSnapshotPath, `${JSON.stringify(snapshot, null, 2)}\n`);
   await fs.writeFile(embeddedBaselineRecordPath, `${JSON.stringify(embeddedBaselineRecord, null, 2)}\n`);
 
+  const resolved = await resolveProductionBaselineInputArtifact({
+    downloadRoot,
+    baselineInputKind: 'current_state',
+    baselineInputPath: 'state/operational-refresh/current-production-state.json',
+    baselineRecordName: 'prod-promotion-record.json',
+    normalizedOutputPath,
+    originRunIdentity: blockerRunIdentity,
+  });
+
+  assert.equal(resolved.raw_baseline_input_path, rawSnapshotPath);
+  assert.equal(resolved.baseline_record_path, embeddedBaselineRecordPath);
+  const normalizedSnapshot = JSON.parse(await fs.readFile(normalizedOutputPath, 'utf8'));
+  assert.deepEqual(
+    validateProdCurrentStateSnapshot(normalizedSnapshot, {
+      requireUsableBaseline: true,
+    }),
+    { valid: true, error: null },
+  );
+  assert.equal(
+    normalizedSnapshot.access.protected_ops_url,
+    'https://matrix-ops-worker-prod.matrixflare.workers.dev',
+  );
+});
+
+test('production baseline input resolver still fails closed when a legacy snapshot omits access metadata and the embedded baseline cannot derive prod ops ingress', async () => {
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-prod-baseline-underivable-ops-url-'));
+  const downloadRoot = path.join(workspaceRoot, 'downloaded', 'baseline');
+  const rawSnapshotPath = path.join(downloadRoot, 'state', 'operational-refresh', 'current-production-state.json');
+  const embeddedBaselineRecordPath = path.join(downloadRoot, 'downloaded', 'baseline', 'prod-promotion-record.json');
+  const normalizedOutputPath = path.join(workspaceRoot, 'state', 'normalized-baseline', 'current-production-state.json');
+  const embeddedBaselineRecord = structuredClone(buildProdPromotionRecordFixture({
+    runId: '24019281851',
+    promotedAt: '2026-04-06T04:55:43.000Z',
+  }));
+  embeddedBaselineRecord.rollback_handle.workers_subdomain = '';
+  const blockerRunIdentity = buildProducerRunIdentityFixture({
+    runId: '24033551396',
+  });
+  const snapshot = {
+    observed_at: '2026-04-06T13:25:40.017Z',
+    baseline_record: {
+      artifact_id: embeddedBaselineRecord.artifact_id,
+      origin_run_uri: embeddedBaselineRecord.origin_run_uri,
+      deployment_identity: embeddedBaselineRecord.current_deployment_identity,
+    },
+    baseline_match: {
+      matches: false,
+      mismatched_fields: ['deployment_ids', 'worker_version_ids'],
+      problems: [],
+    },
+    current_deployment_observation: buildProdCurrentStateSnapshotFixture({
+      runId: blockerRunIdentity.origin_run_id,
+    }).current_deployment_observation,
+  };
+
+  await fs.mkdir(path.dirname(rawSnapshotPath), { recursive: true });
+  await fs.mkdir(path.dirname(embeddedBaselineRecordPath), { recursive: true });
+  await fs.writeFile(rawSnapshotPath, `${JSON.stringify(snapshot, null, 2)}\n`);
+  await fs.writeFile(embeddedBaselineRecordPath, `${JSON.stringify(embeddedBaselineRecord, null, 2)}\n`);
+
   await assert.rejects(
     () => resolveProductionBaselineInputArtifact({
       downloadRoot,
@@ -4817,7 +4888,7 @@ test('production baseline input resolver rejects legacy snapshots that do not re
       normalizedOutputPath,
       originRunIdentity: blockerRunIdentity,
     }),
-    /legacy prod current state snapshot access must be an object/u,
+    /legacy prod current state snapshot missing access\.protected_ops_url and embedded baselineRecord cannot derive it: baselineRecord is invalid: prod_promotion_record rollback_handle\.workers_subdomain must be non-empty/u,
   );
 });
 
@@ -4906,6 +4977,41 @@ test('legacy prod current-state snapshots can be normalized into the current rec
   });
   assert.equal(normalized.origin_run_id, '24033537026');
   assert.equal(normalized.workers['ops-worker'].script_name, 'matrix-ops-worker-prod');
+});
+
+test('legacy prod current-state snapshot normalization derives protected prod ops ingress from the promotion baseline when access metadata is absent', () => {
+  const baselineRecord = buildProdPromotionRecordFixture();
+  const snapshot = buildProdCurrentStateSnapshotFixture({
+    runId: '24033537031',
+  });
+  const legacySnapshot = {
+    observed_at: snapshot.observed_at,
+    baseline_record: {
+      artifact_id: baselineRecord.artifact_id,
+      origin_run_uri: baselineRecord.origin_run_uri,
+      deployment_identity: baselineRecord.current_deployment_identity,
+    },
+    baseline_match: {
+      matches: false,
+      mismatched_fields: ['deployment_ids', 'worker_version_ids'],
+      problems: [],
+    },
+    current_deployment_observation: snapshot.current_deployment_observation,
+  };
+
+  const normalized = normalizeProdCurrentStateSnapshot(legacySnapshot, {
+    baselineRecord,
+    originRunIdentity: buildProducerRunIdentityFixture({
+      runId: '24033537032',
+    }),
+  });
+
+  assert.deepEqual(validateProdCurrentStateSnapshot(normalized), {
+    valid: true,
+    error: null,
+  });
+  assert.equal(normalized.access.protected_ops_url, 'https://matrix-ops-worker-prod.matrixflare.workers.dev');
+  assert.equal(normalized.origin_run_id, '24033537032');
 });
 
 test('legacy prod current-state snapshot normalization rejects explicit protected_ops_url values that do not match the current prod ops-worker host', () => {

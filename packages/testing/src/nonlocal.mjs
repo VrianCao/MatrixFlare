@@ -7364,6 +7364,7 @@ export async function writeProdInstallRecord(outputPath, options) {
 
 function validateLegacyProdCurrentStateSnapshot(payload, {
   requireUsableBaseline = false,
+  baselineRecord = null,
 } = {}) {
   if (!isPlainObject(payload.baseline_record)) {
     return {
@@ -7417,17 +7418,34 @@ function validateLegacyProdCurrentStateSnapshot(payload, {
       error: null,
     };
   }
-  if (!isPlainObject(payload.access)) {
-    return {
-      valid: false,
-      error: 'legacy prod current state snapshot access must be an object',
-    };
-  }
-  if (!isNonEmptyString(payload.access.protected_ops_url)) {
-    return {
-      valid: false,
-      error: 'legacy prod current state snapshot access.protected_ops_url must be non-empty',
-    };
+  if (payload.access == null) {
+    if (baselineRecord == null) {
+      return {
+        valid: false,
+        error: 'legacy prod current state snapshot access must be an object when embedded baselineRecord is unavailable',
+      };
+    }
+    try {
+      resolveRuntimeProductionCurrentStateProtectedOpsUrl(baselineRecord);
+    } catch (error) {
+      return {
+        valid: false,
+        error: `legacy prod current state snapshot missing access.protected_ops_url and embedded baselineRecord cannot derive it: ${error.message}`,
+      };
+    }
+  } else {
+    if (!isPlainObject(payload.access)) {
+      return {
+        valid: false,
+        error: 'legacy prod current state snapshot access must be an object',
+      };
+    }
+    if (!isNonEmptyString(payload.access.protected_ops_url)) {
+      return {
+        valid: false,
+        error: 'legacy prod current state snapshot access.protected_ops_url must be non-empty',
+      };
+    }
   }
   return validateProductionDeploymentIdentity(
     payload.current_deployment_observation.current_deployment_identity,
@@ -7696,6 +7714,7 @@ export function normalizeProdCurrentStateSnapshot(snapshot, {
   }
   const legacyValidation = validateLegacyProdCurrentStateSnapshot(snapshot, {
     requireUsableBaseline: true,
+    baselineRecord,
   });
   if (!legacyValidation.valid) {
     throw new TypeError(legacyValidation.error);
@@ -7721,7 +7740,7 @@ export function normalizeProdCurrentStateSnapshot(snapshot, {
     baselineRecord: resolvedBaselineRecord,
     currentObservation: snapshot.current_deployment_observation,
     originRunIdentity,
-    protectedOpsUrl: snapshot.access?.protected_ops_url ?? null,
+    protectedOpsUrl: snapshot.access?.protected_ops_url ?? resolveRuntimeProductionCurrentStateProtectedOpsUrl(resolvedBaselineRecord),
   });
 }
 
