@@ -795,7 +795,7 @@
 ### 08.05A 建立 production topology install/promote/rollback automation prerequisite
 
 - [x] 通过 `DEC-0005` / `DEC-0006` 把 production automation contract 固化到 Spec/TODO，再落 GitHub Actions + CLI/tooling 的 `prod-install` / `release-candidate` / `promote-prod` / `operational-prod-refresh` / `rollback-prod` / `prod-cost-monthly` 基础设施；same-head remote 验证必须证明执行入口真实可用，且 fail-closed 时仍保留 raw blocker artifact。
-  Spec refs: `42` 2.1-2.3, `24` `DATA-OPS-014`,`DATA-OPS-015`,`DATA-OPS-016`,`DATA-OPS-017`, `25` `FLOW-OPS-PROD-CANDIDATE`,`FLOW-OPS-PROD-INSTALL`,`FLOW-OPS-PROD-PROMOTE`,`FLOW-OPS-PROD-ROLLBACK`,`FLOW-OPS-PROD-COST-SNAPSHOT`,`STATE-PROD-ROLLOUT`,`STATE-PROD-COST-SNAPSHOT`, `26` 5.17, 5.21-5.25, `41` `REQ-OPS-003`, `43` `TEST-OPS-003`, `44` `EVID-OPS-003`, `13` `CF-WKR-012`,`CF-WKR-014`,`CF-WKR-029`,`CF-WKR-030`, `DEC-0005`, `OQ-0002`, `OQ-0007`
+  Spec refs: `42` 2.1-2.3, `24` `DATA-OPS-014`,`DATA-OPS-015`,`DATA-OPS-016`,`DATA-OPS-017`, `25` `FLOW-OPS-PROD-CANDIDATE`,`FLOW-OPS-PROD-INSTALL`,`FLOW-OPS-PROD-PROMOTE`,`FLOW-OPS-PROD-ROLLBACK`,`FLOW-OPS-PROD-COST-SNAPSHOT`,`STATE-PROD-ROLLOUT`,`STATE-PROD-COST-SNAPSHOT`, `26` 5.17, 5.21-5.25, `41` `REQ-OPS-003`, `43` `TEST-OPS-003`, `44` `EVID-OPS-003`, `13` `CF-WKR-012`,`CF-WKR-014`,`CF-WKR-029`,`CF-WKR-030`, `DEC-0005`, `DEC-0006`, `OQ-0002`, `OQ-0006`, `OQ-0007`
   产出:
   reviewed candidate manifest contract、prod topology bootstrap contract、prod promotion / rollback records、受控 `operational_unblock` refresh contract、对应 workflow/tooling/local tests。
   完成标准:
