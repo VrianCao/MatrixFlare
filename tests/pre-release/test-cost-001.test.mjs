@@ -23,6 +23,32 @@ const REQUIRED_COST_SURFACES = Object.freeze([
   'queues',
 ]);
 
+function summarizePayload(payload) {
+  try {
+    return JSON.stringify(payload);
+  } catch {
+    return String(payload);
+  }
+}
+
+function assertKnownCostObservationBlocker(result) {
+  assert.equal(
+    result.response.status,
+    500,
+    `cost observation returned ${result.response.status}: ${summarizePayload(result.payload)}`,
+  );
+  const payload = result.payload;
+  assert.equal(payload?.code, 'internal');
+  assert.match(payload?.message ?? '', /TEST-COST-001 pre-release proof remains fail-closed/);
+  assert.deepEqual(payload?.details?.blocker_ids, ['OQ-0006']);
+  assert.ok(Array.isArray(payload?.details?.blocker_reasons));
+  assert.ok(payload.details.blocker_reasons.length > 0);
+  assert.ok(Array.isArray(payload?.details?.official_source_uris));
+  assert.ok(payload.details.official_source_uris.length > 0);
+  assert.ok(payload.details.official_source_uris.every((entry) => /^https:\/\/([a-z0-9-]+\.)*cloudflare\.com\//u.test(entry)));
+  assert.fail(`TEST-COST-001 remains blocked by OQ-0006: ${summarizePayload(payload)}`);
+}
+
 test('TEST-COST-001 pre-release records an official Cloudflare cost observation for a bounded workload', async (context) => {
   const harness = requireRemoteHarnessContext(context, 'pre-release');
   if (harness == null) {
@@ -64,11 +90,9 @@ test('TEST-COST-001 pre-release records an official Cloudflare cost observation 
   assert.equal(healthz.response.status, 200);
 
   const result = await requestOpsAuthorized(harness, '/_ops/v1/cost/observation');
-  assert.equal(
-    result.response.status,
-    200,
-    `cost observation returned ${result.response.status}: ${JSON.stringify(result.payload)}`,
-  );
+  if (result.response.status !== 200) {
+    assertKnownCostObservationBlocker(result);
+  }
 
   const payload = result.payload;
   assert.equal(typeof payload?.observation_id, 'string');
