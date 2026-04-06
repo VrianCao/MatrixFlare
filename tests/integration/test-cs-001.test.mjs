@@ -59,6 +59,16 @@ test('TEST-CS-001 ci-integration covers discovery, session lifecycle, and capabi
   assert.equal(tokenValidity.response.status, 200);
   assert.deepEqual(tokenValidity.payload, { valid: false });
 
+  const registerChallenge = await request(harness, '/_matrix/client/v3/register', {
+    method: 'POST',
+    json: {},
+  });
+  assert.equal(registerChallenge.response.status, 401);
+  assert.deepEqual(registerChallenge.payload?.flows, [{ stages: ['m.login.dummy'] }]);
+  assert.deepEqual(registerChallenge.payload?.params, {});
+  assert.deepEqual(registerChallenge.payload?.completed, []);
+  assert.equal(typeof registerChallenge.payload?.session, 'string');
+
   const browserOrigin = 'https://app.element.io';
   const browserRegisterFlows = await request(harness, '/_matrix/client/v3/register', {
     headers: {

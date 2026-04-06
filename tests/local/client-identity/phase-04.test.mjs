@@ -66,6 +66,20 @@ async function createRegisterChallenge(rig, {
   return challengeBody;
 }
 
+async function createEmptyRegisterChallenge(rig) {
+  const challengeResponse = await rig.gatewayFetch('/_matrix/client/v3/register', {
+    method: 'POST',
+    json: {},
+  });
+  assert.equal(challengeResponse.status, 401);
+  const challengeBody = await challengeResponse.json();
+  assert.deepEqual(challengeBody.flows, [{ stages: ['m.login.dummy'] }]);
+  assert.deepEqual(challengeBody.params, {});
+  assert.deepEqual(challengeBody.completed, []);
+  assertOpaqueUiaSessionToken(challengeBody.session);
+  return challengeBody;
+}
+
 async function registerViaUia(rig, {
   username,
   password,
@@ -172,6 +186,9 @@ test('Phase 04 discovery surfaces return spec-aligned truth', async (t) => {
   const tokenValidity = await rig.gatewayFetch('/_matrix/client/v1/register/m.login.registration_token/validity?token=bogus');
   assert.equal(tokenValidity.status, 200);
   assert.deepEqual(await tokenValidity.json(), { valid: false });
+
+  const emptyRegisterChallenge = await createEmptyRegisterChallenge(rig);
+  assert.equal(typeof emptyRegisterChallenge.session, 'string');
 });
 
 test('Phase 04 discovery and login surfaces serve browser CORS and preflight truth', async (t) => {
