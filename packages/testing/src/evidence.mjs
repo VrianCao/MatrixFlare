@@ -185,7 +185,10 @@ async function resolveExpectedGitHubRepositoryForRepoRoot(repoRoot, expectedGitH
 
 const L1_TEST_IMPLEMENTATION_FILES = Object.freeze({
   'TEST-CS-001': Object.freeze({
-    local: Object.freeze(['tests/local/client-identity/phase-04.test.mjs']),
+    local: Object.freeze([
+      'tests/local/client-identity/phase-04.test.mjs',
+      'tests/local/runtime-foundations/phase-08-runtime-controls.test.mjs',
+    ]),
     'ci-integration': Object.freeze(['tests/integration/test-cs-001.test.mjs']),
     staging: Object.freeze(['tests/staging/test-cs-001.test.mjs']),
   }),
@@ -252,10 +255,10 @@ const L1_EVIDENCE_DEFINITIONS = Object.freeze([
     scope: 'L1',
     test_ids: ['TEST-CS-001'],
     evidence_type: 'integration/protocol',
-    generation_method: 'client-core CI + staging attestation bundle',
-    required_environments: ['ci-integration', 'staging'],
-    declared_source_ids: ['MX-CS-001', 'MX-CS-002', 'MX-CS-003', 'MX-CS-005', 'MX-CS-006', 'MX-CS-019', 'MX-CS-024', 'MX-CS-026'],
-    pass_criteria: 'Client discovery, capabilities, registration, login, password/UIA, deactivation, refresh, logout, profile fields, and propagation must pass in CI integration and staging.',
+    generation_method: 'client-core CI + staging attestation bundle plus required local runtime-control regression coverage for shared public-entry wiring',
+    required_environments: ['local', 'ci-integration', 'staging'],
+    declared_source_ids: ['MX-CS-001', 'MX-CS-002', 'MX-CS-003', 'MX-CS-005', 'MX-CS-006', 'MX-CS-019', 'MX-CS-024', 'MX-CS-026', 'CF-WKR-027', 'DEC-0007'],
+    pass_criteria: 'Client discovery, capabilities, registration, login, password/UIA, deactivation, refresh, logout, profile fields, and propagation must pass in CI integration and staging; the anonymous public-entry alias matrix must observe at least one live 429 M_LIMIT_EXCEEDED within a bounded non-local retry window while every alias discovery GET stays within the 200/429 envelope, and shared public-entry wiring remains separately locked by local runtime-control regression coverage.',
   }),
   Object.freeze({
     id: 'EVID-CS-002',

@@ -80,9 +80,9 @@ function buildAnonymousPublicEntryAliasMatrix(localpart) {
 }
 
 // CF-WKR-027: Cloudflare Workers ratelimits are local-to-location, eventually
-// consistent, and permissive. The non-local gate therefore proves the shared
-// public-entry limiter by driving the full alias matrix until at least one
-// live 429 appears, while locking every alias to the expected 200/429 envelope.
+// consistent, and permissive. This non-local gate therefore drives the full
+// alias matrix until at least one live 429 appears, while locking every alias
+// to the expected 200/429 envelope.
 async function assertAnonymousPublicEntryLimiterAcrossAliases(harness, localpart, {
   attempts = 100,
   delayMs = 200,

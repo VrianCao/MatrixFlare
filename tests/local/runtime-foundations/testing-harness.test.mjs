@@ -1170,10 +1170,41 @@ test('cost evidence source ids stay in sync with the evidence register', () => {
   );
 });
 
+test('client-core evidence metadata stays in sync with the evidence register', () => {
+  const definition = getL1EvidenceDefinition('EVID-CS-001');
+  assert.deepEqual(
+    definition.declared_source_ids,
+    [
+      'MX-CS-001',
+      'MX-CS-002',
+      'MX-CS-003',
+      'MX-CS-005',
+      'MX-CS-006',
+      'MX-CS-019',
+      'MX-CS-024',
+      'MX-CS-026',
+      'CF-WKR-027',
+      'DEC-0007',
+    ],
+  );
+  assert.match(
+    definition.pass_criteria,
+    /live 429 M_LIMIT_EXCEEDED within a bounded non-local retry window/,
+  );
+  assert.match(
+    definition.pass_criteria,
+    /shared public-entry wiring remains separately locked by local runtime-control regression coverage/,
+  );
+});
+
 test('L1 evidence definitions keep attested generation methods in sync with the evidence register', () => {
   assert.equal(
     getL1EvidenceDefinition('EVID-CS-001').generation_method,
-    'client-core CI + staging attestation bundle',
+    'client-core CI + staging attestation bundle plus required local runtime-control regression coverage for shared public-entry wiring',
+  );
+  assert.deepEqual(
+    getL1EvidenceDefinition('EVID-CS-001').required_environments,
+    ['local', 'ci-integration', 'staging'],
   );
   assert.equal(
     getL1EvidenceDefinition('EVID-CS-002').generation_method,
@@ -1225,7 +1256,10 @@ test('L1 evidence bundle set includes governance and canonical test implementati
   assert.deepEqual(listL1EvidenceBundleIds().slice(0, 2), ['EVID-GOV-001', 'EVID-CS-001']);
   assert.deepEqual(
     getRequiredTestImplementationFiles('TEST-CS-001'),
-    ['tests/local/client-identity/phase-04.test.mjs'],
+    [
+      'tests/local/client-identity/phase-04.test.mjs',
+      'tests/local/runtime-foundations/phase-08-runtime-controls.test.mjs',
+    ],
   );
   assert.deepEqual(
     getRequiredTestImplementationFiles('TEST-OPS-001'),
@@ -1252,6 +1286,38 @@ test('non-local coverage fails closed when a required environment report does no
   assert.equal(results[0].satisfied, false);
   assert.equal(results[0].mapping_error, null);
   assert.deepEqual(results[0].missing_files, ['tests/pre-release/test-ops-001.test.mjs']);
+});
+
+test('EVID-CS-001 fails closed when the required local runtime-control coverage is missing', async () => {
+  const results = await collectTestCoverageResults(
+    getL1EvidenceDefinition('EVID-CS-001'),
+    {
+      local: {
+        expanded_test_files: [
+          'tests/local/client-identity/phase-04.test.mjs',
+        ],
+      },
+      'ci-integration': {
+        expanded_test_files: [
+          'tests/integration/test-cs-001.test.mjs',
+        ],
+      },
+      staging: {
+        expanded_test_files: [
+          'tests/staging/test-cs-001.test.mjs',
+        ],
+      },
+    },
+  );
+
+  assert.equal(results.length, 3);
+  const localResult = results.find((result) => result.environment_name === 'local');
+  assert.equal(localResult?.satisfied, false);
+  assert.equal(localResult?.mapping_error, null);
+  assert.deepEqual(
+    localResult?.missing_files,
+    ['tests/local/runtime-foundations/phase-08-runtime-controls.test.mjs'],
+  );
 });
 
 test('non-local coverage fails closed when a required environment mapping points at generic or shared non-local files', async () => {
