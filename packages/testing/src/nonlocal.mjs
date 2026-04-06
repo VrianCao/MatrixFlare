@@ -7803,7 +7803,33 @@ export async function validateProductionCurrentStateFailureArtifacts({
   const dispositionRecord = await readProdCurrentStateDisposition(resolvedCurrentStateSnapshotPath);
   const currentStateExists = await fileExists(resolvedCurrentStateSnapshotPath);
   const preFailureSnapshotExists = await fileExists(preFailureSnapshotPath);
+  if (dispositionRecord == null && currentStateExists) {
+    let snapshot = null;
+    try {
+      snapshot = JSON.parse(await fs.readFile(resolvedCurrentStateSnapshotPath, 'utf8'));
+    } catch (error) {
+      return {
+        valid: false,
+        error: `prod current state snapshot could not be read: ${error.message}`,
+      };
+    }
+    const snapshotValidation = validateProdCurrentStateSnapshot(snapshot, {
+      requireUsableBaseline: true,
+    });
+    if (!snapshotValidation.valid) {
+      return {
+        valid: false,
+        error: `prod current state snapshot is invalid: ${snapshotValidation.error}`,
+      };
+    }
+  }
   if (requireDisposition && dispositionRecord == null) {
+    if (currentStateExists && !preFailureSnapshotExists) {
+      return {
+        valid: true,
+        error: null,
+      };
+    }
     return {
       valid: false,
       error: 'prod current state failure artifacts must include current-production-state-disposition.json',
