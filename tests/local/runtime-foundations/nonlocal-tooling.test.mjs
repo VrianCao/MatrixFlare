@@ -12,6 +12,8 @@ import {
   buildProdPromotionRecord,
   buildProdRollbackRecord,
   buildPreReleaseRolloutVersionSpecs,
+  buildProductionGatewayRolloutReadinessOptions,
+  buildProductionWorkerPromotionReadinessOptions,
   buildEnvironmentRunProvenance,
   buildGitHubRunUrl,
   buildNonLocalEnvironmentPlan,
@@ -1721,6 +1723,30 @@ test('production readiness can defer the browser-compatible version ladder until
     browser_compatible_cors: true,
   });
   assert.equal(requestLog[0].headers.get('origin'), 'https://app.element.io');
+});
+
+test('production worker promotion readiness only requires the browser-compatible ladder for gateway-worker', () => {
+  assert.deepEqual(buildProductionWorkerPromotionReadinessOptions('jobs-worker'), {
+    requireBrowserCompatibleVersionLadder: false,
+  });
+  assert.deepEqual(buildProductionWorkerPromotionReadinessOptions('ops-worker'), {
+    requireBrowserCompatibleVersionLadder: false,
+  });
+  assert.deepEqual(buildProductionWorkerPromotionReadinessOptions('gateway-worker'), {
+    requireBrowserCompatibleVersionLadder: true,
+  });
+});
+
+test('production gateway rollout readiness only requires the browser-compatible ladder at 100 percent', () => {
+  assert.deepEqual(buildProductionGatewayRolloutReadinessOptions(10), {
+    requireBrowserCompatibleVersionLadder: false,
+  });
+  assert.deepEqual(buildProductionGatewayRolloutReadinessOptions(50), {
+    requireBrowserCompatibleVersionLadder: false,
+  });
+  assert.deepEqual(buildProductionGatewayRolloutReadinessOptions(100), {
+    requireBrowserCompatibleVersionLadder: true,
+  });
 });
 
 test('non-local deployment readiness refuses to probe staging without an Access session payload', async () => {

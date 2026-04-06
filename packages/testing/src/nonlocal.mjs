@@ -120,6 +120,24 @@ const GIT_SHA1_RE = /^[a-f0-9]{40}$/;
 let githubActionsOidcIdentityPromise = null;
 let githubActionsJwksPromise = null;
 
+export function buildProductionWorkerPromotionReadinessOptions(workerName) {
+  if (!WORKER_DEPLOYMENT_ORDER.includes(workerName)) {
+    throw new RangeError(`Unsupported production worker "${workerName}"`);
+  }
+  return Object.freeze({
+    requireBrowserCompatibleVersionLadder: workerName === 'gateway-worker',
+  });
+}
+
+export function buildProductionGatewayRolloutReadinessOptions(percentage) {
+  if (!Number.isInteger(percentage) || percentage <= 0 || percentage > 100) {
+    throw new RangeError('production gateway rollout percentage must be an integer between 1 and 100');
+  }
+  return Object.freeze({
+    requireBrowserCompatibleVersionLadder: percentage === 100,
+  });
+}
+
 function assertNonLocalEnvironmentName(environmentName) {
   if (!NON_LOCAL_ENVIRONMENT_NAMES.includes(environmentName)) {
     throw new RangeError(`Unsupported non-local environment "${environmentName}"`);
@@ -5507,6 +5525,7 @@ export async function promoteProductionEnvironment({
           buildRemoteHarnessEnvironmentVariables(provisionedEnvironment.plan),
           accessSession,
         ),
+        buildProductionWorkerPromotionReadinessOptions(workerName),
       );
       migrationReadinessChecks[migrationReadinessFieldNames[workerName]] = readinessProbe;
       if (!readinessProbe.ready) {
@@ -5601,9 +5620,7 @@ export async function promoteProductionEnvironment({
       buildRemoteHarnessEnvironmentVariables(provisionedEnvironment.plan),
       accessSession,
     ),
-    {
-      requireBrowserCompatibleVersionLadder: false,
-    },
+    buildProductionWorkerPromotionReadinessOptions('jobs-worker'),
   );
   if (!jobsReadiness.ready) {
     throw new Error(`Production jobs-worker readiness probe failed: ${jobsReadiness.last_error}`);
@@ -5640,9 +5657,7 @@ export async function promoteProductionEnvironment({
       buildRemoteHarnessEnvironmentVariables(provisionedEnvironment.plan),
       accessSession,
     ),
-    {
-      requireBrowserCompatibleVersionLadder: false,
-    },
+    buildProductionWorkerPromotionReadinessOptions('ops-worker'),
   );
   if (!opsReadiness.ready) {
     throw new Error(`Production ops-worker readiness probe failed: ${opsReadiness.last_error}`);
@@ -5690,6 +5705,7 @@ export async function promoteProductionEnvironment({
         buildRemoteHarnessEnvironmentVariables(provisionedEnvironment.plan),
         accessSession,
       ),
+      buildProductionGatewayRolloutReadinessOptions(percentage),
     );
     gatewayRolloutSteps.push({
       percentage,
@@ -6709,9 +6725,7 @@ export async function operationalRefreshProductionEnvironment({
       buildRemoteHarnessEnvironmentVariables(provisionedEnvironment.plan),
       accessSession,
     ),
-    {
-      requireBrowserCompatibleVersionLadder: false,
-    },
+    buildProductionWorkerPromotionReadinessOptions('jobs-worker'),
   );
   if (!jobsReadiness.ready) {
     throw new Error(`Operational prod refresh jobs-worker readiness probe failed: ${jobsReadiness.last_error}`);
@@ -6748,9 +6762,7 @@ export async function operationalRefreshProductionEnvironment({
       buildRemoteHarnessEnvironmentVariables(provisionedEnvironment.plan),
       accessSession,
     ),
-    {
-      requireBrowserCompatibleVersionLadder: false,
-    },
+    buildProductionWorkerPromotionReadinessOptions('ops-worker'),
   );
   if (!opsReadiness.ready) {
     throw new Error(`Operational prod refresh ops-worker readiness probe failed: ${opsReadiness.last_error}`);
@@ -6798,6 +6810,7 @@ export async function operationalRefreshProductionEnvironment({
         buildRemoteHarnessEnvironmentVariables(provisionedEnvironment.plan),
         accessSession,
       ),
+      buildProductionGatewayRolloutReadinessOptions(percentage),
     );
     gatewayRolloutSteps.push({
       percentage,
