@@ -5135,17 +5135,31 @@ function buildProdGatewayGradualVersionSpecs(baselineGatewayVersionId, candidate
   ]);
 }
 
-function validateProductionBaselineRecord(record) {
+function validateProductionBaselineRecord(record, {
+  expectedGitHubRepository = null,
+  expectedOriginRunIdentity = null,
+} = {}) {
   if (!isPlainObject(record)) {
     throw new TypeError('baselineRecord must be an object');
   }
   const validation = record.artifact_id === 'prod_install_record'
-    ? validateProdInstallRecord(record)
+    ? validateProdInstallRecord(record, {
+      expectedGitHubRepository,
+      expectedOriginRunIdentity,
+    })
     : record.artifact_id === 'prod_promotion_record'
-      ? validateProdPromotionRecord(record)
+      ? validateProdPromotionRecord(record, {
+        expectedGitHubRepository,
+        expectedOriginRunIdentity,
+      })
+      : record.artifact_id === 'prod_current_state_snapshot'
+        ? validateProdCurrentStateSnapshot(record, {
+          expectedOriginRunIdentity,
+          requireUsableBaseline: true,
+        })
       : {
         valid: false,
-        error: 'baselineRecord must be a prod_install_record or prod_promotion_record',
+        error: 'baselineRecord must be a prod_install_record, prod_promotion_record, or typed prod_current_state_snapshot',
       };
   if (!validation.valid) {
     throw new TypeError(`baselineRecord is invalid: ${validation.error}`);
@@ -5156,14 +5170,26 @@ function validateProductionBaselineRecord(record) {
 function extractBaselineDeploymentIdentity(record) {
   return record.artifact_id === 'prod_install_record'
     ? record.deployment_identity
-    : record.current_deployment_identity;
+    : record.artifact_id === 'prod_promotion_record'
+      ? record.current_deployment_identity
+      : record.current_deployment_observation?.current_deployment_identity ?? null;
 }
 
 function extractBaselineWorkersSubdomain(record) {
   if (record.artifact_id === 'prod_install_record') {
     return record.workers_subdomain;
   }
+  if (record.artifact_id === 'prod_current_state_snapshot') {
+    return isNonEmptyString(record.workers_subdomain) ? record.workers_subdomain : null;
+  }
   return record.rollback_handle?.workers_subdomain ?? null;
+}
+
+function isLegacyProdCurrentStateSnapshot(record) {
+  return isPlainObject(record)
+    && record.artifact_id == null
+    && isPlainObject(record.baseline_record)
+    && isPlainObject(record.current_deployment_observation);
 }
 
 function summarizeProductionBaselineIdentityMatch(baselineIdentity, currentIdentity) {
@@ -5229,6 +5255,55 @@ function buildProductionCurrentStateWorkerObservation(workerName, scriptName, st
       }),
     error,
   });
+}
+
+function resolveProductionCurrentStateWorkerVersionTag(workerObservation, workerVersionId) {
+  if (!isPlainObject(workerObservation) || !isNonEmptyString(workerVersionId)) {
+    return 'unknown';
+  }
+  const versionItems = Array.isArray(workerObservation.raw_cloudflare_api_results?.versions?.items)
+    ? workerObservation.raw_cloudflare_api_results.versions.items
+    : [];
+  const matchedVersion = versionItems.find((entry) => entry?.id === workerVersionId);
+  const annotations = matchedVersion?.annotations;
+  const tag = stableString(
+    annotations?.['workers/tag']
+      ?? annotations?.workers_tag
+      ?? annotations?.workersTag,
+  );
+  return isNonEmptyString(tag) ? tag : 'unknown';
+}
+
+function buildProductionCurrentStateWorkerRecord(workerName, workerObservation, workersSubdomain) {
+  const scriptName = isNonEmptyString(workerObservation?.script_name)
+    ? workerObservation.script_name
+    : buildProductionWorkerScriptName(workerName);
+  const activeWorkerVersionIds = Array.isArray(workerObservation?.active_worker_version_ids)
+    ? workerObservation.active_worker_version_ids.filter((entry) => isNonEmptyString(entry))
+    : [];
+  const workerVersionId = activeWorkerVersionIds.length === 1 ? activeWorkerVersionIds[0] : null;
+  return Object.freeze({
+    worker_name: workerName,
+    script_name: scriptName,
+    url: `https://${scriptName}.${workersSubdomain}.workers.dev`,
+    deployment_id: isNonEmptyString(workerObservation?.latest_active_deployment_id)
+      ? workerObservation.latest_active_deployment_id
+      : null,
+    worker_version_id: workerVersionId,
+    worker_version_tag: resolveProductionCurrentStateWorkerVersionTag(workerObservation, workerVersionId),
+  });
+}
+
+function buildProductionCurrentStateWorkerRecordSet(currentObservation, workersSubdomain) {
+  const workers = {};
+  for (const workerName of WORKER_DEPLOYMENT_ORDER) {
+    workers[workerName] = buildProductionCurrentStateWorkerRecord(
+      workerName,
+      currentObservation?.workers?.[workerName],
+      workersSubdomain,
+    );
+  }
+  return Object.freeze(workers);
 }
 
 function buildProductionInstallTopologyStateSnapshot(currentObservation) {
@@ -5446,11 +5521,17 @@ export async function observeProductionInstallTopologyState({
 export function buildProductionCurrentStateSnapshot({
   baselineRecord,
   currentObservation,
+  originRunIdentity,
 }) {
   const resolvedBaselineRecord = validateProductionBaselineRecord(baselineRecord);
+  const originRunValidation = validateProducerRunIdentity(originRunIdentity, 'originRunIdentity');
+  if (!originRunValidation.valid) {
+    throw new Error(`ProdCurrentStateSnapshot is invalid: ${originRunValidation.error}`);
+  }
   if (!isPlainObject(currentObservation) || currentObservation.environment_id !== PRODUCTION_ENVIRONMENT_NAME) {
     throw new TypeError('currentObservation must be a production current-state observation');
   }
+  const workersSubdomain = extractBaselineWorkersSubdomain(resolvedBaselineRecord);
   const baselineIdentity = extractBaselineDeploymentIdentity(resolvedBaselineRecord);
   const comparison = currentObservation.current_deployment_identity == null
     ? {
@@ -5459,10 +5540,21 @@ export function buildProductionCurrentStateSnapshot({
     }
     : summarizeProductionBaselineIdentityMatch(baselineIdentity, currentObservation.current_deployment_identity);
   return Object.freeze({
+    schema_version: 1,
+    artifact_id: 'prod_current_state_snapshot',
+    source_environment: PRODUCTION_ENVIRONMENT_NAME,
+    origin_repository: originRunIdentity.origin_repository,
+    origin_run_id: originRunIdentity.origin_run_id,
+    origin_run_attempt: originRunIdentity.origin_run_attempt,
+    origin_run_uri: originRunIdentity.origin_run_uri,
+    workers_subdomain: workersSubdomain,
+    access: Object.freeze({
+      protected_ops_url: resolvedBaselineRecord.access?.protected_ops_url ?? '',
+    }),
     observed_at: currentObservation.observed_at ?? new Date().toISOString(),
     baseline_record: Object.freeze({
-      artifact_id: resolvedBaselineRecord.artifact_id,
-      origin_run_uri: resolvedBaselineRecord.origin_run_uri,
+      artifact_id: resolvedBaselineRecord.artifact_id ?? 'prod_current_state_snapshot',
+      origin_run_uri: resolvedBaselineRecord.origin_run_uri ?? resolvedBaselineRecord.baseline_record?.origin_run_uri ?? '',
       deployment_identity: structuredCloneJson(baselineIdentity),
     }),
     baseline_match: Object.freeze({
@@ -5470,6 +5562,9 @@ export function buildProductionCurrentStateSnapshot({
       mismatched_fields: Object.freeze([...comparison.mismatched_fields]),
       problems: Object.freeze(Array.isArray(currentObservation.problems) ? [...currentObservation.problems] : []),
     }),
+    workers: workersSubdomain == null
+      ? {}
+      : buildProductionCurrentStateWorkerRecordSet(currentObservation, workersSubdomain),
     current_deployment_observation: structuredCloneJson(currentObservation),
   });
 }
@@ -5477,15 +5572,178 @@ export function buildProductionCurrentStateSnapshot({
 async function writeProductionCurrentStateSnapshot({
   baselineRecord,
   currentObservation,
+  originRunIdentity,
   outputPath,
 }) {
   const snapshot = buildProductionCurrentStateSnapshot({
     baselineRecord,
     currentObservation,
+    originRunIdentity,
   });
   await fs.mkdir(path.dirname(outputPath), { recursive: true });
-  await fs.writeFile(outputPath, stableJson(snapshot));
+  const temporaryOutputPath = path.join(
+    path.dirname(outputPath),
+    `.${path.basename(outputPath)}.${process.pid}.${Date.now().toString(36)}.tmp`,
+  );
+  try {
+    await fs.writeFile(temporaryOutputPath, stableJson(snapshot));
+    await fs.rename(temporaryOutputPath, outputPath);
+  } catch (error) {
+    await fs.rm(temporaryOutputPath, { force: true });
+    throw error;
+  }
   return snapshot;
+}
+
+function productionCurrentStateDispositionPath(currentStateSnapshotPath) {
+  return path.join(
+    path.dirname(currentStateSnapshotPath),
+    'current-production-state-disposition.json',
+  );
+}
+
+const PRE_FAILURE_CURRENT_STATE_REFRESH_PENDING_MESSAGE = 'pre-failure current-production-state snapshot may be stale until the post-failure refresh completes';
+
+async function writeProductionCurrentStateDisposition({
+  currentStateSnapshotPath,
+  refreshed = false,
+  staleSnapshotPath = null,
+  canonicalSnapshotRemoved = false,
+  refreshError = null,
+}) {
+  const dispositionPath = productionCurrentStateDispositionPath(currentStateSnapshotPath);
+  await fs.writeFile(dispositionPath, stableJson({
+    schema_version: 1,
+    artifact_id: 'prod_current_state_disposition',
+    observed_at: new Date().toISOString(),
+    current_state_path: path.basename(currentStateSnapshotPath),
+    disposition: refreshed
+      ? 'refreshed'
+      : staleSnapshotPath != null
+        ? 'quarantined'
+        : canonicalSnapshotRemoved
+          ? 'removed'
+          : 'refresh_failed',
+    pre_failure_snapshot_path: staleSnapshotPath == null ? null : path.basename(staleSnapshotPath),
+    canonical_snapshot_removed: canonicalSnapshotRemoved,
+    refresh_error: refreshError == null ? null : String(refreshError),
+  }));
+  return dispositionPath;
+}
+
+async function markProductionCurrentStateSnapshotPotentiallyStale(currentStateSnapshotPath) {
+  return writeProductionCurrentStateDisposition({
+    currentStateSnapshotPath,
+    refreshError: PRE_FAILURE_CURRENT_STATE_REFRESH_PENDING_MESSAGE,
+  });
+}
+
+async function quarantinePotentiallyStaleProductionCurrentStateSnapshot(currentStateSnapshotPath) {
+  try {
+    await fs.access(currentStateSnapshotPath);
+  } catch {
+    return null;
+  }
+  const staleSnapshotPath = path.join(
+    path.dirname(currentStateSnapshotPath),
+    'pre-failure-current-production-state.json',
+  );
+  await fs.rm(staleSnapshotPath, { force: true });
+  await fs.rename(currentStateSnapshotPath, staleSnapshotPath);
+  return staleSnapshotPath;
+}
+
+async function refreshProductionCurrentStateSnapshotAfterFailure({
+  baselineRecord,
+  currentStateSnapshotPath,
+  originRunIdentity,
+  accountId,
+  apiToken,
+  error,
+}) {
+  let provisionalDispositionPath = null;
+  let preemptivelyQuarantinedSnapshotPath = null;
+  let preemptivelyRemovedCanonicalSnapshot = false;
+  try {
+    provisionalDispositionPath = await markProductionCurrentStateSnapshotPotentiallyStale(currentStateSnapshotPath);
+  } catch (initialDispositionError) {
+    if (error instanceof Error) {
+      error.message = `${error.message}; additionally failed to mark the pre-failure current-production-state snapshot as potentially stale before attempting a post-failure refresh: ${initialDispositionError.message}`;
+    }
+    try {
+      preemptivelyQuarantinedSnapshotPath = await quarantinePotentiallyStaleProductionCurrentStateSnapshot(currentStateSnapshotPath);
+    } catch (quarantineError) {
+      try {
+        await fs.rm(currentStateSnapshotPath, { force: true });
+        preemptivelyRemovedCanonicalSnapshot = true;
+      } catch (removeError) {
+        if (error instanceof Error) {
+          error.message = `${error.message}; additionally failed to quarantine the potentially stale current-production-state snapshot before attempting a post-failure refresh: ${quarantineError.message}; additionally failed to delete the canonical current-production-state snapshot before attempting a post-failure refresh: ${removeError.message}`;
+        }
+      }
+      if (error instanceof Error) {
+        error.message = `${error.message}; additionally failed to quarantine the potentially stale current-production-state snapshot before attempting a post-failure refresh: ${quarantineError.message}${preemptivelyRemovedCanonicalSnapshot ? '; removed the canonical current-production-state snapshot instead' : ''}`;
+      }
+    }
+  }
+  try {
+    const refreshedObservation = await observeProductionCurrentCloudflareState(baselineRecord, {
+      accountId,
+      apiToken,
+    });
+    await writeProductionCurrentStateSnapshot({
+      baselineRecord,
+      currentObservation: refreshedObservation,
+      originRunIdentity,
+      outputPath: currentStateSnapshotPath,
+    });
+    await writeProductionCurrentStateDisposition({
+      currentStateSnapshotPath,
+      refreshed: true,
+    });
+  } catch (snapshotError) {
+    let staleSnapshotPath = preemptivelyQuarantinedSnapshotPath;
+    let canonicalSnapshotRemoved = preemptivelyRemovedCanonicalSnapshot;
+    if (staleSnapshotPath == null && !canonicalSnapshotRemoved) {
+      try {
+        staleSnapshotPath = await quarantinePotentiallyStaleProductionCurrentStateSnapshot(currentStateSnapshotPath);
+      } catch (quarantineError) {
+        try {
+          await fs.rm(currentStateSnapshotPath, { force: true });
+          canonicalSnapshotRemoved = true;
+        } catch (removeError) {
+          if (error instanceof Error) {
+            error.message = `${error.message}; additionally failed to quarantine the potentially stale current-production-state snapshot: ${quarantineError.message}; additionally failed to delete the canonical current-production-state snapshot: ${removeError.message}`;
+          }
+        }
+        if (error instanceof Error) {
+          error.message = `${error.message}; additionally failed to quarantine the potentially stale current-production-state snapshot: ${quarantineError.message}${canonicalSnapshotRemoved ? '; removed the canonical current-production-state snapshot instead' : ''}`;
+        }
+      }
+    }
+    let dispositionPath = provisionalDispositionPath;
+    try {
+      dispositionPath = await writeProductionCurrentStateDisposition({
+        currentStateSnapshotPath,
+        staleSnapshotPath,
+        canonicalSnapshotRemoved,
+        refreshError: snapshotError.message,
+      });
+    } catch (dispositionError) {
+      if (error instanceof Error) {
+        error.message = `${error.message}; additionally failed to write current-production-state disposition artifact: ${dispositionError.message}`;
+      }
+    }
+    if (error instanceof Error) {
+      const staleSnapshotDisposition = staleSnapshotPath != null
+        ? `removed current-production-state snapshot because it may be stale; preserved the pre-failure snapshot at ${staleSnapshotPath}`
+        : canonicalSnapshotRemoved
+          ? 'removed current-production-state snapshot because it may be stale'
+          : 'current-production-state snapshot may still be stale because quarantine and deletion both failed';
+      error.message = `${error.message}; additionally failed to refresh current-production-state snapshot after failure: ${snapshotError.message}; ${staleSnapshotDisposition}${dispositionPath == null ? '' : `; wrote current-production-state disposition artifact to ${dispositionPath}`}`;
+    }
+  }
+  return error;
 }
 
 export async function startPreReleaseGatewayRollout(environmentName, {
@@ -5758,6 +6016,7 @@ export async function promoteProductionEnvironment({
   repoRoot = process.cwd(),
   candidateManifest,
   baselineRecord = null,
+  baselineCurrentState = null,
   installRecord,
   promotionId = null,
   workingRoot = null,
@@ -5772,6 +6031,7 @@ export async function promoteProductionEnvironment({
   });
   const currentRepository = await resolveCurrentGitHubRepository(repoRoot, claims);
   const currentHeadSha = await resolveCurrentGitCommitSha(repoRoot);
+  const originRunIdentity = buildGitHubActionsProducerRunIdentity(claims);
   const manifestValidation = validateReleaseCandidateManifest(candidateManifest, {
     expectedGitHubRepository: currentRepository,
   });
@@ -5780,7 +6040,9 @@ export async function promoteProductionEnvironment({
   }
   assertArtifactRepositoryMatchesCurrent('candidateManifest', candidateManifest, currentRepository);
   assertReleaseCommitMatchesCurrentHead('candidateManifest.release_commit_sha', candidateManifest.release_commit_sha, currentHeadSha);
-  const resolvedBaselineRecord = validateProductionBaselineRecord(baselineRecord ?? installRecord);
+  const resolvedBaselineRecord = validateProductionBaselineRecord(
+    baselineCurrentState ?? baselineRecord ?? installRecord,
+  );
   assertArtifactRepositoryMatchesCurrent('baselineRecord', resolvedBaselineRecord, currentRepository);
   const { accountId, apiToken } = requireCloudflareCredentials({
     accountId: explicitAccountId,
@@ -5788,20 +6050,6 @@ export async function promoteProductionEnvironment({
   });
   const resolvedWorkingRoot = path.resolve(workingRoot ?? path.join(repoRoot, '.tmp', 'prod-promote'));
   await fs.mkdir(resolvedWorkingRoot, { recursive: true });
-  const provisionedEnvironment = await ensureProductionEnvironmentResources({
-    repoRoot,
-    preferredWorkersSubdomain: extractBaselineWorkersSubdomain(resolvedBaselineRecord),
-    accountId,
-    apiToken,
-  });
-  const accessSession = await prepareProductionOpsAccessSession({
-    repoRoot,
-    provisionedEnvironment,
-    deploymentSummary: cloneProductionDeploymentSummary(resolvedBaselineRecord, provisionedEnvironment),
-    workingRoot: path.join(resolvedWorkingRoot, 'ops-access'),
-    accountId,
-    apiToken,
-  });
   const currentStateSnapshotPath = path.join(resolvedWorkingRoot, 'current-production-state.json');
   const currentObservation = await observeProductionCurrentCloudflareState(resolvedBaselineRecord, {
     accountId,
@@ -5810,6 +6058,7 @@ export async function promoteProductionEnvironment({
   await writeProductionCurrentStateSnapshot({
     baselineRecord: resolvedBaselineRecord,
     currentObservation,
+    originRunIdentity,
     outputPath: currentStateSnapshotPath,
   });
   if (currentObservation.current_deployment_identity == null) {
@@ -5821,6 +6070,12 @@ export async function promoteProductionEnvironment({
   assertProductionBaselineMatchesCurrentIdentity(resolvedBaselineRecord, currentIdentity, {
     observedStatePath: currentStateSnapshotPath,
   });
+  const provisionedEnvironment = await ensureProductionEnvironmentResources({
+    repoRoot,
+    preferredWorkersSubdomain: extractBaselineWorkersSubdomain(resolvedBaselineRecord),
+    accountId,
+    apiToken,
+  });
   const currentDeploymentSummary = cloneProductionDeploymentSummary(resolvedBaselineRecord, provisionedEnvironment);
   for (const workerName of WORKER_DEPLOYMENT_ORDER) {
     updateProductionDeploymentSummaryWorker(currentDeploymentSummary, provisionedEnvironment.plan, workerName, {
@@ -5829,13 +6084,23 @@ export async function promoteProductionEnvironment({
       workerVersionTag: resolvedBaselineRecord.workers?.[workerName]?.worker_version_tag ?? null,
     });
   }
+  const accessSession = await prepareProductionOpsAccessSession({
+    repoRoot,
+    provisionedEnvironment,
+    deploymentSummary: currentDeploymentSummary,
+    workingRoot: path.join(resolvedWorkingRoot, 'ops-access'),
+    accountId,
+    apiToken,
+  });
 
   const resolvedPromotionId = promotionId ?? deploymentId ?? `gha-prod-promote-${Date.now().toString(36)}`;
   const sourceCandidate = {
     candidate_id: candidateManifest.candidate_id,
     source_run_uri: candidateManifest.source_run_uri,
   };
-  if (candidateManifest.requires_do_migration) {
+  try {
+    if (candidateManifest.requires_do_migration) {
+    await markProductionCurrentStateSnapshotPotentiallyStale(currentStateSnapshotPath);
     const migrationWorkingRoot = path.join(resolvedWorkingRoot, 'deploy');
     await fs.mkdir(migrationWorkingRoot, { recursive: true });
     const migrationRuntimeComposition = buildDeploymentCompositionFromSummary(currentDeploymentSummary);
@@ -5925,7 +6190,7 @@ export async function promoteProductionEnvironment({
       readinessChecks: migrationReadinessChecks,
       rollbackHandle: null,
       promotionId: resolvedPromotionId,
-      originRunIdentity: buildGitHubActionsProducerRunIdentity(claims),
+      originRunIdentity,
     });
     assertArtifactRepositoryMatchesCurrent('prodPromotionRecord', record, currentRepository);
     if (outputPath != null) {
@@ -5952,6 +6217,7 @@ export async function promoteProductionEnvironment({
     apiToken,
     productionSecretSeed,
   });
+  await markProductionCurrentStateSnapshotPotentiallyStale(currentStateSnapshotPath);
   const jobsDeploy = await deployProductionWorkerVersion(
     'jobs-worker',
     jobsUpload.config_path,
@@ -6121,20 +6387,30 @@ export async function promoteProductionEnvironment({
       },
     }),
     promotionId: resolvedPromotionId,
-    originRunIdentity: buildGitHubActionsProducerRunIdentity(claims),
+    originRunIdentity,
   });
   assertArtifactRepositoryMatchesCurrent('prodPromotionRecord', record, currentRepository);
   if (outputPath != null) {
     await fs.mkdir(path.dirname(outputPath), { recursive: true });
     await fs.writeFile(outputPath, stableJson(record));
   }
-  return {
-    provisioned_environment: provisionedEnvironment,
-    access_session: accessSession,
-    promotion_mode: 'gradual',
-    record,
-    output_path: outputPath,
-  };
+    return {
+      provisioned_environment: provisionedEnvironment,
+      access_session: accessSession,
+      promotion_mode: 'gradual',
+      record,
+      output_path: outputPath,
+    };
+  } catch (error) {
+    throw await refreshProductionCurrentStateSnapshotAfterFailure({
+      baselineRecord: resolvedBaselineRecord,
+      currentStateSnapshotPath,
+      originRunIdentity,
+      accountId,
+      apiToken,
+      error,
+    });
+  }
 }
 
 export async function rollbackProductionEnvironment({
@@ -6199,6 +6475,7 @@ export async function rollbackProductionEnvironment({
   await writeProductionCurrentStateSnapshot({
     baselineRecord: promotionRecord,
     currentObservation,
+    originRunIdentity: buildGitHubActionsProducerRunIdentity(claims),
     outputPath: currentStateSnapshotPath,
   });
   if (currentObservation.current_deployment_identity == null) {
@@ -6566,6 +6843,49 @@ function validateProducerRunIdentity(originRunIdentity, label = 'origin run iden
   };
 }
 
+function validateExpectedProducerRunIdentity(actualRunIdentity, expectedOriginRunIdentity, {
+  label = 'producer run identity',
+  expectedLabel = 'expectedOriginRunIdentity',
+} = {}) {
+  if (expectedOriginRunIdentity == null) {
+    return {
+      valid: true,
+      error: null,
+    };
+  }
+  const expectedValidation = validateProducerRunIdentity(expectedOriginRunIdentity, expectedLabel);
+  if (!expectedValidation.valid) {
+    return expectedValidation;
+  }
+  for (const field of ['origin_repository', 'origin_run_id', 'origin_run_attempt', 'origin_run_uri']) {
+    if (actualRunIdentity[field] !== expectedOriginRunIdentity[field]) {
+      return {
+        valid: false,
+        error: `${label}.${field} must match ${expectedLabel}.${field}`,
+      };
+    }
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function looksLikeTypedProdCurrentStateSnapshot(payload) {
+  return isPlainObject(payload) && (
+    'schema_version' in payload
+    || 'artifact_id' in payload
+    || 'source_environment' in payload
+    || 'origin_repository' in payload
+    || 'origin_run_id' in payload
+    || 'origin_run_attempt' in payload
+    || 'origin_run_uri' in payload
+    || 'workers_subdomain' in payload
+    || 'access' in payload
+    || 'workers' in payload
+  );
+}
+
 function assertProductionRecordedIdentityMatchesCurrent(expectedIdentity, currentIdentity, label, {
   observedStatePath = null,
 } = {}) {
@@ -6715,6 +7035,98 @@ function validateProdWorkerRecordSet(workers, deploymentIdentity, {
   };
 }
 
+function validateProdCurrentStateBaselineMatch(baselineMatch, label) {
+  if (!isPlainObject(baselineMatch)) {
+    return {
+      valid: false,
+      error: `${label} must be an object`,
+    };
+  }
+  if (typeof baselineMatch.matches !== 'boolean') {
+    return {
+      valid: false,
+      error: `${label}.matches must be a boolean`,
+    };
+  }
+  if (!Array.isArray(baselineMatch.mismatched_fields) || !baselineMatch.mismatched_fields.every((entry) => isNonEmptyString(entry))) {
+    return {
+      valid: false,
+      error: `${label}.mismatched_fields must be an array of non-empty strings`,
+    };
+  }
+  if (!Array.isArray(baselineMatch.problems) || !baselineMatch.problems.every((entry) => isNonEmptyString(entry))) {
+    return {
+      valid: false,
+      error: `${label}.problems must be an array of non-empty strings`,
+    };
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+function validateProdCurrentStateObservationWorkers(workers, label) {
+  if (!isPlainObject(workers)) {
+    return {
+      valid: false,
+      error: `${label} must be an object`,
+    };
+  }
+  for (const workerName of WORKER_DEPLOYMENT_ORDER) {
+    const observation = workers[workerName];
+    if (!isPlainObject(observation)) {
+      return {
+        valid: false,
+        error: `${label}.${workerName} must be an object`,
+      };
+    }
+    if (observation.worker_name !== workerName) {
+      return {
+        valid: false,
+        error: `${label}.${workerName}.worker_name must equal ${workerName}`,
+      };
+    }
+    const expectedScriptName = buildProductionWorkerScriptName(workerName);
+    if (observation.script_name !== expectedScriptName) {
+      return {
+        valid: false,
+        error: `${label}.${workerName}.script_name must equal ${expectedScriptName}`,
+      };
+    }
+    if (observation.latest_active_deployment_id != null && !isNonEmptyString(observation.latest_active_deployment_id)) {
+      return {
+        valid: false,
+        error: `${label}.${workerName}.latest_active_deployment_id must be a non-empty string or null`,
+      };
+    }
+    for (const field of ['deployment_ids', 'active_worker_version_ids', 'worker_version_ids']) {
+      if (!Array.isArray(observation[field]) || !observation[field].every((entry) => isNonEmptyString(entry))) {
+        return {
+          valid: false,
+          error: `${label}.${workerName}.${field} must be an array of non-empty strings`,
+        };
+      }
+    }
+    if (observation.raw_cloudflare_api_results != null && !isPlainObject(observation.raw_cloudflare_api_results)) {
+      return {
+        valid: false,
+        error: `${label}.${workerName}.raw_cloudflare_api_results must be an object or null`,
+      };
+    }
+    if (observation.error != null && !isPlainObject(observation.error)) {
+      return {
+        valid: false,
+        error: `${label}.${workerName}.error must be an object or null`,
+      };
+    }
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
 export function validateReleaseCandidateManifest(payload, {
   expectedGitHubRepository = null,
 } = {}) {
@@ -6801,10 +7213,17 @@ export async function writeReleaseCandidateManifest(outputPath, options) {
 
 export function validateProdInstallRecord(payload, {
   expectedGitHubRepository = null,
+  expectedOriginRunIdentity = null,
 } = {}) {
   const validation = validateManualArtifactPayload('prod_install_record', payload);
   if (!validation.valid) {
     return validation;
+  }
+  const expectedOriginRunValidation = validateExpectedProducerRunIdentity(payload, expectedOriginRunIdentity, {
+    label: 'prod install record',
+  });
+  if (!expectedOriginRunValidation.valid) {
+    return expectedOriginRunValidation;
   }
   if (isNonEmptyString(expectedGitHubRepository) && payload.origin_repository !== expectedGitHubRepository) {
     return {
@@ -6871,6 +7290,636 @@ export async function writeProdInstallRecord(outputPath, options) {
   };
 }
 
+function validateLegacyProdCurrentStateSnapshot(payload, {
+  requireUsableBaseline = false,
+} = {}) {
+  if (!isPlainObject(payload.baseline_record)) {
+    return {
+      valid: false,
+      error: 'legacy prod current state snapshot baseline_record must be an object',
+    };
+  }
+  if (
+    payload.baseline_record.artifact_id !== 'prod_install_record'
+    && payload.baseline_record.artifact_id !== 'prod_promotion_record'
+  ) {
+    return {
+      valid: false,
+      error: 'legacy prod current state snapshot baseline_record.artifact_id must be prod_install_record or prod_promotion_record',
+    };
+  }
+  if (!isGitHubActionsRunUrl(payload.baseline_record.origin_run_uri)) {
+    return {
+      valid: false,
+      error: 'legacy prod current state snapshot baseline_record.origin_run_uri must be a GitHub Actions run URL',
+    };
+  }
+  const baselineIdentityValidation = validateProductionDeploymentIdentity(
+    payload.baseline_record.deployment_identity,
+    'legacy prod current state snapshot baseline_record.deployment_identity',
+  );
+  if (!baselineIdentityValidation.valid) {
+    return baselineIdentityValidation;
+  }
+  if (!isPlainObject(payload.baseline_match)) {
+    return {
+      valid: false,
+      error: 'legacy prod current state snapshot baseline_match must be an object',
+    };
+  }
+  if (!isPlainObject(payload.current_deployment_observation)) {
+    return {
+      valid: false,
+      error: 'legacy prod current state snapshot current_deployment_observation must be an object',
+    };
+  }
+  if (payload.current_deployment_observation.environment_id !== PRODUCTION_ENVIRONMENT_NAME) {
+    return {
+      valid: false,
+      error: 'legacy prod current state snapshot current_deployment_observation.environment_id must equal prod',
+    };
+  }
+  if (!requireUsableBaseline) {
+    return {
+      valid: true,
+      error: null,
+    };
+  }
+  return validateProductionDeploymentIdentity(
+    payload.current_deployment_observation.current_deployment_identity,
+    'legacy prod current state snapshot current_deployment_observation.current_deployment_identity',
+  );
+}
+
+function validateProdCurrentStateDisposition(payload) {
+  if (!isPlainObject(payload)) {
+    return {
+      valid: false,
+      error: 'prod current state disposition must be an object',
+    };
+  }
+  if (payload.schema_version !== 1) {
+    return {
+      valid: false,
+      error: 'prod current state disposition schema_version must equal 1',
+    };
+  }
+  if (payload.artifact_id !== 'prod_current_state_disposition') {
+    return {
+      valid: false,
+      error: 'prod current state disposition artifact_id must equal prod_current_state_disposition',
+    };
+  }
+  if (!isRfc3339UtcTimestamp(payload.observed_at)) {
+    return {
+      valid: false,
+      error: 'prod current state disposition observed_at must be an RFC 3339 UTC timestamp',
+    };
+  }
+  if (payload.current_state_path !== 'current-production-state.json') {
+    return {
+      valid: false,
+      error: 'prod current state disposition current_state_path must equal current-production-state.json',
+    };
+  }
+  if (!['refreshed', 'quarantined', 'removed', 'refresh_failed'].includes(payload.disposition)) {
+    return {
+      valid: false,
+      error: 'prod current state disposition disposition must be refreshed, quarantined, removed, or refresh_failed',
+    };
+  }
+  if (payload.disposition === 'quarantined') {
+    if (payload.pre_failure_snapshot_path !== 'pre-failure-current-production-state.json') {
+      return {
+        valid: false,
+        error: 'prod current state disposition pre_failure_snapshot_path must equal pre-failure-current-production-state.json when disposition is quarantined',
+      };
+    }
+  } else if (payload.pre_failure_snapshot_path != null) {
+    return {
+      valid: false,
+      error: 'prod current state disposition pre_failure_snapshot_path must be null unless disposition is quarantined',
+    };
+  }
+  if (typeof payload.canonical_snapshot_removed !== 'boolean') {
+    return {
+      valid: false,
+      error: 'prod current state disposition canonical_snapshot_removed must be a boolean',
+    };
+  }
+  if (payload.canonical_snapshot_removed !== (payload.disposition === 'removed')) {
+    return {
+      valid: false,
+      error: 'prod current state disposition canonical_snapshot_removed must be true only when disposition is removed',
+    };
+  }
+  if (payload.disposition === 'refreshed') {
+    if (payload.refresh_error != null) {
+      return {
+        valid: false,
+        error: 'prod current state disposition refresh_error must be null when disposition is refreshed',
+      };
+    }
+  } else if (!isNonEmptyString(payload.refresh_error)) {
+    return {
+      valid: false,
+      error: 'prod current state disposition refresh_error must be non-empty when disposition is not refreshed',
+    };
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+export function validateProdCurrentStateSnapshot(payload, {
+  expectedGitHubRepository = null,
+  expectedOriginRunIdentity = null,
+  requireUsableBaseline = false,
+} = {}) {
+  if (!isPlainObject(payload)) {
+    return {
+      valid: false,
+      error: 'prod current state snapshot must be an object',
+    };
+  }
+  if (payload.schema_version !== 1) {
+    return {
+      valid: false,
+      error: 'prod current state snapshot schema_version must equal 1',
+    };
+  }
+  if (payload.artifact_id !== 'prod_current_state_snapshot') {
+    return {
+      valid: false,
+      error: 'prod current state snapshot artifact_id must equal prod_current_state_snapshot',
+    };
+  }
+  if (payload.source_environment !== PRODUCTION_ENVIRONMENT_NAME) {
+    return {
+      valid: false,
+      error: 'prod current state snapshot source_environment must equal prod',
+    };
+  }
+  const originRunValidation = validateProducerRunIdentity(payload, 'prod current state snapshot');
+  if (!originRunValidation.valid) {
+    return originRunValidation;
+  }
+  const expectedOriginRunValidation = validateExpectedProducerRunIdentity(payload, expectedOriginRunIdentity, {
+    label: 'prod current state snapshot',
+  });
+  if (!expectedOriginRunValidation.valid) {
+    return expectedOriginRunValidation;
+  }
+  if (isNonEmptyString(expectedGitHubRepository) && payload.origin_repository !== expectedGitHubRepository) {
+    return {
+      valid: false,
+      error: 'prod current state snapshot origin_repository must match the current repository',
+    };
+  }
+  if (!isNonEmptyString(payload.workers_subdomain)) {
+    return {
+      valid: false,
+      error: 'prod current state snapshot workers_subdomain must be non-empty',
+    };
+  }
+  try {
+    if (!isRfc3339UtcTimestamp(payload.observed_at)) {
+      throw new TypeError('prod current state snapshot observed_at must be an RFC 3339 UTC timestamp');
+    }
+    if (!isPlainObject(payload.access)) {
+      throw new TypeError('prod current state snapshot access must be an object');
+    }
+    if (!isNonEmptyString(payload.access.protected_ops_url)) {
+      throw new TypeError('prod current state snapshot access.protected_ops_url must be non-empty');
+    }
+    const protectedOpsUrl = parseAbsoluteHttpsUrl(payload.access.protected_ops_url, 'prod current state snapshot access.protected_ops_url');
+    if (protectedOpsUrl.host !== buildWorkersDevHost(buildProductionWorkerScriptName('ops-worker'), payload.workers_subdomain)) {
+      throw new TypeError('prod current state snapshot access.protected_ops_url must match the current prod ops-worker host');
+    }
+  } catch (error) {
+    return {
+      valid: false,
+      error: error.message,
+    };
+  }
+  if (!isPlainObject(payload.baseline_record)) {
+    return {
+      valid: false,
+      error: 'prod current state snapshot baseline_record must be an object',
+    };
+  }
+  if (
+    payload.baseline_record.artifact_id !== 'prod_install_record'
+    && payload.baseline_record.artifact_id !== 'prod_promotion_record'
+    && payload.baseline_record.artifact_id !== 'prod_current_state_snapshot'
+  ) {
+    return {
+      valid: false,
+      error: 'prod current state snapshot baseline_record.artifact_id must be prod_install_record, prod_promotion_record, or prod_current_state_snapshot',
+    };
+  }
+  if (!isGitHubActionsRunUrl(payload.baseline_record.origin_run_uri)) {
+    return {
+      valid: false,
+      error: 'prod current state snapshot baseline_record.origin_run_uri must be a GitHub Actions run URL',
+    };
+  }
+  const baselineIdentityValidation = validateProductionDeploymentIdentity(
+    payload.baseline_record.deployment_identity,
+    'prod current state snapshot baseline_record.deployment_identity',
+  );
+  if (!baselineIdentityValidation.valid) {
+    return baselineIdentityValidation;
+  }
+  const baselineMatchValidation = validateProdCurrentStateBaselineMatch(
+    payload.baseline_match,
+    'prod current state snapshot baseline_match',
+  );
+  if (!baselineMatchValidation.valid) {
+    return baselineMatchValidation;
+  }
+  if (!isPlainObject(payload.current_deployment_observation)) {
+    return {
+      valid: false,
+      error: 'prod current state snapshot current_deployment_observation must be an object',
+    };
+  }
+  if (payload.current_deployment_observation.environment_id !== PRODUCTION_ENVIRONMENT_NAME) {
+    return {
+      valid: false,
+      error: 'prod current state snapshot current_deployment_observation.environment_id must equal prod',
+    };
+  }
+  const currentObservationWorkersValidation = validateProdCurrentStateObservationWorkers(
+    payload.current_deployment_observation.workers,
+    'prod current state snapshot current_deployment_observation.workers',
+  );
+  if (!currentObservationWorkersValidation.valid) {
+    return currentObservationWorkersValidation;
+  }
+  if (!requireUsableBaseline) {
+    return {
+      valid: true,
+      error: null,
+    };
+  }
+  const currentIdentityValidation = validateProductionDeploymentIdentity(
+    payload.current_deployment_observation.current_deployment_identity,
+    'prod current state snapshot current_deployment_observation.current_deployment_identity',
+  );
+  if (!currentIdentityValidation.valid) {
+    return currentIdentityValidation;
+  }
+  if (!isPlainObject(payload.workers)) {
+    return {
+      valid: false,
+      error: 'prod current state snapshot workers must be an object',
+    };
+  }
+  const workerValidation = validateProdWorkerRecordSet(
+    payload.workers,
+    payload.current_deployment_observation.current_deployment_identity,
+    {
+      workersSubdomain: isNonEmptyString(payload.workers_subdomain) ? payload.workers_subdomain : null,
+    },
+  );
+  if (!workerValidation.valid) {
+    return workerValidation;
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+export function normalizeProdCurrentStateSnapshot(snapshot, {
+  baselineRecord = null,
+  originRunIdentity = null,
+} = {}) {
+  const currentValidation = validateProdCurrentStateSnapshot(snapshot, {
+    expectedOriginRunIdentity: originRunIdentity,
+    requireUsableBaseline: true,
+  });
+  if (currentValidation.valid) {
+    return structuredCloneJson(snapshot);
+  }
+  if (looksLikeTypedProdCurrentStateSnapshot(snapshot)) {
+    throw new TypeError(`typed prod current state snapshot is invalid: ${currentValidation.error}`);
+  }
+  if (!isPlainObject(snapshot)) {
+    throw new TypeError('prod current state snapshot must be an object');
+  }
+  if (!isPlainObject(snapshot.current_deployment_observation) || snapshot.current_deployment_observation.environment_id !== PRODUCTION_ENVIRONMENT_NAME) {
+    throw new TypeError('legacy prod current state snapshot current_deployment_observation must target prod');
+  }
+  const originRunValidation = validateProducerRunIdentity(originRunIdentity, 'originRunIdentity');
+  if (!originRunValidation.valid) {
+    throw new TypeError(`legacy prod current state snapshot normalization requires a valid originRunIdentity: ${originRunValidation.error}`);
+  }
+  const resolvedBaselineRecord = validateProductionBaselineRecord(baselineRecord, {
+    expectedOriginRunIdentity: originRunIdentity,
+  });
+  return buildProductionCurrentStateSnapshot({
+    baselineRecord: resolvedBaselineRecord,
+    currentObservation: snapshot.current_deployment_observation,
+    originRunIdentity,
+  });
+}
+
+function resolveArtifactRelativePath(artifactRoot, artifactRelativePath, label) {
+  if (!isNonEmptyString(artifactRelativePath)) {
+    throw new TypeError(`${label} must be non-empty`);
+  }
+  const resolvedArtifactRoot = path.resolve(artifactRoot);
+  const resolvedPath = path.resolve(resolvedArtifactRoot, artifactRelativePath);
+  const relativePath = path.relative(resolvedArtifactRoot, resolvedPath);
+  if (relativePath.startsWith('..') || path.isAbsolute(relativePath)) {
+    throw new RangeError(`${label} must stay within downloadRoot`);
+  }
+  return resolvedPath;
+}
+
+async function collectArtifactFilesNamed(rootDirectory, targetBasename) {
+  const pendingDirectories = [path.resolve(rootDirectory)];
+  const matches = [];
+  while (pendingDirectories.length > 0) {
+    const currentDirectory = pendingDirectories.pop();
+    const entries = await fs.readdir(currentDirectory, {
+      withFileTypes: true,
+    });
+    for (const entry of entries) {
+      const entryPath = path.join(currentDirectory, entry.name);
+      if (entry.isDirectory()) {
+        pendingDirectories.push(entryPath);
+        continue;
+      }
+      if (entry.isFile() && entry.name === targetBasename) {
+        matches.push(entryPath);
+      }
+    }
+  }
+  matches.sort((left, right) => left.localeCompare(right));
+  return matches;
+}
+
+async function readProdCurrentStateDisposition(rawBaselineInputPath) {
+  const dispositionPath = productionCurrentStateDispositionPath(rawBaselineInputPath);
+  try {
+    await fs.access(dispositionPath);
+  } catch {
+    return null;
+  }
+  const disposition = JSON.parse(await fs.readFile(dispositionPath, 'utf8'));
+  const validation = validateProdCurrentStateDisposition(disposition);
+  if (!validation.valid) {
+    throw new TypeError(`prod current state disposition is invalid: ${validation.error}`);
+  }
+  return Object.freeze({
+    dispositionPath,
+    disposition,
+  });
+}
+
+async function fileExists(filePath) {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function validateProductionCurrentStateFailureArtifacts({
+  currentStateSnapshotPath,
+  requireDisposition = true,
+} = {}) {
+  if (!isNonEmptyString(currentStateSnapshotPath)) {
+    throw new TypeError('currentStateSnapshotPath must be non-empty');
+  }
+  const resolvedCurrentStateSnapshotPath = path.resolve(currentStateSnapshotPath);
+  const preFailureSnapshotPath = path.join(
+    path.dirname(resolvedCurrentStateSnapshotPath),
+    'pre-failure-current-production-state.json',
+  );
+  const dispositionRecord = await readProdCurrentStateDisposition(resolvedCurrentStateSnapshotPath);
+  const currentStateExists = await fileExists(resolvedCurrentStateSnapshotPath);
+  const preFailureSnapshotExists = await fileExists(preFailureSnapshotPath);
+  if (requireDisposition && dispositionRecord == null) {
+    return {
+      valid: false,
+      error: 'prod current state failure artifacts must include current-production-state-disposition.json',
+    };
+  }
+  if (dispositionRecord == null) {
+    return {
+      valid: true,
+      error: null,
+    };
+  }
+  const { disposition } = dispositionRecord;
+  if (disposition.current_state_path !== path.basename(resolvedCurrentStateSnapshotPath)) {
+    return {
+      valid: false,
+      error: 'prod current state disposition current_state_path must match the canonical snapshot basename',
+    };
+  }
+  if (disposition.disposition === 'refreshed') {
+    if (!currentStateExists) {
+      return {
+        valid: false,
+        error: 'prod current state disposition refreshed requires canonical current-production-state.json',
+      };
+    }
+    return {
+      valid: true,
+      error: null,
+    };
+  }
+  if (currentStateExists) {
+    return {
+      valid: false,
+      error: `prod current state disposition ${disposition.disposition} requires canonical current-production-state.json to be absent`,
+    };
+  }
+  if (disposition.disposition === 'quarantined' && !preFailureSnapshotExists) {
+    return {
+      valid: false,
+      error: 'prod current state disposition quarantined requires pre-failure-current-production-state.json',
+    };
+  }
+  if (
+    disposition.disposition === 'refresh_failed'
+    && !preFailureSnapshotExists
+    && disposition.canonical_snapshot_removed !== true
+  ) {
+    return {
+      valid: false,
+      error: 'prod current state disposition refresh_failed requires quarantine evidence or canonical_snapshot_removed=true',
+    };
+  }
+  return {
+    valid: true,
+    error: null,
+  };
+}
+
+async function copyDirectoryIfPresent(sourceRoot, outputRoot) {
+  if (!await fileExists(sourceRoot)) {
+    return false;
+  }
+  await fs.cp(sourceRoot, outputRoot, {
+    recursive: true,
+    force: true,
+  });
+  return true;
+}
+
+export async function stageProductionRawStateArtifactForUpload({
+  stateRoot,
+  downloadRoot,
+  artifactRoot,
+  outputRoot,
+} = {}) {
+  for (const [name, value] of [
+    ['stateRoot', stateRoot],
+    ['downloadRoot', downloadRoot],
+    ['artifactRoot', artifactRoot],
+    ['outputRoot', outputRoot],
+  ]) {
+    if (!isNonEmptyString(value)) {
+      throw new TypeError(`${name} must be non-empty`);
+    }
+  }
+  const resolvedStateRoot = path.resolve(stateRoot);
+  const resolvedDownloadRoot = path.resolve(downloadRoot);
+  const resolvedArtifactRoot = path.resolve(artifactRoot);
+  const resolvedOutputRoot = path.resolve(outputRoot);
+  const stagedStateRoot = path.join(resolvedOutputRoot, 'state');
+  const stagedDownloadRoot = path.join(resolvedOutputRoot, 'downloaded');
+  const stagedArtifactRoot = path.join(resolvedOutputRoot, 'artifacts');
+  await fs.rm(resolvedOutputRoot, {
+    recursive: true,
+    force: true,
+  });
+  await fs.mkdir(resolvedOutputRoot, { recursive: true });
+  await Promise.all([
+    copyDirectoryIfPresent(resolvedStateRoot, stagedStateRoot),
+    copyDirectoryIfPresent(resolvedDownloadRoot, stagedDownloadRoot),
+    copyDirectoryIfPresent(resolvedArtifactRoot, stagedArtifactRoot),
+  ]);
+  return {
+    output_root: resolvedOutputRoot,
+    staged_state_root: stagedStateRoot,
+    staged_download_root: stagedDownloadRoot,
+    staged_artifact_root: stagedArtifactRoot,
+  };
+}
+
+export async function resolveProductionBaselineInputArtifact({
+  downloadRoot,
+  baselineInputKind,
+  baselineInputPath,
+  baselineRecordName,
+  normalizedOutputPath = null,
+  originRunIdentity = null,
+} = {}) {
+  if (!isNonEmptyString(downloadRoot)) {
+    throw new TypeError('downloadRoot must be non-empty');
+  }
+  const originRunValidation = validateProducerRunIdentity(originRunIdentity, 'originRunIdentity');
+  if (!originRunValidation.valid) {
+    throw new TypeError(`originRunIdentity is invalid: ${originRunValidation.error}`);
+  }
+  const resolvedDownloadRoot = path.resolve(downloadRoot);
+  const rawBaselineInputPath = resolveArtifactRelativePath(
+    resolvedDownloadRoot,
+    baselineInputPath,
+    'baselineInputPath',
+  );
+  if (baselineInputKind === 'record') {
+    await fs.access(rawBaselineInputPath);
+    const record = JSON.parse(await fs.readFile(rawBaselineInputPath, 'utf8'));
+    const validation = record?.artifact_id === 'prod_install_record'
+      ? validateProdInstallRecord(record, {
+        expectedOriginRunIdentity: originRunIdentity,
+      })
+      : record?.artifact_id === 'prod_promotion_record'
+        ? validateProdPromotionRecord(record, {
+          expectedOriginRunIdentity: originRunIdentity,
+        })
+        : {
+          valid: false,
+          error: 'record baseline input must be a prod_install_record or prod_promotion_record',
+        };
+    if (!validation.valid) {
+      throw new TypeError(`record baseline input is invalid: ${validation.error}`);
+    }
+    return Object.freeze({
+      baseline_input_kind: baselineInputKind,
+      raw_baseline_input_path: rawBaselineInputPath,
+      baseline_record_path: rawBaselineInputPath,
+      resolved_baseline_input_path: rawBaselineInputPath,
+    });
+  }
+  if (baselineInputKind !== 'current_state') {
+    throw new RangeError(`Unsupported baselineInputKind ${baselineInputKind}`);
+  }
+  if (!isNonEmptyString(baselineRecordName)) {
+    throw new TypeError('baselineRecordName must be non-empty');
+  }
+  if (!isNonEmptyString(normalizedOutputPath)) {
+    throw new TypeError('normalizedOutputPath must be non-empty when baselineInputKind is current_state');
+  }
+  const currentStateDisposition = await readProdCurrentStateDisposition(rawBaselineInputPath);
+  try {
+    await fs.access(rawBaselineInputPath);
+  } catch (error) {
+    if (currentStateDisposition != null && currentStateDisposition.disposition.disposition !== 'refreshed') {
+      throw new Error(
+        `current-state baseline input is unavailable because prod current state disposition marked the canonical snapshot as ${currentStateDisposition.disposition.disposition}`,
+      );
+    }
+    throw error;
+  }
+  if (currentStateDisposition != null && currentStateDisposition.disposition.disposition !== 'refreshed') {
+    throw new Error(
+      `current-state baseline input is unavailable because prod current state disposition marked the canonical snapshot as ${currentStateDisposition.disposition.disposition}`,
+    );
+  }
+  const rawSnapshot = JSON.parse(await fs.readFile(rawBaselineInputPath, 'utf8'));
+  const typedSnapshotValidation = validateProdCurrentStateSnapshot(rawSnapshot, {
+    expectedOriginRunIdentity: originRunIdentity,
+    requireUsableBaseline: true,
+  });
+  let baselineRecordPath = null;
+  let normalizedSnapshot = null;
+  if (typedSnapshotValidation.valid) {
+    normalizedSnapshot = structuredCloneJson(rawSnapshot);
+  } else if (looksLikeTypedProdCurrentStateSnapshot(rawSnapshot)) {
+    throw new TypeError(`typed prod current state snapshot is invalid: ${typedSnapshotValidation.error}`);
+  } else {
+    const baselineRecordCandidates = await collectArtifactFilesNamed(resolvedDownloadRoot, baselineRecordName);
+    if (baselineRecordCandidates.length !== 1) {
+      throw new Error(`expected exactly one embedded ${baselineRecordName} under ${resolvedDownloadRoot}, found ${baselineRecordCandidates.length}`);
+    }
+    [baselineRecordPath] = baselineRecordCandidates;
+    normalizedSnapshot = normalizeProdCurrentStateSnapshot(rawSnapshot, {
+      baselineRecord: JSON.parse(await fs.readFile(baselineRecordPath, 'utf8')),
+      originRunIdentity,
+    });
+  }
+  const resolvedNormalizedOutputPath = path.resolve(normalizedOutputPath);
+  await fs.mkdir(path.dirname(resolvedNormalizedOutputPath), { recursive: true });
+  await fs.writeFile(resolvedNormalizedOutputPath, `${JSON.stringify(normalizedSnapshot, null, 2)}\n`);
+  return Object.freeze({
+    baseline_input_kind: baselineInputKind,
+    raw_baseline_input_path: rawBaselineInputPath,
+    baseline_record_path: baselineRecordPath,
+    resolved_baseline_input_path: resolvedNormalizedOutputPath,
+  });
+}
+
 function validateProdRollbackHandle(value) {
   if (!isPlainObject(value)) {
     return {
@@ -6931,10 +7980,17 @@ function validateProdRollbackHandle(value) {
 
 export function validateProdPromotionRecord(payload, {
   expectedGitHubRepository = null,
+  expectedOriginRunIdentity = null,
 } = {}) {
   const validation = validateManualArtifactPayload('prod_promotion_record', payload);
   if (!validation.valid) {
     return validation;
+  }
+  const expectedOriginRunValidation = validateExpectedProducerRunIdentity(payload, expectedOriginRunIdentity, {
+    label: 'prod promotion record',
+  });
+  if (!expectedOriginRunValidation.valid) {
+    return expectedOriginRunValidation;
   }
   if (isNonEmptyString(expectedGitHubRepository) && payload.origin_repository !== expectedGitHubRepository) {
     return {
@@ -7007,6 +8063,7 @@ export async function writeProdPromotionRecord(outputPath, options) {
 export async function operationalRefreshProductionEnvironment({
   repoRoot = process.cwd(),
   baselineRecord,
+  baselineCurrentState = null,
   promotionId = null,
   workingRoot = null,
   outputPath = null,
@@ -7022,7 +8079,8 @@ export async function operationalRefreshProductionEnvironment({
   });
   const currentRepository = await resolveCurrentGitHubRepository(repoRoot, claims);
   const currentHeadSha = await resolveCurrentGitCommitSha(repoRoot);
-  const resolvedBaselineRecord = validateProductionBaselineRecord(baselineRecord);
+  const originRunIdentity = buildGitHubActionsProducerRunIdentity(claims);
+  const resolvedBaselineRecord = validateProductionBaselineRecord(baselineCurrentState ?? baselineRecord);
   assertArtifactRepositoryMatchesCurrent('baselineRecord', resolvedBaselineRecord, currentRepository);
   const { accountId, apiToken } = requireCloudflareCredentials({
     accountId: explicitAccountId,
@@ -7030,20 +8088,6 @@ export async function operationalRefreshProductionEnvironment({
   });
   const resolvedWorkingRoot = path.resolve(workingRoot ?? path.join(repoRoot, '.tmp', 'prod-operational-refresh'));
   await fs.mkdir(resolvedWorkingRoot, { recursive: true });
-  const provisionedEnvironment = await ensureProductionEnvironmentResources({
-    repoRoot,
-    preferredWorkersSubdomain: extractBaselineWorkersSubdomain(resolvedBaselineRecord),
-    accountId,
-    apiToken,
-  });
-  const accessSession = await prepareProductionOpsAccessSession({
-    repoRoot,
-    provisionedEnvironment,
-    deploymentSummary: cloneProductionDeploymentSummary(resolvedBaselineRecord, provisionedEnvironment),
-    workingRoot: path.join(resolvedWorkingRoot, 'ops-access'),
-    accountId,
-    apiToken,
-  });
   const currentStateSnapshotPath = path.join(resolvedWorkingRoot, 'current-production-state.json');
   const currentObservation = await observeProductionCurrentCloudflareState(resolvedBaselineRecord, {
     accountId,
@@ -7052,6 +8096,7 @@ export async function operationalRefreshProductionEnvironment({
   await writeProductionCurrentStateSnapshot({
     baselineRecord: resolvedBaselineRecord,
     currentObservation,
+    originRunIdentity,
     outputPath: currentStateSnapshotPath,
   });
   if (currentObservation.current_deployment_identity == null) {
@@ -7063,6 +8108,12 @@ export async function operationalRefreshProductionEnvironment({
   assertProductionBaselineMatchesCurrentIdentity(resolvedBaselineRecord, currentIdentity, {
     observedStatePath: currentStateSnapshotPath,
   });
+  const provisionedEnvironment = await ensureProductionEnvironmentResources({
+    repoRoot,
+    preferredWorkersSubdomain: extractBaselineWorkersSubdomain(resolvedBaselineRecord),
+    accountId,
+    apiToken,
+  });
   const currentDeploymentSummary = cloneProductionDeploymentSummary(resolvedBaselineRecord, provisionedEnvironment);
   for (const workerName of WORKER_DEPLOYMENT_ORDER) {
     updateProductionDeploymentSummaryWorker(currentDeploymentSummary, provisionedEnvironment.plan, workerName, {
@@ -7071,9 +8122,18 @@ export async function operationalRefreshProductionEnvironment({
       workerVersionTag: resolvedBaselineRecord.workers?.[workerName]?.worker_version_tag ?? null,
     });
   }
+  const accessSession = await prepareProductionOpsAccessSession({
+    repoRoot,
+    provisionedEnvironment,
+    deploymentSummary: currentDeploymentSummary,
+    workingRoot: path.join(resolvedWorkingRoot, 'ops-access'),
+    accountId,
+    apiToken,
+  });
 
   const resolvedPromotionId = promotionId ?? deploymentId ?? `gha-prod-operational-refresh-${Date.now().toString(36)}`;
-  const jobsUpload = await uploadWorkerVersion('jobs-worker', provisionedEnvironment, {
+  try {
+    const jobsUpload = await uploadWorkerVersion('jobs-worker', provisionedEnvironment, {
     repoRoot,
     deploymentSummary: currentDeploymentSummary,
     workingRoot: path.join(resolvedWorkingRoot, 'jobs-worker'),
@@ -7082,6 +8142,7 @@ export async function operationalRefreshProductionEnvironment({
     apiToken,
     productionSecretSeed,
   });
+  await markProductionCurrentStateSnapshotPotentiallyStale(currentStateSnapshotPath);
   const jobsDeploy = await deployProductionWorkerVersion(
     'jobs-worker',
     jobsUpload.config_path,
@@ -7256,20 +8317,30 @@ export async function operationalRefreshProductionEnvironment({
       },
     }),
     promotionId: resolvedPromotionId,
-    originRunIdentity: buildGitHubActionsProducerRunIdentity(claims),
+    originRunIdentity,
   });
   assertArtifactRepositoryMatchesCurrent('prodPromotionRecord', record, currentRepository);
   if (outputPath != null) {
     await fs.mkdir(path.dirname(outputPath), { recursive: true });
     await fs.writeFile(outputPath, stableJson(record));
   }
-  return {
-    provisioned_environment: provisionedEnvironment,
-    access_session: accessSession,
-    promotion_mode: 'gradual',
-    record,
-    output_path: outputPath,
-  };
+    return {
+      provisioned_environment: provisionedEnvironment,
+      access_session: accessSession,
+      promotion_mode: 'gradual',
+      record,
+      output_path: outputPath,
+    };
+  } catch (error) {
+    throw await refreshProductionCurrentStateSnapshotAfterFailure({
+      baselineRecord: resolvedBaselineRecord,
+      currentStateSnapshotPath,
+      originRunIdentity,
+      accountId,
+      apiToken,
+      error,
+    });
+  }
 }
 
 export function validateProdRollbackRecord(payload, {

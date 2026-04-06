@@ -140,30 +140,51 @@ jobs:
               repo: context.repo.repo,
               run_id: Number(process.env.BASELINE_RUN_ID),
             });
-            const allowedPaths = [
-              '.github/workflows/prod-install.yml',
-              '.github/workflows/promote-prod.yml',
-              '.github/workflows/operational-prod-refresh.yml',
-            ];
-            if (!allowedPaths.includes(baseline.data.path)) {
-              core.setFailed(`baseline_run_id must come from ${allowedPaths.join(', ')}, got ${baseline.data.path}`);
+            const descriptors = {
+              '.github/workflows/prod-install.yml': {
+                recordPrefix: 'prod-install-record-',
+                recordName: 'prod-install-record.json',
+                rawPrefix: 'prod-install-raw-state-',
+                rawCurrentStatePath: null,
+              },
+              '.github/workflows/promote-prod.yml': {
+                recordPrefix: 'prod-promotion-record-',
+                recordName: 'prod-promotion-record.json',
+                rawPrefix: 'prod-promote-raw-state-',
+                rawCurrentStatePath: 'state/promote/current-production-state.json',
+              },
+              '.github/workflows/operational-prod-refresh.yml': {
+                recordPrefix: 'prod-operational-refresh-record-',
+                recordName: 'prod-promotion-record.json',
+                rawPrefix: 'prod-operational-refresh-raw-state-',
+                rawCurrentStatePath: 'state/operational-refresh/current-production-state.json',
+              },
+            };
+            const descriptor = descriptors[baseline.data.path];
+            if (descriptor == null) {
+              core.setFailed(`baseline_run_id must come from ${Object.keys(descriptors).join(', ')}, got ${baseline.data.path}`);
+              return;
+            }
+            const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: Number(process.env.BASELINE_RUN_ID),
+              per_page: 100,
+            });
+            const expectedSuffix = `-${process.env.BASELINE_RUN_ID}-${baseline.data.run_attempt}`;
+            const recordArtifact = artifacts.find((artifact) => artifact.name.startsWith(descriptor.recordPrefix) && artifact.name.endsWith(expectedSuffix));
+            const rawArtifact = descriptor.rawCurrentStatePath == null
+              ? null
+              : artifacts.find((artifact) => artifact.name.startsWith(descriptor.rawPrefix) && artifact.name.endsWith(expectedSuffix));
+            if (recordArtifact == null && rawArtifact == null) {
+              core.setFailed(`baseline_run_id ${process.env.BASELINE_RUN_ID} must expose either a production record artifact or a current-production-state raw blocker artifact`);
               return;
             }
             core.setOutput('baseline_run_attempt', String(baseline.data.run_attempt));
-            core.setOutput(
-              'baseline_artifact_prefix',
-              baseline.data.path === '.github/workflows/prod-install.yml'
-                ? 'prod-install-record'
-                : baseline.data.path === '.github/workflows/promote-prod.yml'
-                  ? 'prod-promotion-record'
-                  : 'prod-operational-refresh-record',
-            );
-            core.setOutput(
-              'baseline_record_name',
-              baseline.data.path === '.github/workflows/prod-install.yml'
-                ? 'prod-install-record.json'
-                : 'prod-promotion-record.json',
-            );
+            core.setOutput('baseline_artifact_name', recordArtifact?.name ?? rawArtifact.name);
+            core.setOutput('baseline_input_kind', recordArtifact == null ? 'current_state' : 'record');
+            core.setOutput('baseline_input_path', recordArtifact == null ? descriptor.rawCurrentStatePath : descriptor.recordName);
+            core.setOutput('baseline_record_name', descriptor.recordName);
 
       - name: Download production baseline record
         id: download_baseline
@@ -174,32 +195,69 @@ jobs:
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
           run-id: ${{ inputs.baseline_run_id }}
-          pattern: ${{ steps.baseline_run.outputs.baseline_artifact_prefix }}-*-${{ inputs.baseline_run_id }}-${{ steps.baseline_run.outputs.baseline_run_attempt }}
+          pattern: ${{ steps.baseline_run.outputs.baseline_artifact_name }}
           merge-multiple: true
           path: ${{ steps.paths.outputs.download_root }}/baseline
 
+      - name: Resolve production baseline input
+        id: resolve_baseline_input
+        if: steps.download_baseline.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          node packages/testing/src/cli.mjs prod-baseline-resolve \
+            --download-root "${{ steps.paths.outputs.download_root }}/baseline" \
+            --baseline-input-kind "${{ steps.baseline_run.outputs.baseline_input_kind }}" \
+            --baseline-input-path "${{ steps.baseline_run.outputs.baseline_input_path }}" \
+            --baseline-record-name "${{ steps.baseline_run.outputs.baseline_record_name }}" \
+            --normalized-output "${{ steps.paths.outputs.state_root }}/normalized-baseline/current-production-state.json" \
+            --origin-repository "${{ github.repository }}" \
+            --origin-run-id "${{ inputs.baseline_run_id }}" \
+            --origin-run-attempt "${{ steps.baseline_run.outputs.baseline_run_attempt }}" \
+            --origin-run-uri "https://github.com/${{ github.repository }}/actions/runs/${{ inputs.baseline_run_id }}" \
+            --output "${{ steps.paths.outputs.state_root }}/baseline-resolution.json"
+
+          resolved_baseline_input_path="$(node -e "const fs=require('fs');const data=JSON.parse(fs.readFileSync(process.argv[1],'utf8'));process.stdout.write(String(data.resolved_baseline_input_path));" "${{ steps.paths.outputs.state_root }}/baseline-resolution.json")"
+
+          if [ ! -f "${resolved_baseline_input_path}" ]; then
+            echo "Resolved production baseline input is missing: ${resolved_baseline_input_path}" >&2
+            exit 1
+          fi
+
+          echo "baseline_input_path=${resolved_baseline_input_path}" >> "$GITHUB_OUTPUT"
+
       - name: Refresh production topology operationally
         id: operational_refresh
-        if: steps.download_baseline.outcome == 'success'
+        if: steps.resolve_baseline_input.outcome == 'success'
         continue-on-error: true
         run: |
           node packages/testing/src/cli.mjs prod-operational-refresh \
-            --baseline-record "${{ steps.paths.outputs.download_root }}/baseline/${{ steps.baseline_run.outputs.baseline_record_name }}" \
+            --baseline-record "${{ steps.resolve_baseline_input.outputs.baseline_input_path }}" \
             --working-root "${{ steps.paths.outputs.state_root }}/operational-refresh" \
             --output "${{ steps.paths.outputs.record }}" \
             --promotion-id "gha-prod-operational-refresh-${{ steps.paths.outputs.run_timestamp }}-${{ github.run_id }}-${{ github.run_attempt }}" \
             --reason "${{ inputs.reason }}" \
             --blocked-by-open-questions "${{ inputs.blocked_by_open_questions }}"
 
+      - name: Stage prod-operational-refresh raw state artifact
+        id: stage_raw_state
+        if: always() && steps.paths.outcome == 'success'
+        shell: bash
+        run: |
+          upload_root="${{ steps.paths.outputs.workspace_root }}/upload"
+          node packages/testing/src/cli.mjs prod-raw-state-stage \
+            --state-root "${{ steps.paths.outputs.state_root }}" \
+            --download-root "${{ steps.paths.outputs.download_root }}" \
+            --artifact-root "${{ steps.paths.outputs.artifact_root }}" \
+            --output-root "${upload_root}"
+          echo "upload_root=${upload_root}" >> "$GITHUB_OUTPUT"
+
       - name: Upload prod-operational-refresh raw state artifact
         if: always() && steps.paths.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.paths.outputs.raw_state_artifact_name }}
-          path: |
-            ${{ steps.paths.outputs.state_root }}
-            ${{ steps.paths.outputs.download_root }}
-            ${{ steps.paths.outputs.artifact_root }}
+          path: ${{ steps.stage_raw_state.outputs.upload_root }}
           if-no-files-found: error
 
       - name: Upload operational refresh record artifact
@@ -249,6 +307,19 @@ jobs:
           if [ "${{ steps.download_baseline.outcome }}" != "success" ]; then
             echo "Downloading production baseline artifact failed after raw state preservation." >&2
             exit 1
+          fi
+          if [ "${{ steps.resolve_baseline_input.outcome }}" != "success" ]; then
+            echo "Resolving the production baseline input failed after raw state preservation." >&2
+            exit 1
+          fi
+          if [ "${{ steps.resolve_baseline_input.outcome }}" = "success" ] && [ "${{ steps.operational_refresh.outcome }}" != "success" ]; then
+            if [ -f "${{ steps.paths.outputs.state_root }}/operational-refresh/current-production-state-disposition.json" ]; then
+              node packages/testing/src/cli.mjs prod-current-state-failure-validate \
+                --current-state-snapshot "${{ steps.paths.outputs.state_root }}/operational-refresh/current-production-state.json"
+            elif [ ! -f "${{ steps.paths.outputs.state_root }}/operational-refresh/current-production-state.json" ]; then
+              echo "Operational prod refresh failed without retaining a usable current-production-state snapshot or disposition artifact after baseline resolution." >&2
+              exit 1
+            fi
           fi
           if [ "${{ steps.operational_refresh.outcome }}" != "success" ]; then
             echo "Operational prod refresh failed after raw state preservation." >&2

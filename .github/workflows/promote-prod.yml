@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       baseline_run_id:
-        description: Current prod baseline run id (prod-install or prior promote-prod)
+        description: Current prod baseline run id (prod-install, prior promote-prod, or prior operational-prod-refresh)
         required: true
         type: string
 
@@ -124,14 +124,52 @@ jobs:
               core.setFailed(`candidate_run_id must come from .github/workflows/release-candidate.yml, got ${candidate.data.path}`);
               return;
             }
-            if (!['.github/workflows/prod-install.yml', '.github/workflows/promote-prod.yml'].includes(baseline.data.path)) {
-              core.setFailed(`baseline_run_id must come from .github/workflows/prod-install.yml or .github/workflows/promote-prod.yml, got ${baseline.data.path}`);
+            if (!['.github/workflows/prod-install.yml', '.github/workflows/promote-prod.yml', '.github/workflows/operational-prod-refresh.yml'].includes(baseline.data.path)) {
+              core.setFailed(`baseline_run_id must come from .github/workflows/prod-install.yml, .github/workflows/promote-prod.yml, or .github/workflows/operational-prod-refresh.yml, got ${baseline.data.path}`);
               return;
             }
             core.setOutput('candidate_run_attempt', String(candidate.data.run_attempt));
+            const descriptors = {
+              '.github/workflows/prod-install.yml': {
+                recordPrefix: 'prod-install-record-',
+                recordName: 'prod-install-record.json',
+                rawPrefix: 'prod-install-raw-state-',
+                rawCurrentStatePath: null,
+              },
+              '.github/workflows/promote-prod.yml': {
+                recordPrefix: 'prod-promotion-record-',
+                recordName: 'prod-promotion-record.json',
+                rawPrefix: 'prod-promote-raw-state-',
+                rawCurrentStatePath: 'state/promote/current-production-state.json',
+              },
+              '.github/workflows/operational-prod-refresh.yml': {
+                recordPrefix: 'prod-operational-refresh-record-',
+                recordName: 'prod-promotion-record.json',
+                rawPrefix: 'prod-operational-refresh-raw-state-',
+                rawCurrentStatePath: 'state/operational-refresh/current-production-state.json',
+              },
+            };
+            const descriptor = descriptors[baseline.data.path];
+            const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: Number(process.env.BASELINE_RUN_ID),
+              per_page: 100,
+            });
+            const expectedSuffix = `-${process.env.BASELINE_RUN_ID}-${baseline.data.run_attempt}`;
+            const recordArtifact = artifacts.find((artifact) => artifact.name.startsWith(descriptor.recordPrefix) && artifact.name.endsWith(expectedSuffix));
+            const rawArtifact = descriptor.rawCurrentStatePath == null
+              ? null
+              : artifacts.find((artifact) => artifact.name.startsWith(descriptor.rawPrefix) && artifact.name.endsWith(expectedSuffix));
+            if (recordArtifact == null && rawArtifact == null) {
+              core.setFailed(`baseline_run_id ${process.env.BASELINE_RUN_ID} must expose either a production record artifact or a current-production-state raw blocker artifact`);
+              return;
+            }
             core.setOutput('baseline_run_attempt', String(baseline.data.run_attempt));
-            core.setOutput('baseline_artifact_prefix', baseline.data.path === '.github/workflows/prod-install.yml' ? 'prod-install-record' : 'prod-promotion-record');
-            core.setOutput('baseline_record_name', baseline.data.path === '.github/workflows/prod-install.yml' ? 'prod-install-record.json' : 'prod-promotion-record.json');
+            core.setOutput('baseline_artifact_name', recordArtifact?.name ?? rawArtifact.name);
+            core.setOutput('baseline_input_kind', recordArtifact == null ? 'current_state' : 'record');
+            core.setOutput('baseline_input_path', recordArtifact == null ? descriptor.rawCurrentStatePath : descriptor.recordName);
+            core.setOutput('baseline_record_name', descriptor.recordName);
 
       - name: Download release candidate
         id: download_candidate
@@ -155,9 +193,36 @@ jobs:
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
           run-id: ${{ inputs.baseline_run_id }}
-          pattern: ${{ steps.runs.outputs.baseline_artifact_prefix }}-*-${{ inputs.baseline_run_id }}-${{ steps.runs.outputs.baseline_run_attempt }}
+          pattern: ${{ steps.runs.outputs.baseline_artifact_name }}
           merge-multiple: true
           path: ${{ steps.paths.outputs.download_root }}/baseline
+
+      - name: Resolve production baseline input
+        id: resolve_baseline_input
+        if: steps.download_baseline.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          node packages/testing/src/cli.mjs prod-baseline-resolve \
+            --download-root "${{ steps.paths.outputs.download_root }}/baseline" \
+            --baseline-input-kind "${{ steps.runs.outputs.baseline_input_kind }}" \
+            --baseline-input-path "${{ steps.runs.outputs.baseline_input_path }}" \
+            --baseline-record-name "${{ steps.runs.outputs.baseline_record_name }}" \
+            --normalized-output "${{ steps.paths.outputs.state_root }}/normalized-baseline/current-production-state.json" \
+            --origin-repository "${{ github.repository }}" \
+            --origin-run-id "${{ inputs.baseline_run_id }}" \
+            --origin-run-attempt "${{ steps.runs.outputs.baseline_run_attempt }}" \
+            --origin-run-uri "https://github.com/${{ github.repository }}/actions/runs/${{ inputs.baseline_run_id }}" \
+            --output "${{ steps.paths.outputs.state_root }}/baseline-resolution.json"
+
+          resolved_baseline_input_path="$(node -e "const fs=require('fs');const data=JSON.parse(fs.readFileSync(process.argv[1],'utf8'));process.stdout.write(String(data.resolved_baseline_input_path));" "${{ steps.paths.outputs.state_root }}/baseline-resolution.json")"
+
+          if [ ! -f "${resolved_baseline_input_path}" ]; then
+            echo "Resolved production baseline input is missing: ${resolved_baseline_input_path}" >&2
+            exit 1
+          fi
+
+          echo "baseline_input_path=${resolved_baseline_input_path}" >> "$GITHUB_OUTPUT"
 
       - name: Resolve candidate commit sha
         id: candidate
@@ -187,25 +252,35 @@ jobs:
 
       - name: Promote reviewed candidate into production
         id: promote_candidate
-        if: steps.download_baseline.outcome == 'success' && steps.candidate.outcome == 'success' && steps.checkout_candidate.outcome == 'success' && steps.require_candidate_checkout_match.outcome == 'success'
+        if: steps.resolve_baseline_input.outcome == 'success' && steps.candidate.outcome == 'success' && steps.checkout_candidate.outcome == 'success' && steps.require_candidate_checkout_match.outcome == 'success'
         continue-on-error: true
         run: |
           node packages/testing/src/cli.mjs prod-promote \
-            --baseline-record "${{ steps.paths.outputs.download_root }}/baseline/${{ steps.runs.outputs.baseline_record_name }}" \
+            --baseline-record "${{ steps.resolve_baseline_input.outputs.baseline_input_path }}" \
             --candidate-manifest "${{ steps.candidate.outputs.manifest_path }}" \
             --working-root "${{ steps.paths.outputs.state_root }}/promote" \
             --output "${{ steps.paths.outputs.record }}" \
             --promotion-id "gha-prod-promote-${{ steps.paths.outputs.run_timestamp }}-${{ github.run_id }}-${{ github.run_attempt }}"
+
+      - name: Stage prod-promote raw state artifact
+        id: stage_raw_state
+        if: always() && steps.paths.outcome == 'success'
+        shell: bash
+        run: |
+          upload_root="${{ steps.paths.outputs.workspace_root }}/upload"
+          node packages/testing/src/cli.mjs prod-raw-state-stage \
+            --state-root "${{ steps.paths.outputs.state_root }}" \
+            --download-root "${{ steps.paths.outputs.download_root }}" \
+            --artifact-root "${{ steps.paths.outputs.artifact_root }}" \
+            --output-root "${upload_root}"
+          echo "upload_root=${upload_root}" >> "$GITHUB_OUTPUT"
 
       - name: Upload prod-promote raw state artifact
         if: always() && steps.paths.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.paths.outputs.raw_state_artifact_name }}
-          path: |
-            ${{ steps.paths.outputs.state_root }}
-            ${{ steps.paths.outputs.download_root }}
-            ${{ steps.paths.outputs.artifact_root }}
+          path: ${{ steps.stage_raw_state.outputs.upload_root }}
           if-no-files-found: error
 
       - name: Upload promotion record artifact
@@ -256,6 +331,10 @@ jobs:
             echo "Downloading production baseline artifact failed after raw state preservation." >&2
             exit 1
           fi
+          if [ "${{ steps.resolve_baseline_input.outcome }}" != "success" ]; then
+            echo "Resolving the production baseline input failed after raw state preservation." >&2
+            exit 1
+          fi
           if [ "${{ steps.candidate.outcome }}" != "success" ]; then
             echo "Resolving candidate commit sha failed after raw state preservation." >&2
             exit 1
@@ -267,6 +346,15 @@ jobs:
           if [ "${{ steps.require_candidate_checkout_match.outcome }}" != "success" ]; then
             echo "Candidate checkout/manifest match failed after raw state preservation." >&2
             exit 1
+          fi
+          if [ "${{ steps.resolve_baseline_input.outcome }}" = "success" ] && [ "${{ steps.promote_candidate.outcome }}" != "success" ]; then
+            if [ -f "${{ steps.paths.outputs.state_root }}/promote/current-production-state-disposition.json" ]; then
+              node packages/testing/src/cli.mjs prod-current-state-failure-validate \
+                --current-state-snapshot "${{ steps.paths.outputs.state_root }}/promote/current-production-state.json"
+            elif [ ! -f "${{ steps.paths.outputs.state_root }}/promote/current-production-state.json" ]; then
+              echo "promote-prod failed without retaining a usable current-production-state snapshot or disposition artifact after baseline resolution." >&2
+              exit 1
+            fi
           fi
           if [ "${{ steps.promote_candidate.outcome }}" != "success" ]; then
             echo "Promote reviewed candidate failed after raw state preservation." >&2

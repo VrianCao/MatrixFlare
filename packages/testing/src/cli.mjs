@@ -23,13 +23,17 @@ import {
   downloadImmutableArtifactFromR2,
   deployNonLocalEnvironment,
   installProductionTopology,
+  normalizeProdCurrentStateSnapshot,
   operationalRefreshProductionEnvironment,
   promoteProductionEnvironment,
   resolveClosedProdBillingWindow,
   rollbackProductionEnvironment,
+  stageProductionRawStateArtifactForUpload,
+  validateProductionCurrentStateFailureArtifacts,
   writeReleaseCandidateManifest,
   ensureNonLocalEnvironmentResources,
   prepareNonLocalOpsAccessSession,
+  resolveProductionBaselineInputArtifact,
   restorePreReleaseGatewayRollout,
   runEnvironmentBackedSuite,
   startPreReleaseGatewayRollout,
@@ -515,9 +519,22 @@ async function main() {
   }
   if (requestedEnvironment === 'prod-promote') {
     const options = parseKeyValueOptions(process.argv);
+    const baselineRecordPath = typeof options['baseline-record'] === 'string'
+      ? path.resolve(process.cwd(), options['baseline-record'])
+      : null;
+    const baselineCurrentStatePath = typeof options['baseline-current-state'] === 'string'
+      ? path.resolve(process.cwd(), options['baseline-current-state'])
+      : null;
+    if (baselineRecordPath == null && baselineCurrentStatePath == null) {
+      throw new Error('prod-promote requires --baseline-record or --baseline-current-state');
+    }
+    if (baselineRecordPath != null && baselineCurrentStatePath != null) {
+      throw new Error('prod-promote accepts only one of --baseline-record or --baseline-current-state');
+    }
     const result = await promoteProductionEnvironment({
       repoRoot: process.cwd(),
-      baselineRecord: await readJsonFile(path.resolve(process.cwd(), requireOption(options, 'baseline-record'))),
+      baselineRecord: baselineRecordPath == null ? null : await readJsonFile(baselineRecordPath),
+      baselineCurrentState: baselineCurrentStatePath == null ? null : await readJsonFile(baselineCurrentStatePath),
       candidateManifest: await readJsonFile(path.resolve(process.cwd(), requireOption(options, 'candidate-manifest'))),
       workingRoot: typeof options['working-root'] === 'string'
         ? path.resolve(process.cwd(), options['working-root'])
@@ -538,11 +555,110 @@ async function main() {
     }, null, 2)}\n`);
     return;
   }
+  if (requestedEnvironment === 'prod-current-state-normalize') {
+    const options = parseKeyValueOptions(process.argv);
+    const normalizedSnapshot = normalizeProdCurrentStateSnapshot(
+      await readJsonFile(path.resolve(process.cwd(), requireOption(options, 'snapshot'))),
+      {
+        baselineRecord: await readJsonFile(path.resolve(process.cwd(), requireOption(options, 'baseline-record'))),
+        originRunIdentity: {
+          origin_repository: requireOption(options, 'origin-repository'),
+          origin_run_id: requireOption(options, 'origin-run-id'),
+          origin_run_attempt: Number.parseInt(requireOption(options, 'origin-run-attempt'), 10),
+          origin_run_uri: requireOption(options, 'origin-run-uri'),
+        },
+      },
+    );
+    const outputPath = typeof options.output === 'string'
+      ? path.resolve(process.cwd(), options.output)
+      : null;
+    if (outputPath != null) {
+      await fs.mkdir(path.dirname(outputPath), { recursive: true });
+      await fs.writeFile(outputPath, `${JSON.stringify(normalizedSnapshot, null, 2)}\n`);
+    }
+    process.stdout.write(`${JSON.stringify({
+      output_path: typeof options.output === 'string' ? options.output : null,
+      artifact_id: normalizedSnapshot.artifact_id,
+      observed_at: normalizedSnapshot.observed_at,
+      workers_subdomain: normalizedSnapshot.workers_subdomain,
+    }, null, 2)}\n`);
+    return;
+  }
+  if (requestedEnvironment === 'prod-baseline-resolve') {
+    const options = parseKeyValueOptions(process.argv);
+    const resolvedBaseline = await resolveProductionBaselineInputArtifact({
+      downloadRoot: path.resolve(process.cwd(), requireOption(options, 'download-root')),
+      baselineInputKind: requireOption(options, 'baseline-input-kind'),
+      baselineInputPath: requireOption(options, 'baseline-input-path'),
+      baselineRecordName: requireOption(options, 'baseline-record-name'),
+      normalizedOutputPath: typeof options['normalized-output'] === 'string'
+        ? path.resolve(process.cwd(), options['normalized-output'])
+        : null,
+      originRunIdentity: {
+        origin_repository: requireOption(options, 'origin-repository'),
+        origin_run_id: requireOption(options, 'origin-run-id'),
+        origin_run_attempt: Number.parseInt(requireOption(options, 'origin-run-attempt'), 10),
+        origin_run_uri: requireOption(options, 'origin-run-uri'),
+      },
+    });
+    const outputPath = typeof options.output === 'string'
+      ? path.resolve(process.cwd(), options.output)
+      : null;
+    if (outputPath != null) {
+      await fs.mkdir(path.dirname(outputPath), { recursive: true });
+      await fs.writeFile(outputPath, `${JSON.stringify(resolvedBaseline, null, 2)}\n`);
+    }
+    process.stdout.write(`${JSON.stringify({
+      output_path: typeof options.output === 'string' ? options.output : null,
+      ...resolvedBaseline,
+    }, null, 2)}\n`);
+    return;
+  }
+  if (requestedEnvironment === 'prod-current-state-failure-validate') {
+    const options = parseKeyValueOptions(process.argv);
+    const validation = await validateProductionCurrentStateFailureArtifacts({
+      currentStateSnapshotPath: path.resolve(process.cwd(), requireOption(options, 'current-state-snapshot')),
+    });
+    if (!validation.valid) {
+      throw new Error(`Production current-state failure artifacts are invalid: ${validation.error}`);
+    }
+    process.stdout.write(`${JSON.stringify({
+      current_state_snapshot: requireOption(options, 'current-state-snapshot'),
+      status: 'valid',
+    }, null, 2)}\n`);
+    return;
+  }
+  if (requestedEnvironment === 'prod-raw-state-stage') {
+    const options = parseKeyValueOptions(process.argv);
+    const result = await stageProductionRawStateArtifactForUpload({
+      stateRoot: path.resolve(process.cwd(), requireOption(options, 'state-root')),
+      downloadRoot: path.resolve(process.cwd(), requireOption(options, 'download-root')),
+      artifactRoot: path.resolve(process.cwd(), requireOption(options, 'artifact-root')),
+      outputRoot: path.resolve(process.cwd(), requireOption(options, 'output-root')),
+    });
+    process.stdout.write(`${JSON.stringify({
+      output_root: path.relative(process.cwd(), result.output_root),
+    }, null, 2)}\n`);
+    return;
+  }
   if (requestedEnvironment === 'prod-operational-refresh') {
     const options = parseKeyValueOptions(process.argv);
+    const baselineRecordPath = typeof options['baseline-record'] === 'string'
+      ? path.resolve(process.cwd(), options['baseline-record'])
+      : null;
+    const baselineCurrentStatePath = typeof options['baseline-current-state'] === 'string'
+      ? path.resolve(process.cwd(), options['baseline-current-state'])
+      : null;
+    if (baselineRecordPath == null && baselineCurrentStatePath == null) {
+      throw new Error('prod-operational-refresh requires --baseline-record or --baseline-current-state');
+    }
+    if (baselineRecordPath != null && baselineCurrentStatePath != null) {
+      throw new Error('prod-operational-refresh accepts only one of --baseline-record or --baseline-current-state');
+    }
     const result = await operationalRefreshProductionEnvironment({
       repoRoot: process.cwd(),
-      baselineRecord: await readJsonFile(path.resolve(process.cwd(), requireOption(options, 'baseline-record'))),
+      baselineRecord: baselineRecordPath == null ? null : await readJsonFile(baselineRecordPath),
+      baselineCurrentState: baselineCurrentStatePath == null ? null : await readJsonFile(baselineCurrentStatePath),
       workingRoot: typeof options['working-root'] === 'string'
         ? path.resolve(process.cwd(), options['working-root'])
         : path.resolve(process.cwd(), '.tmp', 'prod', 'operational-refresh'),
