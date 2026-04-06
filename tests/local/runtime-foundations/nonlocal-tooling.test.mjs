@@ -4482,6 +4482,27 @@ test('production current-state failure artifact validator rejects missing dispos
   );
 });
 
+test('production current-state failure artifact validator accepts a typed canonical snapshot without a disposition sidecar when no stale pre-failure quarantine exists', async () => {
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-prod-current-state-failure-canonical-only-'));
+  const rawSnapshotPath = path.join(workspaceRoot, 'state', 'operational-refresh', 'current-production-state.json');
+  const snapshot = buildProdCurrentStateSnapshotFixture({
+    runId: '24045788582',
+  });
+
+  await fs.mkdir(path.dirname(rawSnapshotPath), { recursive: true });
+  await fs.writeFile(rawSnapshotPath, `${JSON.stringify(snapshot, null, 2)}\n`);
+
+  assert.deepEqual(
+    await validateProductionCurrentStateFailureArtifacts({
+      currentStateSnapshotPath: rawSnapshotPath,
+    }),
+    {
+      valid: true,
+      error: null,
+    },
+  );
+});
+
 test('production current-state failure artifact validator rejects refresh_failed sidecars that leave the canonical snapshot in place', async () => {
   const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-prod-current-state-failure-stale-canonical-'));
   const rawSnapshotPath = path.join(workspaceRoot, 'state', 'operational-refresh', 'current-production-state.json');
