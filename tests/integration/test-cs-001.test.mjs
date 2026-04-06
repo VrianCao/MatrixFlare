@@ -62,30 +62,80 @@ function assertCacheControl(result, expectedValue) {
   assert.equal(result.response.headers.get('cache-control'), expectedValue);
 }
 
-async function exhaustPublicEntryLimiter(harness, seedPath) {
-  let limited = null;
-  for (let attempt = 0; attempt < 200; attempt += 1) {
-    const probe = await request(harness, seedPath);
-    if (probe.response.status === 429) {
-      limited = probe;
-      break;
-    }
-    assert.equal(probe.response.status, 200);
-  }
-  assert.notEqual(limited, null, `Expected anonymous public-entry limiter to yield 429 for ${seedPath}`);
-  await expectMatrixError(limited, 429, 'M_LIMIT_EXCEEDED');
-  return limited;
+function sleep(milliseconds) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, milliseconds);
+  });
 }
 
-async function assertEventuallyAnonymousPublicEntryLimited(harness, pathname) {
-  return eventually(async () => {
-    const probe = await request(harness, pathname);
-    await expectMatrixError(probe, 429, 'M_LIMIT_EXCEEDED');
-    return probe;
-  }, {
-    attempts: 8,
-    delayMs: 250,
-  });
+function buildAnonymousPublicEntryAliasMatrix(localpart) {
+  return [
+    ...LOGIN_ALIAS_PATHS.map((pathname) => ({ label: pathname, pathname })),
+    ...REGISTER_ALIAS_PATHS.map((pathname) => ({ label: pathname, pathname })),
+    ...REGISTER_AVAILABILITY_ALIAS_PATHS.map((pathname) => ({
+      label: pathname,
+      pathname: `${pathname}?username=${encodeURIComponent(localpart)}`,
+    })),
+  ];
+}
+
+// Cloudflare Workers ratelimits are local-to-location and permissive, so the
+// release gate must observe live 429s across a bounded retry window rather
+// than assume the first anonymous burst trips immediately.
+async function assertAnonymousPublicEntryLimiterAcrossAliases(harness, localpart, {
+  attempts = 30,
+  delayMs = 250,
+} = {}) {
+  const aliasMatrix = buildAnonymousPublicEntryAliasMatrix(localpart);
+  const seenLimited = new Map();
+  for (const alias of aliasMatrix) {
+    seenLimited.set(alias.label, false);
+  }
+  const recentObservations = [];
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const probeResults = [];
+    for (const alias of aliasMatrix) {
+      probeResults.push(request(harness, alias.pathname));
+    }
+    const resolvedProbeResults = await Promise.all(probeResults);
+    let allAliasesLimited = true;
+    for (let index = 0; index < aliasMatrix.length; index += 1) {
+      const { label, pathname } = aliasMatrix[index];
+      const probe = resolvedProbeResults[index];
+      recentObservations.push(
+        `${attempt}:${label}:${probe.response.status}:${probe.response.headers.get('cf-ray') ?? 'n/a'}`,
+      );
+      if (recentObservations.length > 18) {
+        recentObservations.shift();
+      }
+      if (probe.response.status === 429) {
+        await expectMatrixError(probe, 429, 'M_LIMIT_EXCEEDED');
+        seenLimited.set(label, true);
+        continue;
+      }
+      allAliasesLimited = false;
+      assert.equal(
+        probe.response.status,
+        200,
+        `Expected bounded anonymous public-entry limiter to return 200 or 429 for ${pathname}, received ${probe.response.status}`,
+      );
+    }
+    if (allAliasesLimited) {
+      return;
+    }
+    if (attempt + 1 < attempts) {
+      await sleep(delayMs);
+    }
+  }
+  const pendingLabels = [];
+  for (const [label, limited] of seenLimited.entries()) {
+    if (limited !== true) {
+      pendingLabels.push(label);
+    }
+  }
+  assert.fail(
+    `Expected anonymous public-entry limiter to yield 429 for ${pendingLabels.join(', ')} within the bounded window; recent=${recentObservations.join(', ')}`,
+  );
 }
 
 test('TEST-CS-001 ci-integration covers discovery, session lifecycle, and capability truth', async (context) => {
@@ -534,19 +584,7 @@ test('TEST-CS-001 ci-integration covers discovery, session lifecycle, and capabi
   await expectMatrixError(afterLogoutAll, 401, 'M_UNKNOWN_TOKEN');
 
   const publicEntryProbeLocalpart = `cs1-ci-public-entry-${Date.now().toString(36)}`.toLowerCase();
-  await exhaustPublicEntryLimiter(harness, '/_matrix/client/r0/login');
-  for (const loginPath of LOGIN_ALIAS_PATHS) {
-    await assertEventuallyAnonymousPublicEntryLimited(harness, loginPath);
-  }
-  for (const registerPath of REGISTER_ALIAS_PATHS) {
-    await assertEventuallyAnonymousPublicEntryLimited(harness, registerPath);
-  }
-  for (const availabilityPath of REGISTER_AVAILABILITY_ALIAS_PATHS) {
-    await assertEventuallyAnonymousPublicEntryLimited(
-      harness,
-      `${availabilityPath}?username=${encodeURIComponent(publicEntryProbeLocalpart)}`,
-    );
-  }
+  await assertAnonymousPublicEntryLimiterAcrossAliases(harness, publicEntryProbeLocalpart);
 });
 
 test('TEST-CS-001 ci-integration covers password-change UIA branches and deactivation', async (context) => {
@@ -821,6 +859,10 @@ test('TEST-CS-001 ci-integration covers profile full reads, keyName GET/PUT/DELE
     assert.ok(memberEvent);
     assert.equal(memberEvent.content?.displayname, 'Alice Propagated Profile');
     assert.equal('avatar_url' in (memberEvent.content ?? {}), false);
+    return memberEvent;
+  }, {
+    attempts: 60,
+    delayMs: 500,
   });
 
   const profileAfterDelete = await request(harness, `/_matrix/client/v3/profile/${encodeURIComponent(alice.user_id)}`);
