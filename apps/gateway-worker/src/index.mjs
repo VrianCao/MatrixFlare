@@ -107,6 +107,7 @@ const STUB_ROUTE_MATCHERS = Object.freeze([
 ]);
 const CLIENT_REGISTER_DISCOVERY_PATTERN = /^\/_matrix\/client\/(?:r0|v1|v3)\/register$/;
 const CLIENT_REGISTER_AVAILABILITY_PATTERN = /^\/_matrix\/client\/(?:r0|v1|v3)\/register\/available$/;
+const CLIENT_LOGIN_PATTERN = /^\/_matrix\/client\/(?:r0|v1|v3)\/login$/;
 
 function jsonResponse(payload, status = 200, headers = {}) {
   return new Response(JSON.stringify(payload), {
@@ -4876,7 +4877,7 @@ async function handleRequest(request, env) {
           unstable_features: {},
         });
       }
-      if (pathname === '/_matrix/client/v3/login' && method === 'GET') {
+      if (CLIENT_LOGIN_PATTERN.test(pathname) && method === 'GET') {
         return jsonResponse({
           flows: [
             { type: 'm.login.password' },
@@ -4894,10 +4895,10 @@ async function handleRequest(request, env) {
       if (CLIENT_REGISTER_DISCOVERY_PATTERN.test(pathname) && method === 'GET') {
         return handleRegisterDiscovery(env);
       }
-      if (pathname === '/_matrix/client/v3/login' && method === 'POST') {
+      if (CLIENT_LOGIN_PATTERN.test(pathname) && method === 'POST') {
         return handleLogin(request, env);
       }
-      if (pathname === '/_matrix/client/v3/register' && method === 'POST') {
+      if (CLIENT_REGISTER_DISCOVERY_PATTERN.test(pathname) && method === 'POST') {
         return handleRegister(request, env);
       }
       if (pathname === '/_matrix/client/v3/refresh' && method === 'POST') {

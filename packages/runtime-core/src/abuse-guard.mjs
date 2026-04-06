@@ -159,7 +159,7 @@ export function classifyGatewayRequest(method, pathname) {
     pathname === '/.well-known/matrix/client'
     || pathname === '/.well-known/matrix/server'
     || pathname === '/_matrix/client/versions'
-    || pathname === '/_matrix/client/v3/register/available'
+    || /^\/_matrix\/client\/(?:r0|v1|v3)\/register\/available$/.test(pathname)
     || pathname === '/_matrix/client/v1/register/m.login.registration_token/validity'
   ) {
     return {
@@ -167,13 +167,13 @@ export function classifyGatewayRequest(method, pathname) {
       gateway_policy_id: method === 'GET' ? 'gateway_public_entry' : null,
     };
   }
-  if (pathname === '/_matrix/client/v3/register') {
+  if (/^\/_matrix\/client\/(?:r0|v1|v3)\/register$/.test(pathname)) {
     return {
-      route_family: 'register',
-      gateway_policy_id: method === 'POST' ? 'gateway_register' : null,
+      route_family: method === 'GET' ? 'public-entry' : 'register',
+      gateway_policy_id: method === 'POST' ? 'gateway_register' : method === 'GET' ? 'gateway_public_entry' : null,
     };
   }
-  if (pathname === '/_matrix/client/v3/login') {
+  if (/^\/_matrix\/client\/(?:r0|v1|v3)\/login$/.test(pathname)) {
     return {
       route_family: method === 'GET' ? 'public-entry' : 'login',
       gateway_policy_id: method === 'POST' ? 'gateway_login' : 'gateway_public_entry',

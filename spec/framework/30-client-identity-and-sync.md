@@ -120,13 +120,14 @@
 
 ### 4.2 注册
 
-* `GET /_matrix/client/*/register` 必须存在，作为 registration discovery compatibility surface 返回当前真实支持的 registration UIA stages；当 homeserver 当前不允许 registration 时，必须返回 `403 M_FORBIDDEN`。
+* `GET /_matrix/client/r0/register`、`GET /_matrix/client/v1/register` 与 `GET /_matrix/client/v3/register` 都必须存在，作为 registration discovery compatibility surface 返回当前真实支持的 registration UIA stages；当 homeserver 当前不允许 registration 时，必须返回 `403 M_FORBIDDEN`。
 * `GET /_matrix/client/*/register` 只能宣告当前真实实现的 registration UIA stage；当前基线只允许宣告 `m.login.dummy`。registration token policy 若存在，必须继续由 `POST /register` 的 policy enforcement 与 `GET /register/m.login.registration_token/validity` 真值承担，不得被误宣告成已实现的 UIA stage。
 * `GET /_matrix/client/*/register` 不得被 shared edge cache、browser cache 或其它跨请求缓存当作可陈旧结果复用；响应必须使用 `no-store` 语义。
 * `POST /_matrix/client/*/register` 在缺少或未完成 UIA 时，必须优先返回 route-bound `401` challenge，而不是先因为缺少 `username`、`password` 或 `registration_token` 之类的请求字段返回 `400/403`；这条顺序约束是为了兼容先用空请求探测 registration options 的客户端。
 * `GET /_matrix/client/*/register/available` 必须存在，并只根据当前 registration policy、MXID grammar 与本地账户真值裁决可用性；不得读取可陈旧目录索引替代 `DATA-USER-017`。
 * `GET /_matrix/client/*/register/available` 不得被 shared edge cache、browser cache 或其它跨请求缓存当作可陈旧结果复用；响应必须使用 `no-store` 语义，最多只允许同一请求链路内的局部 memoization。
 * `GET /_matrix/client/v1/register/m.login.registration_token/validity` 必须存在；当 homeserver 当前不允许 registration 时，必须返回 `403 M_FORBIDDEN`；否则必须返回 `200 { valid: boolean }`，并对未知或当前无效 token 返回 `valid = false`。
+* `POST /_matrix/client/r0/register`、`POST /_matrix/client/v1/register` 与 `POST /_matrix/client/v3/register` 都必须收敛到同一 registration/UIA 真值，不得因 alias 不同而漂移 challenge、错误模型或成功写入语义。
 * 所有注册流程都必须收敛到 `UserDO` 创建用户主记录、初始 device 和初始 session。
 * 成功注册必须原子写入 `DATA-USER-017`、初始 `DATA-USER-002` device 与初始 `DATA-USER-001` session。
 * 若注册需要 UIA、registration token 或其他前置校验，`gateway-worker` 只负责协议编排，最终提交仍由 `UserDO` 原子完成。
@@ -135,9 +136,10 @@
 
 ### 4.3 登录
 
-* `GET /_matrix/client/*/login` 必须始终可用，并由 `IF-CS-005` 输出当前真实支持的 login flow 集合。
+* `GET /_matrix/client/r0/login`、`GET /_matrix/client/v1/login` 与 `GET /_matrix/client/v3/login` 都必须始终可用，并由 `IF-CS-005` 输出当前真实支持的 login flow 集合。
 * `L1-L3` 基线下，`GET /login` 必须宣告 `m.login.password`；只有在 `MX-CS-003` 真正启用且 dedicated contracts 完整落地后，才允许宣告 `m.login.sso`。
 * `m.login.token` 只有在服务器同时支持对应的 login-token consumption 语义时才允许出现在 `GET /login`；当前默认关闭 `MX-CS-003` 时不得宣告。
+* `POST /_matrix/client/r0/login`、`POST /_matrix/client/v1/login` 与 `POST /_matrix/client/v3/login` 都必须收敛到同一 password-login 真值，不得因 alias 不同而漂移成功条件、错误模型或 session/device 副作用。
 * `POST /login` 若收到未在 `GET /login` 中宣告的 login type，必须按 Matrix `v1.17` core login 规则返回 `400` + `M_UNKNOWN`，不得把“关闭的 flow”做成节点间漂移的任意错误。
 * `POST /login` 对本地 password flow 的认证真值必须来自 `DATA-USER-017.password_hash_or_null` 与 `password_login_enabled`；不得绕过 `UserDO` 在 Worker 内直接验密。
 * 若账户已在 `DATA-USER-017` 中标记停用，登录必须返回 `M_USER_DEACTIVATED`。
@@ -179,9 +181,15 @@
 
 ### 4.7 注销
 
-* `logout` 只撤销当前 session。
-* `logout/all` 撤销全部 session，并强制后续 access token 失效。
+* `POST /_matrix/client/*/logout` 只撤销当前 session。
+* `POST /_matrix/client/*/logout/all` 撤销全部 session，并强制后续 access token 失效。
 * 注销不删除 device；设备删除是单独操作。
+
+### 4.8 `whoami`
+
+* `GET /_matrix/client/*/account/whoami` 必须返回当前 access token 绑定的 `user_id`，并在存在 device 绑定时返回与该 session 真值一致的 `device_id`。
+* `whoami` 必须与 `IF-INT-USER-001` / `STATE-USER-SESSION` 使用同一 session 权威路径，不得在 `gateway-worker` 本地缓存或推断主体真值。
+* 当 access token 已失效、被 `logout`/`logout/all` 撤销，或其所属账户已停用时，`whoami` 必须返回与同一 session 解析路径一致的鉴权失败，而不是继续泄露旧主体。
 
 ## 5. 能力声明、Device Management、Profile、账号数据、Push Rules、To-Device 与 Presence
 
@@ -483,7 +491,7 @@ membership 到 `/sync` bucket 的映射必须固定为：
 
 | Capability | Public IF | Internal IF | Primary Data |
 | --- | --- | --- | --- |
-| register availability + register/login/logout/refresh | `IF-CS-009`,`IF-CS-010`,`IF-CS-011`,`IF-CS-012`,`IF-CS-013` | `IF-INT-USER-001` | `DATA-USER-001`,`DATA-USER-017`,`DATA-ID-006` |
+| register discovery/availability + login discovery/exchange + logout/refresh/whoami | `IF-CS-005`,`IF-CS-009`,`IF-CS-010`,`IF-CS-011`,`IF-CS-012`,`IF-CS-013`,`IF-CS-014`,`IF-CS-067` | `IF-INT-USER-001` | `DATA-USER-001`,`DATA-USER-017`,`DATA-ID-006` |
 | password change / deactivate | `IF-CS-006`,`IF-CS-008` | `IF-INT-USER-001` | `DATA-ID-006`,`DATA-USER-001`,`DATA-USER-017` |
 | registration/password-reset requestToken bootstrap | `IF-CS-007` | none | `none` |
 | capabilities / filters | `IF-CS-002`,`IF-CS-003`,`IF-CS-004` | none | `DATA-USER-014` |
