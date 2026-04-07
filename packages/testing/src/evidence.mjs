@@ -298,7 +298,7 @@ const L1_EVIDENCE_DEFINITIONS = Object.freeze([
     generation_method: 'room-core attested CI + staging report',
     required_environments: ['ci-integration', 'staging'],
     declared_source_ids: ['MX-CS-008', 'MX-CS-009', 'MX-CS-010'],
-    pass_criteria: 'Room creation, membership, event send, fanout, receipts, and typing must pass in CI integration and staging.',
+    pass_criteria: 'Room creation, membership, event send, fanout, receipts, and typing must pass in CI integration and staging, and empty-state-key room-state /state/{eventType} and /state/{eventType}/ variants must converge on the same truth.',
   }),
   Object.freeze({
     id: 'EVID-ROOM-002',

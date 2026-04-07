@@ -1222,6 +1222,10 @@ test('L1 evidence definitions keep attested generation methods in sync with the 
     getL1EvidenceDefinition('EVID-ROOM-001').generation_method,
     'room-core attested CI + staging report',
   );
+  assert.match(
+    getL1EvidenceDefinition('EVID-ROOM-001').pass_criteria,
+    /empty-state-key room-state \/state\/\{eventType\} and \/state\/\{eventType\}\/ variants must converge on the same truth/,
+  );
   assert.equal(
     getL1EvidenceDefinition('EVID-ROOM-002').generation_method,
     'room-version attested CI + staging report',
