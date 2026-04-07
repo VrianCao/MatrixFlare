@@ -1218,6 +1218,7 @@ function ensureRoomProjectionTarget(targets, roomId) {
     targets.set(roomId, {
       room_id: roomId,
       room_pos: 0,
+      visibility_room_pos: null,
       membership_bucket: null,
       timeline_event_ids: new Set(),
       state_event_ids: new Set(),
@@ -1393,6 +1394,9 @@ async function assembleSyncResponse(env, batch, {
     for (const snapshotEntry of batch.room_membership_snapshot ?? []) {
       const target = ensureRoomProjectionTarget(roomTargets, snapshotEntry.room_id);
       target.room_pos = snapshotEntry.room_pos ?? target.room_pos;
+      target.visibility_room_pos = Number.isInteger(snapshotEntry.room_pos) && snapshotEntry.room_pos >= 1
+        ? snapshotEntry.room_pos
+        : target.visibility_room_pos;
       target.membership_bucket = snapshotEntry.membership_bucket ?? target.membership_bucket;
     }
   }
@@ -1440,7 +1444,7 @@ async function assembleSyncResponse(env, batch, {
         membership_bucket: target.membership_bucket,
         initial_sync: initial_sync === true,
         visibility_context: {
-          room_pos: target.room_pos ?? null,
+          room_pos: target.visibility_room_pos ?? null,
           initial_sync: initial_sync === true,
         },
         filter_hash,
