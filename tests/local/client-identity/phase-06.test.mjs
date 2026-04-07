@@ -147,6 +147,10 @@ test('Phase 06 covers room send/state/query/redaction surfaces', async (t) => {
     topic: 'Phase 06 Topic',
   });
   assert.equal(topicWriteRetry.event_id, topicWrite.event_id);
+  const topicWriteTrailingSlash = await putJson(rig, alice.access_token, roomPath(roomId, '/state/m.room.topic/'), {
+    topic: 'Phase 06 Topic',
+  });
+  assert.equal(topicWriteTrailingSlash.event_id, topicWrite.event_id);
   await expectMatrixError(
     await rig.gatewayFetch(roomPath(roomId, '/state/m.room.topic'), {
       method: 'PUT',
@@ -177,6 +181,10 @@ test('Phase 06 covers room send/state/query/redaction surfaces', async (t) => {
 
   const topicContent = await getJson(rig, alice.access_token, roomPath(roomId, '/state/m.room.topic'));
   assert.deepEqual(topicContent, {
+    topic: 'Phase 06 Topic',
+  });
+  const topicContentTrailingSlash = await getJson(rig, alice.access_token, roomPath(roomId, '/state/m.room.topic/'));
+  assert.deepEqual(topicContentTrailingSlash, {
     topic: 'Phase 06 Topic',
   });
 

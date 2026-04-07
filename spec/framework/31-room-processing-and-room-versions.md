@@ -253,13 +253,13 @@ room version `12` 的以下差异必须封装在策略层：
 * `/messages`
 * `/context/{eventId}`
 * `/event/{eventId}`
-* `/state` 与 `/state/{eventType}/{stateKey}`
+* `/state`、`/state/{eventType}` 与 `/state/{eventType}/{stateKey}`
 * `/members` 与 `/joined_members`
 * `/relations/{eventId}` 家族
 * `/threads`
 * `/timestamp_to_event`
 
-这些查询都必须共享同一套房间可见性、redaction 后视图与 membership 边界判断；任何查询面都不得绕过 `RoomDO` 直接从 D1、KV 或 R2 给出权威答案。
+这些查询都必须共享同一套房间可见性、redaction 后视图与 membership 边界判断；任何查询面都不得绕过 `RoomDO` 直接从 D1、KV 或 R2 给出权威答案。对于空字符串 `state_key`，`/state/{eventType}` 与保留尾斜杠的 `/state/{eventType}/` 都必须命中同一个空 `state_key` 查询结果。
 
 ### 10.2 关系、线程与时间定位
 

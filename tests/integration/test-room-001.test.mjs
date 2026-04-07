@@ -83,10 +83,29 @@ test('TEST-ROOM-001 ci-integration covers room creation, membership, send, redac
     },
   );
   assert.equal(topicWrite.response.status, 200);
+  const topicWriteTrailingSlash = await putAuthenticated(
+    harness,
+    alice.access_token,
+    roomPath(createdRoom.room_id, '/state/m.room.topic/'),
+    {
+      topic: 'Phase 08 Integration Topic',
+    },
+  );
+  assert.equal(topicWriteTrailingSlash.response.status, 200);
+  assert.equal(topicWriteTrailingSlash.payload?.event_id, topicWrite.payload?.event_id);
 
   const topicRead = await getAuthenticated(harness, alice.access_token, roomPath(createdRoom.room_id, '/state/m.room.topic'));
   assert.equal(topicRead.response.status, 200);
   assert.deepEqual(topicRead.payload, {
+    topic: 'Phase 08 Integration Topic',
+  });
+  const topicReadTrailingSlash = await getAuthenticated(
+    harness,
+    alice.access_token,
+    roomPath(createdRoom.room_id, '/state/m.room.topic/'),
+  );
+  assert.equal(topicReadTrailingSlash.response.status, 200);
+  assert.deepEqual(topicReadTrailingSlash.payload, {
     topic: 'Phase 08 Integration Topic',
   });
 

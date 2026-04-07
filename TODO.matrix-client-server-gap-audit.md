@@ -234,6 +234,28 @@
   `tests/integration/test-cs-001.test.mjs`
   `tests/staging/test-cs-001.test.mjs`
 
+### 12. 空 `state_key` 的 room-state 路径缺少官方允许的尾斜杠兼容，真实客户端会把 `m.room.encryption` 打到 `404`
+
+- [x] `CS-GAP-012` 为空 `state_key` room-state path 的双形态兼容补齐本地显式覆盖。
+  Official basis:
+  官方 Matrix Client-Server API 对 `PUT/GET /_matrix/client/v3/rooms/{roomId}/state/{eventType}/{stateKey}` 明确写明：当 `stateKey` 为空字符串时，endpoint 末尾的 `/` 是可选的，因此 `.../state/{eventType}` 与 `.../state/{eventType}/` 都必须表示同一个空 `state_key`。
+  Historical pre-closure status:
+  本地 `12/23/31` 之前只显式写了 `/state/{eventType}/{stateKey}` 一种形态，local/staging 回归也只覆盖不带尾斜杠的空 `state_key` 路径；`gateway-worker` 路由 matcher 因此会把真实客户端发出的 `PUT /rooms/{roomId}/state/m.room.encryption/` 误落到 `404 M_UNRECOGNIZED`。
+  Closure delivered:
+  已把 `MX-CS-009`、`IF-CS-033`、`IF-CS-034` 与 room query/domain 正文补到空 `state_key` 的双形态 contract，`gateway-worker` 现在也会把 `/state/{eventType}` 与 `/state/{eventType}/` 统一收敛为同一空 `state_key` 裁决；local `Phase 06` 与 staging canonical `TEST-ROOM-001` 已新增 parity regression，`TEST-CS-003` 的 `m.room.encryption` helper 也改为直接走真实客户端常见的尾斜杠路径。
+  Artifact targets:
+  `spec/framework/12-matrix-protocol-compliance-profile.md`
+  `spec/framework/23-interface-contract-catalog.md`
+  `spec/framework/31-room-processing-and-room-versions.md`
+  `spec/framework/43-testing-and-compliance.md`
+  `spec/framework/44-verification-and-evidence-register.md`
+  `packages/testing/src/evidence.mjs`
+  `tests/local/client-identity/phase-05a.test.mjs`
+  `tests/local/client-identity/phase-06.test.mjs`
+  `tests/local/runtime-foundations/testing-harness.test.mjs`
+  `tests/staging/test-cs-003.test.mjs`
+  `tests/staging/test-room-001.test.mjs`
+
 ## Execution Rule
 
 当上述任一项真正进入主线补全时，必须在同一变更集中同步：

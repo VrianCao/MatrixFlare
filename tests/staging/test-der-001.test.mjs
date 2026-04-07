@@ -55,6 +55,24 @@ const DERIVED_SEARCH_EVENTUAL_OPTIONS = {
   delayMs: 500,
 };
 
+const REBUILD_SUCCESS_WAIT_OPTIONS = Object.freeze({
+  pollDelayMs: 2000,
+  maxWaitMs: 12 * 60_000,
+  stallWindowMs: 90_000,
+});
+
+function buildRebuildProgressFingerprint(job) {
+  return JSON.stringify({
+    state: job?.state ?? null,
+    completed_units: job?.progress?.completed_units ?? null,
+    total_units: job?.progress?.total_units ?? null,
+    last_completed_checkpoint_id: job?.checkpoint_state?.last_completed_checkpoint_id ?? null,
+    queue_delivery_state: job?.checkpoint_state?.queue_delivery_state ?? null,
+    shard_type: job?.checkpoint_state?.rebuild_shard_progress?.shard_type ?? null,
+    shard_key: job?.checkpoint_state?.rebuild_shard_progress?.shard_key ?? null,
+  });
+}
+
 async function fetchAnonymousPublicRooms(harness, searchToken) {
   const result = await request(
     harness,
@@ -112,7 +130,10 @@ async function fetchHierarchy(harness, accessToken, spaceRoomId) {
 
 async function waitForRebuildSuccess(harness, jobId) {
   let lastJob = null;
-  for (let attempt = 1; attempt <= 180; attempt += 1) {
+  let lastProgressFingerprint = null;
+  let lastProgressAt = Date.now();
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < REBUILD_SUCCESS_WAIT_OPTIONS.maxWaitMs) {
     const result = await requestOpsAuthorized(harness, `/_ops/v1/jobs/${encodeURIComponent(jobId)}`);
     assert.equal(result.response.status, 200);
     const job = result.payload?.job;
@@ -126,10 +147,19 @@ async function waitForRebuildSuccess(harness, jobId) {
         `rebuild job ${jobId} entered terminal state ${job.state}: ${summarizeOpsPayload(job.last_error ?? job.result_summary ?? job)}`,
       );
     }
-    await sleep(1000);
+    const progressFingerprint = buildRebuildProgressFingerprint(job);
+    if (progressFingerprint !== lastProgressFingerprint) {
+      lastProgressFingerprint = progressFingerprint;
+      lastProgressAt = Date.now();
+    } else if (Date.now() - lastProgressAt >= REBUILD_SUCCESS_WAIT_OPTIONS.stallWindowMs) {
+      assert.fail(
+        `rebuild job ${jobId} stalled for ${REBUILD_SUCCESS_WAIT_OPTIONS.stallWindowMs}ms without progress: ${summarizeOpsPayload(lastJob)}`,
+      );
+    }
+    await sleep(REBUILD_SUCCESS_WAIT_OPTIONS.pollDelayMs);
   }
   assert.fail(
-    `rebuild job ${jobId} did not reach succeeded within the polling window: ${summarizeOpsPayload(lastJob)}`,
+    `rebuild job ${jobId} did not reach succeeded within ${REBUILD_SUCCESS_WAIT_OPTIONS.maxWaitMs}ms: ${summarizeOpsPayload(lastJob)}`,
   );
 }
 

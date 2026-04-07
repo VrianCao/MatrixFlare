@@ -2,7 +2,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  authHeaders,
   createRoom,
+  expectMatrixError,
   findStateEvent,
   getAuthenticated,
   getJoinedRoomEntry,

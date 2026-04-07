@@ -5193,13 +5193,17 @@ async function handleRequest(request, env) {
       if (roomSendMatch && method === 'PUT') {
         return handleRoomSendEvent(request, env, roomSendMatch[1], roomSendMatch[2], roomSendMatch[3]);
       }
+      const roomStateEmptyKeyMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/state\/([^/]+)\/$/.exec(pathname);
+      if (roomStateEmptyKeyMatch && method === 'PUT') {
+        return handleRoomStateWrite(request, env, roomStateEmptyKeyMatch[1], roomStateEmptyKeyMatch[2], '');
+      }
       const roomStateWithKeyMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/state\/([^/]+)\/([^/]+)$/.exec(pathname);
       if (roomStateWithKeyMatch && method === 'PUT') {
         return handleRoomStateWrite(request, env, roomStateWithKeyMatch[1], roomStateWithKeyMatch[2], roomStateWithKeyMatch[3]);
       }
-      const roomStateWithoutKeyWriteMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/state\/([^/]+)$/.exec(pathname);
-      if (roomStateWithoutKeyWriteMatch && method === 'PUT') {
-        return handleRoomStateWrite(request, env, roomStateWithoutKeyWriteMatch[1], roomStateWithoutKeyWriteMatch[2], '');
+      const roomStateWithoutKeyMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/state\/([^/]+)$/.exec(pathname);
+      if (roomStateWithoutKeyMatch && method === 'PUT') {
+        return handleRoomStateWrite(request, env, roomStateWithoutKeyMatch[1], roomStateWithoutKeyMatch[2], '');
       }
       const roomRedactMatch = /^\/_matrix\/client\/v3\/rooms\/([^/]+)\/redact\/([^/]+)\/([^/]+)$/.exec(pathname);
       if (roomRedactMatch && method === 'PUT') {
@@ -5231,6 +5235,13 @@ async function handleRequest(request, env) {
           kind: 'state',
         });
       }
+      if (roomStateEmptyKeyMatch && method === 'GET') {
+        return handleRoomQueryRequest(request, env, roomStateEmptyKeyMatch[1], {
+          kind: 'state',
+          eventType: roomStateEmptyKeyMatch[2],
+          stateKey: '',
+        });
+      }
       if (roomStateWithKeyMatch && method === 'GET') {
         return handleRoomQueryRequest(request, env, roomStateWithKeyMatch[1], {
           kind: 'state',
@@ -5238,10 +5249,10 @@ async function handleRequest(request, env) {
           stateKey: roomStateWithKeyMatch[3],
         });
       }
-      if (roomStateWithoutKeyWriteMatch && method === 'GET') {
-        return handleRoomQueryRequest(request, env, roomStateWithoutKeyWriteMatch[1], {
+      if (roomStateWithoutKeyMatch && method === 'GET') {
+        return handleRoomQueryRequest(request, env, roomStateWithoutKeyMatch[1], {
           kind: 'state',
-          eventType: roomStateWithoutKeyWriteMatch[2],
+          eventType: roomStateWithoutKeyMatch[2],
           stateKey: '',
         });
       }

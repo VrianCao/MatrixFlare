@@ -92,7 +92,7 @@ async function enableMegolmRoom(rig, accessToken, roomId) {
   const response = await requestAs(
     rig,
     accessToken,
-    `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/state/m.room.encryption`,
+    `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/state/m.room.encryption/`,
     {
       method: 'PUT',
       json: {
