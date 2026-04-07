@@ -51,6 +51,27 @@ async function syncRequest(rig, accessToken, query = '') {
   return response.json();
 }
 
+async function loginWithPassword(rig, {
+  user,
+  password,
+  deviceId,
+}) {
+  const response = await rig.gatewayFetch('/_matrix/client/v3/login', {
+    method: 'POST',
+    json: {
+      type: 'm.login.password',
+      identifier: {
+        type: 'm.id.user',
+        user,
+      },
+      password,
+      ...(deviceId ? { device_id: deviceId } : {}),
+    },
+  });
+  assert.equal(response.status, 200);
+  return response.json();
+}
+
 test('Phase 05 browser-origin /sync keeps auth, CORS, preflight, and long-poll truth aligned', async (t) => {
   const rig = createGatewayPhase04Rig();
   t.after(() => rig.close());
@@ -394,6 +415,10 @@ async function appendRoomMessageDelta(roomDo, {
 
 function getJoinedRoomEntry(syncBody, roomId) {
   return syncBody.rooms?.join?.[roomId] ?? null;
+}
+
+function getLeftRoomEntry(syncBody, roomId) {
+  return syncBody.rooms?.leave?.[roomId] ?? null;
 }
 
 function getStateEvent(roomEntry, {
@@ -1076,6 +1101,187 @@ test('Phase 05 /sync since tokens remain valid when the caller switches between 
   assert.equal(typeof switchedFilterSync.next_batch, 'string');
 });
 
+test('Phase 05 initial /sync on a new device includes recent joined-room timeline and keeps later filter switching incremental', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, {
+    username: 'alice-history',
+    password: 'correct horse battery staple',
+    deviceId: 'ALICEPHONE',
+  });
+
+  const room = await postJson(rig, alice.access_token, '/_matrix/client/v3/createRoom', {
+    name: 'Phase 05 History Room',
+  });
+  const roomId = room.room_id;
+  const preTokenMessage = await putJson(
+    rig,
+    alice.access_token,
+    roomPath(roomId, '/send/m.room.message/phase05-history-pretoken'),
+    {
+      msgtype: 'm.text',
+      body: 'phase05 initial sync history pre-token',
+    },
+  );
+
+  const laptop = await loginWithPassword(rig, {
+    user: alice.user_id,
+    password: 'correct horse battery staple',
+    deviceId: 'ALICELAPTOP',
+  });
+
+  const cinnyInlineFilter = {
+    room: {
+      state: {
+        lazy_load_members: true,
+      },
+      timeline: {
+        limit: 8,
+      },
+    },
+  };
+  const cinnyStoredFilter = createStoredFilterEnvelope({
+    room: {
+      state: {
+        lazy_load_members: true,
+      },
+    },
+  });
+  const storeFilter = await rig.gatewayFetch(`/_matrix/client/v3/user/${encodeURIComponent(alice.user_id)}/filter`, {
+    method: 'POST',
+    headers: rig.authHeaders(laptop.access_token),
+    json: {
+      room: {
+        state: {
+          lazy_load_members: true,
+        },
+      },
+    },
+  });
+  assert.equal(storeFilter.status, 200);
+  assert.deepEqual(await storeFilter.json(), {
+    filter_id: cinnyStoredFilter.filter_id,
+  });
+
+  const cinnyInitialSync = await syncRequest(
+    rig,
+    laptop.access_token,
+    `filter=${encodeURIComponent(JSON.stringify(cinnyInlineFilter))}&use_state_after=true`,
+  );
+  const initialRoom = getJoinedRoomEntry(cinnyInitialSync, roomId);
+  assert.ok(initialRoom);
+  assert.equal(typeof cinnyInitialSync.next_batch, 'string');
+  assert.equal(initialRoom.timeline.events.at(-1).event_id, preTokenMessage.event_id);
+  assert.ok(initialRoom.timeline.events.some((event) => event.event_id === preTokenMessage.event_id));
+  assert.equal(typeof initialRoom.timeline.prev_batch, 'string');
+  assert.ok(!('state' in initialRoom));
+  assert.ok(Array.isArray(initialRoom.state_after?.events));
+
+  const postTokenMessage = await putJson(
+    rig,
+    alice.access_token,
+    roomPath(roomId, '/send/m.room.message/phase05-history-posttoken'),
+    {
+      msgtype: 'm.text',
+      body: 'phase05 initial sync history post-token',
+    },
+  );
+  const cinnyStoredSync = await syncRequest(
+    rig,
+    laptop.access_token,
+    `since=${encodeURIComponent(cinnyInitialSync.next_batch)}&filter=${encodeURIComponent(cinnyStoredFilter.filter_id)}&use_state_after=true`,
+  );
+  const storedRoom = getJoinedRoomEntry(cinnyStoredSync, roomId);
+  assert.ok(storedRoom);
+  assert.deepEqual(
+    storedRoom.timeline?.events?.map((event) => event.event_id),
+    [postTokenMessage.event_id],
+  );
+  assert.equal(
+    storedRoom.timeline?.events?.some((event) => event.event_id === preTokenMessage.event_id),
+    false,
+  );
+});
+
+test('Phase 05 initial /sync recent-timeline bootstrap respects the collected room snapshot boundary', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, {
+    username: 'alice-snapshot-history',
+    password: 'correct horse battery staple',
+    deviceId: 'ALICESNAPSHOTPHONE',
+  });
+  const room = await postJson(rig, alice.access_token, '/_matrix/client/v3/createRoom', {
+    name: 'Phase 05 Snapshot Boundary Room',
+  });
+  const roomId = room.room_id;
+  const roomDo = rig.getRoomDo(roomId);
+
+  const preSnapshotMessage = await putJson(
+    rig,
+    alice.access_token,
+    roomPath(roomId, '/send/m.room.message/phase05-snapshot-pre'),
+    {
+      msgtype: 'm.text',
+      body: 'phase05 snapshot boundary before collectSince',
+    },
+  );
+  const laptop = await loginWithPassword(rig, {
+    user: alice.user_id,
+    password: 'correct horse battery staple',
+    deviceId: 'ALICESNAPSHOTLAPTOP',
+  });
+
+  const originalProjectForSync = roomDo.projectForSync.bind(roomDo);
+  let injectedPostSnapshotDelta = null;
+  roomDo.projectForSync = async function projectForSyncWithInjectedDelta(request = {}) {
+    if (injectedPostSnapshotDelta == null) {
+      injectedPostSnapshotDelta = await appendRoomMessageDelta(roomDo, {
+        roomId,
+        userId: alice.user_id,
+        eventId: '$phase05-snapshot-post',
+        body: 'phase05 snapshot boundary after collectSince',
+      });
+    }
+    return originalProjectForSync(request);
+  };
+  t.after(() => {
+    roomDo.projectForSync = originalProjectForSync;
+  });
+
+  const filter = encodeURIComponent(JSON.stringify({
+    room: {
+      timeline: {
+        limit: 8,
+      },
+    },
+  }));
+  const initialSync = await syncRequest(rig, laptop.access_token, `filter=${filter}`);
+  const initialRoom = getJoinedRoomEntry(initialSync, roomId);
+  assert.ok(initialRoom);
+  assert.ok(initialRoom.timeline.events.some((event) => event.event_id === preSnapshotMessage.event_id));
+  assert.equal(
+    initialRoom.timeline.events.some((event) => event.event_id === injectedPostSnapshotDelta.eventId),
+    false,
+  );
+
+  roomDo.projectForSync = originalProjectForSync;
+
+  const incrementalSync = await syncRequest(
+    rig,
+    laptop.access_token,
+    `since=${encodeURIComponent(initialSync.next_batch)}&filter=${filter}`,
+  );
+  const incrementalRoom = getJoinedRoomEntry(incrementalSync, roomId);
+  assert.ok(incrementalRoom);
+  assert.deepEqual(
+    incrementalRoom.timeline?.events?.map((event) => event.event_id),
+    [injectedPostSnapshotDelta.eventId],
+  );
+});
+
 test('Phase 05 room fanout projections surface timeline and unread counts through /sync', async (t) => {
   const rig = createGatewayPhase04Rig();
   t.after(() => rig.close());
@@ -1170,6 +1376,161 @@ test('Phase 05 room fanout projections surface timeline and unread counts throug
     },
   });
   assert.equal(roomDo.persistence.fanoutOutbox.get({ room_pos: filteredDelta.roomPos, user_id: aliceUserId }).status, 'acked');
+});
+
+test('Phase 05 initial /sync on a newly logged-in device returns recent room timeline plus prev_batch', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, {
+    username: 'phase05-history-alice',
+    password: 'correct horse battery staple',
+    deviceId: 'HISTORYPHONE',
+  });
+  const room = await postJson(rig, alice.access_token, '/_matrix/client/v3/createRoom', {
+    name: 'Phase 05 Initial Sync History Room',
+  });
+  const roomId = room.room_id;
+
+  const firstMessage = await putJson(
+    rig,
+    alice.access_token,
+    roomPath(roomId, '/send/m.room.message/phase05-history-1'),
+    {
+      msgtype: 'm.text',
+      body: 'phase05 initial sync history one',
+    },
+  );
+  const secondMessage = await putJson(
+    rig,
+    alice.access_token,
+    roomPath(roomId, '/send/m.room.message/phase05-history-2'),
+    {
+      msgtype: 'm.text',
+      body: 'phase05 initial sync history two',
+    },
+  );
+  const thirdMessage = await putJson(
+    rig,
+    alice.access_token,
+    roomPath(roomId, '/send/m.room.message/phase05-history-3'),
+    {
+      msgtype: 'm.text',
+      body: 'phase05 initial sync history three',
+    },
+  );
+
+  const laptop = await loginWithPassword(rig, {
+    user: alice.user_id,
+    password: 'correct horse battery staple',
+    deviceId: 'HISTORYLAPTOP',
+  });
+  const filter = encodeURIComponent(JSON.stringify({
+    room: {
+      timeline: {
+        limit: 2,
+      },
+      state: {
+        lazy_load_members: true,
+      },
+    },
+  }));
+  const initialSync = await syncRequest(
+    rig,
+    laptop.access_token,
+    `filter=${filter}&use_state_after=true`,
+  );
+  const initialRoom = getJoinedRoomEntry(initialSync, roomId);
+  assert.ok(initialRoom);
+  assert.deepEqual(
+    initialRoom.timeline?.events?.map((event) => event.event_id),
+    [secondMessage.event_id, thirdMessage.event_id],
+  );
+  assert.equal(initialRoom.timeline?.limited, true);
+  assert.equal(typeof initialRoom.timeline?.prev_batch, 'string');
+  assert.ok(!('state' in initialRoom));
+  assert.ok(Array.isArray(initialRoom.state_after?.events));
+
+  const backfill = await getJson(
+    rig,
+    laptop.access_token,
+    `${roomPath(roomId, '/messages')}?from=${encodeURIComponent(initialRoom.timeline.prev_batch)}&dir=b&limit=1`,
+  );
+  assert.deepEqual(backfill.chunk.map((event) => event.event_id), [firstMessage.event_id]);
+});
+
+test('Phase 05 initial /sync on a newly logged-in device includes recent leave-room timeline when include_leave is enabled', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, {
+    username: 'phase05-leave-alice',
+    password: 'correct horse battery staple',
+    deviceId: 'LEAVEALICE',
+  });
+  const bob = await registerUser(rig, {
+    username: 'phase05-leave-bob',
+    password: 'correct horse battery staple',
+    deviceId: 'LEAVEBOB',
+  });
+
+  const room = await postJson(rig, alice.access_token, '/_matrix/client/v3/createRoom', {
+    invite: [bob.user_id],
+    name: 'Phase 05 Leave History Room',
+  });
+  const roomId = room.room_id;
+  await postJson(rig, bob.access_token, roomPath(roomId, '/join'));
+
+  const leaveBackfillMessage = await putJson(
+    rig,
+    alice.access_token,
+    roomPath(roomId, '/send/m.room.message/phase05-leave-backfill'),
+    {
+      msgtype: 'm.text',
+      body: 'phase05 leave backfill message',
+    },
+  );
+  const leaveInlineMessage = await putJson(
+    rig,
+    alice.access_token,
+    roomPath(roomId, '/send/m.room.message/phase05-leave-inline'),
+    {
+      msgtype: 'm.text',
+      body: 'phase05 leave inline message',
+    },
+  );
+  await postJson(rig, bob.access_token, roomPath(roomId, '/leave'));
+
+  const relogin = await loginWithPassword(rig, {
+    user: bob.user_id,
+    password: 'correct horse battery staple',
+    deviceId: 'LEAVEBOB2',
+  });
+  const filter = encodeURIComponent(JSON.stringify({
+    room: {
+      include_leave: true,
+      timeline: {
+        limit: 2,
+      },
+    },
+  }));
+  const initialSync = await syncRequest(rig, relogin.access_token, `filter=${filter}`);
+  const leaveRoom = getLeftRoomEntry(initialSync, roomId);
+  assert.ok(leaveRoom);
+  assert.ok(leaveRoom.timeline.events.some((event) => event.event_id === leaveInlineMessage.event_id));
+  assert.ok(leaveRoom.timeline.events.some((event) => (
+    event.type === 'm.room.member'
+    && event.state_key === bob.user_id
+    && event.content?.membership === 'leave'
+  )));
+  assert.equal(typeof leaveRoom.timeline.prev_batch, 'string');
+
+  const backfill = await getJson(
+    rig,
+    relogin.access_token,
+    `${roomPath(roomId, '/messages')}?from=${encodeURIComponent(leaveRoom.timeline.prev_batch)}&dir=b&limit=1`,
+  );
+  assert.deepEqual(backfill.chunk.map((event) => event.event_id), [leaveBackfillMessage.event_id]);
 });
 
 test('Phase 05 /sync applies timeline limits plus full_state, use_state_after, lazy-load members, and include_leave semantics', async (t) => {

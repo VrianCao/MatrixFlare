@@ -942,7 +942,7 @@ async function requireAccessSession(request, env) {
   if (!result?.ok) {
     return {
       ok: false,
-      response: matrixErrorResponse(401, 'M_UNKNOWN_TOKEN', 'Unknown or unsupported token'),
+      response: mapInternalErrorToResponse(result?.error),
     };
   }
   return {
@@ -1109,6 +1109,17 @@ function mapInternalErrorToResponse(error) {
   if (error.code === 'bad_json' || error.code === 'invalid_event') {
     return matrixErrorResponse(400, 'M_BAD_JSON', error.message ?? 'Request body must be a JSON object');
   }
+  if (error.code === 'expired_session') {
+    return matrixErrorResponse(
+      401,
+      'M_UNKNOWN_TOKEN',
+      error.message ?? 'Unknown or unsupported token',
+      error.details?.soft_logout === true ? { soft_logout: true } : null,
+    );
+  }
+  if (error.code === 'deactivated_account') {
+    return matrixErrorResponse(401, 'M_UNKNOWN_TOKEN', 'Unknown or unsupported token');
+  }
   if (error.code === 'unknown_session' || error.code === 'invalid_token') {
     return matrixErrorResponse(401, 'M_UNKNOWN_TOKEN', error.message ?? 'Unknown or unsupported token');
   }
@@ -1207,6 +1218,7 @@ function ensureRoomProjectionTarget(targets, roomId) {
     targets.set(roomId, {
       room_id: roomId,
       room_pos: 0,
+      visibility_room_pos: null,
       membership_bucket: null,
       timeline_event_ids: new Set(),
       state_event_ids: new Set(),
@@ -1382,6 +1394,9 @@ async function assembleSyncResponse(env, batch, {
     for (const snapshotEntry of batch.room_membership_snapshot ?? []) {
       const target = ensureRoomProjectionTarget(roomTargets, snapshotEntry.room_id);
       target.room_pos = snapshotEntry.room_pos ?? target.room_pos;
+      target.visibility_room_pos = Number.isInteger(snapshotEntry.room_pos) && snapshotEntry.room_pos >= 1
+        ? snapshotEntry.room_pos
+        : target.visibility_room_pos;
       target.membership_bucket = snapshotEntry.membership_bucket ?? target.membership_bucket;
     }
   }
@@ -1427,6 +1442,11 @@ async function assembleSyncResponse(env, batch, {
         room_id: target.room_id,
         room_pos: target.room_pos,
         membership_bucket: target.membership_bucket,
+        initial_sync: initial_sync === true,
+        visibility_context: {
+          room_pos: target.visibility_room_pos ?? null,
+          initial_sync: initial_sync === true,
+        },
         filter_hash,
         filter_flags: batch.filter_flags,
         full_state: batch.full_state === true || initial_sync,
@@ -4766,10 +4786,6 @@ async function handleSync(request, env, url) {
     };
   };
 
-  let syncSnapshot = await collectAndAssemble();
-  if (!syncSnapshot.ok) {
-    return syncSnapshot.response;
-  }
   const presenceResult = await access.user_do.syncPresence({
     user_id: access.session.user_id,
     presence: setPresence,
@@ -4777,11 +4793,10 @@ async function handleSync(request, env, url) {
   if (!presenceResult.ok) {
     return jsonResponse(presenceResult.matrix_error.body, presenceResult.matrix_error.status);
   }
-  if (presenceResult.response?.changed === true) {
-    syncSnapshot = await collectAndAssemble();
-    if (!syncSnapshot.ok) {
-      return syncSnapshot.response;
-    }
+
+  let syncSnapshot = await collectAndAssemble();
+  if (!syncSnapshot.ok) {
+    return syncSnapshot.response;
   }
 
   if (hasVisibleSyncChanges(syncSnapshot.collected.batch, {

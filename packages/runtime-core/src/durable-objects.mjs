@@ -625,8 +625,80 @@ function makeTokenResponse({
   };
 }
 
+const DEFAULT_INITIAL_SYNC_TIMELINE_LIMIT = 10;
+
 function findSessionByHashedToken(persistence, fieldName, hashedToken) {
   return persistence.sessions.list().find((session) => session[fieldName] === hashedToken) ?? null;
+}
+
+function readSessionRefreshGrace(session) {
+  const candidate = session?.record?.refresh_grace;
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+    return null;
+  }
+  const refreshTokenHash = typeof candidate.refresh_token_hash === 'string' && candidate.refresh_token_hash.length > 0
+    ? candidate.refresh_token_hash
+    : null;
+  if (!refreshTokenHash) {
+    return null;
+  }
+  return {
+    refresh_token_hash: refreshTokenHash,
+    refresh_expires_at: typeof candidate.refresh_expires_at === 'string' ? candidate.refresh_expires_at : null,
+    issued_at: typeof candidate.issued_at === 'string' ? candidate.issued_at : null,
+  };
+}
+
+function replaceSessionRefreshGraceRecord(session, refreshGrace = null) {
+  const nextRecord = {
+    ...(session?.record ?? {}),
+  };
+  if (refreshGrace == null) {
+    delete nextRecord.refresh_grace;
+    return nextRecord;
+  }
+  nextRecord.refresh_grace = {
+    refresh_token_hash: refreshGrace.refresh_token_hash,
+    refresh_expires_at: refreshGrace.refresh_expires_at ?? null,
+    issued_at: refreshGrace.issued_at ?? null,
+  };
+  return nextRecord;
+}
+
+function findSessionByGraceRefreshToken(persistence, hashedToken) {
+  return persistence.sessions.list().find((session) => {
+    return readSessionRefreshGrace(session)?.refresh_token_hash === hashedToken;
+  }) ?? null;
+}
+
+function isSessionRefreshRecoverable({
+  session,
+  principal,
+  runtimeState,
+  device,
+  nowIso,
+}) {
+  if (!session || !principal || !runtimeState) {
+    return false;
+  }
+  if (principal.deactivated_at_or_null || session.revoked_at) {
+    return false;
+  }
+  if (session.auth_version !== principal.auth_version || session.session_epoch !== runtimeState.session_epoch) {
+    return false;
+  }
+  if (!device || device.deleted_at) {
+    return false;
+  }
+  return toMillisOrInfinity(session.refresh_expires_at) > Date.parse(nowIso);
+}
+
+function getRemainingTokenLifetimeMs(expiresAt, nowIso) {
+  const remainingMs = toMillisOrInfinity(expiresAt) - Date.parse(nowIso);
+  if (!Number.isFinite(remainingMs)) {
+    return 0;
+  }
+  return Math.max(0, Math.floor(remainingMs));
 }
 
 function getSessionTokenRevision(session) {
@@ -682,6 +754,16 @@ function isSessionUsable({
       }),
     };
   }
+  if (session.revoked_at) {
+    return {
+      valid: false,
+      error: createInternalErrorEnvelope({
+        code: 'invalid_token',
+        message: 'The session has been revoked',
+        retryable: false,
+      }),
+    };
+  }
   if (!principal) {
     return {
       valid: false,
@@ -702,16 +784,6 @@ function isSessionUsable({
       }),
     };
   }
-  if (session.revoked_at) {
-    return {
-      valid: false,
-      error: createInternalErrorEnvelope({
-        code: 'invalid_token',
-        message: 'The session has been revoked',
-        retryable: false,
-      }),
-    };
-  }
   if (toMillisOrInfinity(session.expires_at) <= Date.parse(nowIso)) {
     return {
       valid: false,
@@ -719,6 +791,15 @@ function isSessionUsable({
         code: 'expired_session',
         message: 'The session has expired',
         retryable: false,
+        details: isSessionRefreshRecoverable({
+          session,
+          principal,
+          runtimeState,
+          device,
+          nowIso,
+        })
+          ? { soft_logout: true }
+          : null,
       }),
     };
   }
@@ -2191,6 +2272,23 @@ export class UserDO extends BaseDurableObject {
         ok: false,
         error: usability.error,
       };
+    }
+
+    if (readSessionRefreshGrace(session)) {
+      const currentAccessTokenHash = accessTokenHash ?? hashOpaqueToken(legacyAccessToken);
+      if (session.access_token_hash === currentAccessTokenHash) {
+        const sql = this.requireSqlStorage();
+        withSqliteTransaction(sql, () => {
+          const currentSession = this.persistence.sessions.get(session.session_id);
+          if (!currentSession || !readSessionRefreshGrace(currentSession)) {
+            return;
+          }
+          this.persistence.sessions.put(sessionRowToPutRecord(currentSession, {
+            updated_at: now,
+            record: replaceSessionRefreshGraceRecord(currentSession, null),
+          }));
+        });
+      }
     }
 
     return createSuccessResult({
@@ -5980,11 +6078,18 @@ export class UserDO extends BaseDurableObject {
       return createMatrixError(401, 'M_UNKNOWN_TOKEN', 'Unknown refresh token');
     }
 
-    const session = findSessionByHashedToken(this.persistence, 'refresh_token_hash', hashOpaqueToken(refreshToken));
+    const hashedRefreshToken = hashOpaqueToken(refreshToken);
+    const directSession = findSessionByHashedToken(this.persistence, 'refresh_token_hash', hashedRefreshToken);
+    const graceSession = directSession == null
+      ? findSessionByGraceRefreshToken(this.persistence, hashedRefreshToken)
+      : null;
+    const session = directSession ?? graceSession;
+    const refreshGrace = readSessionRefreshGrace(graceSession);
+    const usingGraceRefresh = refreshGrace?.refresh_token_hash === hashedRefreshToken;
     if (
       !session
       || session.revoked_at
-      || toMillisOrInfinity(session.refresh_expires_at) <= Date.parse(now)
+      || toMillisOrInfinity(usingGraceRefresh ? refreshGrace.refresh_expires_at : session.refresh_expires_at) <= Date.parse(now)
       || session.auth_version !== principal.auth_version
       || session.session_epoch !== runtimeState.session_epoch
     ) {
@@ -6003,32 +6108,79 @@ export class UserDO extends BaseDurableObject {
         });
       }
       return withSqliteTransaction(sql, () => {
-      const nextTokenRevision = getSessionTokenRevision(session) + 1;
-      const { accessToken: nextAccessToken, refreshToken: nextRefreshToken, tokenRootKeyVersion } = issueSessionTokens(this.env, {
-        userId: principal.user_id,
-        sessionId: session.session_id,
-        tokenRevision: nextTokenRevision,
-      });
-      this.persistence.sessions.put(sessionRowToPutRecord(session, {
-        access_token_hash: hashOpaqueToken(nextAccessToken),
-        refresh_token_hash: hashOpaqueToken(nextRefreshToken),
-        updated_at: now,
-        expires_at: isoAfter(now, DEFAULT_ACCESS_TOKEN_TTL_MS),
-        refresh_expires_at: isoAfter(now, DEFAULT_REFRESH_TOKEN_TTL_MS),
-        record: {
-          ...(session.record ?? {}),
-          refreshed_at: now,
-          token_revision: nextTokenRevision,
-          token_root_key_version: tokenRootKeyVersion,
-        },
-      }));
-      return createSuccessResult({
-        response: {
-          access_token: nextAccessToken,
-          expires_in_ms: DEFAULT_ACCESS_TOKEN_TTL_MS,
-          refresh_token: nextRefreshToken,
-        },
-      });
+        const currentSession = this.persistence.sessions.get(session.session_id);
+        const currentGrace = readSessionRefreshGrace(currentSession);
+        const usingCurrentRefresh = currentSession?.refresh_token_hash === hashedRefreshToken;
+        const usingRetriablePriorRefresh = currentGrace?.refresh_token_hash === hashedRefreshToken;
+        if (
+          !currentSession
+          || currentSession.revoked_at
+          || currentSession.auth_version !== principal.auth_version
+          || currentSession.session_epoch !== runtimeState.session_epoch
+          || (
+            !usingCurrentRefresh
+            && !usingRetriablePriorRefresh
+          )
+          || toMillisOrInfinity(
+            usingRetriablePriorRefresh ? currentGrace.refresh_expires_at : currentSession.refresh_expires_at,
+          ) <= Date.parse(now)
+        ) {
+          return createMatrixError(401, 'M_UNKNOWN_TOKEN', 'Unknown refresh token');
+        }
+
+        const nextTokenRevision = usingCurrentRefresh
+          ? getSessionTokenRevision(currentSession) + 1
+          : getSessionTokenRevision(currentSession);
+        const { accessToken: nextAccessToken, refreshToken: nextRefreshToken, tokenRootKeyVersion } = issueSessionTokens(this.env, {
+          userId: principal.user_id,
+          sessionId: currentSession.session_id,
+          tokenRevision: nextTokenRevision,
+          tokenRootKeyVersion: getSessionTokenRootKeyVersion(currentSession),
+        });
+        const nextAccessTokenHash = hashOpaqueToken(nextAccessToken);
+        const nextRefreshTokenHash = hashOpaqueToken(nextRefreshToken);
+        const nextExpiresAt = isoAfter(now, DEFAULT_ACCESS_TOKEN_TTL_MS);
+        const nextRefreshExpiresAt = isoAfter(now, DEFAULT_REFRESH_TOKEN_TTL_MS);
+        if (usingRetriablePriorRefresh) {
+          return createSuccessResult({
+            response: {
+              access_token: nextAccessToken,
+              expires_in_ms: getRemainingTokenLifetimeMs(currentSession.expires_at, now),
+              refresh_token: nextRefreshToken,
+            },
+          });
+        }
+        const nextRefreshGrace = usingCurrentRefresh
+          ? {
+              refresh_token_hash: currentSession.refresh_token_hash,
+              refresh_expires_at: nextRefreshExpiresAt,
+              issued_at: now,
+            }
+          : {
+              refresh_token_hash: currentGrace.refresh_token_hash,
+              refresh_expires_at: nextRefreshExpiresAt,
+              issued_at: currentGrace.issued_at ?? now,
+            };
+        this.persistence.sessions.put(sessionRowToPutRecord(currentSession, {
+          access_token_hash: nextAccessTokenHash,
+          refresh_token_hash: nextRefreshTokenHash,
+          updated_at: now,
+          expires_at: nextExpiresAt,
+          refresh_expires_at: nextRefreshExpiresAt,
+          record: {
+            ...replaceSessionRefreshGraceRecord(currentSession, nextRefreshGrace),
+            refreshed_at: now,
+            token_revision: nextTokenRevision,
+            token_root_key_version: tokenRootKeyVersion,
+          },
+        }));
+        return createSuccessResult({
+          response: {
+            access_token: nextAccessToken,
+            expires_in_ms: getRemainingTokenLifetimeMs(nextExpiresAt, now),
+            refresh_token: nextRefreshToken,
+          },
+        });
       });
     } finally {
       this.observeAuthorityMetric('userdo.operation.latency_ms', Date.now() - startedAt, {
@@ -8431,9 +8583,18 @@ export class RoomDO extends BaseDurableObject {
     if (membershipBucket === 'leave' && filterFlags.include_leave !== true) {
       return createSuccessResult({ projection: null });
     }
-    const visibilityRoomPos = membershipBucket === 'join'
-      ? null
-      : (Number.isInteger(membership?.room_pos) && membership.room_pos >= 1 ? membership.room_pos : null);
+    const visibilityContext = request?.visibility_context && typeof request.visibility_context === 'object' && !Array.isArray(request.visibility_context)
+      ? request.visibility_context
+      : {};
+    const requestedVisibilityRoomPos = Number.isInteger(visibilityContext.room_pos) && visibilityContext.room_pos >= 1
+      ? visibilityContext.room_pos
+      : null;
+    const visibilityRoomPos = requestedVisibilityRoomPos
+      ?? (
+        membershipBucket === 'join'
+          ? null
+          : (Number.isInteger(membership?.room_pos) && membership.room_pos >= 1 ? membership.room_pos : null)
+      );
     const snapshotId = visibilityRoomPos == null ? null : this.resolveSnapshotIdForRoomPos(visibilityRoomPos);
 
     const timelineEventIds = uniqueStringArray(request?.timeline_event_ids);
@@ -8466,20 +8627,28 @@ export class RoomDO extends BaseDurableObject {
     if (!deltaStateEventsResult.ok) {
       return deltaStateEventsResult;
     }
-    const timelineLimit = Number.isInteger(filterFlags.timeline_limit) && filterFlags.timeline_limit >= 1
+    const requestedTimelineLimit = Number.isInteger(filterFlags.timeline_limit) && filterFlags.timeline_limit >= 1
       ? filterFlags.timeline_limit
       : null;
-    const fullTimelineEntries = timelineEventsResult.entries;
-    const limitedTimelineEntries = timelineLimit != null && fullTimelineEntries.length > timelineLimit
-      ? fullTimelineEntries.slice(-timelineLimit)
+    const shouldBackfillInitialTimeline = request?.initial_sync === true
+      && timelineEventsResult.entries.length === 0
+      && ['join', 'leave'].includes(membershipBucket);
+    const backfillTimelineLimit = requestedTimelineLimit ?? DEFAULT_INITIAL_SYNC_TIMELINE_LIMIT;
+    const fullTimelineEntries = shouldBackfillInitialTimeline
+      ? this.listVisibleTimelineMetadata({ maxRoomPos: visibilityRoomPos })
+        .slice(-backfillTimelineLimit)
+        .map((row) => this.loadVisibleRoomEventById(row.event_id, { maxRoomPos: visibilityRoomPos }))
+      : timelineEventsResult.entries;
+    const limitedTimelineEntries = requestedTimelineLimit != null && fullTimelineEntries.length > requestedTimelineLimit
+      ? fullTimelineEntries.slice(-requestedTimelineLimit)
       : fullTimelineEntries;
     const timelineEvents = limitedTimelineEntries.map((entry) => entry.event);
     const deltaStateEvents = deltaStateEventsResult.entries.map((entry) => entry.event);
-    const filteredByTimelineLimit = timelineLimit != null && fullTimelineEntries.length > timelineLimit;
-    const limitedPrevBatch = filteredByTimelineLimit && limitedTimelineEntries.length > 0
-      ? (limitedTimelineEntries[0].metadata.room_pos > 1
-        ? encodeRoomCursor(limitedTimelineEntries[0].metadata.room_pos)
-        : null)
+    const filteredByTimelineLimit = shouldBackfillInitialTimeline
+      ? this.listVisibleTimelineMetadata({ maxRoomPos: visibilityRoomPos }).length > fullTimelineEntries.length
+      : (requestedTimelineLimit != null && fullTimelineEntries.length > requestedTimelineLimit);
+    const computedPrevBatch = limitedTimelineEntries.length > 0
+      ? encodeRoomCursor(limitedTimelineEntries[0].metadata.room_pos)
       : null;
 
     let currentStateEvents = [];
@@ -8505,7 +8674,8 @@ export class RoomDO extends BaseDurableObject {
       room_id: roomId,
       membership_bucket: membershipBucket,
       limited: request?.limited === true || filteredByTimelineLimit,
-      prev_batch: limitedPrevBatch ?? (typeof request?.prev_batch === 'string' && request.prev_batch.length > 0 ? request.prev_batch : null),
+      prev_batch: computedPrevBatch
+        ?? (typeof request?.prev_batch === 'string' && request.prev_batch.length > 0 ? request.prev_batch : null),
       timeline_events: timelineEvents,
       state_events: request?.full_state === true ? currentStateEvents : deltaStateEvents,
       state_after_events: request?.use_state_after === true ? currentStateEvents : null,
@@ -8525,9 +8695,8 @@ export class RoomDO extends BaseDurableObject {
         ? structuredClone(request.unread_thread_notifications)
         : null,
       summary,
-      room_pos: membershipBucket === 'join'
-        ? (request?.room_pos ?? membership?.room_pos ?? 0)
-        : (visibilityRoomPos ?? 0),
+      room_pos: visibilityRoomPos
+        ?? (request?.room_pos ?? membership?.room_pos ?? 0),
     };
     return createSuccessResult({
       projection,

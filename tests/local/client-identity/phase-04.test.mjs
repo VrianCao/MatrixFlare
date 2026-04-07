@@ -665,18 +665,46 @@ test('Phase 04 session lifecycle covers register, login, refresh, logout, whoami
   assert.notEqual(refreshedBody.access_token, registration.access_token);
   assert.notEqual(refreshedBody.refresh_token, registration.refresh_token);
 
-  const oldAccessAfterRefresh = await rig.gatewayFetch('/_matrix/client/v3/account/whoami', {
-    headers: rig.authHeaders(registration.access_token),
-  });
-  await expectMatrixError(oldAccessAfterRefresh, 401, 'M_UNKNOWN_TOKEN');
-
-  const oldRefreshAfterRefresh = await rig.gatewayFetch('/_matrix/client/v3/refresh', {
+  const retryStartedAt = Date.now();
+  const oldRefreshRetry = await rig.gatewayFetch('/_matrix/client/v3/refresh', {
     method: 'POST',
     json: {
       refresh_token: registration.refresh_token,
     },
   });
-  await expectMatrixError(oldRefreshAfterRefresh, 401, 'M_UNKNOWN_TOKEN');
+  const retryEndedAt = Date.now();
+  assert.equal(oldRefreshRetry.status, 200);
+  const oldRefreshRetryBody = await oldRefreshRetry.json();
+  assert.equal(oldRefreshRetryBody.access_token, refreshedBody.access_token);
+  assert.equal(oldRefreshRetryBody.refresh_token, refreshedBody.refresh_token);
+  const refreshedSession = rig.getUserDo(registration.user_id).persistence.sessions.list()[0];
+  const retryRemainingUpperBound = Date.parse(refreshedSession.expires_at) - retryStartedAt;
+  const retryRemainingLowerBound = Date.parse(refreshedSession.expires_at) - retryEndedAt;
+  assert.ok(oldRefreshRetryBody.expires_in_ms <= retryRemainingUpperBound);
+  assert.ok(oldRefreshRetryBody.expires_in_ms >= retryRemainingLowerBound);
+
+  const oldAccessAfterRefresh = await rig.gatewayFetch('/_matrix/client/v3/account/whoami', {
+    headers: rig.authHeaders(registration.access_token),
+  });
+  await expectMatrixError(oldAccessAfterRefresh, 401, 'M_UNKNOWN_TOKEN');
+
+  const refreshedWhoAmI = await rig.gatewayFetch('/_matrix/client/v3/account/whoami', {
+    headers: rig.authHeaders(refreshedBody.access_token),
+  });
+  assert.equal(refreshedWhoAmI.status, 200);
+  assert.deepEqual(await refreshedWhoAmI.json(), {
+    user_id: '@alice:matrix.example.test',
+    device_id: 'ALICEPHONE',
+    is_guest: false,
+  });
+
+  const oldRefreshAfterCurrentAccess = await rig.gatewayFetch('/_matrix/client/v3/refresh', {
+    method: 'POST',
+    json: {
+      refresh_token: registration.refresh_token,
+    },
+  });
+  await expectMatrixError(oldRefreshAfterCurrentAccess, 401, 'M_UNKNOWN_TOKEN');
 
   const logout = await rig.gatewayFetch('/_matrix/client/v3/logout', {
     method: 'POST',
@@ -710,6 +738,175 @@ test('Phase 04 session lifecycle covers register, login, refresh, logout, whoami
     headers: rig.authHeaders(loginAgainBody.access_token),
   });
   await expectMatrixError(whoAmIAfterLogoutAll, 401, 'M_UNKNOWN_TOKEN');
+});
+
+test('Phase 04 expired access tokens advertise soft logout when refresh can recover the session', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const registration = await registerViaUia(rig, {
+    username: 'soft-logout-user',
+    password: 'soft logout password',
+    deviceId: 'SOFTLOGOUT',
+  });
+  const userDo = rig.getUserDo(registration.user_id);
+  const session = userDo.persistence.sessions.list()[0];
+  const now = Date.now();
+  userDo.persistence.sessions.put({
+    session_id: session.session_id,
+    access_token_hash: session.access_token_hash,
+    refresh_token_hash: session.refresh_token_hash,
+    device_id: session.device_id,
+    auth_version: session.auth_version,
+    session_epoch: session.session_epoch,
+    is_guest: session.is_guest,
+    created_at: session.created_at,
+    updated_at: session.updated_at,
+    expires_at: new Date(now - 60_000).toISOString(),
+    refresh_expires_at: new Date(now + 60 * 60 * 1000).toISOString(),
+    revoked_at: session.revoked_at,
+    record_json: session.record ?? {},
+  });
+
+  const expiredWhoAmI = await rig.gatewayFetch('/_matrix/client/v3/account/whoami', {
+    headers: rig.authHeaders(registration.access_token),
+  });
+  assert.equal(expiredWhoAmI.status, 401);
+  assert.deepEqual(await expiredWhoAmI.json(), {
+    errcode: 'M_UNKNOWN_TOKEN',
+    error: 'The session has expired',
+    soft_logout: true,
+  });
+
+  const refreshed = await rig.gatewayFetch('/_matrix/client/v3/refresh', {
+    method: 'POST',
+    json: {
+      refresh_token: registration.refresh_token,
+    },
+  });
+  assert.equal(refreshed.status, 200);
+  const refreshedBody = await refreshed.json();
+  assert.equal(typeof refreshedBody.access_token, 'string');
+  assert.equal(typeof refreshedBody.refresh_token, 'string');
+
+  const refreshedWhoAmI = await rig.gatewayFetch('/_matrix/client/v3/account/whoami', {
+    headers: rig.authHeaders(refreshedBody.access_token),
+  });
+  assert.equal(refreshedWhoAmI.status, 200);
+  assert.deepEqual(await refreshedWhoAmI.json(), {
+    user_id: registration.user_id,
+    device_id: 'SOFTLOGOUT',
+    is_guest: false,
+  });
+});
+
+test('Phase 04 expired access tokens do not advertise soft logout when refresh cannot recover the session', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const registration = await registerViaUia(rig, {
+    username: 'hard-logout-user',
+    password: 'hard logout password',
+    deviceId: 'HARDLOGOUT',
+  });
+  const userDo = rig.getUserDo(registration.user_id);
+  const session = userDo.persistence.sessions.list()[0];
+  const now = Date.now();
+  userDo.persistence.sessions.put({
+    session_id: session.session_id,
+    access_token_hash: session.access_token_hash,
+    refresh_token_hash: session.refresh_token_hash,
+    device_id: session.device_id,
+    auth_version: session.auth_version,
+    session_epoch: session.session_epoch,
+    is_guest: session.is_guest,
+    created_at: session.created_at,
+    updated_at: session.updated_at,
+    expires_at: new Date(now - 60_000).toISOString(),
+    refresh_expires_at: new Date(now - 1_000).toISOString(),
+    revoked_at: session.revoked_at,
+    record_json: session.record ?? {},
+  });
+
+  const expiredWhoAmI = await rig.gatewayFetch('/_matrix/client/v3/account/whoami', {
+    headers: rig.authHeaders(registration.access_token),
+  });
+  assert.equal(expiredWhoAmI.status, 401);
+  assert.deepEqual(await expiredWhoAmI.json(), {
+    errcode: 'M_UNKNOWN_TOKEN',
+    error: 'The session has expired',
+  });
+
+  const refresh = await rig.gatewayFetch('/_matrix/client/v3/refresh', {
+    method: 'POST',
+    json: {
+      refresh_token: registration.refresh_token,
+    },
+  });
+  await expectMatrixError(refresh, 401, 'M_UNKNOWN_TOKEN');
+});
+
+test('Phase 04 refresh retries converge on the rotated lineage without extending token lifetime', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const registration = await registerViaUia(rig, {
+    username: 'refresh-retry-user',
+    password: 'refresh retry password',
+    deviceId: 'REFRESHRETRY',
+  });
+  const userDo = rig.getUserDo(registration.user_id);
+  const initialSession = userDo.persistence.sessions.list()[0];
+  const firstRefreshAt = new Date(Date.parse(initialSession.updated_at) + 60_000).toISOString();
+
+  const firstRefresh = await userDo.refreshSession({
+    refresh_token: registration.refresh_token,
+    now: firstRefreshAt,
+  });
+  assert.equal(firstRefresh.ok, true);
+  const firstRefreshBody = firstRefresh.response;
+  assert.equal(typeof firstRefreshBody.access_token, 'string');
+  assert.equal(typeof firstRefreshBody.refresh_token, 'string');
+
+  const rotatedSession = userDo.persistence.sessions.get(initialSession.session_id);
+  const rotatedExpiresAt = rotatedSession.expires_at;
+  const rotatedRefreshExpiresAt = rotatedSession.refresh_expires_at;
+  const rotatedRefreshGrace = structuredClone(rotatedSession.record.refresh_grace);
+
+  const retryAt = new Date(Date.parse(firstRefreshAt) + 5 * 60_000).toISOString();
+  const oldRefreshRetry = await userDo.refreshSession({
+    refresh_token: registration.refresh_token,
+    now: retryAt,
+  });
+  assert.equal(oldRefreshRetry.ok, true);
+  assert.deepEqual(oldRefreshRetry.response, {
+    access_token: firstRefreshBody.access_token,
+    expires_in_ms: Math.max(0, Date.parse(rotatedExpiresAt) - Date.parse(retryAt)),
+    refresh_token: firstRefreshBody.refresh_token,
+  });
+
+  const sessionAfterRetry = userDo.persistence.sessions.get(initialSession.session_id);
+  assert.equal(sessionAfterRetry.expires_at, rotatedExpiresAt);
+  assert.equal(sessionAfterRetry.refresh_expires_at, rotatedRefreshExpiresAt);
+  assert.deepEqual(sessionAfterRetry.record.refresh_grace, rotatedRefreshGrace);
+
+  const secondRefreshAt = new Date(Date.parse(retryAt) + 60_000).toISOString();
+  const currentRefresh = await userDo.refreshSession({
+    refresh_token: firstRefreshBody.refresh_token,
+    now: secondRefreshAt,
+  });
+  assert.equal(currentRefresh.ok, true);
+
+  const oldRefreshAfterCurrentRefresh = await userDo.refreshSession({
+    refresh_token: registration.refresh_token,
+    now: new Date(Date.parse(secondRefreshAt) + 60_000).toISOString(),
+  });
+  assert.equal(oldRefreshAfterCurrentRefresh.ok, false);
+  assert.equal(oldRefreshAfterCurrentRefresh.matrix_error?.status, 401);
+  assert.deepEqual(oldRefreshAfterCurrentRefresh.matrix_error?.body, {
+    errcode: 'M_UNKNOWN_TOKEN',
+    error: 'Unknown refresh token',
+  });
 });
 
 test('Phase 04 UIA routes enforce route binding, tokenless password UIA, and deactivation erase semantics', async (t) => {
