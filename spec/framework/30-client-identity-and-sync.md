@@ -180,8 +180,10 @@
 ### 4.6 刷新
 
 * `refresh` 必须通过 `IF-CS-012` 与 `IF-INT-USER-001`/`IF-INT-USER-002` 相同的 `UserDO` 权威路径完成。
-* refresh 成功后，旧 refresh token 必须失效，access token 应同时轮换。
-* refresh token 重放必须返回明确失败，而不是返回新的可用 token。
+* refresh 成功后，access token 与 refresh token 都必须进入新的 session revision；但 Matrix `v1.17` 要求紧邻上一代 refresh token 在“新 access token 或新 refresh token 尚未被使用”之前仍保持可重试，用于客户端处理 refresh 响应丢失或竞态重试。
+* 上述旧 refresh token 的 retry path 必须收敛到同一已发行的 rotated token lineage，而不是额外再分叉出新的 access/refresh 对。
+* 一旦新 access token 或新 refresh token 已被使用，上一代 refresh token 就必须明确失败。
+* 当 client 携带的 access token 已过期，但同一 session 的 refresh token 仍可恢复时，authenticated client route 必须返回 `401 M_UNKNOWN_TOKEN` 并显式附带 `soft_logout: true`；若该 session 已不可恢复，则不得滥发 `soft_logout`。
 
 ### 4.7 注销
 
@@ -441,10 +443,12 @@
 * 若任一房间投影失败，则本次 `/sync` 不得推进 `next_batch`。
 * to-device、device lists、one-time key count 和 fallback key types 都必须来自与 `since` 同一用户流快照边界。
 * `RoomProjectionRequest` 至少必须包含 `user_id`,`room_id`,`room_pos`,`membership_bucket`,`filter_hash` 与本次 `/sync` 的 visibility context；不得只用 `{room_id,room_pos,filter_hash}` 这类可跨用户碰撞的键推导房间投影。
+* 对 joined / leave 房间的 initial timeline bootstrap 与 `full_state` / `use_state_after` 投影，`visibility context.room_pos` 必须固定到 `collectSince()` 观察到的 per-room snapshot cutoff；不得在房间投影阶段再偷看 collect 之后才出现的 live timeline 或 live state。
 
 ### 9.2 Initial / Incremental 语义
 
 * `since` 缺失表示 initial sync；实现必须在单一 `upper_bound_user_stream_pos` 上返回用户当前可见的 joined / invited / knocked 房间视图与当前用户域快照；`rooms.leave` 只在 filter 显式启用 `include_leave = true` 时返回 left / banned-but-not-forgotten 房间。
+* 对 initial sync 中当前可见的 `rooms.join` 房间，以及 filter 显式启用 `include_leave = true` 后仍可见的 `rooms.leave` 房间，服务端还必须返回最近一段当前可见的 room timeline，而不是只返回 membership/state 快照；若请求显式给出 `room.timeline.limit`，recent timeline 必须受该上限约束，若未给出则必须使用 bounded implementation-defined default。当前 profile 将该 default 固定为 `10` 条当前可见事件，而不是返回空 timeline 或无界全量历史。相应 `prev_batch` 必须允许新设备/新登录会话继续向后分页已有房间历史，而且这段 initial timeline 必须严格受该次 snapshot cutoff 约束，不能夹带 collect 之后才出现的房间事件。
 * `since` 存在表示 incremental sync；实现只能返回满足 `stream_pos > since_pos && stream_pos <= upper_bound_user_stream_pos` 的增量。
 * token 解析失败、版本不兼容、设备或用户作用域不匹配时，必须在进入 long poll 前失败，并且不得前移任何 session ack 状态。
 

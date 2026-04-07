@@ -74,6 +74,7 @@
 | --- | --- | --- |
 | `errcode` | string | 固定为 `M_UNKNOWN_TOKEN` |
 | `error` | string | 固定为 `Unknown or unsupported token` |
+| `soft_logout` | boolean, optional | 只允许 client-session 过期且同一 session refresh 仍可恢复时出现；其它 unknown-token 场景不得便利性追加 |
 
 适用面：
 
@@ -853,7 +854,7 @@
 | `room_pos` | integer | 投影截止位置 |
 | `membership_bucket` | string | 参与可见性裁决 |
 | `filter_hash` | string | canonical filter hash |
-| `visibility_context` | object | 不得省略 |
+| `visibility_context` | object | 不得省略；至少包含本次 `collectSince()` 冻结下来的 `room_pos` snapshot cutoff。对于 initial `/sync` 的 joined/leave timeline bootstrap，`RoomDO` 必须按这个 cutoff 裁切 timeline/state，而不是读取 live latest truth |
 
 #### `RoomSyncProjection`
 
