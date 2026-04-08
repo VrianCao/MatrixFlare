@@ -1095,6 +1095,144 @@ test('Phase 05A joining an encrypted invited room exposes m.room.encryption in t
   );
 });
 
+test('Phase 05A invite-to-join collapse keeps only the final rooms.join bucket with encrypted state', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, {
+    username: 'alice-encrypted-collapsed-join',
+    password: 'correct horse battery staple',
+    deviceId: 'ALICEPHONE',
+  });
+  const bob = await registerUser(rig, {
+    username: 'bob-encrypted-collapsed-join',
+    password: 'secret bob password',
+    deviceId: 'BOBPHONE',
+  });
+
+  const bobBaselineSync = await syncRequest(rig, bob.access_token);
+  const createRoom = await requestAs(rig, alice.access_token, '/_matrix/client/v3/createRoom', {
+    method: 'POST',
+    json: {
+      invite: [bob.user_id],
+      name: 'encrypted-collapsed-join-room',
+    },
+  });
+  assert.equal(createRoom.status, 200);
+  const { room_id: roomId } = await createRoom.json();
+
+  await enableMegolmRoom(rig, alice.access_token, roomId);
+
+  const bobJoin = await requestAs(rig, bob.access_token, `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/join`, {
+    method: 'POST',
+    json: {},
+  });
+  assert.equal(bobJoin.status, 200);
+
+  const bobCollapsedSync = await syncRequest(
+    rig,
+    bob.access_token,
+    `since=${encodeURIComponent(bobBaselineSync.next_batch)}&timeout=0`,
+  );
+  assert.equal(
+    bobCollapsedSync.rooms?.invite?.[roomId] ?? null,
+    null,
+    'expected invite->join collapse to suppress the intermediate rooms.invite bucket',
+  );
+  const joinedRoom = bobCollapsedSync.rooms?.join?.[roomId];
+  assert.ok(joinedRoom, 'expected the final incremental /sync bucket to be rooms.join');
+  assert.ok(
+    (joinedRoom.timeline?.events ?? []).some((event) => (
+      event.type === 'm.room.member' && event.state_key === bob.user_id && event.content?.membership === 'join'
+    )),
+    'expected Bob collapsed join delta to keep the join event in timeline',
+  );
+  assert.ok(
+    (joinedRoom.state?.events ?? []).some((event) => (
+      event.type === 'm.room.encryption'
+      && event.state_key === ''
+      && event.content?.algorithm === 'm.megolm.v1.aes-sha2'
+    )),
+    'expected invite->join collapse to preserve encrypted room semantics in rooms.join',
+  );
+});
+
+test('Phase 05A knock-to-join collapse keeps only the final rooms.join bucket with encrypted state', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, {
+    username: 'alice-encrypted-collapsed-knock',
+    password: 'correct horse battery staple',
+    deviceId: 'ALICEPHONE',
+  });
+  const bob = await registerUser(rig, {
+    username: 'bob-encrypted-collapsed-knock',
+    password: 'secret bob password',
+    deviceId: 'BOBPHONE',
+  });
+
+  const bobBaselineSync = await syncRequest(rig, bob.access_token);
+  const createRoom = await requestAs(rig, alice.access_token, '/_matrix/client/v3/createRoom', {
+    method: 'POST',
+    json: {
+      initial_state: [
+        {
+          type: 'm.room.join_rules',
+          state_key: '',
+          content: {
+            join_rule: 'knock',
+          },
+        },
+      ],
+      name: 'encrypted-collapsed-knock-room',
+    },
+  });
+  assert.equal(createRoom.status, 200);
+  const { room_id: roomId } = await createRoom.json();
+
+  await enableMegolmRoom(rig, alice.access_token, roomId);
+
+  const bobKnock = await requestAs(rig, bob.access_token, `/_matrix/client/v3/knock/${encodeURIComponent(roomId)}`, {
+    method: 'POST',
+    json: {},
+  });
+  assert.equal(bobKnock.status, 200);
+
+  const bobJoin = await requestAs(rig, bob.access_token, `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/join`, {
+    method: 'POST',
+    json: {},
+  });
+  assert.equal(bobJoin.status, 200);
+
+  const bobCollapsedSync = await syncRequest(
+    rig,
+    bob.access_token,
+    `since=${encodeURIComponent(bobBaselineSync.next_batch)}&timeout=0`,
+  );
+  assert.equal(
+    bobCollapsedSync.rooms?.knock?.[roomId] ?? null,
+    null,
+    'expected knock->join collapse to suppress the intermediate rooms.knock bucket',
+  );
+  const joinedRoom = bobCollapsedSync.rooms?.join?.[roomId];
+  assert.ok(joinedRoom, 'expected the final incremental /sync bucket to be rooms.join');
+  assert.ok(
+    (joinedRoom.timeline?.events ?? []).some((event) => (
+      event.type === 'm.room.member' && event.state_key === bob.user_id && event.content?.membership === 'join'
+    )),
+    'expected Bob collapsed knock->join delta to keep the join event in timeline',
+  );
+  assert.ok(
+    (joinedRoom.state?.events ?? []).some((event) => (
+      event.type === 'm.room.encryption'
+      && event.state_key === ''
+      && event.content?.algorithm === 'm.megolm.v1.aes-sha2'
+    )),
+    'expected knock->join collapse to preserve encrypted room semantics in rooms.join',
+  );
+});
+
 test('Phase 05A joined-user profile refreshes do not replay the full encrypted room snapshot', async (t) => {
   const rig = createGatewayPhase04Rig();
   t.after(() => rig.close());
