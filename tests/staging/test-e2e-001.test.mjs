@@ -10,7 +10,7 @@ import { chromium } from 'playwright';
 import {
   buildBrowserJourneyCoverageReport,
   validateBrowserJourneyCoverageReport,
-} from '../../packages/testing/src/browser-e2e.mjs';
+} from './browser-e2e-support.mjs';
 import {
   acceptInviteByRoomName,
   approveNewSessionWithExistingDevice,

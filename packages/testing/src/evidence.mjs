@@ -4458,6 +4458,57 @@ function isCallLikeExpressionAt(sourceText, index) {
   return false;
 }
 
+function isPotentialBracketPropertyAccess(sourceText, index) {
+  let cursor = index - 1;
+  while (cursor >= 0 && /\s/.test(sourceText[cursor])) {
+    cursor -= 1;
+  }
+  if (cursor < 0) {
+    return false;
+  }
+  if (sourceText[cursor] === '?') {
+    let dotCursor = cursor - 1;
+    while (dotCursor >= 0 && /\s/.test(sourceText[dotCursor])) {
+      dotCursor -= 1;
+    }
+    return dotCursor >= 0 && sourceText[dotCursor] === '.';
+  }
+  const previousChar = sourceText[cursor];
+  if (
+    previousChar === '.'
+    || previousChar === ')'
+    || previousChar === ']'
+    || previousChar === '}'
+    || previousChar === '\''
+    || previousChar === '"'
+    || previousChar === '`'
+  ) {
+    return true;
+  }
+  if (!/[A-Za-z0-9_$]/.test(previousChar)) {
+    return false;
+  }
+  let identifierStart = cursor;
+  while (identifierStart > 0 && /[A-Za-z0-9_$]/.test(sourceText[identifierStart - 1])) {
+    identifierStart -= 1;
+  }
+  const precedingIdentifier = sourceText.slice(identifierStart, cursor + 1);
+  return !new Set([
+    'await',
+    'case',
+    'delete',
+    'in',
+    'instanceof',
+    'new',
+    'of',
+    'return',
+    'throw',
+    'typeof',
+    'void',
+    'yield',
+  ]).has(precedingIdentifier);
+}
+
 function readCallableContinuationInvocationProperty(sourceText, index) {
   const property = readChainedPropertyName(sourceText, index);
   if (property == null || !isCallableContinuationMethodName(property.name)) {
@@ -4494,6 +4545,11 @@ function isOpaqueStaticModuleSpecifier(specifier) {
     && !isTrackedModuleSpecifier(specifier)
     && !hasExplicitModuleScheme(specifier)
     && !isSafeBuiltinModuleSpecifier(specifier);
+}
+
+function isAllowedBarePackageModuleSpecifier(specifier) {
+  return typeof specifier === 'string'
+    && /^(?:@[^/\s]+\/[^/\s]+|[A-Za-z0-9][A-Za-z0-9._-]*)(?:\/[A-Za-z0-9._-]+)*$/u.test(specifier);
 }
 
 function findStaticModuleSpecifier(sourceText, startIndex) {
@@ -4665,6 +4721,10 @@ function collectRelativeModuleDependencies(sourceText, inheritedAliasState = nul
       }
     }
     if (current === '[') {
+      if (!isPotentialBracketPropertyAccess(sourceText, cursor)) {
+        cursor += 1;
+        continue;
+      }
       const bracketProperty = parseBracketPropertyExpression(sourceText, cursor);
       if (bracketProperty != null) {
         const staticBracketPropertyName = getStaticBracketPropertyName(bracketProperty);
@@ -4844,6 +4904,8 @@ function collectRelativeModuleDependencies(sourceText, inheritedAliasState = nul
           hasUnresolvedDynamicImport = true;
         } else if (isTrackedModuleSpecifier(literalSpecifier)) {
           moduleSpecifiers.push(literalSpecifier);
+        } else if (isAllowedBarePackageModuleSpecifier(literalSpecifier)) {
+          // Installed package imports are outside the repo-owned closure and are allowed.
         } else if (isOpaqueStaticModuleSpecifier(literalSpecifier)) {
           hasUnresolvedDynamicImport = true;
         } else if (hasExplicitModuleScheme(literalSpecifier) && !isSafeBuiltinModuleSpecifier(literalSpecifier)) {
@@ -4860,6 +4922,8 @@ function collectRelativeModuleDependencies(sourceText, inheritedAliasState = nul
       if (staticSpecifier != null) {
         if (isTrackedModuleSpecifier(staticSpecifier.specifier)) {
           moduleSpecifiers.push(staticSpecifier.specifier);
+        } else if (isAllowedBarePackageModuleSpecifier(staticSpecifier.specifier)) {
+          // Installed package imports are outside the repo-owned closure and are allowed.
         } else if (isOpaqueStaticModuleSpecifier(staticSpecifier.specifier)) {
           hasUnresolvedDynamicImport = true;
         } else if (
@@ -4879,6 +4943,8 @@ function collectRelativeModuleDependencies(sourceText, inheritedAliasState = nul
       if (staticSpecifier != null) {
         if (isTrackedModuleSpecifier(staticSpecifier.specifier)) {
           moduleSpecifiers.push(staticSpecifier.specifier);
+        } else if (isAllowedBarePackageModuleSpecifier(staticSpecifier.specifier)) {
+          // Installed package imports are outside the repo-owned closure and are allowed.
         } else if (isOpaqueStaticModuleSpecifier(staticSpecifier.specifier)) {
           hasUnresolvedDynamicImport = true;
         } else if (

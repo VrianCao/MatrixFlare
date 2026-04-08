@@ -1221,6 +1221,7 @@ function ensureRoomProjectionTarget(targets, roomId) {
       visibility_room_pos: null,
       membership_bucket: null,
       timeline_event_ids: new Set(),
+      pinned_timeline_event_ids: new Set(),
       state_event_ids: new Set(),
       account_data_events: new Map(),
       ephemeral_events: [],
@@ -1254,6 +1255,11 @@ function mergeRoomDeltaIntoTarget(target, delta) {
   for (const eventId of Array.isArray(delta.timeline_event_ids) ? delta.timeline_event_ids : []) {
     if (typeof eventId === 'string' && eventId.length > 0) {
       target.timeline_event_ids.add(eventId);
+    }
+  }
+  for (const eventId of Array.isArray(delta.pinned_timeline_event_ids) ? delta.pinned_timeline_event_ids : []) {
+    if (typeof eventId === 'string' && eventId.length > 0) {
+      target.pinned_timeline_event_ids.add(eventId);
     }
   }
   for (const eventId of Array.isArray(delta.state_event_ids) ? delta.state_event_ids : []) {
@@ -1452,6 +1458,7 @@ async function assembleSyncResponse(env, batch, {
         full_state: batch.full_state === true || initial_sync,
         use_state_after: batch.use_state_after === true,
         timeline_event_ids: [...target.timeline_event_ids],
+        pinned_timeline_event_ids: [...target.pinned_timeline_event_ids],
         state_event_ids: [...target.state_event_ids],
         ephemeral_events: target.ephemeral_events,
         notification_count: target.notification_count,

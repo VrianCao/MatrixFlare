@@ -6,7 +6,7 @@ import {
   buildElementWebConfig,
   ensureElementWebBundle,
   startElementWebServer,
-} from '../../packages/testing/src/browser-harness.mjs';
+} from './browser-harness-support.mjs';
 import {
   eventually,
 } from './support.mjs';

@@ -1095,6 +1095,636 @@ test('Phase 05A joining an encrypted invited room exposes m.room.encryption in t
   );
 });
 
+test('Phase 05A invite-to-join DM sync with use_state_after carries recent encrypted timeline context', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, {
+    username: 'alice-dm-join-context',
+    password: 'correct horse battery staple',
+    deviceId: 'ALICEPHONE',
+  });
+  const bob = await registerUser(rig, {
+    username: 'bob-dm-join-context',
+    password: 'secret bob password',
+    deviceId: 'BOBPHONE',
+  });
+
+  const bobBaselineSync = await syncRequest(rig, bob.access_token, 'use_state_after=true&timeout=0');
+  const createRoom = await requestAs(rig, alice.access_token, '/_matrix/client/v3/createRoom', {
+    method: 'POST',
+    json: {
+      preset: 'trusted_private_chat',
+      visibility: 'private',
+      invite: [bob.user_id],
+      is_direct: true,
+      initial_state: [
+        {
+          type: 'm.room.guest_access',
+          state_key: '',
+          content: {
+            guest_access: 'can_join',
+          },
+        },
+        {
+          type: 'm.room.encryption',
+          state_key: '',
+          content: {
+            algorithm: 'm.megolm.v1.aes-sha2',
+          },
+        },
+        {
+          type: 'm.room.history_visibility',
+          content: {
+            history_visibility: 'invited',
+          },
+        },
+      ],
+    },
+  });
+  assert.equal(createRoom.status, 200);
+  const { room_id: roomId } = await createRoom.json();
+
+  const bootstrapMessage = 'dm-join-bootstrap';
+  const preJoinSend = await requestAs(
+    rig,
+    alice.access_token,
+    `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/m.room.message/dm-join-bootstrap`,
+    {
+      method: 'PUT',
+      json: {
+        msgtype: 'm.text',
+        body: bootstrapMessage,
+      },
+    },
+  );
+  assert.equal(preJoinSend.status, 200);
+
+  const bobInviteSync = await syncRequest(
+    rig,
+    bob.access_token,
+    `use_state_after=true&since=${encodeURIComponent(bobBaselineSync.next_batch)}&timeout=0`,
+  );
+  assert.ok(bobInviteSync.rooms?.invite?.[roomId], 'expected Bob to observe the DM invite before joining');
+
+  const bobJoin = await requestAs(rig, bob.access_token, `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/join`, {
+    method: 'POST',
+    json: {},
+  });
+  assert.equal(bobJoin.status, 200);
+
+  const bobJoinSync = await syncRequest(
+    rig,
+    bob.access_token,
+    `use_state_after=true&since=${encodeURIComponent(bobInviteSync.next_batch)}&timeout=0`,
+  );
+  const joinedRoom = bobJoinSync.rooms?.join?.[roomId];
+  assert.ok(joinedRoom, 'expected Bob joined DM room to appear in incremental /sync');
+  assert.equal(joinedRoom.state ?? null, null, 'use_state_after=true must omit legacy state payloads');
+  assert.ok(Array.isArray(joinedRoom.state_after?.events), 'expected state_after events for the joined DM room');
+  assert.ok(
+    (joinedRoom.state_after?.events ?? []).some((event) => (
+      event.type === 'm.room.encryption'
+      && event.state_key === ''
+      && event.content?.algorithm === 'm.megolm.v1.aes-sha2'
+    )),
+    'expected state_after to carry the current encryption state for the newly joined DM',
+  );
+  assert.ok(
+    (joinedRoom.timeline?.events ?? []).some((event) => (
+      event.type === 'm.room.message'
+      && event.content?.body === bootstrapMessage
+    )),
+    'expected the joined DM timeline to include the pre-join bootstrap message',
+  );
+  assert.ok(
+    (joinedRoom.timeline?.events ?? []).some((event) => (
+      event.type === 'm.room.encryption'
+      && event.state_key === ''
+      && event.content?.algorithm === 'm.megolm.v1.aes-sha2'
+    )),
+    'expected the joined DM timeline to carry recent encrypted room semantics for immediate client context',
+  );
+  assert.ok(
+    (joinedRoom.timeline?.events ?? []).some((event) => (
+      event.type === 'm.room.member'
+      && event.state_key === bob.user_id
+      && event.content?.membership === 'join'
+    )),
+    'expected the joined DM timeline to retain Bob join event',
+  );
+});
+
+test('Phase 05A bounded join backfill marks joined sync limited when older visible history is omitted', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, {
+    username: 'alice-dm-join-limited',
+    password: 'correct horse battery staple',
+    deviceId: 'ALICEPHONE',
+  });
+  const bob = await registerUser(rig, {
+    username: 'bob-dm-join-limited',
+    password: 'secret bob password',
+    deviceId: 'BOBPHONE',
+  });
+
+  const bobBaselineSync = await syncRequest(rig, bob.access_token, 'use_state_after=true&timeout=0');
+  const createRoom = await requestAs(rig, alice.access_token, '/_matrix/client/v3/createRoom', {
+    method: 'POST',
+    json: {
+      preset: 'trusted_private_chat',
+      visibility: 'private',
+      invite: [bob.user_id],
+      is_direct: true,
+      initial_state: [
+        {
+          type: 'm.room.encryption',
+          state_key: '',
+          content: {
+            algorithm: 'm.megolm.v1.aes-sha2',
+          },
+        },
+        {
+          type: 'm.room.history_visibility',
+          content: {
+            history_visibility: 'invited',
+          },
+        },
+      ],
+    },
+  });
+  assert.equal(createRoom.status, 200);
+  const { room_id: roomId } = await createRoom.json();
+
+  const sentBodies = [];
+  for (let index = 0; index < 12; index += 1) {
+    const body = `dm-prejoin-${index.toString().padStart(2, '0')}`;
+    sentBodies.push(body);
+    const response = await requestAs(
+      rig,
+      alice.access_token,
+      `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/m.room.message/dm-prejoin-${index}`,
+      {
+        method: 'PUT',
+        json: {
+          msgtype: 'm.text',
+          body,
+        },
+      },
+    );
+    assert.equal(response.status, 200);
+  }
+
+  const bobInviteSync = await syncRequest(
+    rig,
+    bob.access_token,
+    `use_state_after=true&since=${encodeURIComponent(bobBaselineSync.next_batch)}&timeout=0`,
+  );
+  assert.ok(bobInviteSync.rooms?.invite?.[roomId], 'expected Bob to observe the DM invite before joining');
+
+  const bobJoin = await requestAs(rig, bob.access_token, `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/join`, {
+    method: 'POST',
+    json: {},
+  });
+  assert.equal(bobJoin.status, 200);
+
+  const bobJoinSync = await syncRequest(
+    rig,
+    bob.access_token,
+    `use_state_after=true&since=${encodeURIComponent(bobInviteSync.next_batch)}&timeout=0`,
+  );
+  const joinedRoom = bobJoinSync.rooms?.join?.[roomId];
+  assert.ok(joinedRoom, 'expected Bob joined DM room to appear in incremental /sync');
+  assert.equal(joinedRoom.timeline?.limited, true, 'expected bounded join backfill to mark the joined room limited');
+  assert.equal(typeof joinedRoom.timeline?.prev_batch, 'string');
+  assert.equal(
+    (joinedRoom.timeline?.events ?? []).some((event) => event.content?.body === sentBodies[0]),
+    false,
+    'expected the bounded join backfill to omit the oldest visible pre-join message',
+  );
+  assert.ok(
+    (joinedRoom.timeline?.events ?? []).some((event) => event.content?.body === sentBodies.at(-1)),
+    'expected the bounded join backfill to keep the newest visible pre-join message',
+  );
+
+  const olderHistory = await requestAs(
+    rig,
+    bob.access_token,
+    `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/messages?from=${encodeURIComponent(joinedRoom.timeline.prev_batch)}&dir=b&limit=20`,
+  );
+  assert.equal(olderHistory.status, 200);
+  const olderHistoryBody = await olderHistory.json();
+  assert.ok(
+    (olderHistoryBody.chunk ?? []).some((event) => event.content?.body === sentBodies[0]),
+    'expected prev_batch to page into older visible pre-join history omitted from the bounded join backfill',
+  );
+});
+
+test('Phase 05A joined history visibility join backfill does not leak pre-join messages', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, {
+    username: 'alice-joined-history-cutoff',
+    password: 'correct horse battery staple',
+    deviceId: 'ALICEPHONE',
+  });
+  const bob = await registerUser(rig, {
+    username: 'bob-joined-history-cutoff',
+    password: 'secret bob password',
+    deviceId: 'BOBPHONE',
+  });
+
+  const bobBaselineSync = await syncRequest(rig, bob.access_token, 'use_state_after=true&timeout=0');
+  const createRoom = await requestAs(rig, alice.access_token, '/_matrix/client/v3/createRoom', {
+    method: 'POST',
+    json: {
+      invite: [bob.user_id],
+      initial_state: [
+        {
+          type: 'm.room.history_visibility',
+          content: {
+            history_visibility: 'joined',
+          },
+        },
+      ],
+    },
+  });
+  assert.equal(createRoom.status, 200);
+  const { room_id: roomId } = await createRoom.json();
+
+  const preJoinBody = 'joined-history-hidden-prejoin';
+  const preJoinSend = await requestAs(
+    rig,
+    alice.access_token,
+    `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/m.room.message/joined-history-hidden-prejoin`,
+    {
+      method: 'PUT',
+      json: {
+        msgtype: 'm.text',
+        body: preJoinBody,
+      },
+    },
+  );
+  assert.equal(preJoinSend.status, 200);
+
+  const bobInviteSync = await syncRequest(
+    rig,
+    bob.access_token,
+    `use_state_after=true&since=${encodeURIComponent(bobBaselineSync.next_batch)}&timeout=0`,
+  );
+  assert.ok(bobInviteSync.rooms?.invite?.[roomId], 'expected Bob to observe the invite before joining');
+
+  const bobJoin = await requestAs(rig, bob.access_token, `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/join`, {
+    method: 'POST',
+    json: {},
+  });
+  assert.equal(bobJoin.status, 200);
+
+  const bobJoinSync = await syncRequest(
+    rig,
+    bob.access_token,
+    `use_state_after=true&since=${encodeURIComponent(bobInviteSync.next_batch)}&timeout=0`,
+  );
+  const joinedRoom = bobJoinSync.rooms?.join?.[roomId];
+  assert.ok(joinedRoom, 'expected Bob joined room to appear in incremental /sync');
+  assert.equal(
+    (joinedRoom.timeline?.events ?? []).some((event) => event.content?.body === preJoinBody),
+    false,
+    'expected joined-history backfill to exclude pre-join messages for the newly joined user',
+  );
+  assert.ok(
+    (joinedRoom.timeline?.events ?? []).some((event) => (
+      event.type === 'm.room.member'
+      && event.state_key === bob.user_id
+      && event.content?.membership === 'join'
+    )),
+    'expected joined-history backfill to retain Bob join event',
+  );
+});
+
+test('Phase 05A knock-to-join backfill respects joined history visibility', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, {
+    username: 'alice-knock-history-cutoff',
+    password: 'correct horse battery staple',
+    deviceId: 'ALICEPHONE',
+  });
+  const bob = await registerUser(rig, {
+    username: 'bob-knock-history-cutoff',
+    password: 'secret bob password',
+    deviceId: 'BOBPHONE',
+  });
+
+  const bobBaselineSync = await syncRequest(rig, bob.access_token, 'use_state_after=true&timeout=0');
+  const createRoom = await requestAs(rig, alice.access_token, '/_matrix/client/v3/createRoom', {
+    method: 'POST',
+    json: {
+      initial_state: [
+        {
+          type: 'm.room.join_rules',
+          state_key: '',
+          content: {
+            join_rule: 'knock',
+          },
+        },
+        {
+          type: 'm.room.history_visibility',
+          content: {
+            history_visibility: 'joined',
+          },
+        },
+        {
+          type: 'm.room.encryption',
+          state_key: '',
+          content: {
+            algorithm: 'm.megolm.v1.aes-sha2',
+          },
+        },
+      ],
+    },
+  });
+  assert.equal(createRoom.status, 200);
+  const { room_id: roomId } = await createRoom.json();
+
+  const preJoinBody = 'knock-history-hidden-prejoin';
+  const preJoinSend = await requestAs(
+    rig,
+    alice.access_token,
+    `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/m.room.message/knock-history-hidden-prejoin`,
+    {
+      method: 'PUT',
+      json: {
+        msgtype: 'm.text',
+        body: preJoinBody,
+      },
+    },
+  );
+  assert.equal(preJoinSend.status, 200);
+
+  const bobKnock = await requestAs(rig, bob.access_token, `/_matrix/client/v3/knock/${encodeURIComponent(roomId)}`, {
+    method: 'POST',
+    json: {},
+  });
+  assert.equal(bobKnock.status, 200);
+
+  const bobJoin = await requestAs(rig, bob.access_token, `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/join`, {
+    method: 'POST',
+    json: {},
+  });
+  assert.equal(bobJoin.status, 200);
+
+  const bobJoinSync = await syncRequest(
+    rig,
+    bob.access_token,
+    `use_state_after=true&since=${encodeURIComponent(bobBaselineSync.next_batch)}&timeout=0`,
+  );
+  const joinedRoom = bobJoinSync.rooms?.join?.[roomId];
+  assert.ok(joinedRoom, 'expected Bob joined room to appear in incremental /sync after knock->join');
+  assert.equal(
+    (joinedRoom.timeline?.events ?? []).some((event) => event.content?.body === preJoinBody),
+    false,
+    'expected knock->join backfill to exclude pre-join messages when history visibility is joined',
+  );
+  assert.ok(
+    (joinedRoom.state_after?.events ?? []).some((event) => (
+      event.type === 'm.room.encryption'
+      && event.state_key === ''
+      && event.content?.algorithm === 'm.megolm.v1.aes-sha2'
+    )),
+    'expected knock->join backfill to preserve current encrypted room semantics in state_after',
+  );
+  assert.ok(
+    (joinedRoom.timeline?.events ?? []).some((event) => (
+      event.type === 'm.room.member'
+      && event.state_key === bob.user_id
+      && event.content?.membership === 'join'
+    )),
+    'expected knock->join backfill to retain Bob join event',
+  );
+});
+
+test('Phase 05A join backfill keeps join event when timeline limit would otherwise evict it', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, {
+    username: 'alice-join-limit-pin',
+    password: 'correct horse battery staple',
+    deviceId: 'ALICEPHONE',
+  });
+  const bob = await registerUser(rig, {
+    username: 'bob-join-limit-pin',
+    password: 'secret bob password',
+    deviceId: 'BOBPHONE',
+  });
+
+  const bobBaselineSync = await syncRequest(rig, bob.access_token, 'use_state_after=true&timeout=0');
+  const createRoom = await requestAs(rig, alice.access_token, '/_matrix/client/v3/createRoom', {
+    method: 'POST',
+    json: {
+      invite: [bob.user_id],
+      initial_state: [
+        {
+          type: 'm.room.history_visibility',
+          content: {
+            history_visibility: 'invited',
+          },
+        },
+      ],
+    },
+  });
+  assert.equal(createRoom.status, 200);
+  const { room_id: roomId } = await createRoom.json();
+
+  const preJoinBody = 'join-pin-visible-prejoin';
+  const preJoinSend = await requestAs(
+    rig,
+    alice.access_token,
+    `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/m.room.message/join-pin-visible-prejoin`,
+    {
+      method: 'PUT',
+      json: {
+        msgtype: 'm.text',
+        body: preJoinBody,
+      },
+    },
+  );
+  assert.equal(preJoinSend.status, 200);
+
+  const bobInviteSync = await syncRequest(
+    rig,
+    bob.access_token,
+    `use_state_after=true&since=${encodeURIComponent(bobBaselineSync.next_batch)}&timeout=0`,
+  );
+  assert.ok(bobInviteSync.rooms?.invite?.[roomId], 'expected Bob to observe the invite before joining');
+
+  const bobJoin = await requestAs(rig, bob.access_token, `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/join`, {
+    method: 'POST',
+    json: {},
+  });
+  assert.equal(bobJoin.status, 200);
+
+  const postJoinBodies = ['join-pin-postjoin-00', 'join-pin-postjoin-01'];
+  for (const body of postJoinBodies) {
+    const response = await requestAs(
+      rig,
+      alice.access_token,
+      `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${body}`,
+      {
+        method: 'PUT',
+        json: {
+          msgtype: 'm.text',
+          body,
+        },
+      },
+    );
+    assert.equal(response.status, 200);
+  }
+
+  const limitedFilter = encodeURIComponent(JSON.stringify({
+    room: {
+      timeline: {
+        limit: 1,
+      },
+    },
+  }));
+  const bobJoinSync = await syncRequest(
+    rig,
+    bob.access_token,
+    `use_state_after=true&since=${encodeURIComponent(bobInviteSync.next_batch)}&timeout=0&filter=${limitedFilter}`,
+  );
+  const joinedRoom = bobJoinSync.rooms?.join?.[roomId];
+  assert.ok(joinedRoom, 'expected Bob joined room to appear in incremental /sync');
+  assert.equal(joinedRoom.timeline?.limited, true, 'expected pinned join backfill to remain limited');
+  assert.equal(typeof joinedRoom.timeline?.prev_batch, 'string');
+  assert.ok(
+    (joinedRoom.timeline?.events ?? []).some((event) => (
+      event.type === 'm.room.member'
+      && event.state_key === bob.user_id
+      && event.content?.membership === 'join'
+    )),
+    'expected limited join backfill to retain Bob join event',
+  );
+  assert.deepEqual(
+    (joinedRoom.timeline?.events ?? [])
+      .filter((event) => event.type === 'm.room.message')
+      .map((event) => event.content?.body),
+    postJoinBodies,
+    'expected the retained join suffix to stay contiguous through the newest post-join messages',
+  );
+  assert.equal(joinedRoom.timeline?.events?.length, 3, 'expected join-event pinning to expand beyond the raw tail limit');
+
+  const olderHistory = await requestAs(
+    rig,
+    bob.access_token,
+    `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/messages?from=${encodeURIComponent(joinedRoom.timeline.prev_batch)}&dir=b&limit=20`,
+  );
+  assert.equal(olderHistory.status, 200);
+  const olderHistoryBody = await olderHistory.json();
+  assert.ok(
+    (olderHistoryBody.chunk ?? []).some((event) => event.content?.body === preJoinBody),
+    'expected prev_batch to page into visible pre-join history omitted by the limited pinned suffix',
+  );
+});
+
+test('Phase 05A direct public join keeps the causal join event when timeline limit truncates newer events', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, {
+    username: 'alice-public-join-pin',
+    password: 'correct horse battery staple',
+    deviceId: 'ALICEPHONE',
+  });
+  const bob = await registerUser(rig, {
+    username: 'bob-public-join-pin',
+    password: 'secret bob password',
+    deviceId: 'BOBPHONE',
+  });
+
+  const bobBaselineSync = await syncRequest(rig, bob.access_token, 'use_state_after=true&timeout=0');
+  const createRoom = await requestAs(rig, alice.access_token, '/_matrix/client/v3/createRoom', {
+    method: 'POST',
+    json: {
+      preset: 'public_chat',
+      initial_state: [
+        {
+          type: 'm.room.history_visibility',
+          content: {
+            history_visibility: 'joined',
+          },
+        },
+      ],
+    },
+  });
+  assert.equal(createRoom.status, 200);
+  const { room_id: roomId } = await createRoom.json();
+
+  const bobJoin = await requestAs(rig, bob.access_token, `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/join`, {
+    method: 'POST',
+    json: {},
+  });
+  assert.equal(bobJoin.status, 200);
+
+  const postJoinBodies = ['public-join-postjoin-00', 'public-join-postjoin-01'];
+  for (const body of postJoinBodies) {
+    const response = await requestAs(
+      rig,
+      alice.access_token,
+      `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${body}`,
+      {
+        method: 'PUT',
+        json: {
+          msgtype: 'm.text',
+          body,
+        },
+      },
+    );
+    assert.equal(response.status, 200);
+  }
+
+  const limitedFilter = encodeURIComponent(JSON.stringify({
+    room: {
+      timeline: {
+        limit: 1,
+      },
+    },
+  }));
+  const bobJoinSync = await syncRequest(
+    rig,
+    bob.access_token,
+    `use_state_after=true&since=${encodeURIComponent(bobBaselineSync.next_batch)}&timeout=0&filter=${limitedFilter}`,
+  );
+  const joinedRoom = bobJoinSync.rooms?.join?.[roomId];
+  assert.ok(joinedRoom, 'expected Bob public joined room to appear in incremental /sync');
+  assert.equal(
+    joinedRoom.timeline?.limited,
+    false,
+    'expected direct public join pinning to return the full visible suffix once no older visible history remains omitted',
+  );
+  assert.ok(
+    (joinedRoom.timeline?.events ?? []).some((event) => (
+      event.type === 'm.room.member'
+      && event.state_key === bob.user_id
+      && event.content?.membership === 'join'
+    )),
+    'expected direct public join backfill to retain Bob join event',
+  );
+  assert.deepEqual(
+    (joinedRoom.timeline?.events ?? [])
+      .filter((event) => event.type === 'm.room.message')
+      .map((event) => event.content?.body),
+    postJoinBodies,
+    'expected direct public join backfill to keep the newest contiguous post-join suffix',
+  );
+  assert.equal(joinedRoom.timeline?.events?.length, 3, 'expected join-event pinning to expand beyond the raw tail limit');
+});
+
 test('Phase 05A invite-to-join collapse keeps only the final rooms.join bucket with encrypted state', async (t) => {
   const rig = createGatewayPhase04Rig();
   t.after(() => rig.close());

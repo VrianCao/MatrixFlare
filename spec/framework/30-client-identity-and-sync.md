@@ -477,10 +477,13 @@ membership 到 `/sync` bucket 的映射必须固定为：
 
 若同一房间在 `(since, upper_bound]` 窗口内跨多个 membership bucket 迁移，响应中必须只出现最终 bucket；为解释最终 bucket 所必需的 timeline / state 仍必须一并返回。
 特别地，当目标用户在该窗口内从 `invite` / `knock` / 非 joined 可见态迁移到最终 `join` bucket 时，`rooms.join` 投影必须携带该用户进入 joined 语义后立即生效的当前 room state snapshot，而不能只返回那条 `m.room.member join` 事件；至少像 `m.room.encryption` 这类会改变客户端房间语义与 composer 行为的当前 state，必须在该次增量 `/sync` 中对新加入者可见。
+同一次真实 `join` 迁移若还存在“当前已对 joined 用户可见、但未被这次 timeline delta 明确携带”的 recent room context，`rooms.join.timeline` 还必须一并回填一个 bounded recent visible timeline slice，而不是只给出孤立的 `join` 事件；这段 slice 至少要足以让主流客户端在不额外猜测服务器状态的前提下 materialize 新加入房间的立即可见上下文。该 slice 必须按目标用户在当前 `m.room.history_visibility` 与 membership 边界下实际可见的 timeline 选取，不得把对该用户仍不可见的 pre-join message history 混入 `rooms.join.timeline`；但像 `m.room.encryption` 这类会立刻改变房间语义的 current-state anchor，仍必须通过本次 `/sync` 的 state snapshot 与必要 recent context 对新加入者可见。回填 recent context 时，不得把引发本次 bucket 迁移的那条 `m.room.member join` 事件从 `rooms.join.timeline` 中挤掉。
 
 ### 9.4 `limited` 与 `prev_batch`
 
 * 当服务端因为 `timeline.limit`、repair gap、backfill 边界或可见性压缩而省略了更早但本应可见的 timeline 事件时，房间投影必须设置 `limited = true`。
+* 上述规则同样适用于 `invite` / `knock` / 非 joined 可见态 -> `join` 的 recent timeline 回填：若 bounded join backfill 仍省略了更早但对该 joined 用户已可见的历史，服务端必须把该房间标记为 `limited = true`，并提供可继续向后分页的 `prev_batch`。
+* 若 `filter.room.timeline.limit` 的纯尾部截断会把触发本次 bucket 迁移的 `m.room.member join` 事件挤出返回窗口，服务端必须把 `rooms.join.timeline` 扩展成仍然包含该 join 事件的最小连续可见后缀；不得为了保留 join 事件而制造中间缺口。
 * 只要返回了 `timeline.events`，就必须返回 `prev_batch`；其中 `prev_batch` 必须绑定 `DATA-ID-002`，由 `RoomDO` 签发为 opaque cursor，且能独立支持向后分页，不依赖 mutable waiter state。
 * 当 `limited = true` 时，`prev_batch` 必须指向“最老一条已返回 timeline event 之前”的房间位置。
 * 当没有返回 timeline events 时，`prev_batch` 可以省略。

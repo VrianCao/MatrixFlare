@@ -3426,6 +3426,63 @@ test('non-local harness readiness can scope expansion to release-gate file selec
   assert.ok(!integrationReadiness.expanded_test_files.includes('tests/integration/bootstrap.test.mjs'));
   assert.ok(!integrationReadiness.expanded_test_files.includes('tests/integration/l1-mandatory.test.mjs'));
   assert.ok(!integrationReadiness.expanded_test_files.includes('tests/shared/nonlocal/support.mjs'));
+
+  const stagingReadiness = await assessNonLocalEnvironmentHarnessReadiness('staging', repoRoot, {
+    getRequiredTestFilesImpl: getReleaseGateTestFiles,
+  });
+  assert.equal(stagingReadiness.ready, true);
+  assert.deepEqual(stagingReadiness.local_test_expansions, []);
+  assert.deepEqual(stagingReadiness.environment_boundary_escapes, []);
+  assert.deepEqual(stagingReadiness.unresolved_dynamic_imports, []);
+
+  const preReleaseReadiness = await assessNonLocalEnvironmentHarnessReadiness('pre-release', repoRoot, {
+    getRequiredTestFilesImpl: getReleaseGateTestFiles,
+  });
+  assert.equal(preReleaseReadiness.ready, true);
+  assert.deepEqual(preReleaseReadiness.local_test_expansions, []);
+  assert.deepEqual(preReleaseReadiness.environment_boundary_escapes, []);
+  assert.deepEqual(preReleaseReadiness.unresolved_dynamic_imports, []);
+});
+
+test('non-local harness readiness allows bare package imports while keeping repo-owned closure local', async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-testing-harness-bare-package-'));
+  await fs.mkdir(path.join(tempRoot, 'tests', 'staging'), { recursive: true });
+  await fs.writeFile(
+    path.join(tempRoot, 'tests', 'staging', 'package-import.test.mjs'),
+    [
+      "import assert from 'node:assert/strict';",
+      "import { chromium } from 'playwright';",
+      '',
+      "export function verifyPackageImportShape() {",
+      "  assert.equal(typeof chromium.launch, 'function');",
+      '}',
+      '',
+    ].join('\n'),
+  );
+
+  const readiness = await assessNonLocalEnvironmentHarnessReadiness('staging', tempRoot);
+  assert.equal(readiness.ready, true);
+  assert.deepEqual(readiness.unresolved_dynamic_imports, []);
+  assert.deepEqual(readiness.expanded_test_files, ['tests/staging/package-import.test.mjs']);
+});
+
+test('non-local harness readiness does not treat array-literal method chains as bracket-property escapes', async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-testing-harness-array-literal-'));
+  await fs.mkdir(path.join(tempRoot, 'tests', 'staging'), { recursive: true });
+  await fs.writeFile(
+    path.join(tempRoot, 'tests', 'staging', 'array-literal.test.mjs'),
+    [
+      "const activeStages = ['choose_method', 'device_verified', 'app'].includes('app');",
+      "const detail = ['page_states: example', null].filter(Boolean).join('\\\\n\\\\n');",
+      'export { activeStages, detail };',
+      '',
+    ].join('\n'),
+  );
+
+  const readiness = await assessNonLocalEnvironmentHarnessReadiness('staging', tempRoot);
+  assert.equal(readiness.ready, true);
+  assert.deepEqual(readiness.unresolved_dynamic_imports, []);
+  assert.deepEqual(readiness.expanded_test_files, ['tests/staging/array-literal.test.mjs']);
 });
 
 test('non-local harness readiness does not treat exported object string literals as module imports', async () => {
