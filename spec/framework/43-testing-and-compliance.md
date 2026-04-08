@@ -45,6 +45,7 @@
 | `TEST-MEDIA-001` | local upload/download/thumbnail/quota | staging + pre-release | `L1-L3` | 必须验证 streaming、body limit handling、`/_matrix/client/v1/media/*` authenticated current surface，以及 deprecated `/_matrix/media/*/download` / `thumbnail` 的 legacy unauthenticated + freeze 行为；同时覆盖 browser-style `Origin`/`OPTIONS` 对 `/_matrix/client/v1/media/config` 与 deprecated `/_matrix/media/*/config` 的 CORS/preflight truth，并锁定 `Access-Control-Allow-Methods` / `Access-Control-Allow-Headers` 等关键响应头，避免 authenticated media config fetch 在浏览器层被拦截；animated thumbnail 变体也不得污染 non-animated cache key。 |
 | `TEST-MEDIA-002` | remote media cache, timeout, retry, cache eviction | staging | `L2-L3` | 受连接上限约束；必须验证 deprecated unauthenticated media routes 在 freeze 之后对 cache miss 不会触发新的远端抓取，而 current authenticated routes 仍可正常抓取与缓存。 |
 | `TEST-DER-001` | search, user directory, public rooms derived consistency | staging + pre-release | `L1-L3` | 验证派生索引正确性与 rebuild 后一致性，并显式覆盖对等价请求时匿名 `GET /publicRooms` 与鉴权态 `POST /publicRooms` 的同语义 query dispatch / visibility fail-closed 行为；同时验证未带 access token 的 `POST /publicRooms` 被 deterministic 拒绝，而不是被降级为匿名查询。 |
+| `TEST-E2E-001` | real-browser Element Web mainstream user journeys | staging | `L1-L3` | 必须以真实 Chromium + Playwright 驱动 pinned official Element Web release bundle，并使用测试时生成的 `config.json` 指向已部署 staging homeserver；不得用 SDK-only、DOM stub、网络录制回放或 mock browser storage 冒充通过。canonical browser journey matrix 见 `5.1`；同一 attested run 必须满足：`coverage_ratio >= 0.80`、全部 `P0` journeys 为 `pass`、并且至少覆盖自定义 homeserver 配置/注册与登录、session restore / relogin / new-session history、private room & DM 核心协作、文件上传下载、profile propagation、加密房间消息、Secure Backup recovery key 生成、以及新 session device verification + 历史加密消息解密。 |
 | `TEST-AS-001` | appservice namespace, query, transaction delivery and retry | staging | `L3 when enabled` | appservice 开启时才进入门禁；当前不包含 client `/login` `/register` 上 `m.login.application_service` legacy auth 子集，该部分仍受 [`OQ-0008`](/root/Matrix/spec/open-questions/OQ-0008.md) 约束。 |
 | `TEST-SEC-001` | token revocation, UIA challenge binding, secret handling, baseline abuse guards, federation auth failures | staging + pre-release | `L1-L3` | 重点验证 auth invalidation、`auth_version` 推进、route-bound UIA challenge 不可跨路由重放、secret boundaries，以及对始终开启的注册、登录、媒体、房间发送、搜索和本地公开入口的 baseline rate-limit / quota guard。对于 `gateway-worker` 基于 Workers `ratelimits` binding 的 coarse public-entry shaping，断言必须与 `CF-WKR-027` 一致：允许 bounded eventual consistency / permissive 行为，但在同一 bounded retry window 内必须观察到 `429`，且不得漂移成 `5xx` 或无界放行。 |
 | `TEST-SEC-002` | advanced abuse resistance, SSRF, provider trust, and conditional external integrations | staging + pre-release | `L3` | 在 `TEST-SEC-001` baseline 之上，覆盖 URL preview 的 SSRF / fetch guard；若启用 pushers / external push gateway、email/SMS `requestToken` bootstrap 或 TURN credential issuance，也必须把对应 provider trust、鉴权、回调/credential 边界纳入同一门禁。 |
@@ -89,6 +90,35 @@
   * R2
   * Queues
 
+### 5.1 真实浏览器 Element Web E2E
+
+* `TEST-E2E-001` 的 canonical non-local 实现必须落在 dedicated staging suite，例如 `tests/staging/test-e2e-001*.test.mjs`；它仍受 `5` 中 non-local dedicated suite / attestation / environment directory closure 全部约束。
+* 浏览器层必须真实加载 pinned official Element Web release bundle，并在运行时生成 `config.json`，把 `default_server_config.m.homeserver.base_url` 与 `server_name` 指向当前 staging deployment；不得直接依赖 `https://app.element.io`、浮动 `develop` bundle 或其它不受当前仓库版本控制的前端真相。
+* 浏览器执行必须使用 Playwright Chromium；GitHub Actions 是 canonical heavy-runner，本地默认门禁只承担 companion contract / harness / coverage-matrix regression，不得把“本地没跑浏览器”描述成 remote browser gate 已完成。
+* canonical browser journey matrix 固定如下：
+  * `E2E-JRY-001` `P0`: custom homeserver configure + register
+  * `E2E-JRY-002` `P0`: custom homeserver configure + login existing account
+  * `E2E-JRY-003` `P0`: session restore after browser refresh
+  * `E2E-JRY-004` `P0`: logout then relogin and existing room history remains visible
+  * `E2E-JRY-005` `P0`: new session / new device login sees existing recent room history
+  * `E2E-JRY-006` `P0`: create private room + invite + second user joins
+  * `E2E-JRY-007` `P0`: create DM + two-way text messaging
+  * `E2E-JRY-008` `P0`: file upload + download
+  * `E2E-JRY-009` `P0`: profile modification is observed by another live session
+  * `E2E-JRY-010` `P1`: message edit + reaction
+  * `E2E-JRY-011` `P1`: in-room search
+  * `E2E-JRY-012` `P1`: space creation + add existing room + navigation
+  * `E2E-JRY-013` `P0`: encrypted room or DM send/receive
+  * `E2E-JRY-014` `P0`: Secure Backup / recovery key generation
+  * `E2E-JRY-015` `P0`: new session device verification and decryption of earlier encrypted history
+* `TEST-E2E-001` 的 pass criteria 不是代码覆盖率，而是 journey coverage：
+  * `coverage_ratio = pass journeys / total declared journeys`
+  * `coverage_ratio` 必须 `>= 0.80`
+  * 全部 `P0` journeys 必须 `pass`
+  * 任一 `P0` journey `fail`、`missing`、或未写入 attested browser journey coverage sidecar，都必须让 `TEST-E2E-001` fail-closed
+* 对不直接测试的 setup，可使用 Matrix API 或预置用户态减少 UI 步数，但被声明为已覆盖的 journey 本身必须至少在用户可见的关键动作与结果断言上走真实浏览器路径；不得把“API 成功 + 某个页面最终出现”伪装成完整旅程。
+* raw bundle 必须保留 browser journey coverage sidecar，以及每个失败或关键安全旅程对应的 trace / screenshot / download artifact reference，便于审计 secure backup、device verification、history decryption 等高风险路径。
+
 ## 6. Protocol Compliance Testing
 
 * 所有协议合规测试必须直接从 Matrix `v1.17` versioned spec 生成。
@@ -128,7 +158,7 @@
 
 | Profile ID | Canonical Name | Mandatory TEST IDs |
 | --- | --- | --- |
-| `L1` | `Local-Core` | `TEST-GOV-001`,`TEST-CS-001`,`TEST-CS-002`,`TEST-CS-003`,`TEST-CS-004`,`TEST-ROOM-001`,`TEST-ROOM-002`,`TEST-MEDIA-001`,`TEST-DER-001`,`TEST-SEC-001`,`TEST-OPS-001`,`TEST-COST-001` |
+| `L1` | `Local-Core` | `TEST-GOV-001`,`TEST-CS-001`,`TEST-CS-002`,`TEST-CS-003`,`TEST-CS-004`,`TEST-ROOM-001`,`TEST-ROOM-002`,`TEST-MEDIA-001`,`TEST-DER-001`,`TEST-E2E-001`,`TEST-SEC-001`,`TEST-OPS-001`,`TEST-COST-001` |
 | `L2` | `Federation-Core` | `L1` + `TEST-FED-001`,`TEST-FED-002`,`TEST-FED-003`,`TEST-FED-004`,`TEST-MEDIA-002` |
 | `L3` | `Enterprise-Hardening` | `L2` + `TEST-AS-001` when enabled, `TEST-SEC-002`,`TEST-OPS-002`,`TEST-PERF-001`,`TEST-PERF-002` |
 

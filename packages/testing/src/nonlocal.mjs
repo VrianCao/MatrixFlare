@@ -41,6 +41,9 @@ import {
   hasClientDiscoveryBrowserCors,
   summarizeClientDiscoveryVersionPayload,
 } from './client-discovery.mjs';
+import {
+  validateBrowserJourneyCoverageReport,
+} from './browser-e2e.mjs';
 
 const NON_LOCAL_ENVIRONMENT_NAMES = Object.freeze([
   'ci-integration',
@@ -8632,6 +8635,8 @@ function buildSuiteRunArtifactPaths(outputRoot, environmentName) {
     report_path: path.join(outputDirectory, `${environmentName}.json`),
     rollout_skew_probe_path: path.join(outputDirectory, 'rollout-skew-probe.json'),
     pre_release_cost_observation_path: path.join(outputDirectory, 'pre-release-cost-observation.json'),
+    browser_journey_coverage_path: path.join(outputDirectory, 'browser-journey-coverage.json'),
+    browser_artifact_root: path.join(outputDirectory, 'browser-artifacts'),
   };
 }
 
@@ -8639,6 +8644,8 @@ async function clearSuiteSidecarArtifacts(suiteArtifacts) {
   await Promise.all([
     fs.rm(suiteArtifacts.rollout_skew_probe_path, { force: true }),
     fs.rm(suiteArtifacts.pre_release_cost_observation_path, { force: true }),
+    fs.rm(suiteArtifacts.browser_journey_coverage_path, { force: true }),
+    fs.rm(suiteArtifacts.browser_artifact_root, { recursive: true, force: true }),
   ]);
 }
 
@@ -8790,6 +8797,11 @@ export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
       const basename = path.basename(file).toLowerCase();
       return basename.startsWith('test-cost-001') && basename.endsWith('.test.mjs');
     });
+  const coversBrowserE2E = normalizedEnvironmentName === 'staging'
+    && files.some((file) => {
+      const basename = path.basename(file).toLowerCase();
+      return basename.startsWith('test-e2e-001') && basename.endsWith('.test.mjs');
+    });
   if (coversPreReleaseOps && rolloutState == null) {
     throw new TypeError('pre-release suite covering TEST-OPS-001 requires rolloutState');
   }
@@ -8818,6 +8830,8 @@ export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
           MATRIX_TEST_ENVIRONMENT: normalizedEnvironmentName,
           MATRIX_TEST_RUN_ROLLOUT_SKEW_PROBE_PATH: suiteArtifacts.rollout_skew_probe_path,
           MATRIX_TEST_RUN_PRE_RELEASE_COST_OBSERVATION_PATH: suiteArtifacts.pre_release_cost_observation_path,
+          MATRIX_TEST_RUN_BROWSER_JOURNEY_COVERAGE_PATH: suiteArtifacts.browser_journey_coverage_path,
+          MATRIX_TEST_RUN_BROWSER_ARTIFACT_ROOT: suiteArtifacts.browser_artifact_root,
           ...buildSuiteRolloutEnvironmentVariables(rolloutState),
         },
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -8835,6 +8849,7 @@ export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
   const durationMs = Date.now() - startedMs;
   let rolloutSkewProbe = null;
   let preReleaseCostObservation = null;
+  let browserJourneyCoverage = null;
   let artifactFailureMessage = null;
   try {
     const rolloutProbeArtifact = await readOptionalJsonArtifact(suiteArtifacts.rollout_skew_probe_path);
@@ -8879,6 +8894,21 @@ export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
     } else if (coversPreReleaseCost) {
       throw new Error('pre_release_cost_observation sidecar is required when TEST-COST-001 is covered');
     }
+    browserJourneyCoverage = await readOptionalJsonArtifact(suiteArtifacts.browser_journey_coverage_path);
+    if (browserJourneyCoverage != null) {
+      if (!coversBrowserE2E) {
+        throw new Error('browser_journey_coverage sidecar must be absent unless TEST-E2E-001 is covered');
+      }
+      const coverageValidation = validateBrowserJourneyCoverageReport(browserJourneyCoverage, {
+        expectedEnvironmentName: normalizedEnvironmentName,
+        requirePass: true,
+      });
+      if (!coverageValidation.valid) {
+        throw new Error(coverageValidation.error);
+      }
+    } else if (coversBrowserE2E) {
+      throw new Error('browser_journey_coverage sidecar is required when TEST-E2E-001 is covered');
+    }
   } catch (error) {
     artifactFailureMessage = `Suite artifact parsing failed: ${error.message}`;
     exitCode = 1;
@@ -8915,6 +8945,7 @@ export async function runEnvironmentBackedSuite(environmentName, repoRoot, {
     cloudflare_resources: validatedCloudflareResources,
     rollout_skew_probe: rolloutSkewProbe,
     pre_release_cost_observation: preReleaseCostObservation,
+    browser_journey_coverage: browserJourneyCoverage,
     deployment_identity_validation: deploymentIdentityValidation,
     run_timestamp: runTimestamp,
   };

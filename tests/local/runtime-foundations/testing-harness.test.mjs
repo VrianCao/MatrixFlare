@@ -41,6 +41,10 @@ import {
   summarizeClientDiscoveryVersionPayload,
 } from '../../../packages/testing/src/client-discovery.mjs';
 import {
+  BROWSER_JOURNEY_MATRIX,
+  buildBrowserJourneyCoverageReport,
+} from '../../../packages/testing/src/browser-e2e.mjs';
+import {
   assertPathsDoNotExist,
   writeGovernanceEvidence,
 } from '../../../packages/spec-tools/src/governance.mjs';
@@ -213,6 +217,29 @@ function buildValidPreReleaseCostObservation(runTimestamp, overrides = {}) {
   };
 }
 
+function buildValidBrowserJourneyCoverageFixture(overrides = {}) {
+  const journeys = BROWSER_JOURNEY_MATRIX
+    .filter((journey) => journey.required)
+    .map((journey) => ({
+      journey_id: journey.journey_id,
+      status: 'pass',
+      artifacts: [`browser-artifacts/${journey.journey_id.toLowerCase()}.png`],
+    }));
+
+  return buildBrowserJourneyCoverageReport({
+    environmentName: 'staging',
+    capturedAt: '2026-03-31T14:04:30.000Z',
+    journeys,
+    playwright: {
+      package_version: '1.59.1',
+      browser_name: 'chromium',
+      browser_version: '136.0.0.0',
+      headless: true,
+    },
+    ...overrides,
+  });
+}
+
 function buildValidEnvironmentReport(environmentName, runTimestamp, overrides = {}) {
   const directory = getTestEnvironmentDefinition(environmentName).directory;
   const readinessSteps = [
@@ -256,6 +283,7 @@ function buildValidEnvironmentReport(environmentName, runTimestamp, overrides = 
     cloudflare_resources: buildExpectedCloudflareResources(environmentName),
     rollout_skew_probe: null,
     pre_release_cost_observation: null,
+    browser_journey_coverage: null,
     readiness_probe: {
       ready: true,
       environment_name: environmentName,
@@ -874,6 +902,7 @@ async function createEnvironmentBackedEvidenceFixture() {
       'TEST-ROOM-002': 'tests/local-env-backed/environment-backed.test.mjs',
       'TEST-MEDIA-001': 'tests/local-env-backed/environment-backed.test.mjs',
       'TEST-DER-001': 'tests/local-env-backed/environment-backed.test.mjs',
+      'TEST-E2E-001': 'tests/local-env-backed/environment-backed.test.mjs',
       'TEST-SEC-001': 'tests/local-env-backed/environment-backed.test.mjs',
       'TEST-OPS-001': 'tests/local-env-backed/environment-backed.test.mjs',
       'TEST-COST-001': 'tests/local-env-backed/environment-backed.test.mjs',
@@ -893,6 +922,7 @@ async function createEnvironmentBackedEvidenceFixture() {
       'TEST-ROOM-002': 'tests/staging-env-backed/test-room-002.test.mjs',
       'TEST-MEDIA-001': 'tests/staging-env-backed/test-media-001.test.mjs',
       'TEST-DER-001': 'tests/staging-env-backed/test-der-001.test.mjs',
+      'TEST-E2E-001': 'tests/staging-env-backed/test-e2e-001.test.mjs',
       'TEST-SEC-001': 'tests/staging-env-backed/test-sec-001.test.mjs',
     },
     'pre-release': {
@@ -965,6 +995,7 @@ async function createEnvironmentBackedEvidenceFixture() {
     `  'TEST-ROOM-002': Object.freeze({ local: Object.freeze(['${sharedProofFile}']), 'ci-integration': Object.freeze(['${environmentTestFiles['ci-integration']['TEST-ROOM-002']}']), staging: Object.freeze(['${environmentTestFiles.staging['TEST-ROOM-002']}']) }),`,
     `  'TEST-MEDIA-001': Object.freeze({ local: Object.freeze(['${sharedProofFile}']), staging: Object.freeze(['${environmentTestFiles.staging['TEST-MEDIA-001']}']), 'pre-release': Object.freeze(['${environmentTestFiles['pre-release']['TEST-MEDIA-001']}']) }),`,
     `  'TEST-DER-001': Object.freeze({ local: Object.freeze(['${sharedProofFile}']), staging: Object.freeze(['${environmentTestFiles.staging['TEST-DER-001']}']), 'pre-release': Object.freeze(['${environmentTestFiles['pre-release']['TEST-DER-001']}']) }),`,
+    `  'TEST-E2E-001': Object.freeze({ local: Object.freeze(['${sharedProofFile}']), staging: Object.freeze(['${environmentTestFiles.staging['TEST-E2E-001']}']) }),`,
     `  'TEST-SEC-001': Object.freeze({ local: Object.freeze(['${sharedProofFile}']), staging: Object.freeze(['${environmentTestFiles.staging['TEST-SEC-001']}']), 'pre-release': Object.freeze(['${environmentTestFiles['pre-release']['TEST-SEC-001']}']) }),`,
     `  'TEST-OPS-001': Object.freeze({ local: Object.freeze(['${sharedProofFile}']), 'pre-release': Object.freeze(['${environmentTestFiles['pre-release']['TEST-OPS-001']}']) }),`,
     `  'TEST-COST-001': Object.freeze({ local: Object.freeze(['${sharedProofFile}']), 'pre-release': Object.freeze(['${environmentTestFiles['pre-release']['TEST-COST-001']}']) }),`,
@@ -1014,6 +1045,8 @@ async function createEnvironmentBackedManualArtifacts(fixtureRoot, runTimestamp,
       && environmentTopLevelTestFiles.some((file) => path.basename(file).startsWith('test-ops-001'));
     const coversPreReleaseCost = environmentName === 'pre-release'
       && environmentTopLevelTestFiles.some((file) => path.basename(file).startsWith('test-cost-001'));
+    const coversStagingBrowserE2E = environmentName === 'staging'
+      && environmentTopLevelTestFiles.some((file) => path.basename(file).startsWith('test-e2e-001'));
     if (coversPreReleaseOps) {
       const validPreReleaseOpsReport = buildValidPreReleaseOpsReport(runTimestamp, reportOverrides);
       reportOverrides = {
@@ -1043,6 +1076,12 @@ async function createEnvironmentBackedManualArtifacts(fixtureRoot, runTimestamp,
       reportOverrides = {
         ...reportOverrides,
         pre_release_cost_observation: buildValidPreReleaseCostObservation(runTimestamp),
+      };
+    }
+    if (coversStagingBrowserE2E) {
+      reportOverrides = {
+        ...reportOverrides,
+        browser_journey_coverage: buildValidBrowserJourneyCoverageFixture(),
       };
     }
     await fs.writeFile(
@@ -1520,6 +1559,59 @@ test('manual artifact payload validation requires structured non-local reports a
     {
       valid: true,
       error: null,
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('staging_run_report', buildValidEnvironmentReport('staging', runTimestamp, {
+      test_directory: 'tests/staging',
+      test_file_count: 1,
+      test_files: ['tests/staging/test-e2e-001.test.mjs'],
+      expanded_test_file_count: 1,
+      expanded_test_files: ['tests/staging/test-e2e-001.test.mjs'],
+      browser_journey_coverage: buildValidBrowserJourneyCoverageFixture(),
+    }), { runTimestamp }),
+    {
+      valid: true,
+      error: null,
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('staging_run_report', buildValidEnvironmentReport('staging', runTimestamp, {
+      test_directory: 'tests/staging',
+      test_file_count: 1,
+      test_files: ['tests/staging/test-e2e-001.test.mjs'],
+      expanded_test_file_count: 1,
+      expanded_test_files: ['tests/staging/test-e2e-001.test.mjs'],
+      browser_journey_coverage: null,
+    }), { runTimestamp }),
+    {
+      valid: false,
+      error: 'environment run report browser_journey_coverage is invalid: browser journey coverage report must be an object',
+    },
+  );
+
+  assert.deepEqual(
+    validateManualArtifactPayload('staging_run_report', buildValidEnvironmentReport('staging', runTimestamp, {
+      test_directory: 'tests/staging',
+      test_file_count: 1,
+      test_files: ['tests/staging/test-e2e-001.test.mjs'],
+      expanded_test_file_count: 1,
+      expanded_test_files: ['tests/staging/test-e2e-001.test.mjs'],
+      browser_journey_coverage: buildValidBrowserJourneyCoverageFixture({
+        journeys: BROWSER_JOURNEY_MATRIX
+          .filter((journey) => journey.required && journey.journey_id !== 'E2E-JRY-015')
+          .map((journey) => ({
+            journey_id: journey.journey_id,
+            status: 'pass',
+            artifacts: [`browser-artifacts/${journey.journey_id.toLowerCase()}.png`],
+          })),
+      }),
+    }), { runTimestamp }),
+    {
+      valid: false,
+      error: 'environment run report browser_journey_coverage is invalid: browser journey coverage report coverage_summary.coverage_ratio must satisfy the minimum coverage threshold',
     },
   );
 

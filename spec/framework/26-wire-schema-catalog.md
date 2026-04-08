@@ -438,6 +438,50 @@
 
 ### 5.16 `EnvironmentRunReport`
 
+#### 5.16.0 `BrowserJourneyResult`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `journey_id` | string | 非空；固定使用 `E2E-JRY-###` 形式 |
+| `name` | string | 非空；与 `43` 中 canonical browser journey matrix 的名称一致 |
+| `priority` | string | `P0` 或 `P1` |
+| `required` | boolean | `priority = P0` 时必须为 `true`；`P1` 时允许为 `false` |
+| `status` | string | `pass` 或 `fail` |
+| `artifacts` | array | 相对 suite output root 的 artifact path 列表；允许空数组，但若该旅程失败且存在 trace/screenshot/download，则必须列出对应 path |
+| `notes` | string or null | 可选简短说明；不得用它替代 `fail` |
+
+#### 5.16.1 `BrowserJourneyCoverageSummary`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `total_journeys` | integer | 正整数 |
+| `required_journeys` | integer | 非负整数；且必须 `<= total_journeys` |
+| `passed_journeys` | integer | 非负整数；且必须 `<= total_journeys` |
+| `passed_required_journeys` | integer | 非负整数；且必须 `<= required_journeys` |
+| `coverage_ratio` | number | `passed_journeys / total_journeys`；范围 `[0,1]` |
+| `required_pass_ratio` | number | `required_journeys = 0` 时固定 `1`，否则为 `passed_required_journeys / required_journeys`；范围 `[0,1]` |
+| `minimum_coverage_ratio` | number | 首版固定为 `0.8` |
+
+#### 5.16.2 `BrowserJourneyCoverageReport`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `schema_version` | integer | 固定为 `1` |
+| `test_id` | string | 固定为 `TEST-E2E-001` |
+| `environment_name` | string | 首版固定为 `staging` |
+| `captured_at` | string | RFC 3339 UTC |
+| `element_web` | object | 至少包含 `version`,`source_uri`,`sha256`；`source_uri` 必须是绝对外部 URI / locator，`sha256` 必须为 64 字符小写 hex |
+| `playwright` | object | 至少包含 `package_version`,`browser_name`,`browser_version`,`headless`；首版 `browser_name` 固定为 `chromium` |
+| `journeys` | array | `BrowserJourneyResult[]`；至少包含 `43` 5.1 声明的全部 canonical journey IDs |
+| `coverage_summary` | `BrowserJourneyCoverageSummary` | 不得省略；其计数与 `journeys` 真值必须一致 |
+
+附加规则：
+
+* `journeys` 中的 `journey_id` 不得重复，且必须完整覆盖 `43` 5.1 定义的 canonical browser journey matrix；缺项、多项、或未登记 ID 都必须 fail-closed。
+* `coverage_summary.coverage_ratio` 必须等于 `journeys.status == pass` 的数量除以 `journeys.length`。
+* `coverage_summary.required_pass_ratio` 必须等于 `journeys.required == true && status == pass` 的数量除以 `journeys.required == true` 的数量。
+* `TEST-E2E-001` 通过要求：`coverage_summary.minimum_coverage_ratio == 0.8`、`coverage_summary.coverage_ratio >= 0.8`、以及 `coverage_summary.required_pass_ratio == 1`。
+
 | Field | Type | Rule |
 | --- | --- | --- |
 | `environment_name` | string | `ci-integration`,`staging`,`pre-release` 之一 |
@@ -463,6 +507,7 @@
 | `cloudflare_resources` | `CloudflareResourceSnapshot` | 本次执行所绑定资源快照 |
 | `rollout_skew_probe` | `RolloutSkewProbeResponse` or null | `pre-release` 且覆盖 `TEST-OPS-001` 时必须非空；其他环境必须为 `null`。有效 payload 必须保留 targeted version IDs、对应 official version tags，以及 observation 中的 official version ID / tag 观测结果；若 runtime 未提供 official version ID，则 `observed_gateway_version_id` 必须为 `null` 并改由 `observed_gateway_version_tag` 承载 override 观测。 |
 | `pre_release_cost_observation` | `PreReleaseCostObservation` or null | `pre-release` 且覆盖 `TEST-COST-001` 时必须非空；其他环境必须为 `null` |
+| `browser_journey_coverage` | `BrowserJourneyCoverageReport` or null | `staging` 且覆盖 `TEST-E2E-001` 时必须非空；其他环境必须为 `null` |
 
 ### 5.17 `ProdCostSnapshot`
 
@@ -529,6 +574,7 @@
 * 若 `payload.expanded_test_files` 触及 `tests/local/*`、存在 repo boundary escape、或存在 unresolved dynamic import，consumer 必须 fail-closed。
 * 若 `payload.test_files` / `payload.expanded_test_files` 覆盖 `tests/pre-release/test-ops-001*.test.mjs`，则 `payload.rollout_skew_probe` 必须非空，且 `payload.rollout_skew_probe.assertions.new_worker_old_authority` 与 `payload.rollout_skew_probe.assertions.old_worker_new_authority` 都必须为 `true`。
 * 若 `payload.test_files` / `payload.expanded_test_files` 覆盖 `tests/pre-release/test-cost-001*.test.mjs`，则 `payload.pre_release_cost_observation` 必须非空，且 `payload.pre_release_cost_observation.capture_method` 必须为 `cloudflare-official-metrics`。
+* 若 `payload.test_files` / `payload.expanded_test_files` 覆盖 `tests/staging/test-e2e-001*.test.mjs`，则 `payload.browser_journey_coverage` 必须非空，且 `payload.browser_journey_coverage.test_id` 必须为 `TEST-E2E-001`、`coverage_summary.minimum_coverage_ratio` 必须为 `0.8`、`coverage_summary.coverage_ratio` 必须 `>= 0.8`，并且 `coverage_summary.required_pass_ratio` 必须为 `1`。
 
 ### 5.21 `ProdCostSnapshotAttestation`
 
