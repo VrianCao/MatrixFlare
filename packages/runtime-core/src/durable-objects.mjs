@@ -7515,6 +7515,7 @@ export class RoomDO extends BaseDurableObject {
           committedEvent,
           roomPos,
           snapshotId,
+          previousMembership: currentMembershipState?.membership ?? null,
         });
         const relationInfo = getRelationInfo(candidateEvent);
         this.persistence.eventMetadata.put({
@@ -7708,6 +7709,7 @@ export class RoomDO extends BaseDurableObject {
     committedEvent,
     roomPos,
     snapshotId,
+    previousMembership = null,
   }) {
     const roomId = this.persistence.getRuntimeState()?.room_id ?? committedEvent.room_id ?? null;
     const roomVersion = this.persistence.getRuntimeState()?.room_version ?? DEFAULT_ROOM_VERSION;
@@ -7783,10 +7785,10 @@ export class RoomDO extends BaseDurableObject {
       }
       if (committedEvent.type === 'm.room.member'
         && membership.user_id === stateKey) {
-        if (membershipBucket === 'join') {
-          // A self-join transition must carry the current room state snapshot so the
-          // next incremental /sync can materialize active room semantics such as
-          // m.room.encryption for the newly joined user.
+        if (membershipBucket === 'join' && previousMembership !== 'join') {
+          // Only an actual self transition into join should carry the current room
+          // state snapshot so the next incremental /sync can materialize active
+          // room semantics such as m.room.encryption for the newly joined user.
           delta.state_event_ids = [...new Set(currentSnapshotEventIds)];
         } else if (['invite', 'knock'].includes(membershipBucket)) {
           delta.timeline_event_ids = [];

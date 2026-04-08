@@ -1095,6 +1095,89 @@ test('Phase 05A joining an encrypted invited room exposes m.room.encryption in t
   );
 });
 
+test('Phase 05A joined-user profile refreshes do not replay the full encrypted room snapshot', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, {
+    username: 'alice-encrypted-refresh-sync',
+    password: 'correct horse battery staple',
+    deviceId: 'ALICEPHONE',
+  });
+  const bob = await registerUser(rig, {
+    username: 'bob-encrypted-refresh-sync',
+    password: 'secret bob password',
+    deviceId: 'BOBPHONE',
+  });
+
+  const bobBaselineSync = await syncRequest(rig, bob.access_token);
+  const createRoom = await requestAs(rig, alice.access_token, '/_matrix/client/v3/createRoom', {
+    method: 'POST',
+    json: {
+      invite: [bob.user_id],
+      name: 'encrypted-refresh-sync-room',
+    },
+  });
+  assert.equal(createRoom.status, 200);
+  const { room_id: roomId } = await createRoom.json();
+
+  await enableMegolmRoom(rig, alice.access_token, roomId);
+
+  const bobInviteSync = await syncRequest(
+    rig,
+    bob.access_token,
+    `since=${encodeURIComponent(bobBaselineSync.next_batch)}&timeout=0`,
+  );
+  assert.ok(bobInviteSync.rooms?.invite?.[roomId], 'expected Bob to observe the invite before joining');
+
+  const bobJoin = await requestAs(rig, bob.access_token, `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/join`, {
+    method: 'POST',
+    json: {},
+  });
+  assert.equal(bobJoin.status, 200);
+
+  const bobJoinSync = await syncRequest(
+    rig,
+    bob.access_token,
+    `since=${encodeURIComponent(bobInviteSync.next_batch)}&timeout=0`,
+  );
+  assert.ok(bobJoinSync.rooms?.join?.[roomId], 'expected Bob to observe the joined room before refreshing profile');
+
+  const setDisplayName = await requestAs(
+    rig,
+    bob.access_token,
+    `/_matrix/client/v3/profile/${encodeURIComponent(bob.user_id)}/displayname`,
+    {
+      method: 'PUT',
+      json: {
+        displayname: 'Bob Encrypted Refresh',
+      },
+    },
+  );
+  assert.equal(setDisplayName.status, 200);
+
+  const bobProfileRefreshSync = await syncRequest(
+    rig,
+    bob.access_token,
+    `since=${encodeURIComponent(bobJoinSync.next_batch)}&timeout=0`,
+  );
+  const refreshedRoom = bobProfileRefreshSync.rooms?.join?.[roomId];
+  assert.ok(refreshedRoom, 'expected Bob profile refresh to produce a joined-room delta');
+  assert.ok(
+    (refreshedRoom.state?.events ?? []).some((event) => (
+      event.type === 'm.room.member'
+      && event.state_key === bob.user_id
+      && event.content?.displayname === 'Bob Encrypted Refresh'
+    )),
+    'expected Bob profile refresh to surface the updated self membership event',
+  );
+  assert.equal(
+    (refreshedRoom.state?.events ?? []).some((event) => event.type === 'm.room.encryption' && event.state_key === ''),
+    false,
+    'joined-user profile refresh must not replay the full encrypted room snapshot',
+  );
+});
+
 test('Phase 05A room key backup metadata and opaque backup objects round-trip via HTTP surface', async (t) => {
   const rig = createGatewayPhase04Rig();
   t.after(() => rig.close());
