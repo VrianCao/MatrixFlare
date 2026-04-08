@@ -7782,10 +7782,16 @@ export class RoomDO extends BaseDurableObject {
         delta.state_event_ids.push(committedEvent.event_id);
       }
       if (committedEvent.type === 'm.room.member'
-        && membership.user_id === stateKey
-        && ['invite', 'knock'].includes(membershipBucket)) {
-        delta.timeline_event_ids = [];
-        delta.state_event_ids = [...new Set(currentSnapshotEventIds)];
+        && membership.user_id === stateKey) {
+        if (membershipBucket === 'join') {
+          // A self-join transition must carry the current room state snapshot so the
+          // next incremental /sync can materialize active room semantics such as
+          // m.room.encryption for the newly joined user.
+          delta.state_event_ids = [...new Set(currentSnapshotEventIds)];
+        } else if (['invite', 'knock'].includes(membershipBucket)) {
+          delta.timeline_event_ids = [];
+          delta.state_event_ids = [...new Set(currentSnapshotEventIds)];
+        }
       }
       deltas.push(delta);
     }

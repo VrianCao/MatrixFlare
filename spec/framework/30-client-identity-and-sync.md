@@ -476,6 +476,7 @@ membership 到 `/sync` bucket 的映射必须固定为：
 * forgotten rooms 不得再出现在任何 bucket 中
 
 若同一房间在 `(since, upper_bound]` 窗口内跨多个 membership bucket 迁移，响应中必须只出现最终 bucket；为解释最终 bucket 所必需的 timeline / state 仍必须一并返回。
+特别地，当目标用户在该窗口内从 `invite` / `knock` / 非 joined 可见态迁移到最终 `join` bucket 时，`rooms.join` 投影必须携带该用户进入 joined 语义后立即生效的当前 room state snapshot，而不能只返回那条 `m.room.member join` 事件；至少像 `m.room.encryption` 这类会改变客户端房间语义与 composer 行为的当前 state，必须在该次增量 `/sync` 中对新加入者可见。
 
 ### 9.4 `limited` 与 `prev_batch`
 

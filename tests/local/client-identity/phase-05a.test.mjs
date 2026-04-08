@@ -1031,6 +1031,70 @@ test('Phase 05A keys/changes reports shared-room peer changes and left users', a
   assert.deepEqual(aliceAfterPlainLeave.device_lists.left ?? [], []);
 });
 
+test('Phase 05A joining an encrypted invited room exposes m.room.encryption in the join /sync delta', async (t) => {
+  const rig = createGatewayPhase04Rig();
+  t.after(() => rig.close());
+
+  const alice = await registerUser(rig, {
+    username: 'alice-encrypted-join-sync',
+    password: 'correct horse battery staple',
+    deviceId: 'ALICEPHONE',
+  });
+  const bob = await registerUser(rig, {
+    username: 'bob-encrypted-join-sync',
+    password: 'secret bob password',
+    deviceId: 'BOBPHONE',
+  });
+
+  const bobBaselineSync = await syncRequest(rig, bob.access_token);
+  const createRoom = await requestAs(rig, alice.access_token, '/_matrix/client/v3/createRoom', {
+    method: 'POST',
+    json: {
+      invite: [bob.user_id],
+      name: 'encrypted-join-sync-room',
+    },
+  });
+  assert.equal(createRoom.status, 200);
+  const { room_id: roomId } = await createRoom.json();
+
+  await enableMegolmRoom(rig, alice.access_token, roomId);
+
+  const bobInviteSync = await syncRequest(
+    rig,
+    bob.access_token,
+    `since=${encodeURIComponent(bobBaselineSync.next_batch)}&timeout=0`,
+  );
+  assert.ok(bobInviteSync.rooms?.invite?.[roomId], 'expected Bob to observe the invite before joining');
+
+  const bobJoin = await requestAs(rig, bob.access_token, `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/join`, {
+    method: 'POST',
+    json: {},
+  });
+  assert.equal(bobJoin.status, 200);
+
+  const bobJoinSync = await syncRequest(
+    rig,
+    bob.access_token,
+    `since=${encodeURIComponent(bobInviteSync.next_batch)}&timeout=0`,
+  );
+  const joinedRoom = bobJoinSync.rooms?.join?.[roomId];
+  assert.ok(joinedRoom, 'expected joined room to appear in Bob incremental /sync');
+  assert.ok(
+    (joinedRoom.timeline?.events ?? []).some((event) => (
+      event.type === 'm.room.member' && event.state_key === bob.user_id && event.content?.membership === 'join'
+    )),
+    'expected Bob join delta to keep the join event in timeline',
+  );
+  assert.ok(
+    (joinedRoom.state?.events ?? []).some((event) => (
+      event.type === 'm.room.encryption'
+      && event.state_key === ''
+      && event.content?.algorithm === 'm.megolm.v1.aes-sha2'
+    )),
+    'expected Bob join /sync state to include the room encryption event',
+  );
+});
+
 test('Phase 05A room key backup metadata and opaque backup objects round-trip via HTTP surface', async (t) => {
   const rig = createGatewayPhase04Rig();
   t.after(() => rig.close());
