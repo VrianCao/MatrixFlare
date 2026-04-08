@@ -67,6 +67,10 @@ import {
   summarizeClientDiscoveryVersionPayload,
 } from '../../../packages/testing/src/client-discovery.mjs';
 import {
+  BROWSER_JOURNEY_MATRIX,
+  buildBrowserJourneyCoverageReport,
+} from '../../../packages/testing/src/browser-e2e.mjs';
+import {
   GATEWAY_RATE_LIMIT_BINDING_DEFINITIONS,
 } from '../../../packages/runtime-core/src/abuse-guard.mjs';
 
@@ -349,6 +353,27 @@ function buildEnvironmentAttestationFixture(environmentName, runTimestamp, {
   };
 }
 
+function buildBrowserJourneyCoverageFixture(overrides = {}) {
+  return buildBrowserJourneyCoverageReport({
+    environmentName: 'staging',
+    capturedAt: '2026-03-31T14:04:30.000Z',
+    journeys: BROWSER_JOURNEY_MATRIX
+      .filter((journey) => journey.required)
+      .map((journey) => ({
+        journey_id: journey.journey_id,
+        status: 'pass',
+        artifacts: [`browser-artifacts/${journey.journey_id.toLowerCase()}.png`],
+      })),
+    playwright: {
+      package_version: '1.59.1',
+      browser_name: 'chromium',
+      browser_version: '136.0.0.0',
+      headless: true,
+    },
+    ...overrides,
+  });
+}
+
 function buildProductionReadinessProbeFixture(overrides = {}) {
   return {
     environment_name: 'prod',
@@ -484,6 +509,9 @@ function buildHarnessReadinessFixture(testFiles, overrides = {}) {
     const match = /^tests\/(integration|staging|pre-release)\//.exec(file);
     if (match) {
       expandedTestFiles.add(`tests/${match[1]}/support.mjs`);
+    }
+    if (file === 'tests/staging/test-e2e-001.test.mjs') {
+      expandedTestFiles.add('tests/staging/browser-support.mjs');
     }
   }
   return {
@@ -2929,6 +2957,318 @@ test('runEnvironmentBackedSuite injects the prepared Access session into the chi
     assert.equal(capturedEnv.MATRIX_REMOTE_OPS_BASE_URL, 'https://matrix-ops-worker-staging.matrixflare.workers.dev');
     assert.equal(capturedEnv.MATRIX_REMOTE_OPS_ACCESS_CLIENT_ID, 'service-token-id.access');
     assert.equal(capturedEnv.MATRIX_REMOTE_OPS_ACCESS_CLIENT_SECRET, 'service-token-secret');
+  } finally {
+    await fs.rm(outputRoot, { recursive: true, force: true });
+  }
+});
+
+test('runEnvironmentBackedSuite captures browser journey coverage when TEST-E2E-001 is covered', async () => {
+  const repoRoot = path.resolve('.');
+  const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-nonlocal-suite-browser-'));
+  const deploymentSummary = buildDeploymentSummaryFixture('staging');
+  deploymentSummary.access = {
+    protected_ops_url: 'https://matrix-ops-worker-staging.matrixflare.workers.dev',
+  };
+  let capturedEnv = null;
+
+  try {
+    const result = await runEnvironmentBackedSuite('staging', repoRoot, {
+      runTimestamp: '20260402T161500Z',
+      outputRoot,
+      sourceRunUri: 'https://github.com/example/matrix/actions/runs/12345',
+      logArtifact: 'https://github.com/example/matrix/actions/runs/12345/artifacts/1',
+      executedBy: 'gha://example/matrix/nonlocal/staging',
+      reviewedBy: 'gha://example/matrix/nonlocal/staging',
+      topologyKind: 'cloudflare-staging',
+      deploymentSummary,
+      accessSession: {
+        access: {
+          service_token_client_id: 'service-token-id.access',
+          service_token_client_secret: 'service-token-secret',
+        },
+      },
+    }, {
+      requireGitHubActionsExecutionImpl: async () => ({ environment: 'staging' }),
+      assessNonLocalEnvironmentHarnessReadinessImpl: async () => buildHarnessReadinessFixture([
+        'tests/staging/test-e2e-001.test.mjs',
+      ]),
+      requireCloudflareCredentialsImpl: () => ({ accountId: 'cf-account', apiToken: 'cf-token' }),
+      readWorkersSubdomainImpl: async () => 'matrixflare',
+      validateDeploymentSummaryAgainstCurrentCloudflareStateImpl: async () => (
+        buildDeploymentIdentityValidationFixture('staging')
+      ),
+      getRequiredTestFilesImpl: async () => [path.join(repoRoot, 'tests/staging/test-e2e-001.test.mjs')],
+      waitForNonLocalDeploymentReadinessImpl: async () => buildReadinessProbeFixture('staging'),
+      spawnImpl: (_command, _args, options) => {
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        capturedEnv = options?.env ?? null;
+        queueMicrotask(async () => {
+          await fs.writeFile(
+            options.env.MATRIX_TEST_RUN_BROWSER_JOURNEY_COVERAGE_PATH,
+            JSON.stringify(buildBrowserJourneyCoverageFixture(), null, 2),
+          );
+          child.stdout.emit('data', Buffer.from('suite ok\n', 'utf8'));
+          child.emit('close', 0);
+        });
+        return child;
+      },
+    });
+
+    assert.ok(capturedEnv);
+    assert.equal(typeof capturedEnv.MATRIX_TEST_RUN_BROWSER_JOURNEY_COVERAGE_PATH, 'string');
+    assert.ok(capturedEnv.MATRIX_TEST_RUN_BROWSER_JOURNEY_COVERAGE_PATH.length > 0);
+    assert.equal(typeof capturedEnv.MATRIX_TEST_RUN_BROWSER_ARTIFACT_ROOT, 'string');
+    assert.ok(capturedEnv.MATRIX_TEST_RUN_BROWSER_ARTIFACT_ROOT.length > 0);
+    assert.equal(result.report.status, 'pass');
+    assert.equal(result.report.exit_code, 0);
+    assert.equal(result.report.browser_journey_coverage?.test_id, 'TEST-E2E-001');
+  } finally {
+    await fs.rm(outputRoot, { recursive: true, force: true });
+  }
+});
+
+test('runEnvironmentBackedSuite fails closed when the browser journey coverage sidecar is malformed', async () => {
+  const repoRoot = path.resolve('.');
+  const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-nonlocal-suite-browser-malformed-'));
+  const deploymentSummary = buildDeploymentSummaryFixture('staging');
+  deploymentSummary.access = {
+    protected_ops_url: 'https://matrix-ops-worker-staging.matrixflare.workers.dev',
+  };
+
+  try {
+    const result = await runEnvironmentBackedSuite('staging', repoRoot, {
+      runTimestamp: '20260402T161600Z',
+      outputRoot,
+      sourceRunUri: 'https://github.com/example/matrix/actions/runs/12345',
+      logArtifact: 'https://github.com/example/matrix/actions/runs/12345/artifacts/1',
+      executedBy: 'gha://example/matrix/nonlocal/staging',
+      reviewedBy: 'gha://example/matrix/nonlocal/staging',
+      topologyKind: 'cloudflare-staging',
+      deploymentSummary,
+      accessSession: {
+        access: {
+          service_token_client_id: 'service-token-id.access',
+          service_token_client_secret: 'service-token-secret',
+        },
+      },
+    }, {
+      requireGitHubActionsExecutionImpl: async () => ({ environment: 'staging' }),
+      assessNonLocalEnvironmentHarnessReadinessImpl: async () => buildHarnessReadinessFixture([
+        'tests/staging/test-e2e-001.test.mjs',
+      ]),
+      requireCloudflareCredentialsImpl: () => ({ accountId: 'cf-account', apiToken: 'cf-token' }),
+      readWorkersSubdomainImpl: async () => 'matrixflare',
+      validateDeploymentSummaryAgainstCurrentCloudflareStateImpl: async () => (
+        buildDeploymentIdentityValidationFixture('staging')
+      ),
+      getRequiredTestFilesImpl: async () => [path.join(repoRoot, 'tests/staging/test-e2e-001.test.mjs')],
+      waitForNonLocalDeploymentReadinessImpl: async () => buildReadinessProbeFixture('staging'),
+      spawnImpl: (_command, _args, options) => {
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        queueMicrotask(async () => {
+          await fs.writeFile(options.env.MATRIX_TEST_RUN_BROWSER_JOURNEY_COVERAGE_PATH, '{bad-json');
+          child.stdout.emit('data', Buffer.from('suite ok\n', 'utf8'));
+          child.emit('close', 0);
+        });
+        return child;
+      },
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.report.status, 'fail');
+    assert.equal(result.report.exit_code, 1);
+    assert.match(result.report.error_message ?? '', /Suite artifact parsing failed/);
+  } finally {
+    await fs.rm(outputRoot, { recursive: true, force: true });
+  }
+});
+
+test('runEnvironmentBackedSuite fails closed when browser journey coverage is below threshold', async () => {
+  const repoRoot = path.resolve('.');
+  const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-nonlocal-suite-browser-low-coverage-'));
+  const deploymentSummary = buildDeploymentSummaryFixture('staging');
+  deploymentSummary.access = {
+    protected_ops_url: 'https://matrix-ops-worker-staging.matrixflare.workers.dev',
+  };
+
+  try {
+    const result = await runEnvironmentBackedSuite('staging', repoRoot, {
+      runTimestamp: '20260402T161700Z',
+      outputRoot,
+      sourceRunUri: 'https://github.com/example/matrix/actions/runs/12345',
+      logArtifact: 'https://github.com/example/matrix/actions/runs/12345/artifacts/1',
+      executedBy: 'gha://example/matrix/nonlocal/staging',
+      reviewedBy: 'gha://example/matrix/nonlocal/staging',
+      topologyKind: 'cloudflare-staging',
+      deploymentSummary,
+      accessSession: {
+        access: {
+          service_token_client_id: 'service-token-id.access',
+          service_token_client_secret: 'service-token-secret',
+        },
+      },
+    }, {
+      requireGitHubActionsExecutionImpl: async () => ({ environment: 'staging' }),
+      assessNonLocalEnvironmentHarnessReadinessImpl: async () => buildHarnessReadinessFixture([
+        'tests/staging/test-e2e-001.test.mjs',
+      ]),
+      requireCloudflareCredentialsImpl: () => ({ accountId: 'cf-account', apiToken: 'cf-token' }),
+      readWorkersSubdomainImpl: async () => 'matrixflare',
+      validateDeploymentSummaryAgainstCurrentCloudflareStateImpl: async () => (
+        buildDeploymentIdentityValidationFixture('staging')
+      ),
+      getRequiredTestFilesImpl: async () => [path.join(repoRoot, 'tests/staging/test-e2e-001.test.mjs')],
+      waitForNonLocalDeploymentReadinessImpl: async () => buildReadinessProbeFixture('staging'),
+      spawnImpl: (_command, _args, options) => {
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        queueMicrotask(async () => {
+          await fs.writeFile(
+            options.env.MATRIX_TEST_RUN_BROWSER_JOURNEY_COVERAGE_PATH,
+            JSON.stringify(buildBrowserJourneyCoverageFixture({
+              journeys: BROWSER_JOURNEY_MATRIX
+                .filter((journey) => journey.required && journey.journey_id !== 'E2E-JRY-015')
+                .map((journey) => ({
+                  journey_id: journey.journey_id,
+                  status: 'pass',
+                  artifacts: [`browser-artifacts/${journey.journey_id.toLowerCase()}.png`],
+                })),
+            }), null, 2),
+          );
+          child.stdout.emit('data', Buffer.from('suite ok\n', 'utf8'));
+          child.emit('close', 0);
+        });
+        return child;
+      },
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.report.status, 'fail');
+    assert.equal(result.report.exit_code, 1);
+    assert.match(result.report.error_message ?? '', /minimum coverage threshold/);
+  } finally {
+    await fs.rm(outputRoot, { recursive: true, force: true });
+  }
+});
+
+test('runEnvironmentBackedSuite fails closed when TEST-E2E-001 is covered but browser journey coverage is missing', async () => {
+  const repoRoot = path.resolve('.');
+  const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-nonlocal-suite-browser-missing-'));
+  const deploymentSummary = buildDeploymentSummaryFixture('staging');
+  deploymentSummary.access = {
+    protected_ops_url: 'https://matrix-ops-worker-staging.matrixflare.workers.dev',
+  };
+
+  try {
+    const result = await runEnvironmentBackedSuite('staging', repoRoot, {
+      runTimestamp: '20260402T161800Z',
+      outputRoot,
+      sourceRunUri: 'https://github.com/example/matrix/actions/runs/12345',
+      logArtifact: 'https://github.com/example/matrix/actions/runs/12345/artifacts/1',
+      executedBy: 'gha://example/matrix/nonlocal/staging',
+      reviewedBy: 'gha://example/matrix/nonlocal/staging',
+      topologyKind: 'cloudflare-staging',
+      deploymentSummary,
+      accessSession: {
+        access: {
+          service_token_client_id: 'service-token-id.access',
+          service_token_client_secret: 'service-token-secret',
+        },
+      },
+    }, {
+      requireGitHubActionsExecutionImpl: async () => ({ environment: 'staging' }),
+      assessNonLocalEnvironmentHarnessReadinessImpl: async () => buildHarnessReadinessFixture([
+        'tests/staging/test-e2e-001.test.mjs',
+      ]),
+      requireCloudflareCredentialsImpl: () => ({ accountId: 'cf-account', apiToken: 'cf-token' }),
+      readWorkersSubdomainImpl: async () => 'matrixflare',
+      validateDeploymentSummaryAgainstCurrentCloudflareStateImpl: async () => (
+        buildDeploymentIdentityValidationFixture('staging')
+      ),
+      getRequiredTestFilesImpl: async () => [path.join(repoRoot, 'tests/staging/test-e2e-001.test.mjs')],
+      waitForNonLocalDeploymentReadinessImpl: async () => buildReadinessProbeFixture('staging'),
+      spawnImpl: () => {
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        queueMicrotask(() => {
+          child.stdout.emit('data', Buffer.from('suite ok\n', 'utf8'));
+          child.emit('close', 0);
+        });
+        return child;
+      },
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.report.status, 'fail');
+    assert.equal(result.report.exit_code, 1);
+    assert.match(result.report.error_message ?? '', /browser_journey_coverage sidecar is required/);
+  } finally {
+    await fs.rm(outputRoot, { recursive: true, force: true });
+  }
+});
+
+test('runEnvironmentBackedSuite clears stale browser journey coverage sidecars before rerunning the suite', async () => {
+  const repoRoot = path.resolve('.');
+  const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'matrix-nonlocal-suite-browser-stale-'));
+  const deploymentSummary = buildDeploymentSummaryFixture('staging');
+  deploymentSummary.access = {
+    protected_ops_url: 'https://matrix-ops-worker-staging.matrixflare.workers.dev',
+  };
+
+  try {
+    await fs.writeFile(
+      path.join(outputRoot, 'browser-journey-coverage.json'),
+      JSON.stringify(buildBrowserJourneyCoverageFixture(), null, 2),
+    );
+    const result = await runEnvironmentBackedSuite('staging', repoRoot, {
+      runTimestamp: '20260402T161900Z',
+      outputRoot,
+      sourceRunUri: 'https://github.com/example/matrix/actions/runs/12345',
+      logArtifact: 'https://github.com/example/matrix/actions/runs/12345/artifacts/1',
+      executedBy: 'gha://example/matrix/nonlocal/staging',
+      reviewedBy: 'gha://example/matrix/nonlocal/staging',
+      topologyKind: 'cloudflare-staging',
+      deploymentSummary,
+      accessSession: {
+        access: {
+          service_token_client_id: 'service-token-id.access',
+          service_token_client_secret: 'service-token-secret',
+        },
+      },
+    }, {
+      requireGitHubActionsExecutionImpl: async () => ({ environment: 'staging' }),
+      assessNonLocalEnvironmentHarnessReadinessImpl: async () => buildHarnessReadinessFixture([
+        'tests/staging/test-e2e-001.test.mjs',
+      ]),
+      requireCloudflareCredentialsImpl: () => ({ accountId: 'cf-account', apiToken: 'cf-token' }),
+      readWorkersSubdomainImpl: async () => 'matrixflare',
+      validateDeploymentSummaryAgainstCurrentCloudflareStateImpl: async () => (
+        buildDeploymentIdentityValidationFixture('staging')
+      ),
+      getRequiredTestFilesImpl: async () => [path.join(repoRoot, 'tests/staging/test-e2e-001.test.mjs')],
+      waitForNonLocalDeploymentReadinessImpl: async () => buildReadinessProbeFixture('staging'),
+      spawnImpl: () => {
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        queueMicrotask(() => {
+          child.stdout.emit('data', Buffer.from('suite ok\n', 'utf8'));
+          child.emit('close', 0);
+        });
+        return child;
+      },
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.report.status, 'fail');
+    assert.equal(result.report.exit_code, 1);
+    assert.match(result.report.error_message ?? '', /browser_journey_coverage sidecar is required/);
   } finally {
     await fs.rm(outputRoot, { recursive: true, force: true });
   }
