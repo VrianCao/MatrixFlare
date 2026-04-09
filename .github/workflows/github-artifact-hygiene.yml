@@ -1,0 +1,164 @@
+name: GitHub Artifact Hygiene
+
+on:
+  workflow_dispatch:
+    inputs:
+      artifact_name_prefixes:
+        description: Comma-separated artifact name prefixes eligible for deletion
+        required: false
+        default: phase08-,prod-cost-raw-,prod-cost-attestation-
+      retention_days:
+        description: Delete matching artifacts older than this many days
+        required: false
+        default: '7'
+      max_deletions:
+        description: Maximum number of artifacts to delete in a single run
+        required: false
+        default: '500'
+      dry_run:
+        description: Report eligible artifacts without deleting them
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    - cron: '37 2 * * *'
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: github-artifact-hygiene
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete aged supplementary GitHub artifacts
+        uses: actions/github-script@v7
+        env:
+          ARTIFACT_NAME_PREFIXES: ${{ github.event.inputs.artifact_name_prefixes || 'phase08-,prod-cost-raw-,prod-cost-attestation-' }}
+          RETENTION_DAYS: ${{ github.event.inputs.retention_days || '7' }}
+          MAX_DELETIONS: ${{ github.event.inputs.max_deletions || '500' }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const retentionDays = Number(process.env.RETENTION_DAYS ?? '7');
+            const maxDeletions = Number(process.env.MAX_DELETIONS ?? '500');
+            const dryRun = String(process.env.DRY_RUN ?? 'false').toLowerCase() === 'true';
+            const prefixes = String(process.env.ARTIFACT_NAME_PREFIXES ?? '')
+              .split(',')
+              .map((value) => value.trim())
+              .filter(Boolean);
+
+            if (!Number.isInteger(retentionDays) || retentionDays < 1) {
+              core.setFailed(`RETENTION_DAYS must be a positive integer, received ${process.env.RETENTION_DAYS}`);
+              return;
+            }
+            if (!Number.isInteger(maxDeletions) || maxDeletions < 1) {
+              core.setFailed(`MAX_DELETIONS must be a positive integer, received ${process.env.MAX_DELETIONS}`);
+              return;
+            }
+            if (prefixes.length === 0) {
+              core.setFailed('ARTIFACT_NAME_PREFIXES must include at least one non-empty prefix');
+              return;
+            }
+
+            const cutoffMs = Date.now() - (retentionDays * 24 * 60 * 60 * 1000);
+            const cutoffIso = new Date(cutoffMs).toISOString();
+            const artifacts = await github.paginate(github.rest.actions.listArtifactsForRepo, {
+              owner,
+              repo,
+              per_page: 100,
+            });
+
+            const candidates = artifacts
+              .filter((artifact) => {
+                const createdAtMs = Date.parse(String(artifact.created_at ?? ''));
+                return Number.isFinite(createdAtMs)
+                  && createdAtMs < cutoffMs
+                  && artifact.expired !== true
+                  && prefixes.some((prefix) => String(artifact.name ?? '').startsWith(prefix));
+              })
+              .sort((left, right) => Date.parse(String(left.created_at)) - Date.parse(String(right.created_at)));
+
+            const selected = candidates.slice(0, maxDeletions);
+            const deleted = [];
+            const failures = [];
+            let reclaimedBytes = 0;
+
+            for (const artifact of selected) {
+              if (dryRun) {
+                deleted.push(artifact);
+                reclaimedBytes += Number(artifact.size_in_bytes ?? 0);
+                continue;
+              }
+              try {
+                await github.rest.actions.deleteArtifact({
+                  owner,
+                  repo,
+                  artifact_id: artifact.id,
+                });
+                deleted.push(artifact);
+                reclaimedBytes += Number(artifact.size_in_bytes ?? 0);
+                core.notice(`Deleted artifact ${artifact.name} (#${artifact.id})`);
+              } catch (error) {
+                failures.push({
+                  id: artifact.id,
+                  name: artifact.name,
+                  message: error instanceof Error ? error.message : String(error),
+                });
+              }
+            }
+
+            const gib = (bytes) => (Number(bytes) / (1024 ** 3)).toFixed(2);
+            const markdownRows = deleted
+              .slice(0, 50)
+              .map((artifact) => {
+                const sizeMiB = (Number(artifact.size_in_bytes ?? 0) / (1024 ** 2)).toFixed(2);
+                return `| ${artifact.id} | ${artifact.name} | ${artifact.created_at} | ${sizeMiB} |`;
+              })
+              .join('\n');
+
+            await core.summary
+              .addHeading('GitHub Artifact Hygiene')
+              .addRaw(`- repository: \`${owner}/${repo}\`\n`, true)
+              .addRaw(`- mode: \`${dryRun ? 'dry-run' : 'delete'}\`\n`, true)
+              .addRaw(`- eligible prefixes: \`${prefixes.join(', ')}\`\n`, true)
+              .addRaw(`- retention_days: \`${retentionDays}\`\n`, true)
+              .addRaw(`- cutoff_before: \`${cutoffIso}\`\n`, true)
+              .addRaw(`- eligible_count: \`${candidates.length}\`\n`, true)
+              .addRaw(`- processed_count: \`${selected.length}\`\n`, true)
+              .addRaw(`- reclaimed_bytes: \`${reclaimedBytes}\`\n`, true)
+              .addRaw(`- reclaimed_gib: \`${gib(reclaimedBytes)}\`\n`, true);
+
+            if (deleted.length > 0) {
+              await core.summary
+                .addRaw('\n| Artifact ID | Name | Created At | Size MiB |\n', true)
+                .addRaw('| --- | --- | --- | ---: |\n', true)
+                .addRaw(`${markdownRows}\n`, true);
+            } else {
+              await core.summary.addRaw('\nNo matching artifacts were deleted.\n', true);
+            }
+
+            if (failures.length > 0) {
+              const failureRows = failures
+                .slice(0, 50)
+                .map((failure) => `| ${failure.id} | ${failure.name} | ${failure.message.replace(/\|/g, '\\|')} |`)
+                .join('\n');
+              await core.summary
+                .addRaw('\n| Failed Artifact ID | Name | Error |\n', true)
+                .addRaw('| --- | --- | --- |\n', true)
+                .addRaw(`${failureRows}\n`, true);
+            }
+
+            await core.summary.write();
+
+            if (failures.length > 0) {
+              core.setFailed(`Failed to delete ${failures.length} artifact(s) after deleting ${deleted.length}`);
+            } else if (candidates.length > maxDeletions) {
+              core.notice(`Deletion capped at ${maxDeletions}; ${candidates.length - maxDeletions} eligible artifacts remain for the next run`);
+            }
