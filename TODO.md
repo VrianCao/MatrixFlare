@@ -865,6 +865,17 @@
   同一 exact-head run `24054413342` 的 embedded `prod-cost` job 还把当前 branch 的 production-side blocker 从 historical merged-master truth 推进成了 branch-owned same-head truth：`Resolve closed production billing window` 已真实通过 subscriptions fallback 写出 `billing-window.json = { resolution_method: cloudflare-account-subscriptions-current-period-end, next_bill_date: 2026-04-29T00:00:00Z, from_date: 2026-03-01, to_date: 2026-03-29 }`，随后 `Capture production cost snapshot` 在同一 job 中按 fail-closed 语义明确报出 `production cost snapshot requires a closed billing window that starts after prod install date 2026-04-05`。因此，当前 branch 的 `08.05` 已可以诚实收敛为 exact-head cost-only blocker set：`OQ-0006` 继续挡住 shared pre-release attestation，`OQ-0002` 继续挡住 truthful `ProdCostSnapshotAttestation`；除此之外没有新的 active `L1` blocker 被这轮 rerun 证实。即便如此，`08.05` 仍未完成，`L1 Local-Core` 也仍不能诚实宣称完成。
   `2026-04-09` latest reviewed pushed-head evidence truth 现已前推到 head `90eb630207a61dd95a14c2a3e08e4b10b1f4b639` 的 run `24169756988`。这轮 same-head evidence 真实显示：`EVID-GOV-001`,`EVID-CS-001`,`EVID-CS-002`,`EVID-CS-003`,`EVID-CS-004`,`EVID-ROOM-001`,`EVID-ROOM-002`,`EVID-E2E-001` 为 `pass`；`EVID-MEDIA-001`,`EVID-DER-001`,`EVID-SEC-001`,`EVID-OPS-001`,`EVID-COST-001` 为 `fail`。其中新增变化不是 attestation topology 放松，而是 current head 已真实拿到 `EVID-E2E-001` pass，证明 pinned Element Web + Playwright browser gate 已在 exact-head staging attestation 上闭环；`EVID-CS-004` 也已在同轮 `ci-integration` / `staging` attestation 上继续保持 `pass`。后五项失败仍都不是 dedicated suite 回退：`pre-release.json` 明确记录 `rollout_skew_probe` 存在且 `TEST-OPS-001` assertions 为 `true`，但同轮 `pre_release_cost_observation = null`，因此 shared pre-release attestation 继续缺失；`phase08-prod-cost-raw-20260409T024929Z-24169756988-1/artifacts/billing-window.json` 也继续写出 `{ resolution_method: cloudflare-account-subscriptions-current-period-end, next_bill_date: 2026-04-29T00:00:00Z, from_date: 2026-03-01, to_date: 2026-03-29 }`，而 prod install baseline 仍是 `installed_at = 2026-04-05T11:43:28.305Z`，所以 `OQ-0002` 侧 truthful post-install closed billing period 仍未出现。换言之，`08.05` 当前 exact-head evidence 也已继续收敛为 `OQ-0006` + `OQ-0002` 两条 cost path；`EVID-E2E-001` 不再是 active blocker。
 
+### 08.05B 建立 GitHub Actions supplementary artifact hygiene
+
+- [x] 为高体积、非权威的 GitHub Actions supplementary artifacts 增加独立的定期清理 workflow，防止 Actions storage quota 被历史 `phase08-*` / standalone `prod-cost-*` bundles 长期占满。
+  Spec refs: `42`, `44`
+  产出:
+  独立的 scheduled + manual GitHub artifact cleanup workflow，按名称前缀与时间窗口删除 aged supplementary GitHub artifacts，同时保留 R2 immutable provenance 与 prod record 类 artifacts。
+  完成标准:
+  仓库可以通过 GitHub Actions 内建 token 回收旧的 `phase08-*` / `prod-cost-*` supplementary GitHub artifacts，不影响 `r2://` provenance truth，也不把仍可能被 prod automation 直接消费的 record artifact 纳入默认删除范围。
+  当前状态:
+  `2026-04-09` 已新增 `.github/workflows/github-artifact-hygiene.yml`。该 workflow 提供 `workflow_dispatch` 与 daily `schedule`，默认清理前缀为 `phase08-`,`prod-cost-raw-`,`prod-cost-attestation-` 的 aged GitHub artifacts，并支持 `retention_days`,`max_deletions`,`dry_run` 覆盖。实现刻意遵守 `42/44` 的现有 contract：GitHub artifacts 只作为 supplementary audit chain，默认清理范围不触碰 R2 immutable locator，也不默认删除 `prod-install-record` / `prod-promotion-record` / `prod-release-candidate` 等 record artifacts，避免把当前 production automation 仍通过 GitHub artifact 下载的 ingress 直接打断。
+
 ## Phase 09: Federation Core And L2 Gate
 
 目标：在 `L1` 基础上完成联邦闭环。
