@@ -548,8 +548,24 @@ test('TEST-CS-001 staging covers discovery, session lifecycle, and capability tr
   assert.notEqual(refreshed.payload.access_token, alice.access_token);
   assert.notEqual(refreshed.payload.refresh_token, alice.refresh_token);
 
+  const refreshRetry = await refreshSession(harness, alice.refresh_token);
+  assert.equal(refreshRetry.response.status, 200);
+  assert.equal(refreshRetry.payload?.access_token, refreshed.payload.access_token);
+  assert.equal(refreshRetry.payload?.refresh_token, refreshed.payload.refresh_token);
+  assert.equal(typeof refreshRetry.payload?.expires_in_ms, 'number');
+  assert.ok(refreshRetry.payload.expires_in_ms > 0);
+  assert.ok(refreshRetry.payload.expires_in_ms <= refreshed.payload.expires_in_ms);
+
   const oldAccessAfterRefresh = await getAuthenticated(harness, alice.access_token, '/_matrix/client/v3/account/whoami');
   await expectMatrixError(oldAccessAfterRefresh, 401, 'M_UNKNOWN_TOKEN');
+
+  const refreshedWhoAmI = await getAuthenticated(harness, refreshed.payload.access_token, '/_matrix/client/v3/account/whoami');
+  assert.equal(refreshedWhoAmI.response.status, 200);
+  assert.equal(refreshedWhoAmI.payload?.user_id, alice.user_id);
+  assert.equal(refreshedWhoAmI.payload?.device_id, 'CS1STGALICE');
+
+  const oldRefreshAfterCurrentAccess = await refreshSession(harness, alice.refresh_token);
+  await expectMatrixError(oldRefreshAfterCurrentAccess, 401, 'M_UNKNOWN_TOKEN');
 
   const logout = await request(harness, '/_matrix/client/v3/logout', {
     method: 'POST',

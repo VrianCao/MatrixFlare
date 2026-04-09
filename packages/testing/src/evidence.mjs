@@ -30,6 +30,11 @@ import {
 import {
   CLIENT_DISCOVERY_VERSION_COUNT,
 } from './client-discovery.mjs';
+import {
+  BROWSER_JOURNEY_MINIMUM_COVERAGE_RATIO,
+  TEST_E2E_ID,
+  validateBrowserJourneyCoverageReport,
+} from './browser-e2e.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -117,6 +122,9 @@ const EXPECTED_WORKER_BASE_NAMES = Object.freeze([
 const PRE_RELEASE_TEST_FILE_PREFIXES = Object.freeze({
   ops: 'test-ops-001',
   cost: 'test-cost-001',
+});
+const STAGING_TEST_FILE_PREFIXES = Object.freeze({
+  e2e: 'test-e2e-001',
 });
 const PRE_RELEASE_COST_SURFACES = Object.freeze([
   'workers',
@@ -228,6 +236,10 @@ const L1_TEST_IMPLEMENTATION_FILES = Object.freeze({
     staging: Object.freeze(['tests/staging/test-der-001.test.mjs']),
     'pre-release': Object.freeze(['tests/pre-release/test-der-001.test.mjs']),
   }),
+  'TEST-E2E-001': Object.freeze({
+    local: Object.freeze(['tests/local/runtime-foundations/browser-e2e.test.mjs']),
+    staging: Object.freeze(['tests/staging/test-e2e-001.test.mjs']),
+  }),
   'TEST-SEC-001': Object.freeze({
     local: Object.freeze([
       'tests/local/client-identity/phase-04.test.mjs',
@@ -332,6 +344,16 @@ const L1_EVIDENCE_DEFINITIONS = Object.freeze([
     declared_source_ids: ['MX-CS-017', 'MX-FED-006'],
     l1_excluded_source_ids: ['MX-FED-006'],
     pass_criteria: 'For L1, search, user directory, public rooms, hierarchy, and rebuild consistency must pass in staging and pre-release, including publicRooms dispatch and deterministic rejection of unauthenticated POST.',
+  }),
+  Object.freeze({
+    id: 'EVID-E2E-001',
+    scope: 'L1',
+    test_ids: [TEST_E2E_ID],
+    evidence_type: 'browser/e2e',
+    generation_method: 'pinned Element Web + Playwright Chromium attested staging report plus local browser-harness contract regression',
+    required_environments: ['staging'],
+    declared_source_ids: ['MX-CS-001', 'MX-CS-002', 'MX-CS-006', 'MX-CS-007', 'MX-CS-008', 'MX-CS-009', 'MX-CS-010', 'MX-CS-011', 'MX-CS-013', 'MX-CS-014', 'MX-CS-017'],
+    pass_criteria: `Pinned Element Web browser journeys must pass in staging with coverage_ratio >= ${BROWSER_JOURNEY_MINIMUM_COVERAGE_RATIO} and all P0 journeys passing, while local browser-harness contract regression remains green.`,
   }),
   Object.freeze({
     id: 'EVID-SEC-001',
@@ -2006,6 +2028,22 @@ function validatePreReleaseCostObservation(reportLabel, value, {
     valid: true,
     error: null,
   };
+}
+
+function validateBrowserJourneyCoverage(reportLabel, value, {
+  expectedEnvironmentName = 'staging',
+  requirePass = true,
+} = {}) {
+  const validation = validateBrowserJourneyCoverageReport(value, {
+    expectedEnvironmentName,
+    requirePass,
+  });
+  return validation.valid
+    ? validation
+    : {
+      valid: false,
+      error: `${reportLabel} browser_journey_coverage is invalid: ${validation.error}`,
+    };
 }
 
 function isDisallowedLocalHostname(hostname) {
@@ -4420,6 +4458,57 @@ function isCallLikeExpressionAt(sourceText, index) {
   return false;
 }
 
+function isPotentialBracketPropertyAccess(sourceText, index) {
+  let cursor = index - 1;
+  while (cursor >= 0 && /\s/.test(sourceText[cursor])) {
+    cursor -= 1;
+  }
+  if (cursor < 0) {
+    return false;
+  }
+  if (sourceText[cursor] === '?') {
+    let dotCursor = cursor - 1;
+    while (dotCursor >= 0 && /\s/.test(sourceText[dotCursor])) {
+      dotCursor -= 1;
+    }
+    return dotCursor >= 0 && sourceText[dotCursor] === '.';
+  }
+  const previousChar = sourceText[cursor];
+  if (
+    previousChar === '.'
+    || previousChar === ')'
+    || previousChar === ']'
+    || previousChar === '}'
+    || previousChar === '\''
+    || previousChar === '"'
+    || previousChar === '`'
+  ) {
+    return true;
+  }
+  if (!/[A-Za-z0-9_$]/.test(previousChar)) {
+    return false;
+  }
+  let identifierStart = cursor;
+  while (identifierStart > 0 && /[A-Za-z0-9_$]/.test(sourceText[identifierStart - 1])) {
+    identifierStart -= 1;
+  }
+  const precedingIdentifier = sourceText.slice(identifierStart, cursor + 1);
+  return !new Set([
+    'await',
+    'case',
+    'delete',
+    'in',
+    'instanceof',
+    'new',
+    'of',
+    'return',
+    'throw',
+    'typeof',
+    'void',
+    'yield',
+  ]).has(precedingIdentifier);
+}
+
 function readCallableContinuationInvocationProperty(sourceText, index) {
   const property = readChainedPropertyName(sourceText, index);
   if (property == null || !isCallableContinuationMethodName(property.name)) {
@@ -4456,6 +4545,11 @@ function isOpaqueStaticModuleSpecifier(specifier) {
     && !isTrackedModuleSpecifier(specifier)
     && !hasExplicitModuleScheme(specifier)
     && !isSafeBuiltinModuleSpecifier(specifier);
+}
+
+function isAllowedBarePackageModuleSpecifier(specifier) {
+  return typeof specifier === 'string'
+    && /^(?:@[^/\s]+\/[^/\s]+|[A-Za-z0-9][A-Za-z0-9._-]*)(?:\/[A-Za-z0-9._-]+)*$/u.test(specifier);
 }
 
 function findStaticModuleSpecifier(sourceText, startIndex) {
@@ -4627,6 +4721,10 @@ function collectRelativeModuleDependencies(sourceText, inheritedAliasState = nul
       }
     }
     if (current === '[') {
+      if (!isPotentialBracketPropertyAccess(sourceText, cursor)) {
+        cursor += 1;
+        continue;
+      }
       const bracketProperty = parseBracketPropertyExpression(sourceText, cursor);
       if (bracketProperty != null) {
         const staticBracketPropertyName = getStaticBracketPropertyName(bracketProperty);
@@ -4806,6 +4904,8 @@ function collectRelativeModuleDependencies(sourceText, inheritedAliasState = nul
           hasUnresolvedDynamicImport = true;
         } else if (isTrackedModuleSpecifier(literalSpecifier)) {
           moduleSpecifiers.push(literalSpecifier);
+        } else if (isAllowedBarePackageModuleSpecifier(literalSpecifier)) {
+          // Installed package imports are outside the repo-owned closure and are allowed.
         } else if (isOpaqueStaticModuleSpecifier(literalSpecifier)) {
           hasUnresolvedDynamicImport = true;
         } else if (hasExplicitModuleScheme(literalSpecifier) && !isSafeBuiltinModuleSpecifier(literalSpecifier)) {
@@ -4822,6 +4922,8 @@ function collectRelativeModuleDependencies(sourceText, inheritedAliasState = nul
       if (staticSpecifier != null) {
         if (isTrackedModuleSpecifier(staticSpecifier.specifier)) {
           moduleSpecifiers.push(staticSpecifier.specifier);
+        } else if (isAllowedBarePackageModuleSpecifier(staticSpecifier.specifier)) {
+          // Installed package imports are outside the repo-owned closure and are allowed.
         } else if (isOpaqueStaticModuleSpecifier(staticSpecifier.specifier)) {
           hasUnresolvedDynamicImport = true;
         } else if (
@@ -4841,6 +4943,8 @@ function collectRelativeModuleDependencies(sourceText, inheritedAliasState = nul
       if (staticSpecifier != null) {
         if (isTrackedModuleSpecifier(staticSpecifier.specifier)) {
           moduleSpecifiers.push(staticSpecifier.specifier);
+        } else if (isAllowedBarePackageModuleSpecifier(staticSpecifier.specifier)) {
+          // Installed package imports are outside the repo-owned closure and are allowed.
         } else if (isOpaqueStaticModuleSpecifier(staticSpecifier.specifier)) {
           hasUnresolvedDynamicImport = true;
         } else if (
@@ -5355,6 +5459,8 @@ export function validateManualArtifactPayload(artifactId, payload, {
       && reportCoversCanonicalTestPrefix(payload, PRE_RELEASE_TEST_FILE_PREFIXES.ops);
     const coversPreReleaseCost = expectedEnvironmentName === 'pre-release'
       && reportCoversCanonicalTestPrefix(payload, PRE_RELEASE_TEST_FILE_PREFIXES.cost);
+    const coversBrowserE2E = expectedEnvironmentName === 'staging'
+      && reportCoversCanonicalTestPrefix(payload, STAGING_TEST_FILE_PREFIXES.e2e);
     if (expectedEnvironmentName === 'pre-release' && !coversPreReleaseOps && payload.rollout_skew_probe != null) {
       return {
         valid: false,
@@ -5377,6 +5483,18 @@ export function validateManualArtifactPayload(artifactId, payload, {
       return {
         valid: false,
         error: 'environment run report pre_release_cost_observation must be null outside pre-release',
+      };
+    }
+    if (expectedEnvironmentName === 'staging' && !coversBrowserE2E && payload.browser_journey_coverage != null) {
+      return {
+        valid: false,
+        error: 'environment run report browser_journey_coverage must be null unless TEST-E2E-001 is covered',
+      };
+    }
+    if (expectedEnvironmentName !== 'staging' && payload.browser_journey_coverage != null) {
+      return {
+        valid: false,
+        error: 'environment run report browser_journey_coverage must be null outside staging',
       };
     }
     if (coversPreReleaseOps) {
@@ -5403,6 +5521,19 @@ export function validateManualArtifactPayload(artifactId, payload, {
       );
       if (!costObservationValidation.valid) {
         return costObservationValidation;
+      }
+    }
+    if (coversBrowserE2E) {
+      const browserCoverageValidation = validateBrowserJourneyCoverage(
+        'environment run report',
+        payload.browser_journey_coverage,
+        {
+          expectedEnvironmentName,
+          requirePass: true,
+        },
+      );
+      if (!browserCoverageValidation.valid) {
+        return browserCoverageValidation;
       }
     }
     return {
@@ -6764,6 +6895,7 @@ function buildAttestedEnvironmentRunSource(artifactResult) {
     readiness_probe: payload.readiness_probe,
     rollout_skew_probe: payload.rollout_skew_probe ?? null,
     pre_release_cost_observation: payload.pre_release_cost_observation ?? null,
+    browser_journey_coverage: payload.browser_journey_coverage ?? null,
     deployment_identity_validation: payload.deployment_identity_validation ?? null,
     attestation_path: artifactResult.provided_path,
     attestation_origin_run_id: artifactResult.attestation_origin_run_id,
@@ -6903,6 +7035,7 @@ function serializeEnvironmentRunSource(environmentRun, evidenceRoot) {
       readiness_probe: environmentRun.readiness_probe ?? null,
       rollout_skew_probe: environmentRun.rollout_skew_probe ?? null,
       pre_release_cost_observation: environmentRun.pre_release_cost_observation ?? null,
+      browser_journey_coverage: environmentRun.browser_journey_coverage ?? null,
       deployment_identity_validation: environmentRun.deployment_identity_validation ?? null,
       artifact_store_uri: environmentRun.attestation_artifact_store_uri,
       artifact_store_key: environmentRun.attestation_artifact_store_key,

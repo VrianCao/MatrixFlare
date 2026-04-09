@@ -1214,6 +1214,7 @@ function normalizeRoomFanoutDelta(delta = {}) {
       ? delta.origin_server_ts
       : null,
     timeline_event_ids: uniqueStringArray(delta.timeline_event_ids),
+    pinned_timeline_event_ids: uniqueStringArray(delta.pinned_timeline_event_ids),
     state_event_ids: uniqueStringArray(delta.state_event_ids),
     limited: delta.limited === true,
     prev_batch: typeof delta.prev_batch === 'string' && delta.prev_batch.length > 0 ? delta.prev_batch : null,
@@ -1327,6 +1328,30 @@ function resolveRoomFanoutNotificationState(userPersistence, principal, delta, n
 
 function buildRoomFanoutDedupeKey(delta) {
   return `${delta.room_id}|${delta.room_pos}|${delta.user_id}`;
+}
+
+function sortLoadedTimelineEntries(entries = []) {
+  return [...entries].sort((left, right) => {
+    return left.metadata.room_pos - right.metadata.room_pos
+      || left.metadata.event_id.localeCompare(right.metadata.event_id);
+  });
+}
+
+function resolveJoinHistoryStartRoomPos({
+  historyVisibility,
+  joinRoomPos,
+  previousMembership,
+  previousMembershipRoomPos,
+}) {
+  if (historyVisibility === 'joined') {
+    return joinRoomPos;
+  }
+  if (historyVisibility === 'invited') {
+    return previousMembership === 'invite' && Number.isInteger(previousMembershipRoomPos) && previousMembershipRoomPos >= 1
+      ? previousMembershipRoomPos
+      : joinRoomPos;
+  }
+  return null;
 }
 
 function decodeRoomCursorOrNull(cursor) {
@@ -7515,6 +7540,8 @@ export class RoomDO extends BaseDurableObject {
           committedEvent,
           roomPos,
           snapshotId,
+          previousMembership: currentMembershipState?.membership ?? null,
+          previousMembershipRoomPos: currentMembershipState?.event_room_pos ?? null,
         });
         const relationInfo = getRelationInfo(candidateEvent);
         this.persistence.eventMetadata.put({
@@ -7708,6 +7735,8 @@ export class RoomDO extends BaseDurableObject {
     committedEvent,
     roomPos,
     snapshotId,
+    previousMembership = null,
+    previousMembershipRoomPos = null,
   }) {
     const roomId = this.persistence.getRuntimeState()?.room_id ?? committedEvent.room_id ?? null;
     const roomVersion = this.persistence.getRuntimeState()?.room_version ?? DEFAULT_ROOM_VERSION;
@@ -7782,10 +7811,66 @@ export class RoomDO extends BaseDurableObject {
         delta.state_event_ids.push(committedEvent.event_id);
       }
       if (committedEvent.type === 'm.room.member'
-        && membership.user_id === stateKey
-        && ['invite', 'knock'].includes(membershipBucket)) {
-        delta.timeline_event_ids = [];
-        delta.state_event_ids = [...new Set(currentSnapshotEventIds)];
+        && membership.user_id === stateKey) {
+        if (membershipBucket === 'join' && previousMembership !== 'join') {
+          // Only an actual self transition into join should carry the current room
+          // state snapshot plus a bounded recent visible timeline slice so the
+          // next incremental /sync can materialize active room semantics and
+          // immediate room context for the newly joined user.
+          const historyVisibility = getSingleStateContent(this, stateMap, 'm.room.history_visibility', '')?.history_visibility ?? 'shared';
+          const visibleHistoryStartRoomPos = resolveJoinHistoryStartRoomPos({
+            historyVisibility,
+            joinRoomPos: roomPos,
+            previousMembership,
+            previousMembershipRoomPos,
+          });
+          const joinTimelineRows = new Map();
+          const addJoinTimelineRow = (eventId, fallbackRoomPos = null) => {
+            if (typeof eventId !== 'string' || eventId.length === 0 || joinTimelineRows.has(eventId)) {
+              return;
+            }
+            const metadata = eventId === committedEvent.event_id
+              ? { room_pos: roomPos }
+              : this.persistence.eventMetadata.get({ event_id: eventId });
+            const resolvedRoomPos = Number.isInteger(metadata?.room_pos) && metadata.room_pos >= 1
+              ? metadata.room_pos
+              : fallbackRoomPos;
+            if (!Number.isInteger(resolvedRoomPos) || resolvedRoomPos < 1) {
+              return;
+            }
+            joinTimelineRows.set(eventId, {
+              event_id: eventId,
+              room_pos: resolvedRoomPos,
+            });
+          };
+          if (visibleHistoryStartRoomPos != null) {
+            const encryptionEventId = getTypedStateEvent(stateMap, 'm.room.encryption', '')?.event_id ?? null;
+            if (typeof encryptionEventId === 'string' && encryptionEventId.length > 0) {
+              const encryptionMetadata = this.persistence.eventMetadata.get({ event_id: encryptionEventId });
+              if (Number.isInteger(encryptionMetadata?.room_pos) && encryptionMetadata.room_pos < visibleHistoryStartRoomPos) {
+                addJoinTimelineRow(encryptionEventId, encryptionMetadata.room_pos);
+              }
+            }
+          }
+          for (const row of this.listVisibleTimelineMetadata({
+            minRoomPos: visibleHistoryStartRoomPos,
+            maxRoomPos: roomPos,
+          })) {
+            addJoinTimelineRow(row.event_id, row.room_pos);
+          }
+          addJoinTimelineRow(committedEvent.event_id, roomPos);
+          const orderedJoinTimelineRows = [...joinTimelineRows.values()]
+            .sort((left, right) => left.room_pos - right.room_pos || left.event_id.localeCompare(right.event_id));
+          delta.timeline_event_ids = orderedJoinTimelineRows
+            .slice(-DEFAULT_INITIAL_SYNC_TIMELINE_LIMIT)
+            .map((row) => row.event_id);
+          delta.pinned_timeline_event_ids = [committedEvent.event_id];
+          delta.limited = orderedJoinTimelineRows.length > delta.timeline_event_ids.length;
+          delta.state_event_ids = [...new Set(currentSnapshotEventIds)];
+        } else if (['invite', 'knock'].includes(membershipBucket)) {
+          delta.timeline_event_ids = [];
+          delta.state_event_ids = [...new Set(currentSnapshotEventIds)];
+        }
       }
       deltas.push(delta);
     }
@@ -8491,9 +8576,10 @@ export class RoomDO extends BaseDurableObject {
     return membership;
   }
 
-  listVisibleTimelineMetadata({ maxRoomPos = null } = {}) {
+  listVisibleTimelineMetadata({ minRoomPos = null, maxRoomPos = null } = {}) {
     return this.persistence.eventMetadata.list()
       .filter((row) => row.soft_failed_flag !== true && row.waiting_missing_flag !== true)
+      .filter((row) => minRoomPos == null || row.room_pos >= minRoomPos)
       .filter((row) => maxRoomPos == null || row.room_pos <= maxRoomPos)
       .sort((left, right) => left.room_pos - right.room_pos || left.event_id.localeCompare(right.event_id));
   }
@@ -8598,6 +8684,7 @@ export class RoomDO extends BaseDurableObject {
     const snapshotId = visibilityRoomPos == null ? null : this.resolveSnapshotIdForRoomPos(visibilityRoomPos);
 
     const timelineEventIds = uniqueStringArray(request?.timeline_event_ids);
+    const pinnedTimelineEventIds = new Set(uniqueStringArray(request?.pinned_timeline_event_ids));
     const stateEventIds = uniqueStringArray(request?.state_event_ids);
     const loadProjectedEvents = (eventIds) => {
       const entries = [];
@@ -8638,15 +8725,27 @@ export class RoomDO extends BaseDurableObject {
       ? this.listVisibleTimelineMetadata({ maxRoomPos: visibilityRoomPos })
         .slice(-backfillTimelineLimit)
         .map((row) => this.loadVisibleRoomEventById(row.event_id, { maxRoomPos: visibilityRoomPos }))
-      : timelineEventsResult.entries;
-    const limitedTimelineEntries = requestedTimelineLimit != null && fullTimelineEntries.length > requestedTimelineLimit
+      : sortLoadedTimelineEntries(timelineEventsResult.entries);
+    let limitedTimelineEntries = requestedTimelineLimit != null && fullTimelineEntries.length > requestedTimelineLimit
       ? fullTimelineEntries.slice(-requestedTimelineLimit)
       : fullTimelineEntries;
+    if (pinnedTimelineEventIds.size > 0 && requestedTimelineLimit != null && fullTimelineEntries.length > limitedTimelineEntries.length) {
+      const returnedEventIds = new Set(limitedTimelineEntries.map((entry) => entry.metadata.event_id));
+      const missingPinnedEntries = fullTimelineEntries.filter((entry) => (
+        pinnedTimelineEventIds.has(entry.metadata.event_id) && !returnedEventIds.has(entry.metadata.event_id)
+      ));
+      const earliestMissingPinnedIndex = missingPinnedEntries.length === 0
+        ? -1
+        : fullTimelineEntries.findIndex((entry) => entry.metadata.event_id === missingPinnedEntries[0].metadata.event_id);
+      if (earliestMissingPinnedIndex >= 0) {
+        limitedTimelineEntries = fullTimelineEntries.slice(earliestMissingPinnedIndex);
+      }
+    }
     const timelineEvents = limitedTimelineEntries.map((entry) => entry.event);
     const deltaStateEvents = deltaStateEventsResult.entries.map((entry) => entry.event);
     const filteredByTimelineLimit = shouldBackfillInitialTimeline
       ? this.listVisibleTimelineMetadata({ maxRoomPos: visibilityRoomPos }).length > fullTimelineEntries.length
-      : (requestedTimelineLimit != null && fullTimelineEntries.length > requestedTimelineLimit);
+      : fullTimelineEntries.length > limitedTimelineEntries.length;
     const computedPrevBatch = limitedTimelineEntries.length > 0
       ? encodeRoomCursor(limitedTimelineEntries[0].metadata.room_pos)
       : null;

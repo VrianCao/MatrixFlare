@@ -13,8 +13,10 @@
     "test:local": "node packages/testing/src/cli.mjs local",
     "test:integration": "node packages/testing/src/cli.mjs ci-integration",
     "test:staging": "node packages/testing/src/cli.mjs staging",
+    "test:e2e:staging": "node --test tests/staging/test-e2e-001.test.mjs",
     "test:pre-release": "node packages/testing/src/cli.mjs pre-release",
     "test:all": "node packages/testing/src/cli.mjs all",
+    "browser:install": "playwright install --with-deps chromium",
     "evidence:l1": "node packages/testing/src/cli.mjs evidence-l1",
     "build": "node packages/spec-tools/src/cli.mjs build",
     "governance:scan": "node packages/spec-tools/src/cli.mjs scan-ids",
@@ -23,5 +25,9 @@
     "governance:traceability-matrix": "node packages/spec-tools/src/cli.mjs traceability-matrix",
     "governance:expand-routes": "node packages/spec-tools/src/cli.mjs expand-routes",
     "governance:evidence": "node packages/spec-tools/src/cli.mjs governance-evidence"
+  },
+  "devDependencies": {
+    "playwright": "1.59.1",
+    "tar": "7.5.13"
   }
 }

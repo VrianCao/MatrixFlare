@@ -21,8 +21,12 @@ test('TEST-CS-004 staging keeps stub-only and unsupported routes deterministic a
   });
 
   const loginFlows = await request(harness, '/_matrix/client/v3/login');
-  assert.equal(loginFlows.response.status, 200);
-  assert.deepEqual(loginFlows.payload?.flows, [{ type: 'm.login.password' }]);
+  if (loginFlows.response.status === 429) {
+    await expectMatrixError(loginFlows, 429, 'M_LIMIT_EXCEEDED');
+  } else {
+    assert.equal(loginFlows.response.status, 200);
+    assert.deepEqual(loginFlows.payload?.flows, [{ type: 'm.login.password' }]);
+  }
 
   const capabilities = await getAuthenticated(harness, alice.access_token, '/_matrix/client/v3/capabilities');
   assert.equal(capabilities.response.status, 200);

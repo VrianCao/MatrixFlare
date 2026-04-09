@@ -166,6 +166,7 @@
 * `Stub-Only` 条目在当前 profile 下必须通过 deterministic stub / disabled truth 的 `TEST-ID` / `EVID-ID` 门禁；在新的或替代 `DEC-ID` 放开前，不得把 feature flag、局部 handler 或 capability 声明视为 full feature 发布授权。
 * 对 [DEC-0001](/root/Matrix/spec/decisions/DEC-0001.md) 覆盖的 `MX-ID`，上一条中的“功能开关启用”不构成 full feature 发布授权；必须同时满足 dedicated sub-spec 完整落地与新的或替代 `DEC-ID` 明示放开。
 * `Deferred`、`Stub-Only`、`Unsupported` 条目必须对外有明确行为，不得静默缺失。
+* 对 `L1-L3` 的“真实 browser-usable Matrix homeserver”声明，除对应 `MX-*` 行本身映射的 `TEST/EVID` 外，还必须额外满足 [43-testing-and-compliance.md](/root/Matrix/spec/framework/43-testing-and-compliance.md) 中的 `TEST-E2E-001` 与 [44-verification-and-evidence-register.md](/root/Matrix/spec/framework/44-verification-and-evidence-register.md) 中的 `EVID-E2E-001`；若缺少基于 pinned Element Web + Playwright 的真实浏览器旅程证据，不得把“API / non-browser protocol tests 已通过”描述成 browser client 已可用。
 
 ## 10. 完成标准
 

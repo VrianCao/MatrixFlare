@@ -180,8 +180,10 @@
 ### 4.6 刷新
 
 * `refresh` 必须通过 `IF-CS-012` 与 `IF-INT-USER-001`/`IF-INT-USER-002` 相同的 `UserDO` 权威路径完成。
-* refresh 成功后，旧 refresh token 必须失效，access token 应同时轮换。
-* refresh token 重放必须返回明确失败，而不是返回新的可用 token。
+* refresh 成功后，access token 与 refresh token 都必须进入新的 session revision；但 Matrix `v1.17` 要求紧邻上一代 refresh token 在“新 access token 或新 refresh token 尚未被使用”之前仍保持可重试，用于客户端处理 refresh 响应丢失或竞态重试。
+* 上述旧 refresh token 的 retry path 必须收敛到同一已发行的 rotated token lineage，而不是额外再分叉出新的 access/refresh 对。
+* 一旦新 access token 或新 refresh token 已被使用，上一代 refresh token 就必须明确失败。
+* 当 client 携带的 access token 已过期，但同一 session 的 refresh token 仍可恢复时，authenticated client route 必须返回 `401 M_UNKNOWN_TOKEN` 并显式附带 `soft_logout: true`；若该 session 已不可恢复，则不得滥发 `soft_logout`。
 
 ### 4.7 注销
 
@@ -441,10 +443,12 @@
 * 若任一房间投影失败，则本次 `/sync` 不得推进 `next_batch`。
 * to-device、device lists、one-time key count 和 fallback key types 都必须来自与 `since` 同一用户流快照边界。
 * `RoomProjectionRequest` 至少必须包含 `user_id`,`room_id`,`room_pos`,`membership_bucket`,`filter_hash` 与本次 `/sync` 的 visibility context；不得只用 `{room_id,room_pos,filter_hash}` 这类可跨用户碰撞的键推导房间投影。
+* 对 joined / leave 房间的 initial timeline bootstrap 与 `full_state` / `use_state_after` 投影，`visibility context.room_pos` 必须固定到 `collectSince()` 观察到的 per-room snapshot cutoff；不得在房间投影阶段再偷看 collect 之后才出现的 live timeline 或 live state。
 
 ### 9.2 Initial / Incremental 语义
 
 * `since` 缺失表示 initial sync；实现必须在单一 `upper_bound_user_stream_pos` 上返回用户当前可见的 joined / invited / knocked 房间视图与当前用户域快照；`rooms.leave` 只在 filter 显式启用 `include_leave = true` 时返回 left / banned-but-not-forgotten 房间。
+* 对 initial sync 中当前可见的 `rooms.join` 房间，以及 filter 显式启用 `include_leave = true` 后仍可见的 `rooms.leave` 房间，服务端还必须返回最近一段当前可见的 room timeline，而不是只返回 membership/state 快照；若请求显式给出 `room.timeline.limit`，recent timeline 必须受该上限约束，若未给出则必须使用 bounded implementation-defined default。当前 profile 将该 default 固定为 `10` 条当前可见事件，而不是返回空 timeline 或无界全量历史。相应 `prev_batch` 必须允许新设备/新登录会话继续向后分页已有房间历史，而且这段 initial timeline 必须严格受该次 snapshot cutoff 约束，不能夹带 collect 之后才出现的房间事件。
 * `since` 存在表示 incremental sync；实现只能返回满足 `stream_pos > since_pos && stream_pos <= upper_bound_user_stream_pos` 的增量。
 * token 解析失败、版本不兼容、设备或用户作用域不匹配时，必须在进入 long poll 前失败，并且不得前移任何 session ack 状态。
 
@@ -472,10 +476,14 @@ membership 到 `/sync` bucket 的映射必须固定为：
 * forgotten rooms 不得再出现在任何 bucket 中
 
 若同一房间在 `(since, upper_bound]` 窗口内跨多个 membership bucket 迁移，响应中必须只出现最终 bucket；为解释最终 bucket 所必需的 timeline / state 仍必须一并返回。
+特别地，当目标用户在该窗口内从 `invite` / `knock` / 非 joined 可见态迁移到最终 `join` bucket 时，`rooms.join` 投影必须携带该用户进入 joined 语义后立即生效的当前 room state snapshot，而不能只返回那条 `m.room.member join` 事件；至少像 `m.room.encryption` 这类会改变客户端房间语义与 composer 行为的当前 state，必须在该次增量 `/sync` 中对新加入者可见。
+同一次真实 `join` 迁移若还存在“当前已对 joined 用户可见、但未被这次 timeline delta 明确携带”的 recent room context，`rooms.join.timeline` 还必须一并回填一个 bounded recent visible timeline slice，而不是只给出孤立的 `join` 事件；这段 slice 至少要足以让主流客户端在不额外猜测服务器状态的前提下 materialize 新加入房间的立即可见上下文。该 slice 必须按目标用户在当前 `m.room.history_visibility` 与 membership 边界下实际可见的 timeline 选取，不得把对该用户仍不可见的 pre-join message history 混入 `rooms.join.timeline`；但像 `m.room.encryption` 这类会立刻改变房间语义的 current-state anchor，仍必须通过本次 `/sync` 的 state snapshot 与必要 recent context 对新加入者可见。回填 recent context 时，不得把引发本次 bucket 迁移的那条 `m.room.member join` 事件从 `rooms.join.timeline` 中挤掉。
 
 ### 9.4 `limited` 与 `prev_batch`
 
 * 当服务端因为 `timeline.limit`、repair gap、backfill 边界或可见性压缩而省略了更早但本应可见的 timeline 事件时，房间投影必须设置 `limited = true`。
+* 上述规则同样适用于 `invite` / `knock` / 非 joined 可见态 -> `join` 的 recent timeline 回填：若 bounded join backfill 仍省略了更早但对该 joined 用户已可见的历史，服务端必须把该房间标记为 `limited = true`，并提供可继续向后分页的 `prev_batch`。
+* 若 `filter.room.timeline.limit` 的纯尾部截断会把触发本次 bucket 迁移的 `m.room.member join` 事件挤出返回窗口，服务端必须把 `rooms.join.timeline` 扩展成仍然包含该 join 事件的最小连续可见后缀；不得为了保留 join 事件而制造中间缺口。
 * 只要返回了 `timeline.events`，就必须返回 `prev_batch`；其中 `prev_batch` 必须绑定 `DATA-ID-002`，由 `RoomDO` 签发为 opaque cursor，且能独立支持向后分页，不依赖 mutable waiter state。
 * 当 `limited = true` 时，`prev_batch` 必须指向“最老一条已返回 timeline event 之前”的房间位置。
 * 当没有返回 timeline events 时，`prev_batch` 可以省略。

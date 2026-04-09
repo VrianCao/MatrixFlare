@@ -24,7 +24,7 @@
 | `DATA-ID-001` | token | `next_batch` sync token | authoritative | `UserDO` | DO SQLite + signed token | opaque | per-user serial | none | 对客户端 opaque，内部至少包含版本和 `user_stream_pos`。 |
 | `DATA-ID-002` | cursor | room pagination token | authoritative | `RoomDO` | signed cursor | opaque | per-room serial | none | 不依赖可变服务端内存。 |
 | `DATA-ID-003` | token | access token hash | authoritative | `UserDO` | DO SQLite | session id / token hash | per-user serial | none | 只存 hash。 |
-| `DATA-ID-004` | token | refresh token hash | authoritative | `UserDO` | DO SQLite | refresh session id | per-user serial | none | 轮换后旧 token 必须可判失效。 |
+| `DATA-ID-004` | token | refresh token hash | authoritative | `UserDO` | DO SQLite | refresh session id | per-user serial | none | refresh 成功后，紧邻上一代 refresh token 只允许在“新 access / 新 refresh 尚未被使用”窗口内继续重试并收敛到同一已发行 lineage；一旦新 access 或新 refresh 被使用，旧 token 必须可判失效。 |
 | `DATA-ID-005` | manifest | queue job id / replay job id | authoritative | producer | DO SQLite / D1 control plane | job id | per job serial | control plane log | 用于补偿、取消和恢复。 |
 | `DATA-ID-006` | token | UIA session token | authoritative | `gateway-worker` | signed opaque token | opaque | route-bound, TTL-bound | none | 用于 `register`、`account/password`、`account/deactivate` 等当前启用的 UIA 路由；payload 至少绑定 `route_family`、HTTP method、`issued_at`、`expires_at`、`auth_subject_hint`、`completed_stages`、`nonce` 与 `root_key_version`；不得被其它路由或其它主体重放。签名验证责任只允许落在 `gateway-worker`，其它 Worker/DO 只可接收归一化后的已验证 challenge 结果，不得直接依赖原始 token bytes 或签名 secret。 |
 

@@ -9,6 +9,7 @@ import {
   getAuthenticated,
   getJoinedRoomEntry,
   joinRoom,
+  loginWithPassword,
   postAuthenticated,
   putAuthenticated,
   request,
@@ -165,6 +166,31 @@ test('TEST-CS-002 staging covers filter lifecycle plus /sync limited, full_state
     `filter=${encodeURIComponent(JSON.stringify(cinnyInlineFilter))}&use_state_after=true`,
   );
   assert.equal(typeof cinnyInitialSync.next_batch, 'string');
+  const cinnyInitialRoom = getJoinedRoomEntry(cinnyInitialSync, roomId);
+  assert.ok(cinnyInitialRoom);
+  assert.ok(Array.isArray(cinnyInitialRoom.timeline?.events));
+  assert.ok(cinnyInitialRoom.timeline.events.some((event) => event.event_id === preTokenMessage.payload.event_id));
+  assert.equal(typeof cinnyInitialRoom.timeline?.prev_batch, 'string');
+  assert.ok(!('state' in cinnyInitialRoom));
+
+  const bobLaptopLogin = await loginWithPassword(harness, {
+    user: bob.user_id,
+    password: bob.password,
+    deviceId: 'CS2STGBOBLAPTOP',
+  });
+  assert.equal(bobLaptopLogin.response.status, 200);
+  const bobLaptopInitialSync = await syncRequest(
+    harness,
+    bobLaptopLogin.payload.access_token,
+    `filter=${encodeURIComponent(JSON.stringify(cinnyInlineFilter))}&use_state_after=true`,
+  );
+  const bobLaptopInitialRoom = getJoinedRoomEntry(bobLaptopInitialSync, roomId);
+  assert.ok(bobLaptopInitialRoom);
+  assert.ok(Array.isArray(bobLaptopInitialRoom.timeline?.events));
+  assert.ok(bobLaptopInitialRoom.timeline.events.some((event) => event.event_id === preTokenMessage.payload.event_id));
+  assert.equal(typeof bobLaptopInitialRoom.timeline?.prev_batch, 'string');
+  assert.ok(!('state' in bobLaptopInitialRoom));
+
   const postTokenMessage = await putAuthenticated(
     harness,
     alice.access_token,
@@ -175,6 +201,16 @@ test('TEST-CS-002 staging covers filter lifecycle plus /sync limited, full_state
     },
   );
   assert.equal(postTokenMessage.response.status, 200);
+  const reloginTailMessage = await putAuthenticated(
+    harness,
+    alice.access_token,
+    roomPath(roomId, '/send/m.room.message/cs2-staging-cinny-relogin-tail'),
+    {
+      msgtype: 'm.text',
+      body: 'phase08 cs2 staging cinny relogin tail',
+    },
+  );
+  assert.equal(reloginTailMessage.response.status, 200);
   const cinnyStoredSync = await syncRequest(
     harness,
     bob.access_token,
@@ -185,13 +221,52 @@ test('TEST-CS-002 staging covers filter lifecycle plus /sync limited, full_state
   assert.ok(cinnyStoredRoom);
   assert.deepEqual(
     cinnyStoredRoom.timeline?.events?.map((event) => event.event_id),
-    [postTokenMessage.payload.event_id],
+    [postTokenMessage.payload.event_id, reloginTailMessage.payload.event_id],
   );
   assert.equal(
     cinnyStoredRoom.timeline?.events?.some((event) => event.event_id === preTokenMessage.payload.event_id),
     false,
   );
   assert.ok(!('state' in cinnyStoredRoom));
+
+  const relogin = await loginWithPassword(harness, {
+    user: bob.user_id,
+    password: bob.password,
+    deviceId: 'CS2STGBOB2',
+  });
+  assert.equal(relogin.response.status, 200);
+  assert.equal(relogin.payload?.device_id, 'CS2STGBOB2');
+
+  const reloginInitialFilter = {
+    room: {
+      state: {
+        lazy_load_members: true,
+      },
+      timeline: {
+        limit: 2,
+      },
+    },
+  };
+  const reloginInitialSync = await syncRequest(
+    harness,
+    relogin.payload.access_token,
+    `filter=${encodeURIComponent(JSON.stringify(reloginInitialFilter))}&use_state_after=true`,
+  );
+  const reloginRoom = getJoinedRoomEntry(reloginInitialSync, roomId);
+  assert.ok(reloginRoom);
+  assert.deepEqual(
+    reloginRoom.timeline?.events?.map((event) => event.event_id),
+    [postTokenMessage.payload.event_id, reloginTailMessage.payload.event_id],
+  );
+  assert.equal(typeof reloginRoom.timeline?.prev_batch, 'string');
+  assert.ok(!('state' in reloginRoom));
+  const reloginBackfill = await getAuthenticated(
+    harness,
+    relogin.payload.access_token,
+    `${roomPath(roomId, '/messages')}?from=${encodeURIComponent(reloginRoom.timeline.prev_batch)}&dir=b&limit=1`,
+  );
+  assert.equal(reloginBackfill.response.status, 200);
+  assert.deepEqual(reloginBackfill.payload?.chunk?.map((event) => event.event_id), [preTokenMessage.payload.event_id]);
 
   const storedFilter = await uploadFilter(harness, bob.access_token, bob.user_id, {
     account_data: {
@@ -385,6 +460,26 @@ test('TEST-CS-002 staging covers filter lifecycle plus /sync limited, full_state
   });
   assert.equal(fullStateCarolMembership, null);
 
+  const leaveBackfillMessage = await putAuthenticated(
+    harness,
+    alice.access_token,
+    roomPath(roomId, '/send/m.room.message/cs2-staging-leave-backfill'),
+    {
+      msgtype: 'm.text',
+      body: 'phase08 cs2 staging leave backfill',
+    },
+  );
+  assert.equal(leaveBackfillMessage.response.status, 200);
+  const leaveInlineMessage = await putAuthenticated(
+    harness,
+    alice.access_token,
+    roomPath(roomId, '/send/m.room.message/cs2-staging-leave-inline'),
+    {
+      msgtype: 'm.text',
+      body: 'phase08 cs2 staging leave inline',
+    },
+  );
+  assert.equal(leaveInlineMessage.response.status, 200);
   const leave = await postAuthenticated(harness, bob.access_token, roomPath(roomId, '/leave'), {});
   assert.equal(leave.response.status, 200);
   const leaveSync = await syncRequest(
@@ -399,6 +494,42 @@ test('TEST-CS-002 staging covers filter lifecycle plus /sync limited, full_state
     && event.state_key === bob.user_id
     && event.content?.membership === 'leave'
   )));
+
+  const leaveRelogin = await loginWithPassword(harness, {
+    user: bob.user_id,
+    password: bob.password,
+    deviceId: 'CS2STGBOBLEAVE',
+  });
+  assert.equal(leaveRelogin.response.status, 200);
+  const leaveInitialFilter = {
+    room: {
+      include_leave: true,
+      timeline: {
+        limit: 2,
+      },
+    },
+  };
+  const leaveInitialSync = await syncRequest(
+    harness,
+    leaveRelogin.payload.access_token,
+    `filter=${encodeURIComponent(JSON.stringify(leaveInitialFilter))}`,
+  );
+  const leaveInitialRoom = leaveInitialSync.rooms?.leave?.[roomId];
+  assert.ok(leaveInitialRoom);
+  assert.ok(leaveInitialRoom.timeline.events.some((event) => event.event_id === leaveInlineMessage.payload.event_id));
+  assert.ok(leaveInitialRoom.timeline.events.some((event) => (
+    event.type === 'm.room.member'
+    && event.state_key === bob.user_id
+    && event.content?.membership === 'leave'
+  )));
+  assert.equal(typeof leaveInitialRoom.timeline?.prev_batch, 'string');
+  const leaveInitialBackfill = await getAuthenticated(
+    harness,
+    leaveRelogin.payload.access_token,
+    `${roomPath(roomId, '/messages')}?from=${encodeURIComponent(leaveInitialRoom.timeline.prev_batch)}&dir=b&limit=1`,
+  );
+  assert.equal(leaveInitialBackfill.response.status, 200);
+  assert.deepEqual(leaveInitialBackfill.payload?.chunk?.map((event) => event.event_id), [leaveBackfillMessage.payload.event_id]);
 
   assert.notEqual(firstMessage.payload.event_id, secondMessage.payload.event_id);
   assert.notEqual(secondMessage.payload.event_id, stateAfterMessage.payload.event_id);

@@ -256,6 +256,45 @@
   `tests/staging/test-cs-003.test.mjs`
   `tests/staging/test-room-001.test.mjs`
 
+### 13. initial `/sync` recent timeline bootstrap 与 snapshot cutoff 必须同时闭合，不能只修“看起来有 timeline”
+
+- [x] `CS-GAP-013` initial `/sync` 的 recent timeline bootstrap / snapshot-boundary contract 已按真实问题闭环补齐。
+  Official basis:
+  官方 Matrix Client-Server `/sync` contract 要求首次同步返回当前房间视图中的 recent room timeline，并提供 `prev_batch` 以便客户端继续向后分页；这段 initial timeline 还必须与同一 `next_batch`/snapshot truth 一致，不能夹带 collect 之后才出现的房间事件。
+  Closed status:
+  `2026-04-07` 已把 `RoomDO.projectForSync()` 的 visibility cutoff 改成显式消费 `collectSince()` 冻结下来的 per-room `visibility_context.room_pos`，不再让 joined-room initial sync 退化成读取 live latest timeline/state；同一变更还补上了 local runtime-control 回归，故意在 `collectSince()` 与 `projectForSync()` 之间注入 post-snapshot room event，现已真实证明该事件不会泄漏进 initial `/sync`，而会在下一次 incremental `/sync` 中出现。与此同时，same-user new-device / relogin 的 joined-room 与 `include_leave = true` leave-room initial `/sync` 也都已补上 timeline + `prev_batch` + `/messages` backfill proof，避免再次把“只有 state 快照”误判为正确。
+  Artifact targets:
+  `spec/framework/23-interface-contract-catalog.md`
+  `spec/framework/26-wire-schema-catalog.md`
+  `spec/framework/30-client-identity-and-sync.md`
+  `spec/framework/43-testing-and-compliance.md`
+  `spec/framework/44-verification-and-evidence-register.md`
+  `packages/runtime-core/src/durable-objects.mjs`
+  `apps/gateway-worker/src/index.mjs`
+  `tests/local/client-identity/phase-05.test.mjs`
+  `tests/staging/test-cs-002.test.mjs`
+
+### 14. refresh retry / soft-logout 语义若与 Matrix `v1.17` 不一致，浏览器客户端会被错误硬登出
+
+- [x] `CS-GAP-014` refresh retry window 与 expired-access `soft_logout` truth 已按官方语义补齐。
+  Official basis:
+  Matrix `v1.17` 要求旧 refresh token 在新 access token 或新 refresh token 被使用前仍保持有效，用于处理 refresh 响应丢失或客户端重试；同时，当 access token 已过期但 refresh 仍可恢复时，client-facing `M_UNKNOWN_TOKEN` 必须附带 `soft_logout: true`。
+  Closed status:
+  `2026-04-07` 已把 session refresh contract 改成“上一代 refresh token 只在当前 rotated token lineage 尚未被使用前可 retry，并收敛到同一已发行 pair；一旦当前 access 或当前 refresh 被使用，旧 refresh 立即失效”。gateway auth path 也已补上 expired-access `soft_logout: true` 传播。local `phase-04` 现已真实证明 retry-before-use、post-use invalidation、以及 expired access + refresh recoverable 的 `soft_logout` truth；staging / integration `TEST-CS-001` 也已补上 non-local refresh retry / invalidation proof。
+  Artifact targets:
+  `TODO.md`
+  `spec/framework/23-interface-contract-catalog.md`
+  `spec/framework/24-data-contract-catalog.md`
+  `spec/framework/26-wire-schema-catalog.md`
+  `spec/framework/30-client-identity-and-sync.md`
+  `spec/framework/43-testing-and-compliance.md`
+  `spec/framework/44-verification-and-evidence-register.md`
+  `packages/runtime-core/src/durable-objects.mjs`
+  `apps/gateway-worker/src/index.mjs`
+  `tests/local/client-identity/phase-04.test.mjs`
+  `tests/staging/test-cs-001.test.mjs`
+  `tests/integration/test-cs-001.test.mjs`
+
 ## Execution Rule
 
 当上述任一项真正进入主线补全时，必须在同一变更集中同步：
