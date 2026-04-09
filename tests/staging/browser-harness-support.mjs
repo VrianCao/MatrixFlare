@@ -4,8 +4,6 @@ import http from 'node:http';
 import path from 'node:path';
 import process from 'node:process';
 
-import * as tar from 'tar';
-
 import {
   ELEMENT_WEB_RELEASE,
 } from './browser-e2e-support.mjs';
@@ -52,6 +50,20 @@ async function pathExists(filePath) {
 async function ensureDirectory(directoryPath) {
   await fs.mkdir(directoryPath, { recursive: true });
   return directoryPath;
+}
+
+async function extractTarball(options) {
+  let tarModule;
+  try {
+    tarModule = await import('tar');
+  } catch (error) {
+    const missingDependencyError = new Error(
+      'ensureElementWebBundle requires the optional devDependency "tar" when bundle extraction is needed',
+    );
+    missingDependencyError.cause = error;
+    throw missingDependencyError;
+  }
+  await tarModule.x(options);
 }
 
 async function downloadElementWebTarball(tarballPath) {
@@ -127,7 +139,7 @@ export async function ensureElementWebBundle(cacheRoot = path.join(process.cwd()
   if (!extractedManifestMatches) {
     await fs.rm(extractionRoot, { recursive: true, force: true });
     await ensureDirectory(extractionRoot);
-    await tar.x({
+    await extractTarball({
       file: tarballPath,
       cwd: extractionRoot,
       preservePaths: false,

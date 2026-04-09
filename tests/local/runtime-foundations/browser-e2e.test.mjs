@@ -7,13 +7,26 @@ import test from 'node:test';
 import {
   BROWSER_JOURNEY_MATRIX,
   BROWSER_JOURNEY_MINIMUM_COVERAGE_RATIO,
+  ELEMENT_WEB_RELEASE,
   buildBrowserJourneyCoverageReport,
+  computeBrowserJourneyCoverageSummary,
   validateBrowserJourneyCoverageReport,
 } from '../../../packages/testing/src/browser-e2e.mjs';
 import {
   buildElementWebConfig,
   startElementWebServer,
 } from '../../../packages/testing/src/browser-harness.mjs';
+import {
+  BROWSER_JOURNEY_MATRIX as STAGING_BROWSER_JOURNEY_MATRIX,
+  BROWSER_JOURNEY_MINIMUM_COVERAGE_RATIO as STAGING_BROWSER_JOURNEY_MINIMUM_COVERAGE_RATIO,
+  ELEMENT_WEB_RELEASE as STAGING_ELEMENT_WEB_RELEASE,
+  buildBrowserJourneyCoverageReport as buildStagingBrowserJourneyCoverageReport,
+  computeBrowserJourneyCoverageSummary as computeStagingBrowserJourneyCoverageSummary,
+  validateBrowserJourneyCoverageReport as validateStagingBrowserJourneyCoverageReport,
+} from '../../staging/browser-e2e-support.mjs';
+import {
+  buildElementWebConfig as buildStagingElementWebConfig,
+} from '../../staging/browser-harness-support.mjs';
 import {
   getRequiredTestImplementationFiles,
   listL1EvidenceBundleIds,
@@ -118,4 +131,51 @@ test('browser harness serves config.json and SPA fallback for pinned Element hos
     await server.close();
     await fs.rm(tempRoot, { recursive: true, force: true });
   }
+});
+
+test('staging-local browser E2E helpers stay aligned with the shared package contract', () => {
+  assert.deepEqual(STAGING_BROWSER_JOURNEY_MATRIX, BROWSER_JOURNEY_MATRIX);
+  assert.equal(STAGING_BROWSER_JOURNEY_MINIMUM_COVERAGE_RATIO, BROWSER_JOURNEY_MINIMUM_COVERAGE_RATIO);
+  assert.deepEqual(STAGING_ELEMENT_WEB_RELEASE, ELEMENT_WEB_RELEASE);
+
+  const journeys = buildPassingP0JourneyInputs();
+  const playwright = {
+    package_version: '1.59.1',
+    browser_name: 'chromium',
+    browser_version: '136.0.0.0',
+    headless: true,
+  };
+  const capturedAt = '2026-04-09T00:00:00.000Z';
+  assert.deepEqual(
+    computeStagingBrowserJourneyCoverageSummary(journeys),
+    computeBrowserJourneyCoverageSummary(journeys),
+  );
+  const stagingReport = buildStagingBrowserJourneyCoverageReport({
+    capturedAt,
+    journeys,
+    playwright,
+  });
+  const packageReport = buildBrowserJourneyCoverageReport({
+    capturedAt,
+    journeys,
+    playwright,
+  });
+  assert.deepEqual(stagingReport, packageReport);
+  assert.deepEqual(
+    validateStagingBrowserJourneyCoverageReport(stagingReport, { expectedEnvironmentName: 'staging' }),
+    validateBrowserJourneyCoverageReport(packageReport, { expectedEnvironmentName: 'staging' }),
+  );
+
+  assert.deepEqual(
+    buildStagingElementWebConfig({
+      homeserverBaseUrl: 'https://matrix.example.test',
+      serverName: 'matrix.example.test',
+      brand: 'Matrix Test Browser',
+    }),
+    buildElementWebConfig({
+      homeserverBaseUrl: 'https://matrix.example.test',
+      serverName: 'matrix.example.test',
+      brand: 'Matrix Test Browser',
+    }),
+  );
 });
